@@ -49,4 +49,11 @@ enum class KernelType {
     KernelNoSF = 2
 };
 
+enum class ActivationType {
+    // SiLU(gate) * up, i.e. gate * sigmoid(gate) * up
+    SwiGLU = 0,
+    // tanh-approximated GELU(gate) * up
+    GeGLU  = 1,
+};
+
 } // namespace deep_gemm

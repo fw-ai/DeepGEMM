@@ -7,9 +7,12 @@ import torch.distributed as dist
 from typing import Tuple
 
 import deep_gemm
-from deep_gemm.utils import per_token_cast_to_fp4, per_token_cast_to_fp8
+from deep_gemm.utils import (
+    per_token_cast_to_fp4, per_token_cast_to_fp8,
+    cast_back_from_fp4, unpack_ue8m0_from_int,
+)
 from deep_gemm.utils.dist import dist_print, init_dist, uneven_all_gather
-from deep_gemm.testing import bench_kineto
+from deep_gemm.testing import bench_kineto, calc_diff
 
 
 def import_baseline():
@@ -31,6 +34,40 @@ def import_baseline():
         dist_print(f'Failed to load legacy code: {ex}, skip baseline benchmarking', once_in_node=True)
         dist_print(once_in_node=True)
     return deep_ep, tilelang_ops, do_bench, is_legacy_loaded
+
+
+def _apply_gate_activation(gate: torch.Tensor, activation: str) -> torch.Tensor:
+    # Both variants reduce to `gate * sigmoid(z)`:
+    #  - SwiGLU: SiLU(gate)        => z = gate
+    #  - GeGLU:  tanh-approx GELU  => z = alpha * (gate + beta * gate ** 3),
+    #    since 0.5 * (1 + tanh(t)) == sigmoid(2 * t)
+    if activation == 'swiglu':
+        z = gate
+    elif activation == 'geglu':
+        alpha = 1.5957691216057308  # 2 * sqrt(2 / pi)
+        beta = 0.044715
+        z = alpha * (gate + beta * gate * gate * gate)
+    else:
+        raise ValueError(f'Unsupported activation: {activation}')
+    return gate * torch.sigmoid(z)
+
+
+def _dequant_x_fp8(x_fp8: torch.Tensor, sf_packed: torch.Tensor, gran_k: int = 32) -> torch.Tensor:
+    # FP8 (E4M3) activations with packed UE8M0 per-`gran_k` scale factors
+    m, n = x_fp8.shape
+    sf = unpack_ue8m0_from_int(sf_packed)[:, :n // gran_k]
+    return (x_fp8.float().view(m, n // gran_k, gran_k) * sf.unsqueeze(2)).view(m, n)
+
+
+def _dequant_weight_fp4(w_bf16: torch.Tensor, gran_k: int = 32) -> torch.Tensor:
+    # Emulate the exact FP4 (E2M1) values the kernel consumes by round-tripping
+    # each expert's weight through the same quantizer used to build the inputs.
+    num_experts = w_bf16.size(0)
+    out = torch.empty_like(w_bf16, dtype=torch.float32)
+    for e in range(num_experts):
+        packed, sf = per_token_cast_to_fp4(w_bf16[e], use_ue8m0=True, gran_k=gran_k)
+        out[e] = cast_back_from_fp4(packed, sf, gran_k=gran_k)
+    return out
 
 
 # TODO: skip the test for SM90
@@ -55,7 +92,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         group, num_experts,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
-        mma_type=args.mma_type
+        mma_type=args.mma_type,
+        activation=args.activation
     )
 
     # Cast weights into FP4
@@ -72,6 +110,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     # noinspection PyGlobalUndefined
     def create_inputs():
         global x, topk_idx, topk_weights, l1_weights, l2_weights, transformed_l1_weights, transformed_l2_weights
+        global l1_weights_bf16, l2_weights_bf16
         global cumulative_local_expert_recv_stats_fused
         global cumulative_local_expert_recv_stats_baseline
         x = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
@@ -79,6 +118,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             (num_experts_per_rank, intermediate_hidden * 2, hidden), dtype=torch.bfloat16, device='cuda')
         l2_weights = torch.randn(
             (num_experts_per_rank, hidden, intermediate_hidden), dtype=torch.bfloat16, device='cuda')
+        # Keep BF16 originals for the self-contained numerical reference
+        l1_weights_bf16, l2_weights_bf16 = l1_weights, l2_weights
         scores = torch.randn((num_tokens, num_experts), dtype=torch.float, device='cuda')
         topk_weights, topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=False)
         cumulative_local_expert_recv_stats_fused = torch.randint(
@@ -115,10 +156,53 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             y=y, l1_weights=transformed_l1_weights, l2_weights=transformed_l2_weights,
             sym_buffer=buffer,
             cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats_fused,
+            activation=args.activation,
             activation_clamp=args.activation_clamp,
             fast_math=bool(args.fast_math))
         (deep_gemm.bf16_mega_moe if is_bf16xbf16 else deep_gemm.fp8_fp4_mega_moe)(**kernel_kwargs)
         return y, cumulative_local_expert_recv_stats_fused
+
+    # Self-contained PyTorch reference (single-rank only: routing/combine is local)
+    # Mirrors the fused pipeline: L1 GEMM -> gated activation (* topk weight) ->
+    # per-32 UE8M0 FP8 requantization -> L2 GEMM -> top-k combine (plain sum).
+    def run_reference():
+        assert num_ranks == 1, 'Reference only supports a single rank'
+        clamp = float(args.activation_clamp)
+        x_deq = _dequant_x_fp8(x[0][:num_tokens], x[1][:num_tokens])
+        l1_w = _dequant_weight_fp4(l1_weights_bf16)
+        l2_w = _dequant_weight_fp4(l2_weights_bf16)
+
+        y = torch.zeros((num_tokens, hidden), dtype=torch.float32, device='cuda')
+        for slot in range(num_topk):
+            expert_idx = topk_idx[:num_tokens, slot]
+            weight = topk_weights[:num_tokens, slot].float()
+            for e in range(num_experts_per_rank):
+                mask = expert_idx == e
+                if not bool(mask.any()):
+                    continue
+                xt = x_deq[mask]
+
+                # L1 GEMM then split into gate/up (first/second half of the output)
+                acc1 = xt @ l1_w[e].t()
+                gate = acc1[:, :intermediate_hidden].to(torch.bfloat16)
+                up = acc1[:, intermediate_hidden:].to(torch.bfloat16)
+                if clamp != float('inf'):
+                    gate = torch.clamp(gate, max=clamp)
+                    up = torch.clamp(up, min=-clamp, max=clamp)
+
+                # Gated activation with the per-token routing weight folded in
+                act = _apply_gate_activation(gate.float(), args.activation) * up.float()
+                act = act * weight[mask].unsqueeze(1)
+
+                # Requantize to FP8 (per-32 UE8M0), matching the kernel's L1 output
+                act_fp8, act_sf = per_token_cast_to_fp8(act, use_ue8m0=True, gran_k=32)
+                n_groups = intermediate_hidden // 32
+                act_deq = (act_fp8.float().view(-1, n_groups, 32) * act_sf[:, :n_groups].unsqueeze(2)
+                           ).view(-1, intermediate_hidden)
+
+                # L2 GEMM, accumulate across the top-k experts
+                y[mask] += act_deq @ l2_w[e].t()
+        return y.to(torch.bfloat16)
 
     dist_print('Config:', once_in_node=True)
     dist_print(f' > MMA: {args.mma_type}', once_in_node=True)
@@ -146,14 +230,18 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     deep_ep, tilelang_ops, tilelang_bench, is_legacy_loaded = import_baseline()
     alignment = deep_gemm.get_theoretical_mk_alignment_for_contiguous_layout()
     deep_gemm.set_mk_alignment_for_contiguous_layout(alignment)
-    ep_buffer = deep_ep.ElasticBuffer(
-        group,
-        num_max_tokens_per_rank=num_max_tokens_per_rank, hidden=hidden,
-        num_topk=num_topk, use_fp8_dispatch=True,
-        explicitly_destroy=True,
-        allow_multiple_reduction=False,
-        num_gpu_timeout_secs=10, num_cpu_timeout_secs=30
-    ) if is_legacy_loaded else None
+    try:
+        ep_buffer = deep_ep.ElasticBuffer(
+            group,
+            num_max_tokens_per_rank=num_max_tokens_per_rank, hidden=hidden,
+            num_topk=num_topk, use_fp8_dispatch=True,
+            explicitly_destroy=True,
+            allow_multiple_reduction=False,
+            num_gpu_timeout_secs=10, num_cpu_timeout_secs=30
+        ) if is_legacy_loaded else None
+    except Exception as ex:
+        dist_print(f'Failed to create legacy EP buffer: {ex}, skip baseline', once_in_node=True)
+        ep_buffer, is_legacy_loaded = None, False
 
     # Baseline params differ by mma type
     run_baseline = None
@@ -201,11 +289,18 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             # Combine
             return ep_buffer.combine(l2_y, handle=handle)[0], cumulative_local_expert_recv_stats_baseline
 
-    # Check correctness (must be bitwise identical)
+    # Check correctness
     num_correctness_tests = 1 if args.num_correctness_tests is None else args.num_correctness_tests
+    # The legacy tilelang baseline is bitwise-identical but only implements SwiGLU
+    use_legacy_baseline = is_legacy_loaded and args.activation == 'swiglu'
+    # The self-contained numerical reference covers any activation but only the
+    # single-rank FP8 path (it models the kernel's FP8 L1-output requantization)
+    use_numerical_reference = num_ranks == 1 and not is_bf16xbf16
+    ran_correctness = False
+
     # noinspection PyBroadException
-    if is_legacy_loaded and num_correctness_tests > 0:
-        dist_print('Running correctness tests:', once_in_node=True)
+    if use_legacy_baseline and num_correctness_tests > 0:
+        dist_print('Running correctness tests (bitwise vs legacy baseline):', once_in_node=True)
         for i in range(num_correctness_tests):
             create_inputs()
             for fused_result, baseline_result in zip(run_fused(), run_baseline()):
@@ -213,7 +308,24 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             if (i + 1) % 100 == 0 or i == num_correctness_tests - 1:
                 dist_print(f' > Correctness test #{i + 1}/{num_correctness_tests} passed', once_in_node=True)
         dist_print(once_in_node=True)
-    else:
+        ran_correctness = True
+
+    if use_numerical_reference and num_correctness_tests > 0:
+        # FP8/FP4 quantization across two GEMMs bounds the achievable similarity
+        max_diff = 0.05
+        dist_print(f'Running correctness tests ({args.activation}, numerical reference):', once_in_node=True)
+        for i in range(num_correctness_tests):
+            create_inputs()
+            fused_y, _ = run_fused()
+            ref_y = run_reference()
+            diff = calc_diff(fused_y, ref_y)
+            assert diff < max_diff, f'{args.activation} diff too large: {diff:.5f} >= {max_diff}'
+            if (i + 1) % 100 == 0 or i == num_correctness_tests - 1:
+                dist_print(f' > Correctness test #{i + 1}/{num_correctness_tests} passed (diff {diff:.5f})', once_in_node=True)
+        dist_print(once_in_node=True)
+        ran_correctness = True
+
+    if not ran_correctness:
         create_inputs()
 
     # Count local received tokens
@@ -286,6 +398,7 @@ if __name__ == '__main__':
     parser.add_argument('--num-max-removed-tokens', type=int, default=0, help='Maximum number of tokens to remove')
     parser.add_argument('--hidden', type=int, default=7168, help='Hidden size')
     parser.add_argument('--intermediate-hidden', type=int, default=3072, help='Intermediate hidden size')
+    parser.add_argument('--activation', type=str, default='swiglu', choices=['swiglu', 'geglu'], help='Gated activation type')
     parser.add_argument('--activation-clamp', type=float, default=10, help='Clamp value for activation')
     parser.add_argument('--num-experts', type=int, default=384, help='Number of experts')
     parser.add_argument('--num-topk', type=int, default=6, help='Number of expert selections')

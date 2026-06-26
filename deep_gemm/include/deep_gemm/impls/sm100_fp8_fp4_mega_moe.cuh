@@ -6,6 +6,7 @@
 
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/tma_copy.cuh>
+#include <deep_gemm/common/types.cuh>
 #include <deep_gemm/common/utils.cuh>
 #include <deep_gemm/comm/barrier.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
@@ -35,6 +36,7 @@ template <
     uint32_t kNumSMs, uint32_t kNumRanks,
     float kActivationClamp,
     bool kFastMath,
+    ActivationType kActivationType,
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
     uint32_t L2_SHAPE_N = kHidden,
@@ -941,7 +943,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const auto num_expected_blocks = (L2_SHAPE_N / BLOCK_N) * (pool_block_idx / kNumRingBlocks);
                 while (ptx::ld_acq(l2_empty_ptr) != num_expected_blocks);
 
-                // Unified L1 epilogue: SwiGLU in-place using granularity 8 interleaved weights
+                // Unified L1 epilogue: gated activation (SwiGLU/GeGLU) in-place using
+                // granularity 8 interleaved weights.
                 // With `SM100_TMEM_LOAD_16dp256b1x`, gate/up pairs are:
                 float stored_cached_weight = 0;
 
@@ -990,7 +993,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             shared_storage.tmem_empty_barriers[accum_stage_idx].arrive(0u);
                         }
 
-                        // Apply SwiGLU: silu(gate) * up
+                        // Apply gated activation: act(gate) * up (SwiGLU or GeGLU)
                         auto fp32_values = reinterpret_cast<float2*>(raw_values);
                         #pragma unroll
                         for (uint32_t k = 0; k < 2; ++ k) {
@@ -1004,19 +1007,37 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                 bf16_up = __hmin2(bf16_up, {kActivationClamp, kActivationClamp});
                             }
 
-                            // SwiGLU
-                            auto gate = __bfloat1622float2(bf16_gate);
-                            auto neg_gate_exp = make_float2(
-                                kFastMath ? __expf(-gate.x) : expf(-gate.x),
-                                kFastMath ? __expf(-gate.y) : expf(-gate.y));
-                            const auto denom = __fadd2_rn({1.0f, 1.0f}, neg_gate_exp);
-                            if constexpr (kFastMath) {
-                                gate = __fmul2_rn(gate, {math::fast_rcp(denom.x), math::fast_rcp(denom.y)});
-                            } else {
-                                gate = {gate.x / denom.x, gate.y / denom.y};
-                            }
+                            const auto gate = __bfloat1622float2(bf16_gate);
                             const auto up = __bfloat1622float2(bf16_up);
-                            activation_values[i][k] = __fmul2_rn(__fmul2_rn(gate, up), weights);
+
+                            // Gated activation, applied to the gate projection. Both variants
+                            // reduce to `gate * sigmoid(z) * up` for an activation-specific `z`:
+                            //  - SwiGLU: SiLU(gate)         => z = gate
+                            //  - GeGLU:  GELU(gate) (tanh)  => z = alpha * (gate + beta * gate^3)
+                            //    since 0.5 * (1 + tanh(t)) == sigmoid(2t)
+                            float2 z;
+                            if constexpr (kActivationType == ActivationType::GeGLU) {
+                                constexpr float kAlpha = 1.5957691216057308f;  // 2 * sqrt(2 / pi)
+                                constexpr float kBeta = 0.044715f;
+                                const auto gate_sq = __fmul2_rn(gate, gate);
+                                z = __fmul2_rn(
+                                    {kAlpha, kAlpha},
+                                    __fmul2_rn(gate, __fadd2_rn({1.0f, 1.0f}, __fmul2_rn({kBeta, kBeta}, gate_sq))));
+                            } else {
+                                z = gate;
+                            }
+
+                            const auto neg_exp = make_float2(
+                                kFastMath ? __expf(-z.x) : expf(-z.x),
+                                kFastMath ? __expf(-z.y) : expf(-z.y));
+                            const auto denom = __fadd2_rn({1.0f, 1.0f}, neg_exp);
+                            float2 activated;
+                            if constexpr (kFastMath) {
+                                activated = __fmul2_rn(gate, {math::fast_rcp(denom.x), math::fast_rcp(denom.y)});
+                            } else {
+                                activated = {gate.x / denom.x, gate.y / denom.y};
+                            }
+                            activation_values[i][k] = __fmul2_rn(__fmul2_rn(activated, up), weights);
                         }
 
                         // Amax reduction (thread-level)
