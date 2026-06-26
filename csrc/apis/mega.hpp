@@ -35,7 +35,7 @@ get_symm_buffer_size_for_mega_moe(
     const std::string& mma_type, const std::string& activation,
     const int& num_ring_tokens) {
     DG_HOST_ASSERT(num_experts % num_ranks == 0);
-    DG_HOST_ASSERT(activation == "swiglu");
+    DG_HOST_ASSERT(activation == "swiglu" or activation == "geglu");
 
     // Pool capacity must fit at least one full wave (one expert per wave) and aligned to block size
     const auto num_experts_per_rank = num_experts / num_ranks;
@@ -180,7 +180,7 @@ static void fp8_fp4_mega_moe(
     const auto num_tokens = static_cast<int>(y.size(0));
     const auto [rm, rn, rk] = recipe;
     DG_HOST_ASSERT(rm == 1 and rn == 1 and rk == 32);
-    DG_HOST_ASSERT(activation == "swiglu");
+    DG_HOST_ASSERT(activation == "swiglu" or activation == "geglu");
 
     // Activation checks
     const auto activation_clamp =
@@ -242,7 +242,7 @@ static void fp8_fp4_mega_moe(
                                num_experts_per_rank,
                                num_tokens, num_topk,
                                hidden, intermediate_hidden,
-                               activation_clamp, fast_math);
+                               activation, activation_clamp, fast_math);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }

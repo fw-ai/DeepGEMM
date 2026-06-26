@@ -15,6 +15,16 @@
 
 namespace deep_gemm {
 
+// Map an activation name to its `deep_gemm::ActivationType` enumerator token
+// (resolved inside the JIT-generated translation unit via `using namespace deep_gemm`).
+static std::string get_activation_type_name(const std::string& activation) {
+    if (activation == "swiglu")
+        return "ActivationType::SwiGLU";
+    if (activation == "geglu")
+        return "ActivationType::GeGLU";
+    DG_HOST_UNREACHABLE("Unsupported activation");
+}
+
 class SM100FP8FP4MegaMoERuntime final : public LaunchRuntime<SM100FP8FP4MegaMoERuntime> {
 public:
     struct Args {
@@ -25,6 +35,7 @@ public:
         int num_ranks;
         float activation_clamp;
         bool fast_math;
+        std::string activation;
         MegaMoEConfig config;
 
         // Runtime arguments
@@ -70,6 +81,7 @@ static void __instantiate_kernel() {{
         {}, {}, {},
         {}, {},
         {},
+        {},
         {}
     >);
 }};
@@ -87,7 +99,8 @@ static void __instantiate_kernel() {{
     args.config.num_dispatch_threads, args.config.num_non_epilogue_threads, args.config.num_epilogue_threads,
     args.launch_args.grid_dim.first, args.num_ranks,
     to_string(args.activation_clamp),
-    args.fast_math ? "true" : "false");
+    args.fast_math ? "true" : "false",
+    get_activation_type_name(args.activation));
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -122,6 +135,7 @@ static void sm100_fp8_fp4_mega_moe(
     const int& num_experts_per_rank,
     const int& num_tokens, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
+    const std::string& activation,
     const float& activation_clamp,
     const bool& fast_math
 ) {
@@ -203,6 +217,7 @@ static void sm100_fp8_fp4_mega_moe(
         .num_ranks = num_ranks,
         .activation_clamp = activation_clamp,
         .fast_math = fast_math,
+        .activation = activation,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,

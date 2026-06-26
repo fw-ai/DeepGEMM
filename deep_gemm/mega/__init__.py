@@ -23,7 +23,7 @@ class SymmBuffer:
                  num_ring_tokens: int,
                  mma_type: str = 'fp8xfp4',
                  activation: str = 'swiglu'):
-        assert activation == 'swiglu', f'Only `swiglu` activation is supported, got `{activation}`'
+        assert activation in ('swiglu', 'geglu'), f'Unsupported activation: `{activation}`'
         self.group = group
         self.num_experts = num_experts
         self.num_max_tokens_per_rank = num_max_tokens_per_rank
@@ -136,7 +136,8 @@ def transform_weights_for_mega_moe(
     activation: str = 'swiglu'
 ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
              Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]:
-    assert activation == 'swiglu', f'Only `swiglu` activation is supported, got `{activation}`'
+    # Gate/up interleaving is independent of the gated-activation variant
+    assert activation in ('swiglu', 'geglu'), f'Unsupported activation: `{activation}`'
     if isinstance(l1_weights, tuple):
         # FP8: interleave gate/up for weight and SF, then transpose L1 SF for UTCCP
         l1_w = _interleave_weights(l1_weights[0])
