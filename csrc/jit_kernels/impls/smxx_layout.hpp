@@ -155,8 +155,10 @@ static torch::Tensor get_mn_major_tma_aligned_tensor(const torch::Tensor& sf) {
 static torch::Tensor get_mn_major_tma_aligned_packed_ue8m0_tensor_torch(const torch::Tensor& sf) {
     const auto sf_reshaped = (sf.dim() == 2) ? sf.unsqueeze(0) : sf;
 
-    // First, convert into UE8M0 `uint8_t`
-    const auto ue8m0_tensor = sf_reshaped.view(torch::kInt32).bitwise_right_shift(23).to(torch::kUInt8);
+    // Round positive fp32 block scales to UE8M0 before packing exponents.
+    const auto sf_pos = sf_reshaped.clamp_min(5.88e-39f);
+    const auto ue8m0_sf = torch::exp2(torch::ceil(torch::log2(sf_pos)));
+    const auto ue8m0_tensor = ue8m0_sf.view(torch::kInt32).bitwise_right_shift(23).to(torch::kUInt8);
 
     // Second, make padded packed tensors
     const auto [num_sf_batches, mn, k] = get_shape<3>(sf_reshaped);
