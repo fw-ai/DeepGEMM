@@ -17,7 +17,7 @@ from deep_gemm.utils.math import (
 sys.path.insert(0, os.path.dirname(__file__))
 from test_mxfp4_gemm import _prepare as _prep_mxfp4_gemm
 from test_nvfp4_gemm import _prepare as _prep_nvfp4_gemm
-from test_nvfp4_mega_moe import _cast_w_nvfp4, _estimate_l2_global_scale, GRAN_K
+from test_nvfp4_mega_moe import _cast_l1_w, _cast_l2_w, _estimate_l2act_gs, GRAN_K
 
 
 def bench_gemm():
@@ -89,18 +89,22 @@ def bench_mega():
                             'mega_moe', suppress_kineto_output=True)
         buf_mx.destroy()
 
-        # NVFP4
+        # NVFP4 (per-expert global scales, TRT-LLM convention)
         buf_nv = deep_gemm.get_symm_buffer_for_mega_moe(group, num_experts, num_max_tokens, num_topk,
                                                         hidden, inter, mma_type='nvfp4xnvfp4')
-        gs_x, gs_w1, gs_w2 = nvfp4_global_scale(x), nvfp4_global_scale(l1w), nvfp4_global_scale(l2w)
-        gs_l2 = _estimate_l2_global_scale(x, l1w, topk_idx, topk_weights, inter, gs_x, gs_w1, clamp)
+        gs_x = nvfp4_global_scale(x)
+        l1, gate_gs, up_gs = _cast_l1_w(l1w)
+        l2, down_gs = _cast_l2_w(l2w)
+        l2act_gs = _estimate_l2act_gs(x, l1w, topk_idx, topk_weights, inter, gs_x, gate_gs, up_gs, clamp, num_experts)
+        gate_alpha = (gs_x * gate_gs).contiguous(); up_alpha = (gs_x * up_gs).contiguous()
+        down_alpha = (l2act_gs * down_gs).contiguous(); l2_input_gs = (1.0 / l2act_gs).contiguous()
         xpn, xsfn = per_token_cast_to_nvfp4(x, gs_x, gran_k=GRAN_K)
-        nl1, nl2 = deep_gemm.transform_weights_for_mega_moe(_cast_w_nvfp4(l1w, gs_w1), _cast_w_nvfp4(l2w, gs_w2))
+        nl1, nl2 = deep_gemm.transform_weights_for_mega_moe(l1, l2)
         buf_nv.x[:num_tokens].copy_(xpn); buf_nv.x_sf[:num_tokens].copy_(xsfn.contiguous().view(torch.int32))
         buf_nv.topk_idx[:num_tokens].copy_(topk_idx); buf_nv.topk_weights[:num_tokens].copy_(topk_weights)
         t_nv = bench_kineto(lambda: deep_gemm.nvfp4_nvfp4_mega_moe(y=y, l1_weights=nl1, l2_weights=nl2, sym_buffer=buf_nv,
-                                                                  l1_act_global_scale=gs_x, l2_act_global_scale=gs_l2,
-                                                                  l1_weight_global_scale=gs_w1, l2_weight_global_scale=gs_w2,
+                                                                  gate_alpha=gate_alpha, up_alpha=up_alpha,
+                                                                  l2_input_global_scale=l2_input_gs, down_alpha=down_alpha,
                                                                   activation_clamp=clamp, fast_math=True),
                             'mega_moe', suppress_kineto_output=True)
         buf_nv.destroy()

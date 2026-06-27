@@ -362,9 +362,12 @@ static void nvfp4_nvfp4_mega_moe(
     const std::vector<int64_t>& sym_buffer_ptrs, const int& rank_idx,
     const int& num_max_tokens_per_rank,
     const int& num_experts, const int& num_topk,
-    // Per-tensor global scales (CPU scalars): activations (L1 input, L2 input) and weights (L1, L2).
-    const float& l1_act_global_scale, const float& l2_act_global_scale,
-    const float& l1_weight_global_scale, const float& l2_weight_global_scale,
+    // NVFP4 per-expert global scales (TRT-LLM convention), each (num_experts_per_rank,) float32:
+    //   gate_alpha / up_alpha = 1/(l1_input_gs * gate|up_weight_gs)   (L1 dequant combiner)
+    //   l2_input_global_scale = L2-input per-expert global scale       (L1-output requant)
+    //   down_alpha            = 1/(l2_input_gs * down_weight_gs)       (L2 dequant combiner)
+    const torch::Tensor& gate_alpha, const torch::Tensor& up_alpha,
+    const torch::Tensor& l2_input_global_scale, const torch::Tensor& down_alpha,
     const std::tuple<int, int, int>& recipe,
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
@@ -437,8 +440,7 @@ static void nvfp4_nvfp4_mega_moe(
                                    hidden, intermediate_hidden,
                                    activation_clamp, fast_math,
                                    MmaKind::NVFP4,
-                                   l1_act_global_scale, l1_weight_global_scale,
-                                   l2_act_global_scale, l2_weight_global_scale);
+                                   gate_alpha, up_alpha, l2_input_global_scale, down_alpha);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }

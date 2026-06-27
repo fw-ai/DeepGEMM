@@ -113,8 +113,11 @@ public:
         bool fast_math;
         // NVFP4 (E4M3 SF gran-16 + global scale) vs MXFP4 (UE8M0 SF gran-32)
         bool is_nvfp4;
-        // NVFP4 global-scale dequant params (CPU scalars; 1.0 for MXFP4)
-        float l1_acc_scale, l2_act_global_scale, l2_acc_scale;
+        // NVFP4 per-expert global-scale device pointers ((num_experts_per_rank,) f32; nullptr for MXFP4)
+        const float* gate_alpha;
+        const float* up_alpha;
+        const float* l2_input_global_scale;
+        const float* down_alpha;
         MegaMoEConfig config;
 
         void* y;
@@ -194,9 +197,10 @@ static void __instantiate_kernel() {{
             args.tensor_map_l2_acts_sf,
             args.tensor_map_l2_weights,
             args.tensor_map_l2_weights_sf,
-            args.l1_acc_scale,
-            args.l2_act_global_scale,
-            args.l2_acc_scale
+            args.gate_alpha,
+            args.up_alpha,
+            args.l2_input_global_scale,
+            args.down_alpha
         ));
     }
 };
@@ -215,17 +219,38 @@ static void sm100_mxfp4_mxfp4_mega_moe(
     const int& hidden, const int& intermediate_hidden,
     const float& activation_clamp,
     const bool& fast_math,
-    // MmaKind::MXFP4 or MmaKind::NVFP4. NVFP4 also needs the per-tensor global scales below.
+    // MmaKind::MXFP4 or MmaKind::NVFP4. NVFP4 also needs the per-expert global-scale tensors below.
     const MmaKind& mma_kind = MmaKind::MXFP4,
-    // NVFP4 global scales (CPU scalars). Derived dequant: L1 acc -> real, L1-output requant, L2 acc -> real.
-    const float& l1_act_gs = 1.0f, const float& l1_weight_gs = 1.0f,
-    const float& l2_act_gs = 1.0f, const float& l2_weight_gs = 1.0f
+    // NVFP4 per-expert global scales (TRT-LLM convention), each (num_experts_per_rank,) float32:
+    //   gate/up_alpha = 1/(l1_input_gs * gate|up_weight_gs); down_alpha = 1/(l2_input_gs * down_weight_gs);
+    //   l2_input_global_scale = the L2-input per-expert global scale (= 448*6/amax).
+    const std::optional<torch::Tensor>& gate_alpha = std::nullopt,
+    const std::optional<torch::Tensor>& up_alpha = std::nullopt,
+    const std::optional<torch::Tensor>& l2_input_global_scale = std::nullopt,
+    const std::optional<torch::Tensor>& down_alpha = std::nullopt
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
     const auto num_ring_tokens = static_cast<int>(l1_acts.size(0));
     const auto num_sf_ring_tokens = static_cast<int>(l1_acts_sf.size(0));
     const bool is_nvfp4 = (mma_kind == MmaKind::NVFP4);
+
+    // Extract per-expert global-scale device pointers (NVFP4 only)
+    const float* gate_alpha_ptr = nullptr;
+    const float* up_alpha_ptr = nullptr;
+    const float* l2_input_gs_ptr = nullptr;
+    const float* down_alpha_ptr = nullptr;
+    if (is_nvfp4) {
+        DG_HOST_ASSERT(gate_alpha and up_alpha and l2_input_global_scale and down_alpha);
+        for (const auto& t : {gate_alpha, up_alpha, l2_input_global_scale, down_alpha}) {
+            DG_HOST_ASSERT(t->scalar_type() == torch::kFloat and t->is_contiguous());
+            DG_HOST_ASSERT(static_cast<int>(t->numel()) == num_experts_per_rank);
+        }
+        gate_alpha_ptr = gate_alpha->data_ptr<float>();
+        up_alpha_ptr = up_alpha->data_ptr<float>();
+        l2_input_gs_ptr = l2_input_global_scale->data_ptr<float>();
+        down_alpha_ptr = down_alpha->data_ptr<float>();
+    }
 
     const auto config = get_mxfp4_mega_moe_config(
         num_ranks, num_experts, num_experts_per_rank,
@@ -294,11 +319,11 @@ static void sm100_mxfp4_mxfp4_mega_moe(
         .activation_clamp = activation_clamp,
         .fast_math = fast_math,
         .is_nvfp4 = is_nvfp4,
-        // L1 acc -> real = gs_l1_act * gs_l1_weight; L1-output requant uses gs_l2_act;
-        // L2 acc -> real = gs_l2_act * gs_l2_weight. (All 1.0 for MXFP4.)
-        .l1_acc_scale = l1_act_gs * l1_weight_gs,
-        .l2_act_global_scale = l2_act_gs,
-        .l2_acc_scale = l2_act_gs * l2_weight_gs,
+        // Per-expert NVFP4 combiners/global-scales (device ptrs); nullptr for MXFP4.
+        .gate_alpha = gate_alpha_ptr,
+        .up_alpha = up_alpha_ptr,
+        .l2_input_global_scale = l2_input_gs_ptr,
+        .down_alpha = down_alpha_ptr,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,

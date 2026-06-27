@@ -64,13 +64,15 @@ sm100_mxfp4_mxfp4_mega_moe_impl(void* y,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts_sf,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights_sf,
-                            // NVFP4 global-scale dequant params (CPU-side scalars; ignored for MXFP4).
-                            //   l1_acc_scale       = gs_l1_act * gs_l1_weight  (L1 MMA acc -> real)
-                            //   l2_act_global_scale = gs_l2_act                (L1-output requant)
-                            //   l2_acc_scale       = gs_l2_act * gs_l2_weight  (L2 MMA acc -> real)
-                            const float l1_acc_scale = 1.0f,
-                            const float l2_act_global_scale = 1.0f,
-                            const float l2_acc_scale = 1.0f) {
+                            // NVFP4 per-expert global-scale tensors (device ptrs, (num_experts_per_rank,) f32;
+                            // ignored for MXFP4). TRT-LLM convention (global_scale = 448*6/amax):
+                            //   gate_alpha[e]/up_alpha[e]  = 1/(l1_input_gs * gate|up_weight_gs)  (L1 acc -> real)
+                            //   l2_input_global_scale[e]                                          (L1-output requant)
+                            //   down_alpha[e]              = 1/(l2_input_gs * down_weight_gs)      (L2 acc -> real)
+                            const float* gate_alpha = nullptr,
+                            const float* up_alpha = nullptr,
+                            const float* l2_input_global_scale = nullptr,
+                            const float* down_alpha = nullptr) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::TMEM::Allocator2Sm;
@@ -1080,12 +1082,17 @@ sm100_mxfp4_mxfp4_mega_moe_impl(void* y,
 
                         // Apply SwiGLU: silu(gate) * up
                         auto fp32_values = reinterpret_cast<float2*>(raw_values);
-                        // NVFP4: dequant the raw MMA accumulator by the L1 global scale BEFORE the
-                        // (nonlinear) SwiGLU. MXFP4's UE8M0 block SFs already fully dequant the accumulator.
+                        // NVFP4: dequant the raw MMA accumulator BEFORE the (nonlinear) SwiGLU, using the
+                        // per-expert combiners. fp32_values are [gate0, up0, gate1, up1] -> even=gate, odd=up.
+                        // MXFP4's UE8M0 block SFs already fully dequant the accumulator.
                         if constexpr (kIsNVFP4) {
+                            const float ga = gate_alpha[local_expert_idx];
+                            const float ua = up_alpha[local_expert_idx];
                             #pragma unroll
-                            for (uint32_t kk = 0; kk < 4; ++ kk)
-                                fp32_values[kk] = __fmul2_rn(fp32_values[kk], {l1_acc_scale, l1_acc_scale});
+                            for (uint32_t kk = 0; kk < 4; ++ kk) {
+                                const float s = (kk & 1) ? ua : ga;
+                                fp32_values[kk] = __fmul2_rn(fp32_values[kk], {s, s});
+                            }
                         }
                         #pragma unroll
                         for (uint32_t k = 0; k < 2; ++ k) {
@@ -1159,14 +1166,17 @@ sm100_mxfp4_mxfp4_mega_moe_impl(void* y,
                         float2 sf_inv;
                         uint8_t sf_byte_x, sf_byte_y;
                         if constexpr (kIsNVFP4) {
-                            const float inv_gs6 = 1.0f / (6.0f * l2_act_global_scale);
-                            const __nv_fp8_e4m3 e4x(amax_values[i].x * inv_gs6);
-                            const __nv_fp8_e4m3 e4y(amax_values[i].y * inv_gs6);
+                            // TRT-LLM: per-expert L2-input global scale (= 448*6/amax). Stored block SF is
+                            // E4M3(amax_block * gs / 6); the E2M1 code uses sf_inv = gs / sf_e4m3.
+                            const float gs = l2_input_global_scale[local_expert_idx];
+                            const float gs6 = gs * (1.0f / 6.0f);
+                            const __nv_fp8_e4m3 e4x(amax_values[i].x * gs6);
+                            const __nv_fp8_e4m3 e4y(amax_values[i].y * gs6);
                             sf_byte_x = e4x.__x;  sf_byte_y = e4y.__x;
-                            const float sx = static_cast<float>(e4x) * l2_act_global_scale;
-                            const float sy = static_cast<float>(e4y) * l2_act_global_scale;
-                            sf_inv.x = sx > 0.f ? 1.0f / sx : 0.f;
-                            sf_inv.y = sy > 0.f ? 1.0f / sy : 0.f;
+                            const float fx = static_cast<float>(e4x);
+                            const float fy = static_cast<float>(e4y);
+                            sf_inv.x = fx > 0.f ? gs / fx : 0.f;
+                            sf_inv.y = fy > 0.f ? gs / fy : 0.f;
                         } else {
                             const float2 scaled = __fmul2_rn(amax_values[i], {1.0f / 6.0f, 1.0f / 6.0f});
                             const int ex = math::fast_log2_ceil(scaled.x);
@@ -1315,11 +1325,12 @@ sm100_mxfp4_mxfp4_mega_moe_impl(void* y,
                                                                values[4], values[5], values[6], values[7]);
                         cutlass::arch::fence_view_async_tmem_load();
 
-                        // NVFP4: dequant the L2 MMA accumulator by the L2 global scale before BF16 cast
+                        // NVFP4: dequant the L2 MMA accumulator by the per-expert combiner before BF16 cast
                         if constexpr (kIsNVFP4) {
+                            const float da = down_alpha[local_expert_idx];
                             #pragma unroll
                             for (uint32_t v = 0; v < ATOM_M; ++ v)
-                                values[v] = __float_as_uint(__uint_as_float(values[v]) * l2_acc_scale);
+                                values[v] = __float_as_uint(__uint_as_float(values[v]) * da);
                         }
 
                         // Wait shared memory release from previous NVLink store
