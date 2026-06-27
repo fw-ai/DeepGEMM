@@ -185,7 +185,15 @@ static void sm100_fp8_fp4_mega_moe(
         cumulative_local_expert_recv_stats_ptr = cumulative_local_expert_recv_stats->data_ptr<int>();
 
     // Launch
-    const auto num_sms = device_runtime->get_num_sms();
+    // Reserve 2 SMs of headroom for co-resident kernels. The mega kernel is a
+    // cooperative grid: its grid_sync / nvlink_barrier expect all NUM_SMS CTAs
+    // (== grid_dim) resident. In disaggregated serving a concurrent NCCL
+    // `ncclDevKernel_SendRecv` (KV transfer) can grab an SM the mega grid needs,
+    // leaving it 1-2 CTAs short -> the grid/NVLink barrier never completes ->
+    // cross-host barrier timeout (the "signal=4 target=8" crash). Reserving 2
+    // SMs (stays even for the 2-CTA cluster launch) lets such a co-resident
+    // SendRecv run without starving the cooperative grid.
+    const auto num_sms = device_runtime->get_num_sms() - 2;
     const SM100FP8FP4MegaMoERuntime::Args args = {
         .num_max_tokens_per_rank = num_max_tokens_per_rank,
         .hidden = hidden, .intermediate_hidden = intermediate_hidden,
