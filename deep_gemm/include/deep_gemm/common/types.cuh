@@ -7,12 +7,27 @@ namespace deep_gemm {
 enum class MmaKind {
     BF16        = 0,
     MXFP8FP4    = 1,
+    // Pure packed MXFP4 x MXFP4 (E2M1 data, UE8M0 SF, 2 elements per byte)
+    MXFP4       = 2,
 };
+
+// NOTES: element size in *bits*, since packed FP4 is sub-byte (4 bits)
+constexpr CUTLASS_HOST_DEVICE int get_element_bits(const MmaKind& mma_kind) {
+    switch (mma_kind) {
+        case MmaKind::BF16:     return 16;
+        case MmaKind::MXFP8FP4: return 8;
+        case MmaKind::MXFP4:    return 4;
+        default: return 0;
+    }
+}
 
 constexpr CUTLASS_HOST_DEVICE int get_element_size(const MmaKind& mma_kind) {
     switch (mma_kind) {
         case MmaKind::BF16:     return 2;
         case MmaKind::MXFP8FP4: return 1;
+        // NOTES: packed FP4 is 0.5 byte/elem; callers must use byte math that
+        // divides element counts by 2 (see `get_element_bits`)
+        case MmaKind::MXFP4:    return 1;
         default: return 0;
     }
 }

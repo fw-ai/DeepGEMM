@@ -175,6 +175,30 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         sym_buffer.num_ring_tokens
     )
 
+def mxfp4_mxfp4_mega_moe(y: torch.Tensor,
+                         l1_weights: Tuple[torch.Tensor, torch.Tensor],
+                         l2_weights: Tuple[torch.Tensor, torch.Tensor],
+                         sym_buffer: SymmBuffer,
+                         cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+                         recipe: Tuple[int, int, int] = (1, 1, 32),
+                         activation: str = 'swiglu',
+                         activation_clamp: Optional[float] = None,
+                         fast_math: bool = True):
+    # Packed MXFP4 x MXFP4 mega MoE (both activations and weights are E2M1 + UE8M0).
+    _C.mxfp4_mxfp4_mega_moe(
+        y,
+        l1_weights, l2_weights,
+        cumulative_local_expert_recv_stats,
+        sym_buffer.buffer,
+        sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
+        sym_buffer.num_max_tokens_per_rank,
+        sym_buffer.num_experts, sym_buffer.num_topk,
+        recipe,
+        activation, activation_clamp,
+        fast_math,
+        sym_buffer.num_ring_tokens
+    )
+
 def bf16_mega_moe(y: torch.Tensor,
                   l1_weights: torch.Tensor,
                   l2_weights: torch.Tensor,
