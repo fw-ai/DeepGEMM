@@ -199,6 +199,37 @@ def mxfp4_mxfp4_mega_moe(y: torch.Tensor,
         sym_buffer.num_ring_tokens
     )
 
+def nvfp4_nvfp4_mega_moe(y: torch.Tensor,
+                         l1_weights: Tuple[torch.Tensor, torch.Tensor],
+                         l2_weights: Tuple[torch.Tensor, torch.Tensor],
+                         sym_buffer: SymmBuffer,
+                         l1_act_global_scale: float,
+                         l2_act_global_scale: float,
+                         l1_weight_global_scale: float,
+                         l2_weight_global_scale: float,
+                         cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+                         recipe: Tuple[int, int, int] = (1, 1, 16),
+                         activation: str = 'swiglu',
+                         activation_clamp: Optional[float] = None,
+                         fast_math: bool = True):
+    # Packed NVFP4 x NVFP4 mega MoE (E2M1 data, E4M3 SF gran-16, per-tensor global scales).
+    # Global scales are CPU-side scalar kernel params (dequant: acc * gs_act * gs_weight).
+    _C.nvfp4_nvfp4_mega_moe(
+        y,
+        l1_weights, l2_weights,
+        cumulative_local_expert_recv_stats,
+        sym_buffer.buffer,
+        sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
+        sym_buffer.num_max_tokens_per_rank,
+        sym_buffer.num_experts, sym_buffer.num_topk,
+        float(l1_act_global_scale), float(l2_act_global_scale),
+        float(l1_weight_global_scale), float(l2_weight_global_scale),
+        recipe,
+        activation, activation_clamp,
+        fast_math,
+        sym_buffer.num_ring_tokens
+    )
+
 def bf16_mega_moe(y: torch.Tensor,
                   l1_weights: torch.Tensor,
                   l2_weights: torch.Tensor,

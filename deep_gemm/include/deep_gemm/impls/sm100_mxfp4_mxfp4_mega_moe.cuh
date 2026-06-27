@@ -35,6 +35,8 @@ template <
     uint32_t kNumSMs, uint32_t kNumRanks,
     float kActivationClamp,
     bool kFastMath,
+    // NVFP4 (E4M3 SF gran-16 + per-tensor global scale) vs MXFP4 (UE8M0 SF gran-32)
+    bool kIsNVFP4 = false,
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
     uint32_t L2_SHAPE_N = kHidden,
@@ -61,7 +63,14 @@ sm100_mxfp4_mxfp4_mega_moe_impl(void* y,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts_sf,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights,
-                            const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights_sf) {
+                            const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights_sf,
+                            // NVFP4 global-scale dequant params (CPU-side scalars; ignored for MXFP4).
+                            //   l1_acc_scale       = gs_l1_act * gs_l1_weight  (L1 MMA acc -> real)
+                            //   l2_act_global_scale = gs_l2_act                (L1-output requant)
+                            //   l2_acc_scale       = gs_l2_act * gs_l2_weight  (L2 MMA acc -> real)
+                            const float l1_acc_scale = 1.0f,
+                            const float l2_act_global_scale = 1.0f,
+                            const float l2_acc_scale = 1.0f) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::TMEM::Allocator2Sm;
@@ -102,8 +111,9 @@ sm100_mxfp4_mxfp4_mega_moe_impl(void* y,
     constexpr auto fp8_token_layout = layout::Data(kHidden / 2);
     constexpr auto bf16_token_layout = layout::Data(kHidden * sizeof(nv_bfloat16));
     constexpr auto fp8_intermediate_token_layout = layout::Data(kIntermediateHidden / 2);
-    constexpr auto fp8_sf_layout = layout::Data(kHidden / 32);
-    constexpr auto fp8_intermediate_sf_layout = layout::Data(kIntermediateHidden / 32);
+    constexpr uint32_t kGranK = kIsNVFP4 ? 16 : 32;
+    constexpr auto fp8_sf_layout = layout::Data(kHidden / kGranK);
+    constexpr auto fp8_intermediate_sf_layout = layout::Data(kIntermediateHidden / kGranK);
     constexpr auto input_topk_idx_layout = layout::Data(kNumTopk * sizeof(int64_t), false);
     constexpr auto input_topk_weights_layout = layout::Data(kNumTopk * sizeof(float), false);
     constexpr auto l1_topk_weights_layout = layout::Data(sizeof(float), false);
@@ -123,7 +133,6 @@ sm100_mxfp4_mxfp4_mega_moe_impl(void* y,
         input_topk_idx_buffer.get_end_ptr());
 
     // SF and its buffer configs
-    constexpr uint32_t kGranK = 32;
     constexpr uint32_t kNumUTCCPAlignedElems = 128;
     DG_STATIC_ASSERT(SF_BLOCK_M == math::constexpr_align(BLOCK_M, kNumUTCCPAlignedElems), "Invalid SF_BLOCK_M");
     DG_STATIC_ASSERT(SF_BLOCK_N == BLOCK_N, "No padding is needed for SFB");
@@ -183,6 +192,10 @@ sm100_mxfp4_mxfp4_mega_moe_impl(void* y,
     constexpr uint32_t BLOCK_K_BYTES = BLOCK_K / 2;
     constexpr uint32_t UMMA_BLOCK_K_BYTES = UMMA_BLOCK_K / 2;
     constexpr uint32_t UMMA_K_BYTES = UMMA_K / 2;
+    // SF count along K per token, in int32 units (4 SF bytes each): gran-32 -> BLOCK_K/128, gran-16 -> BLOCK_K/64.
+    constexpr uint32_t kNumSFKUint32 = BLOCK_K / (kGranK * 4);
+    // SF int32s per token per UMMA_BLOCK_K (=128): gran-32 -> 1, gran-16 -> 2.
+    constexpr uint32_t kNumSFKUint32PerUmmaBlock = UMMA_BLOCK_K / (kGranK * 4);
 
     // Swizzle configs
     // NOTES: K-major packed FP4 uses a swizzle equal to the K extent in bytes (BLOCK_K/2)
@@ -217,8 +230,8 @@ sm100_mxfp4_mxfp4_mega_moe_impl(void* y,
         // Packed-FP4 A/B tiles: byte-addressed (`BLOCK_K / 2` bytes per row)
         alignas(kSharedMemoryAlignment) uint8_t smem_a[kNumStages][LOAD_BLOCK_M * BLOCK_K_BYTES];
         alignas(kSharedMemoryAlignment) uint8_t smem_b[kNumStages][LOAD_BLOCK_N * BLOCK_K_BYTES];
-        uint32_t smem_sfa[kNumStages][SF_BLOCK_M * (BLOCK_K / 128)];
-        uint32_t smem_sfb[kNumStages][SF_BLOCK_N * (BLOCK_K / 128)];
+        uint32_t smem_sfa[kNumStages][SF_BLOCK_M * kNumSFKUint32];
+        uint32_t smem_sfb[kNumStages][SF_BLOCK_N * kNumSFKUint32];
         float2 amax_reduction[kNumEpilogueWarps][AMAX_REDUCTION_WARP_BUFFER_SIZE];
         Barrier dispatch_barriers[kNumDispatchWarps];
         Barrier full_barriers[kNumStages];
@@ -243,8 +256,13 @@ sm100_mxfp4_mxfp4_mega_moe_impl(void* y,
 
     // Tensor memory size
     constexpr uint32_t kNumAccumTmemCols = UMMA_N * kNumEpilogueStages;
-    constexpr uint32_t kNumSFATmemCols = SF_BLOCK_M / 32;
-    constexpr uint32_t kNumSFBTmemCols = SF_BLOCK_N / 32;
+    // Each K-uint32 of SF occupies (SF_BLOCK/32) tmem cols (the MN rows; cell = 4 SF bytes).
+    // The 2-bit `sf_id` field selects the SF WITHIN a K-uint32 (<=3); crossing K-uint32s
+    // (gran-16 needs 2/K-block) is done via the SF tmem ADDRESS, not sf_id.
+    constexpr uint32_t kSFAColsPerKUint = SF_BLOCK_M / 32;
+    constexpr uint32_t kSFBColsPerKUint = SF_BLOCK_N / 32;
+    constexpr uint32_t kNumSFATmemCols = kSFAColsPerKUint * kNumSFKUint32;
+    constexpr uint32_t kNumSFBTmemCols = kSFBColsPerKUint * kNumSFKUint32;
     constexpr uint32_t kNumTmemCols = utils::get_num_aligned_tmem_cols<kNumAccumTmemCols + kNumSFATmemCols + kNumSFBTmemCols>();
     constexpr uint32_t kTmemStartColOfSFA = kNumAccumTmemCols;
     constexpr uint32_t kTmemStartColOfSFB = kNumAccumTmemCols + kNumSFATmemCols;
@@ -578,7 +596,7 @@ sm100_mxfp4_mxfp4_mega_moe_impl(void* y,
             __syncwarp();
 
             // Load and store SF (overlaps with last chunk's TMA load from remote)
-            constexpr uint32_t kNumSFUint32 = kHidden / 128;
+            constexpr uint32_t kNumSFUint32 = kHidden / (kGranK * 4);
             DG_STATIC_ASSERT(kNumSFUint32 > 0 and kHidden % 128 == 0, "Invalid SF");
             const auto remote_sf_ptr = sym_buffer.map(
                 input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<uint32_t>(),
@@ -717,7 +735,8 @@ sm100_mxfp4_mxfp4_mega_moe_impl(void* y,
                 uint32_t ring_m_idx = ring_block_idx * BLOCK_M;
                 uint32_t k_idx = k_block_idx * BLOCK_K;
                 uint32_t sfa_ring_m_idx = ring_block_idx * SF_BLOCK_M;
-                uint32_t sfa_k_idx = k_block_idx * (BLOCK_K / 128);
+                // K-uint32 stride per K-block: gran-32 -> BLOCK_K/128, gran-16 -> BLOCK_K/64
+                uint32_t sfa_k_idx = k_block_idx * kNumSFKUint32;
 
                 // Add 2 CTA offsets for non-leader CTA
                 if (not is_leader_cta)
@@ -777,7 +796,7 @@ sm100_mxfp4_mxfp4_mega_moe_impl(void* y,
                 uint32_t n_idx = local_expert_idx * shape_n + n_block_idx * BLOCK_N;
                 uint32_t k_idx = k_block_idx * BLOCK_K;
                 uint32_t sfb_n_idx = n_block_idx * BLOCK_N;
-                uint32_t sfb_k_idx = local_expert_idx * shape_sfb_k + k_block_idx * (BLOCK_K / 128);
+                uint32_t sfb_k_idx = local_expert_idx * shape_sfb_k + k_block_idx * kNumSFKUint32;
 
                 // TMA copy weights (TRUE 2-CTA cta_group::2; both CTAs use the same n coord so each
                 // loads the full BLOCK_N replica) + SFB (per-CTA SM90). Data tx routes to the leader.
@@ -806,8 +825,10 @@ sm100_mxfp4_mxfp4_mega_moe_impl(void* y,
         if (is_leader_cta) {
             // Make instruction descriptor with block scaling
             // NOTES: always swap A/B
+            // NVFP4 uses UE4M3 block scale factors; MXFP4 uses UE8M0
+            using sf_dtype_t = cute::conditional_t<kIsNVFP4, cutlass::float_ue4m3_t, cutlass::float_ue8m0_t>;
             auto instr_desc = cute::UMMA::make_instr_desc_block_scaled<
-                b_dtype_t, a_dtype_t, float, cutlass::float_ue8m0_t,
+                b_dtype_t, a_dtype_t, float, sf_dtype_t,
                 UMMA_M, UMMA_N,
                 cute::UMMA::Major::K, cute::UMMA::Major::K
             >();
@@ -861,19 +882,26 @@ sm100_mxfp4_mxfp4_mega_moe_impl(void* y,
                     if (cute::elect_one_sync()) {
                         #pragma unroll
                         for (uint32_t umma_k_block_idx = 0; umma_k_block_idx < BLOCK_K / UMMA_BLOCK_K; ++ umma_k_block_idx) {
-                            // UTCCP copy SFA and SFB to TMEM (SF pre-transposed during dispatch / weight transform)
+                            // UTCCP copy SFA and SFB to TMEM (SF pre-transposed during dispatch / weight transform).
+                            // NVFP4 (gran-16) packs 2x the K-scale-factors per token (kNumSFKUint32PerUmmaBlock),
+                            // laid out [K-uint][M] in smem and [M-group][K-uint][4 cols] in tmem.
                             using cute_utccp_t = cute::SM100_UTCCP_4x32dp128bit_2cta;
                             #pragma unroll
-                            for (uint32_t i = 0; i < SF_BLOCK_M / kNumUTCCPAlignedElems; ++ i) {
-                                auto smem_ptr = shared_storage.smem_sfa[stage_idx] + umma_k_block_idx * SF_BLOCK_M + i * kNumUTCCPAlignedElems;
-                                mma::sm100::replace_smem_desc_addr(sf_desc, smem_ptr);
-                                cute_utccp_t::copy(sf_desc, kTmemStartColOfSFA + i * 4);
-                            }
-                            #pragma unroll
-                            for (uint32_t i = 0; i < SF_BLOCK_N / kNumUTCCPAlignedElems; ++ i) {
-                                auto smem_ptr = shared_storage.smem_sfb[stage_idx] + umma_k_block_idx * SF_BLOCK_N + i * kNumUTCCPAlignedElems;
-                                mma::sm100::replace_smem_desc_addr(sf_desc, smem_ptr);
-                                cute_utccp_t::copy(sf_desc, kTmemStartColOfSFB + i * 4);
+                            for (uint32_t ku = 0; ku < kNumSFKUint32PerUmmaBlock; ++ ku) {
+                                #pragma unroll
+                                for (uint32_t i = 0; i < SF_BLOCK_M / kNumUTCCPAlignedElems; ++ i) {
+                                    auto smem_ptr = shared_storage.smem_sfa[stage_idx]
+                                        + (umma_k_block_idx * kNumSFKUint32PerUmmaBlock + ku) * SF_BLOCK_M + i * kNumUTCCPAlignedElems;
+                                    mma::sm100::replace_smem_desc_addr(sf_desc, smem_ptr);
+                                    cute_utccp_t::copy(sf_desc, kTmemStartColOfSFA + (umma_k_block_idx * kNumSFKUint32PerUmmaBlock + ku) * kSFAColsPerKUint + i * 4);
+                                }
+                                #pragma unroll
+                                for (uint32_t i = 0; i < SF_BLOCK_N / kNumUTCCPAlignedElems; ++ i) {
+                                    auto smem_ptr = shared_storage.smem_sfb[stage_idx]
+                                        + (umma_k_block_idx * kNumSFKUint32PerUmmaBlock + ku) * SF_BLOCK_N + i * kNumUTCCPAlignedElems;
+                                    mma::sm100::replace_smem_desc_addr(sf_desc, smem_ptr);
+                                    cute_utccp_t::copy(sf_desc, kTmemStartColOfSFB + (umma_k_block_idx * kNumSFKUint32PerUmmaBlock + ku) * kSFBColsPerKUint + i * 4);
+                                }
                             }
 
                             // Issue packed-mxf4 UMMA over UMMA_K (=64) sub-tiles (byte-addressed smem)
@@ -881,16 +909,29 @@ sm100_mxfp4_mxfp4_mega_moe_impl(void* y,
                             const auto b_stage_ptr = reinterpret_cast<b_dtype_t*>(shared_storage.smem_b[stage_idx]) + umma_k_block_idx * UMMA_BLOCK_K_BYTES;
                             #pragma unroll
                             for (uint32_t k = 0; k < UMMA_BLOCK_K / UMMA_K; ++ k) {
-                                const uint32_t sf_id = (umma_k_block_idx * (UMMA_BLOCK_K / UMMA_K) + k) * 2;
+                                // 4 SFs pack into one TMEM word (one K-uint32). The 2-bit `sf_id`
+                                // selects WITHIN that K-uint32 (<=3); crossing K-uint32s (gran-16 needs
+                                // 2 per K-block) is done via the SF tmem ADDRESS, not sf_id.
+                                const uint32_t global_sf_idx = (umma_k_block_idx * (UMMA_BLOCK_K / UMMA_K) + k) * (UMMA_K / kGranK);
+                                const uint32_t sf_kuint = global_sf_idx / 4;
+                                const uint32_t sf_id = global_sf_idx % 4;
+                                const uint32_t tmem_sfa = kTmemStartColOfSFA + sf_kuint * kSFAColsPerKUint;
+                                const uint32_t tmem_sfb = kTmemStartColOfSFB + sf_kuint * kSFBColsPerKUint;
                                 const auto runtime_instr_desc =
                                     mma::sm100::make_runtime_instr_desc_with_sf_id(instr_desc, sf_id, sf_id);
                                 auto a_desc = mma::sm100::make_smem_desc(kFP4Layout, a_stage_ptr + k * UMMA_K_BYTES, 8 * kSwizzleAMode, 0);
                                 auto b_desc = mma::sm100::make_smem_desc(kFP4Layout, b_stage_ptr + k * UMMA_K_BYTES, 8 * kSwizzleBMode, 0);
                                 // Swap-AB: weights (b_desc) take the UMMA "A" slot + SFB
-                                ptx::SM100_MMA_MXF4_2x1SM_SS::fma(
-                                    b_desc, a_desc, accum_stage_idx * UMMA_N,
-                                    k_block_idx > 0 or umma_k_block_idx > 0 or k > 0, runtime_instr_desc,
-                                    kTmemStartColOfSFB, kTmemStartColOfSFA);
+                                if constexpr (kIsNVFP4)
+                                    ptx::SM100_MMA_NVF4_2x1SM_SS::fma(
+                                        b_desc, a_desc, accum_stage_idx * UMMA_N,
+                                        k_block_idx > 0 or umma_k_block_idx > 0 or k > 0, runtime_instr_desc,
+                                        tmem_sfb, tmem_sfa);
+                                else
+                                    ptx::SM100_MMA_MXF4_2x1SM_SS::fma(
+                                        b_desc, a_desc, accum_stage_idx * UMMA_N,
+                                        k_block_idx > 0 or umma_k_block_idx > 0 or k > 0, runtime_instr_desc,
+                                        tmem_sfb, tmem_sfa);
                             }
                         }
                     }
@@ -1039,6 +1080,13 @@ sm100_mxfp4_mxfp4_mega_moe_impl(void* y,
 
                         // Apply SwiGLU: silu(gate) * up
                         auto fp32_values = reinterpret_cast<float2*>(raw_values);
+                        // NVFP4: dequant the raw MMA accumulator by the L1 global scale BEFORE the
+                        // (nonlinear) SwiGLU. MXFP4's UE8M0 block SFs already fully dequant the accumulator.
+                        if constexpr (kIsNVFP4) {
+                            #pragma unroll
+                            for (uint32_t kk = 0; kk < 4; ++ kk)
+                                fp32_values[kk] = __fmul2_rn(fp32_values[kk], {l1_acc_scale, l1_acc_scale});
+                        }
                         #pragma unroll
                         for (uint32_t k = 0; k < 2; ++ k) {
                             auto bf16_gate = __float22bfloat162_rn(fp32_values[k * 2 + 0]);
@@ -1080,9 +1128,12 @@ sm100_mxfp4_mxfp4_mega_moe_impl(void* y,
                         amax_values[i].y = math::warp_reduce<4, true>(
                             thread_local_amax.y, math::ReduceMax<float>());
 
-                        // Reduce amax (warp-pair-level)
-                        if (lane_idx < 4)
-                            shared_storage.amax_reduction[epilogue_warp_idx][i * (ATOM_M / 2) + lane_idx] = amax_values[i];
+                        // Reduce amax (warp-pair-level) -- only MXFP4 (gran-32 SF spans 2 warps).
+                        // NVFP4 (gran-16) has one SF per warp, so each warp keeps its own amax.
+                        if constexpr (not kIsNVFP4) {
+                            if (lane_idx < 4)
+                                shared_storage.amax_reduction[epilogue_warp_idx][i * (ATOM_M / 2) + lane_idx] = amax_values[i];
+                        }
                         __syncwarp();
                     }
 
@@ -1095,20 +1146,37 @@ sm100_mxfp4_mxfp4_mega_moe_impl(void* y,
                     // Cast to FP8 E4M3 and store into shared memory
                     #pragma unroll
                     for (uint32_t i = 0; i < kNumAtomsPerStore; ++ i) {
-                        // Reduce amax (warp-pair-level)
-                        const float2 wp_amax =
-                            shared_storage.amax_reduction[epilogue_warp_idx ^ 1][i * (ATOM_M / 2) + lane_idx % 4];
-                        amax_values[i].x = cute::max(amax_values[i].x, wp_amax.x);
-                        amax_values[i].y = cute::max(amax_values[i].y, wp_amax.y);
+                        // Reduce amax (warp-pair-level), MXFP4 only
+                        if constexpr (not kIsNVFP4) {
+                            const float2 wp_amax =
+                                shared_storage.amax_reduction[epilogue_warp_idx ^ 1][i * (ATOM_M / 2) + lane_idx % 4];
+                            amax_values[i].x = cute::max(amax_values[i].x, wp_amax.x);
+                            amax_values[i].y = cute::max(amax_values[i].y, wp_amax.y);
+                        }
 
-                        // Calculate UE8M0 SF (MXFP4: E2M1 max is 6.0, so scale by amax/6)
-                        float2 sf, sf_inv;
-                        {
+                        // Output block SF + the inverse used to scale activations before the E2M1 cast.
+                        // MXFP4: UE8M0 (pow2 of amax/6). NVFP4: E4M3 of amax/(6*gs), code = act/(sf_e4m3*gs).
+                        float2 sf_inv;
+                        uint8_t sf_byte_x, sf_byte_y;
+                        if constexpr (kIsNVFP4) {
+                            const float inv_gs6 = 1.0f / (6.0f * l2_act_global_scale);
+                            const __nv_fp8_e4m3 e4x(amax_values[i].x * inv_gs6);
+                            const __nv_fp8_e4m3 e4y(amax_values[i].y * inv_gs6);
+                            sf_byte_x = e4x.__x;  sf_byte_y = e4y.__x;
+                            const float sx = static_cast<float>(e4x) * l2_act_global_scale;
+                            const float sy = static_cast<float>(e4y) * l2_act_global_scale;
+                            sf_inv.x = sx > 0.f ? 1.0f / sx : 0.f;
+                            sf_inv.y = sy > 0.f ? 1.0f / sy : 0.f;
+                        } else {
                             const float2 scaled = __fmul2_rn(amax_values[i], {1.0f / 6.0f, 1.0f / 6.0f});
                             const int ex = math::fast_log2_ceil(scaled.x);
                             const int ey = math::fast_log2_ceil(scaled.y);
-                            sf.x = math::fast_pow2(ex);  sf_inv.x = math::fast_pow2(-ex);
-                            sf.y = math::fast_pow2(ey);  sf_inv.y = math::fast_pow2(-ey);
+                            sf_inv.x = math::fast_pow2(-ex);
+                            sf_inv.y = math::fast_pow2(-ey);
+                            float2 sf;
+                            sf.x = math::fast_pow2(ex);  sf.y = math::fast_pow2(ey);
+                            sf_byte_x = static_cast<uint8_t>(*reinterpret_cast<const uint32_t*>(&sf.x) >> 23);
+                            sf_byte_y = static_cast<uint8_t>(*reinterpret_cast<const uint32_t*>(&sf.y) >> 23);
                         }
 
                         // Cast 2 activation outputs -> e2m1 nibbles, then write them DIRECTLY to their
@@ -1155,11 +1223,14 @@ sm100_mxfp4_mxfp4_mega_moe_impl(void* y,
                             p[(tok0 + 1) * L1_OUT_BLOCK_N_BYTES + j1] = ((my_nibs >> 24) & 0xF) | (((pr_nibs >> 24) & 0xF) << 4);
                         }
 
-                        // Store SF to `l2_sf_buffer` as UE8M0 (MN-major layout)
-                        // Only one warp per pair writes (both hold the same SF after cross-warp reduce)
-                        // Each lane < 4 holds SF for 2 rows (sf.x and sf.y)
-                        if (warp_idx_in_wg % 2 == 0 and lane_idx < 4) {
-                            const uint32_t k_idx = n_block_idx * 2 + warp_idx_in_wg / 2;
+                        // Store SF to `l2_sf_buffer` (MN-major): MXFP4 UE8M0 byte, NVFP4 E4M3 byte.
+                        // MXFP4 (gran-32): one SF per warp-pair (2 SFs per n-block, even warp writes).
+                        // NVFP4 (gran-16): one SF per warp (4 SFs per n-block, every warp writes).
+                        const bool sf_writer = kIsNVFP4 ? (lane_idx < 4)
+                                                        : (warp_idx_in_wg % 2 == 0 and lane_idx < 4);
+                        if (sf_writer) {
+                            const uint32_t k_idx = kIsNVFP4 ? (n_block_idx * 4 + warp_idx_in_wg)
+                                                            : (n_block_idx * 2 + warp_idx_in_wg / 2);
                             const uint32_t k_uint_idx = k_idx / 4, byte_idx = k_idx % 4;
                             const uint32_t mn_stride = kNumSFRingTokens * sizeof(uint32_t);
                             const auto sf_base_ptr = l2_sf_buffer.get_base_ptr<uint8_t>();
@@ -1176,10 +1247,8 @@ sm100_mxfp4_mxfp4_mega_moe_impl(void* y,
                             const auto sf_ring_token_idx = ring_block_idx * SF_BLOCK_M
                                 + transform_sf_token_idx(token_base_idx) + (lane_idx * 2) * 4;
                             const auto sf_addr = k_uint_idx * mn_stride + sf_ring_token_idx * static_cast<uint32_t>(sizeof(uint32_t)) + byte_idx;
-                            sf_base_ptr[sf_addr] =
-                                (*reinterpret_cast<const uint32_t*>(&sf.x) >> 23);
-                            sf_base_ptr[sf_addr + 4 * static_cast<uint32_t>(sizeof(uint32_t))] =
-                                (*reinterpret_cast<const uint32_t*>(&sf.y) >> 23);
+                            sf_base_ptr[sf_addr] = sf_byte_x;
+                            sf_base_ptr[sf_addr + 4 * static_cast<uint32_t>(sizeof(uint32_t))] = sf_byte_y;
                         }
                         __syncwarp();
                     }
@@ -1245,6 +1314,13 @@ sm100_mxfp4_mxfp4_mega_moe_impl(void* y,
                         cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr | 0x00100000,
                                                                values[4], values[5], values[6], values[7]);
                         cutlass::arch::fence_view_async_tmem_load();
+
+                        // NVFP4: dequant the L2 MMA accumulator by the L2 global scale before BF16 cast
+                        if constexpr (kIsNVFP4) {
+                            #pragma unroll
+                            for (uint32_t v = 0; v < ATOM_M; ++ v)
+                                values[v] = __float_as_uint(__uint_as_float(values[v]) * l2_acc_scale);
+                        }
 
                         // Wait shared memory release from previous NVLink store
                         // NOTES: skip for the first store block since the prior full barrier already ensures completion

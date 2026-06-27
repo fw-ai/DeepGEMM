@@ -22,10 +22,11 @@ static MegaMoEConfig get_mxfp4_mega_moe_config(
     const int& num_ranks, const int& num_experts, const int& num_experts_per_rank,
     const int& num_max_tokens_per_rank, const int& num_tokens, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
-    const int& num_ring_tokens, const int& num_sf_ring_tokens) {
+    const int& num_ring_tokens, const int& num_sf_ring_tokens,
+    const MmaKind& mma_kind) {
 
     const auto [cluster_size, block_m, store_block_m, block_k, num_epilogue_threads] =
-        get_block_config_for_mega_moe(num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens, MmaKind::MXFP4);
+        get_block_config_for_mega_moe(num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens, mma_kind);
     const int block_n = 128;
     const int load_block_m = block_m / 2;
     const int load_block_n = block_n;
@@ -35,7 +36,7 @@ static MegaMoEConfig get_mxfp4_mega_moe_config(
     // Packed FP4 K-major swizzle == K extent in bytes (block_k / 2)
     const int swizzle_acts_mode = block_k / 2;
     const int swizzle_weights_mode = block_k / 2;
-    constexpr int gran_k = 32;
+    const int gran_k = get_sf_gran_k(mma_kind);
 
     const int num_sms = device_runtime->get_num_sms();
     const int num_experts_per_wave = get_num_experts_per_wave_for_mega_moe(
@@ -110,6 +111,10 @@ public:
         int num_ranks;
         float activation_clamp;
         bool fast_math;
+        // NVFP4 (E4M3 SF gran-16 + global scale) vs MXFP4 (UE8M0 SF gran-32)
+        bool is_nvfp4;
+        // NVFP4 global-scale dequant params (CPU scalars; 1.0 for MXFP4)
+        float l1_acc_scale, l2_act_global_scale, l2_acc_scale;
         MegaMoEConfig config;
 
         void* y;
@@ -152,6 +157,7 @@ static void __instantiate_kernel() {{
         {}, {}, {},
         {}, {},
         {},
+        {},
         {}
     >);
 }};
@@ -169,7 +175,8 @@ static void __instantiate_kernel() {{
     args.config.num_dispatch_threads, args.config.num_non_epilogue_threads, args.config.num_epilogue_threads,
     args.launch_args.grid_dim.first, args.num_ranks,
     to_string(args.activation_clamp),
-    args.fast_math ? "true" : "false");
+    args.fast_math ? "true" : "false",
+    args.is_nvfp4 ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -186,7 +193,10 @@ static void __instantiate_kernel() {{
             args.tensor_map_l2_acts,
             args.tensor_map_l2_acts_sf,
             args.tensor_map_l2_weights,
-            args.tensor_map_l2_weights_sf
+            args.tensor_map_l2_weights_sf,
+            args.l1_acc_scale,
+            args.l2_act_global_scale,
+            args.l2_acc_scale
         ));
     }
 };
@@ -204,19 +214,25 @@ static void sm100_mxfp4_mxfp4_mega_moe(
     const int& num_tokens, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const float& activation_clamp,
-    const bool& fast_math
+    const bool& fast_math,
+    // MmaKind::MXFP4 or MmaKind::NVFP4. NVFP4 also needs the per-tensor global scales below.
+    const MmaKind& mma_kind = MmaKind::MXFP4,
+    // NVFP4 global scales (CPU scalars). Derived dequant: L1 acc -> real, L1-output requant, L2 acc -> real.
+    const float& l1_act_gs = 1.0f, const float& l1_weight_gs = 1.0f,
+    const float& l2_act_gs = 1.0f, const float& l2_weight_gs = 1.0f
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
     const auto num_ring_tokens = static_cast<int>(l1_acts.size(0));
     const auto num_sf_ring_tokens = static_cast<int>(l1_acts_sf.size(0));
+    const bool is_nvfp4 = (mma_kind == MmaKind::NVFP4);
 
     const auto config = get_mxfp4_mega_moe_config(
         num_ranks, num_experts, num_experts_per_rank,
         num_max_tokens_per_rank, num_tokens, num_topk, hidden, intermediate_hidden,
-        num_ring_tokens, num_sf_ring_tokens);
+        num_ring_tokens, num_sf_ring_tokens, mma_kind);
 
-    constexpr int kGranK = 32;
+    const int kGranK = get_sf_gran_k(mma_kind);
     const int sf_smem_outer_dim = config.block_k / (kGranK * 4);
 
     // Packed FP4 token/weight TMA descriptors (fp4_unpacked_smem = false -> 16U4_ALIGN8B)
@@ -277,6 +293,12 @@ static void sm100_mxfp4_mxfp4_mega_moe(
         .num_ranks = num_ranks,
         .activation_clamp = activation_clamp,
         .fast_math = fast_math,
+        .is_nvfp4 = is_nvfp4,
+        // L1 acc -> real = gs_l1_act * gs_l1_weight; L1-output requant uses gs_l2_act;
+        // L2 acc -> real = gs_l2_act * gs_l2_weight. (All 1.0 for MXFP4.)
+        .l1_acc_scale = l1_act_gs * l1_weight_gs,
+        .l2_act_global_scale = l2_act_gs,
+        .l2_acc_scale = l2_act_gs * l2_weight_gs,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,

@@ -67,6 +67,8 @@ static MmaKind parse_mma_kind(const std::string& mma_type_str) {
         return MmaKind::BF16;
     if (mma_type_str == "mxfp4xmxfp4")
         return MmaKind::MXFP4;
+    if (mma_type_str == "nvfp4xnvfp4")
+        return MmaKind::NVFP4;
     DG_HOST_ASSERT(mma_type_str == "fp8xfp4");
     return MmaKind::MXFP8FP4;
 }
@@ -78,7 +80,7 @@ static int get_num_mma_elem_bytes(const MmaKind& mma_kind) {
 }
 
 static bool is_mma_with_sf(const MmaKind& mma_kind) {
-    return mma_kind == MmaKind::MXFP8FP4 or mma_kind == MmaKind::MXFP4;
+    return mma_kind == MmaKind::MXFP8FP4 or mma_kind == MmaKind::MXFP4 or mma_kind == MmaKind::NVFP4;
 }
 
 static int get_num_wave_pool_tokens(

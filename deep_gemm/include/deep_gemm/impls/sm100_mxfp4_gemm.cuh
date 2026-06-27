@@ -34,14 +34,18 @@ template <uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
           uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kNumStages,
           uint32_t kNumNonEpilogueThreads, uint32_t kNumEpilogueThreads,
-          uint32_t kNumSMs>
+          uint32_t kNumSMs,
+          // NVFP4 (E4M3/UE4M3 SF gran-16 + per-tensor global scale) vs MXFP4 (UE8M0 SF gran-32)
+          bool kIsNVFP4 = false>
 CUTLASS_GLOBAL void __launch_bounds__(kNumNonEpilogueThreads + kNumEpilogueThreads, 1)
 sm100_mxfp4_gemm_impl(uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
                       const __grid_constant__ cute::TmaDescriptor tensor_map_a,    // acts,    [M, K] K-major (packed E2M1)
-                      const __grid_constant__ cute::TmaDescriptor tensor_map_sfa,  // acts SF, UE8M0 (int32-packed, gran-32)
+                      const __grid_constant__ cute::TmaDescriptor tensor_map_sfa,  // acts SF (int32-packed): UE8M0 gran-32 (mxfp4) / E4M3 gran-16 (nvfp4)
                       const __grid_constant__ cute::TmaDescriptor tensor_map_b,    // weights, [N, K] K-major (packed E2M1)
-                      const __grid_constant__ cute::TmaDescriptor tensor_map_sfb,  // weights SF, UE8M0
-                      const __grid_constant__ cute::TmaDescriptor tensor_map_cd) { // out,     [M, N] BF16
+                      const __grid_constant__ cute::TmaDescriptor tensor_map_sfb,  // weights SF
+                      const __grid_constant__ cute::TmaDescriptor tensor_map_cd,   // out,     [M, N] BF16
+                      // NVFP4 output dequant scale = gs_a * gs_b (CPU scalar; 1.0 for MXFP4)
+                      const float ab_global_scale = 1.0f) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::TMEM::Allocator2Sm;
@@ -75,14 +79,14 @@ sm100_mxfp4_gemm_impl(uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
     constexpr uint32_t kSwizzleABMode = BLOCK_K_BYTES;       // 64 for BLOCK_K = 128
     constexpr uint32_t kSwizzleCDMode = 128;
 
-    // SF configs (UE8M0, gran-K 32, UTCCP 128-aligned)
-    constexpr uint32_t kGranK = 32;
+    // SF configs: MXFP4 -> UE8M0 gran-32, NVFP4 -> E4M3/UE4M3 gran-16. UTCCP 128-aligned.
+    constexpr uint32_t kGranK = kIsNVFP4 ? 16 : 32;
     constexpr uint32_t kNumUTCCPAlignedElems = 128;
     constexpr uint32_t SF_BLOCK_M = math::constexpr_align(BLOCK_M, kNumUTCCPAlignedElems);
     constexpr uint32_t SF_BLOCK_N = math::constexpr_align(BLOCK_N, kNumUTCCPAlignedElems);
-    // One int32 packs 4 gran-32 SFs along K, i.e. covers 128 K
+    // One int32 packs 4 SFs along K: gran-32 -> covers 128 K (1/load), gran-16 -> covers 64 K (2/load)
     constexpr uint32_t kNumSFKPerLoad = BLOCK_K / (kGranK * 4);
-    DG_STATIC_ASSERT(kNumSFKPerLoad == 1, "BLOCK_K must be 128 for a single packed SF int per load");
+    DG_STATIC_ASSERT(kNumSFKPerLoad == 1 or kNumSFKPerLoad == 2, "Invalid packed SF int count per load");
 
     // Epilogue configs (swap-AB)
     constexpr uint32_t kNumEpilogueStages = 2;
@@ -97,13 +101,17 @@ sm100_mxfp4_gemm_impl(uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
     constexpr uint32_t SMEM_CD_SIZE = SMEM_CD_SIZE_PER_STAGE * kNumTMAStoreStages;
     constexpr uint32_t SMEM_A_SIZE_PER_STAGE = LOAD_BLOCK_M * BLOCK_K_BYTES;
     constexpr uint32_t SMEM_B_SIZE_PER_STAGE = LOAD_BLOCK_N * BLOCK_K_BYTES;
-    constexpr uint32_t SMEM_SFA_SIZE_PER_STAGE = SF_BLOCK_M * sizeof(uint32_t);
-    constexpr uint32_t SMEM_SFB_SIZE_PER_STAGE = SF_BLOCK_N * sizeof(uint32_t);
+    constexpr uint32_t SMEM_SFA_SIZE_PER_STAGE = SF_BLOCK_M * kNumSFKPerLoad * sizeof(uint32_t);
+    constexpr uint32_t SMEM_SFB_SIZE_PER_STAGE = SF_BLOCK_N * kNumSFKPerLoad * sizeof(uint32_t);
 
-    // Tensor memory size and offsets
+    // Tensor memory size and offsets. Each K-uint32 occupies (SF_BLOCK/32) cols (the MN rows);
+    // gran-16 has 2 K-uint32s per K-block. The 2-bit `sf_id` selects within a K-uint32; crossing
+    // K-uint32s is done via the SF tmem ADDRESS.
     constexpr uint32_t kNumAccumTmemCols = UMMA_N * kNumEpilogueStages;
-    constexpr uint32_t kNumSFATmemCols = SF_BLOCK_M / 32;
-    constexpr uint32_t kNumSFBTmemCols = SF_BLOCK_N / 32;
+    constexpr uint32_t kSFAColsPerKUint = SF_BLOCK_M / 32;
+    constexpr uint32_t kSFBColsPerKUint = SF_BLOCK_N / 32;
+    constexpr uint32_t kNumSFATmemCols = kSFAColsPerKUint * kNumSFKPerLoad;
+    constexpr uint32_t kNumSFBTmemCols = kSFBColsPerKUint * kNumSFKPerLoad;
     constexpr uint32_t kNumTmemCols = utils::get_num_aligned_tmem_cols<kNumAccumTmemCols + kNumSFATmemCols + kNumSFBTmemCols>();
     constexpr uint32_t kTmemStartColOfSFA = kNumAccumTmemCols;
     constexpr uint32_t kTmemStartColOfSFB = kNumAccumTmemCols + kNumSFATmemCols;
@@ -228,16 +236,17 @@ sm100_mxfp4_gemm_impl(uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
                 // SF: per-CTA SM90 load into THIS CTA's smem (the 2-CTA UTCCP reads both CTAs'
                 // SF), signaling THIS CTA's own `full` barrier (NOT routed to the leader). So both
                 // CTAs' transposers can wait their own `full` and the cross-CTA `with_sf` sync holds.
+                // K-uint32 stride per K-block: gran-32 -> 1, gran-16 -> 2
                 uint32_t sfa_m_idx = m_block_idx * BLOCK_M;
-                uint32_t sfa_k_idx = scheduler.template get_global_idx<true, sched::IndexType::SF_K>(shape_sf_k, 1, k_block_idx);
+                uint32_t sfa_k_idx = scheduler.template get_global_idx<true, sched::IndexType::SF_K>(shape_sf_k, kNumSFKPerLoad, k_block_idx);
                 tma::copy<BLOCK_M, 1, 0>(&tensor_map_sfa, full_barriers[stage_idx], smem_sfa[stage_idx], sfa_m_idx, sfa_k_idx);
                 uint32_t sfb_n_idx = n_block_idx * BLOCK_N;
-                uint32_t sfb_k_idx = scheduler.template get_global_idx<true, sched::IndexType::SF_K>(shape_sf_k, 1, k_block_idx, m_block_idx);
+                uint32_t sfb_k_idx = scheduler.template get_global_idx<true, sched::IndexType::SF_K>(shape_sf_k, kNumSFKPerLoad, k_block_idx, m_block_idx);
                 tma::copy<BLOCK_N, 1, 0>(&tensor_map_sfb, full_barriers[stage_idx], smem_sfb[stage_idx], sfb_n_idx, sfb_k_idx);
 
                 // Expect: the leader collects BOTH CTAs' data (2-SM routed) + its own SF; the
                 // non-leader's `full` only sees its own SF (its data tx went to the leader).
-                const auto sf_bytes = BLOCK_M * sizeof(uint32_t) + BLOCK_N * sizeof(uint32_t);
+                const auto sf_bytes = (BLOCK_M + BLOCK_N) * kNumSFKPerLoad * sizeof(uint32_t);
                 if (is_leader_cta)
                     full_barriers[stage_idx]->arrive_and_expect_tx(
                         SMEM_A_SIZE_PER_STAGE * kNumMulticast + SMEM_B_SIZE_PER_STAGE * kNumMulticast + sf_bytes);
@@ -248,8 +257,9 @@ sm100_mxfp4_gemm_impl(uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
     } else if (warp_idx == 1 and is_leader_cta) {
         // MMA issue warp (leader CTA only)
         // Swap-AB: weights -> UMMA "A" (UMMA_M), acts -> UMMA "B" (UMMA_N)
+        using sf_dtype_t = cute::conditional_t<kIsNVFP4, cutlass::float_ue4m3_t, cutlass::float_ue8m0_t>;
         auto instr_desc = cute::UMMA::make_instr_desc_block_scaled<
-            ab_dtype_t, ab_dtype_t, float, cutlass::float_ue8m0_t,
+            ab_dtype_t, ab_dtype_t, float, sf_dtype_t,
             UMMA_M, UMMA_N, kMajorB, kMajorA>();
 
         DG_STATIC_ASSERT(kNumStages <= 32, "Too many stages");
@@ -289,24 +299,32 @@ sm100_mxfp4_gemm_impl(uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
                 ptx::tcgen05_after_thread_sync();
 
                 if (cute::elect_one_sync()) {
-                    // UTCCP copy SFA / SFB into TMEM (transposed in warp 3 already)
+                    // UTCCP copy SFA / SFB into TMEM (transposed in warp 2 already).
+                    // gran-16 has `kNumSFKPerLoad` K-uint32s per K-block, each at kSF*ColsPerKUint apart.
                     using cute_utccp_t = cute::SM100_UTCCP_4x32dp128bit_2cta;
                     #pragma unroll
-                    for (uint32_t i = 0; i < SF_BLOCK_M / kNumUTCCPAlignedElems; ++ i) {
-                        auto sf_desc = mma::sm100::make_sf_desc(smem_sfa[stage_idx] + i * kNumUTCCPAlignedElems);
-                        cute_utccp_t::copy(sf_desc, kTmemStartColOfSFA + i * 4);
-                    }
-                    #pragma unroll
-                    for (uint32_t i = 0; i < SF_BLOCK_N / kNumUTCCPAlignedElems; ++ i) {
-                        auto sf_desc = mma::sm100::make_sf_desc(smem_sfb[stage_idx] + i * kNumUTCCPAlignedElems);
-                        cute_utccp_t::copy(sf_desc, kTmemStartColOfSFB + i * 4);
+                    for (uint32_t ku = 0; ku < kNumSFKPerLoad; ++ ku) {
+                        #pragma unroll
+                        for (uint32_t i = 0; i < SF_BLOCK_M / kNumUTCCPAlignedElems; ++ i) {
+                            auto sf_desc = mma::sm100::make_sf_desc(smem_sfa[stage_idx] + ku * SF_BLOCK_M + i * kNumUTCCPAlignedElems);
+                            cute_utccp_t::copy(sf_desc, kTmemStartColOfSFA + ku * kSFAColsPerKUint + i * 4);
+                        }
+                        #pragma unroll
+                        for (uint32_t i = 0; i < SF_BLOCK_N / kNumUTCCPAlignedElems; ++ i) {
+                            auto sf_desc = mma::sm100::make_sf_desc(smem_sfb[stage_idx] + ku * SF_BLOCK_N + i * kNumUTCCPAlignedElems);
+                            cute_utccp_t::copy(sf_desc, kTmemStartColOfSFB + ku * kSFBColsPerKUint + i * 4);
+                        }
                     }
 
-                    // Issue UMMA over UMMA_K (=64) sub-tiles
-                    // VALIDATE: descriptor /2 byte addressing + sf_id = k*2
+                    // Issue UMMA over UMMA_K (=64) sub-tiles. The 2-bit `sf_id` selects WITHIN a
+                    // K-uint32; crossing K-uint32s (gran-16) uses the SF tmem ADDRESS.
                     #pragma unroll
                     for (uint32_t k = 0; k < BLOCK_K / UMMA_K; ++ k) {
-                        const uint32_t sf_id = k * 2;
+                        const uint32_t global_sf_idx = k * (UMMA_K / kGranK);
+                        const uint32_t sf_kuint = global_sf_idx / 4;
+                        const uint32_t sf_id = global_sf_idx % 4;
+                        const uint32_t tmem_sfa = kTmemStartColOfSFA + sf_kuint * kSFAColsPerKUint;
+                        const uint32_t tmem_sfb = kTmemStartColOfSFB + sf_kuint * kSFBColsPerKUint;
                         const auto runtime_instr_desc = mma::sm100::make_runtime_instr_desc_with_sf_id(instr_desc, sf_id, sf_id);
                         auto a_desc = mma::sm100::make_smem_desc(
                             kFP4Layout, reinterpret_cast<ab_dtype_t*>(smem_b[stage_idx]) + k * UMMA_K_BYTES,
@@ -315,10 +333,16 @@ sm100_mxfp4_gemm_impl(uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
                             kFP4Layout, reinterpret_cast<ab_dtype_t*>(smem_a[stage_idx]) + k * UMMA_K_BYTES,
                             8 * kSwizzleABMode, 0);
                         // Swap-AB: weights (b_desc) first, SFB id first
-                        ptx::SM100_MMA_MXF4_2x1SM_SS::fma(
-                            a_desc, b_desc, accum_stage_idx * UMMA_N,
-                            k_block_idx > 0 or k > 0, runtime_instr_desc,
-                            kTmemStartColOfSFB, kTmemStartColOfSFA);
+                        if constexpr (kIsNVFP4)
+                            ptx::SM100_MMA_NVF4_2x1SM_SS::fma(
+                                a_desc, b_desc, accum_stage_idx * UMMA_N,
+                                k_block_idx > 0 or k > 0, runtime_instr_desc,
+                                tmem_sfb, tmem_sfa);
+                        else
+                            ptx::SM100_MMA_MXF4_2x1SM_SS::fma(
+                                a_desc, b_desc, accum_stage_idx * UMMA_N,
+                                k_block_idx > 0 or k > 0, runtime_instr_desc,
+                                tmem_sfb, tmem_sfa);
                     }
                 }
                 __syncwarp();
@@ -349,12 +373,16 @@ sm100_mxfp4_gemm_impl(uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
             for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
                 full_barriers[stage_idx]->wait(phase);
                 #pragma unroll
-                for (uint32_t i = 0; i < SF_BLOCK_M / kNumUTCCPAlignedElems; ++ i)
-                    utccp_required_smem_warp_transpose(smem_sfa[stage_idx] + i * kNumUTCCPAlignedElems);
+                for (uint32_t ku = 0; ku < kNumSFKPerLoad; ++ ku)
+                    #pragma unroll
+                    for (uint32_t i = 0; i < SF_BLOCK_M / kNumUTCCPAlignedElems; ++ i)
+                        utccp_required_smem_warp_transpose(smem_sfa[stage_idx] + ku * SF_BLOCK_M + i * kNumUTCCPAlignedElems);
                 cutlass::arch::fence_view_async_shared();
                 #pragma unroll
-                for (uint32_t i = 0; i < SF_BLOCK_N / kNumUTCCPAlignedElems; ++ i)
-                    utccp_required_smem_warp_transpose(smem_sfb[stage_idx] + i * kNumUTCCPAlignedElems);
+                for (uint32_t ku = 0; ku < kNumSFKPerLoad; ++ ku)
+                    #pragma unroll
+                    for (uint32_t i = 0; i < SF_BLOCK_N / kNumUTCCPAlignedElems; ++ i)
+                        utccp_required_smem_warp_transpose(smem_sfb[stage_idx] + ku * SF_BLOCK_N + i * kNumUTCCPAlignedElems);
                 cutlass::arch::fence_view_async_shared();
                 with_sf_full_barriers[stage_idx]->arrive(0u);
             }
@@ -384,7 +412,8 @@ sm100_mxfp4_gemm_impl(uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
             (smem_cd, tma_stage_idx, tmem_base_addr,
              base_m_idx, base_n_idx, scheduler.current_group_idx,
              effective_m, epilogue_warp_idx, lane_idx,
-             tmem_empty_barriers[accum_stage_idx], tensor_map_cd);
+             tmem_empty_barriers[accum_stage_idx], tensor_map_cd,
+             ab_global_scale);
         }
     }
 

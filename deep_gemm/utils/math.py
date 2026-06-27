@@ -111,6 +111,46 @@ def per_token_cast_to_fp4(x: torch.Tensor, use_ue8m0: bool, gran_k: int = 128,
     return packed[:, :n // 2].contiguous(), sf
 
 
+def nvfp4_global_scale(x: torch.Tensor) -> float:
+    # Per-tensor global scale s.t. per-block E4M3 SFs (amax_block / (6*gs)) stay <= E4M3 max (448).
+    amax = x.abs().float().amax().clamp_min(1e-6)
+    return float(amax / (6.0 * 448.0))
+
+
+def per_token_cast_to_nvfp4(x: torch.Tensor, global_scale: float,
+                            gran_k: int = 16) -> Tuple[torch.Tensor, torch.Tensor]:
+    # NVFP4: packed E2M1 codes + per-(gran_k)-block E4M3 scale factors, with a per-tensor global scale.
+    # Dequant: x ~= code_e2m1 * sf_e4m3 * global_scale.
+    m, n = x.shape
+    assert n % 2 == 0
+    padded_n = align(n, gran_k)
+    x_padded = torch.zeros((m, padded_n), dtype=x.dtype, device=x.device)
+    x_padded[:, :n] = x
+    x_view = x_padded.view(m, -1, gran_k)
+    amax = x_view.abs().float().amax(dim=2).clamp_min(1e-6)
+    block_sf_e4m3 = (amax / (6.0 * global_scale)).to(torch.float8_e4m3fn)
+    block_sf = block_sf_e4m3.float().clamp_min(1e-9)
+    x_scaled = x_view / (block_sf.unsqueeze(2) * global_scale)
+    codes = _quantize_to_fp4_e2m1(x_scaled).view(m, padded_n)
+    codes2 = codes.view(m, padded_n // 2, 2)
+    packed = (codes2[:, :, 0] & 0x0F) | ((codes2[:, :, 1] & 0x0F) << 4)
+    sf_bytes = block_sf_e4m3.view(torch.uint8)  # [m, n // gran_k]
+    return packed[:, :n // 2].contiguous(), sf_bytes
+
+
+def cast_back_from_nvfp4(packed: torch.Tensor, sf_bytes: torch.Tensor, global_scale: float,
+                         gran_k: int = 16) -> torch.Tensor:
+    m, n2 = packed.shape
+    n = n2 * 2
+    unpacked = torch.zeros((m, n), dtype=torch.int8, device=packed.device)
+    unpacked[:, ::2] = packed & 0x0F
+    unpacked[:, 1::2] = (packed >> 4) & 0x0F
+    x_deq = _dequantize_from_fp4_e2m1(unpacked)
+    sf = sf_bytes.view(torch.float8_e4m3fn).float() * global_scale
+    group_idx = torch.arange(n, device=packed.device) // gran_k
+    return x_deq * sf[:, group_idx]
+
+
 def transpose_packed_fp4(a: torch.Tensor) -> torch.Tensor:
     assert a.dtype == torch.int8
     assert a.dim() == 2

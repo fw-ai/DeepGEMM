@@ -185,6 +185,30 @@ static void mxfp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
     sm100_mxfp4_gemm(a_val, sfa, b_val, sfb, d, m, n, k);
 }
 
+static void nvfp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
+                          const std::pair<torch::Tensor, torch::Tensor>& b,
+                          const torch::Tensor& d,
+                          const float& a_global_scale,
+                          const float& b_global_scale) {
+    // Standalone packed NVFP4 x NVFP4 GEMM: `[M, K] @ [N, K].T -> [M, N]`.
+    // A/B packed E2M1 stored as int8 `[*, K/2]`; SFs are int32-packed E4M3 (gran-16);
+    // per-tensor global scales (CPU scalars) dequant the output: D = (A@B.T) * gs_a * gs_b.
+    const auto& [a_val, sfa] = a;
+    const auto& [b_val, sfb] = b;
+    DG_HOST_ASSERT(a_val.dim() == 2 and b_val.dim() == 2 and d.dim() == 2);
+    DG_HOST_ASSERT(a_val.is_contiguous() and b_val.is_contiguous());
+
+    const int m = static_cast<int>(a_val.size(0));
+    const int k = static_cast<int>(a_val.size(1)) * 2;  // packed: 2 elements per byte
+    const int n = static_cast<int>(b_val.size(0));
+    DG_HOST_ASSERT(static_cast<int>(b_val.size(1)) * 2 == k);
+    DG_HOST_ASSERT(static_cast<int>(d.size(0)) == m and static_cast<int>(d.size(1)) == n);
+
+    const auto arch_major = device_runtime->get_arch_major();
+    DG_HOST_ASSERT(arch_major == 10 and "NVFP4 GEMM requires SM100");
+    sm100_mxfp4_gemm(a_val, sfa, b_val, sfb, d, m, n, k, MmaKind::NVFP4, a_global_scale, b_global_scale);
+}
+
 static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, torch::Tensor>& a,
                                                  const std::pair<torch::Tensor, torch::Tensor>& b,
                                                  const torch::Tensor& d,
@@ -694,6 +718,9 @@ static void register_apis(pybind11::module_& m) {
           py::arg("disable_ue8m0_cast") = false);
     m.def("mxfp4_gemm_nt", &mxfp4_gemm_nt,
           py::arg("a"), py::arg("b"), py::arg("d"));
+    m.def("nvfp4_gemm_nt", &nvfp4_gemm_nt,
+          py::arg("a"), py::arg("b"), py::arg("d"),
+          py::arg("a_global_scale"), py::arg("b_global_scale"));
     m.def("m_grouped_fp8_fp4_gemm_nt_contiguous", &m_grouped_fp8_fp4_gemm_nt_contiguous,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("grouped_layout"),
           py::arg("recipe") = std::nullopt,
