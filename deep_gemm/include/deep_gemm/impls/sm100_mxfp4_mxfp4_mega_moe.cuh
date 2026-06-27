@@ -1025,6 +1025,15 @@ sm100_mxfp4_mxfp4_mega_moe_impl(void* y,
             const uint32_t pool_m_idx = pool_block_idx * BLOCK_M;       // Full-pool offset for non-ring metadata
             uint32_t n_idx = n_block_idx * BLOCK_N;
 
+            // NVFP4: load per-expert global scales ONCE per block (hoisted out of the per-atom loops).
+            float nv_gate_alpha = 1.0f, nv_up_alpha = 1.0f, nv_l2_in_gs = 1.0f, nv_down_alpha = 1.0f;
+            if constexpr (kIsNVFP4) {
+                nv_gate_alpha = gate_alpha[local_expert_idx];
+                nv_up_alpha   = up_alpha[local_expert_idx];
+                nv_l2_in_gs   = l2_input_global_scale[local_expert_idx];
+                nv_down_alpha = down_alpha[local_expert_idx];
+            }
+
             if (block_phase == sched::BlockPhase::Linear1) {
                 // Wait L2 block empty
                 const auto l2_empty_ptr = workspace.get_l2_empty_count_ptr(ring_block_idx);
@@ -1086,11 +1095,9 @@ sm100_mxfp4_mxfp4_mega_moe_impl(void* y,
                         // per-expert combiners. fp32_values are [gate0, up0, gate1, up1] -> even=gate, odd=up.
                         // MXFP4's UE8M0 block SFs already fully dequant the accumulator.
                         if constexpr (kIsNVFP4) {
-                            const float ga = gate_alpha[local_expert_idx];
-                            const float ua = up_alpha[local_expert_idx];
                             #pragma unroll
                             for (uint32_t kk = 0; kk < 4; ++ kk) {
-                                const float s = (kk & 1) ? ua : ga;
+                                const float s = (kk & 1) ? nv_up_alpha : nv_gate_alpha;
                                 fp32_values[kk] = __fmul2_rn(fp32_values[kk], {s, s});
                             }
                         }
@@ -1168,7 +1175,7 @@ sm100_mxfp4_mxfp4_mega_moe_impl(void* y,
                         if constexpr (kIsNVFP4) {
                             // TRT-LLM: per-expert L2-input global scale (= 448*6/amax). Stored block SF is
                             // E4M3(amax_block * gs / 6); the E2M1 code uses sf_inv = gs / sf_e4m3.
-                            const float gs = l2_input_global_scale[local_expert_idx];
+                            const float gs = nv_l2_in_gs;
                             const float gs6 = gs * (1.0f / 6.0f);
                             const __nv_fp8_e4m3 e4x(amax_values[i].x * gs6);
                             const __nv_fp8_e4m3 e4y(amax_values[i].y * gs6);
@@ -1327,10 +1334,9 @@ sm100_mxfp4_mxfp4_mega_moe_impl(void* y,
 
                         // NVFP4: dequant the L2 MMA accumulator by the per-expert combiner before BF16 cast
                         if constexpr (kIsNVFP4) {
-                            const float da = down_alpha[local_expert_idx];
                             #pragma unroll
                             for (uint32_t v = 0; v < ATOM_M; ++ v)
-                                values[v] = __float_as_uint(__uint_as_float(values[v]) * da);
+                                values[v] = __float_as_uint(__uint_as_float(values[v]) * nv_down_alpha);
                         }
 
                         // Wait shared memory release from previous NVLink store
