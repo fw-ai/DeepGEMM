@@ -11,7 +11,7 @@ import torch.distributed as dist
 import deep_gemm
 from deep_gemm.testing import bench_kineto
 from deep_gemm.utils.math import (
-    per_token_cast_to_fp4, per_token_cast_to_nvfp4, nvfp4_global_scale,
+    per_token_cast_to_fp4, per_token_cast_to_fp8, per_token_cast_to_nvfp4, nvfp4_global_scale,
 )
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -61,8 +61,8 @@ def bench_mega():
     group = dist.group.WORLD
     clamp = 10.0
 
-    print('=== Packed-FP4 mega-MoE (single rank) ===')
-    print(f'{"tok":>5} {"exp":>4} {"topk":>4} {"hid":>5} {"int":>5} | {"mxfp4 us":>9} | {"nvfp4 us":>9} | nv/mx')
+    print('=== mega-MoE (single rank): fp8xfp4 vs mxfp4 vs nvfp4 ===')
+    print(f'{"tok":>5} {"exp":>4} {"topk":>4} {"hid":>5} {"int":>5} | {"fp8fp4 us":>9} | {"mxfp4 us":>9} | {"nvfp4 us":>9} | nv/fp8 | nv/mx')
     torch.manual_seed(0)
     for num_tokens, num_experts, num_topk, hidden, inter in (
         (128, 8, 2, 2048, 2048),
@@ -76,6 +76,18 @@ def bench_mega():
         scores = torch.randn((num_tokens, num_experts), dtype=torch.float, device='cuda')
         topk_weights, topk_idx = torch.topk(scores.softmax(-1), num_topk, dim=-1)
         y = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+
+        # FP8xFP4 (FP8 E4M3 activations, FP4 weights)
+        buf_f8 = deep_gemm.get_symm_buffer_for_mega_moe(group, num_experts, num_max_tokens, num_topk,
+                                                        hidden, inter, mma_type='fp8xfp4')
+        xp8, xsf8 = per_token_cast_to_fp8(x, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
+        f8l1, f8l2 = deep_gemm.transform_weights_for_mega_moe(_cast_w_mxfp4(l1w), _cast_w_mxfp4(l2w))
+        buf_f8.x[:num_tokens].copy_(xp8); buf_f8.x_sf[:num_tokens].copy_(xsf8)
+        buf_f8.topk_idx[:num_tokens].copy_(topk_idx); buf_f8.topk_weights[:num_tokens].copy_(topk_weights)
+        t_f8 = bench_kineto(lambda: deep_gemm.fp8_fp4_mega_moe(y=y, l1_weights=f8l1, l2_weights=f8l2, sym_buffer=buf_f8,
+                                                              activation_clamp=clamp, fast_math=True),
+                            'mega_moe', suppress_kineto_output=True)
+        buf_f8.destroy()
 
         # MXFP4
         buf_mx = deep_gemm.get_symm_buffer_for_mega_moe(group, num_experts, num_max_tokens, num_topk,
@@ -110,7 +122,7 @@ def bench_mega():
         buf_nv.destroy()
 
         print(f'{num_tokens:>5} {num_experts:>4} {num_topk:>4} {hidden:>5} {inter:>5} | '
-              f'{t_mx*1e6:>9.1f} | {t_nv*1e6:>9.1f} | {t_nv/t_mx:>4.2f}x')
+              f'{t_f8*1e6:>9.1f} | {t_mx*1e6:>9.1f} | {t_nv*1e6:>9.1f} | {t_nv/t_f8:>4.2f}x | {t_nv/t_mx:>4.2f}x')
     dist.destroy_process_group()
     print()
 
