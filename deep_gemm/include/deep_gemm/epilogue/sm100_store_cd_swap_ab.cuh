@@ -26,7 +26,9 @@ sm100_store_cd_swap_ab(const utils::PatternVisitor<pattern_cd_t>& smem_cd, uint3
                        const uint32_t& effective_m,
                        const uint32_t& epilogue_warp_idx, const uint32_t& lane_idx,
                        const cutlass::arch::ClusterTransactionBarrier* tmem_empty_barrier,
-                       const cute::TmaDescriptor& tensor_map_cd) {
+                       const cute::TmaDescriptor& tensor_map_cd,
+                       // Optional per-tensor output scale (NVFP4 global-scale dequant); 1.0 = no-op.
+                       const float& out_scale = 1.0f) {
     // NOTES: The epilogue requires a full warpgroup to read all 128 TMEM rows,
     //          implying STORE_BLOCK_N must be 128.
     DG_STATIC_ASSERT(STORE_BLOCK_N == 128, "STORE_BLOCK_N must be 128 to match TMEM rows");
@@ -73,6 +75,11 @@ sm100_store_cd_swap_ab(const utils::PatternVisitor<pattern_cd_t>& smem_cd, uint3
                 // NOTES: Swizzling is not required in this case, but used here for consistency with other cases
                 cute::SM100_TMEM_LOAD_32dp32b8x::copy(tmem_addr, values[0], values[1], values[2], values[3],
                                                                  values[4], values[5], values[6], values[7]);
+                if (out_scale != 1.0f) {
+                    #pragma unroll
+                    for (uint32_t vi = 0; vi < kNumSwizzleAtomRows; ++ vi)
+                        values[vi] = __float_as_uint(__uint_as_float(values[vi]) * out_scale);
+                }
                 uint32_t col = lane_idx / 4;
 
                 #pragma unroll
@@ -91,6 +98,13 @@ sm100_store_cd_swap_ab(const utils::PatternVisitor<pattern_cd_t>& smem_cd, uint3
                 cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr | 0x00100000,
                                                        values[4], values[5], values[6], values[7]);
                 cutlass::arch::fence_view_async_tmem_load();
+
+                // NVFP4: dequant the MMA accumulator by the per-tensor global scale before BF16 cast
+                if (out_scale != 1.0f) {
+                    #pragma unroll
+                    for (uint32_t vi = 0; vi < 8; ++ vi)
+                        values[vi] = __float_as_uint(__uint_as_float(values[vi]) * out_scale);
+                }
 
                 // Destination shared memory address
                 uint32_t row = lane_idx % 8;

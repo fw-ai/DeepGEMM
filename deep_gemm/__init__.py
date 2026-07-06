@@ -34,6 +34,9 @@ from ._C import (
 try:
     # DeepGEMM Kernels
     from ._C import (
+        # Packed MXFP4 / NVFP4 GEMM (standalone de-risk)
+        mxfp4_gemm_nt,
+        nvfp4_gemm_nt,
         # FP8 FP4 GEMMs
         fp8_fp4_gemm_nt, fp8_fp4_gemm_nn,
         fp8_fp4_gemm_tn, fp8_fp4_gemm_tt,
@@ -87,6 +90,8 @@ from .mega import (
     transform_weights_for_mega_moe,
     fp8_fp4_mega_moe,
     bf16_mega_moe,
+    mxfp4_mxfp4_mega_moe,
+    nvfp4_nvfp4_mega_moe,
 )
 
 # Some utils

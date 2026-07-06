@@ -7,6 +7,7 @@
 #include "../jit_kernels/impls/sm90_fp8_gemm_1d2d.hpp"
 #include "../jit_kernels/impls/sm90_bf16_gemm.hpp"
 #include "../jit_kernels/impls/sm100_fp8_fp4_gemm_1d1d.hpp"
+#include "../jit_kernels/impls/sm100_mxfp4_gemm.hpp"
 #include "../jit_kernels/impls/sm100_bf16_gemm.hpp"
 #endif 
 
@@ -161,6 +162,51 @@ static void fp8_fp4_gemm_tt(const std::pair<torch::Tensor, torch::Tensor>& a,
                             const bool& disable_ue8m0_cast) {
     fp8_fp4_gemm_nt({a.first.transpose(0, 1), a.second.transpose(0, 1)}, b,
                     d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast);
+}
+
+static void mxfp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
+                          const std::pair<torch::Tensor, torch::Tensor>& b,
+                          const torch::Tensor& d) {
+    // Standalone packed MXFP4 x MXFP4 de-risk GEMM: `[M, K] @ [N, K].T -> [M, N]`.
+    // A/B packed E2M1 stored as int8 `[*, K/2]`; SFs are int32-packed UE8M0 (gran-32).
+    const auto& [a_val, sfa] = a;
+    const auto& [b_val, sfb] = b;
+    DG_HOST_ASSERT(a_val.dim() == 2 and b_val.dim() == 2 and d.dim() == 2);
+    DG_HOST_ASSERT(a_val.is_contiguous() and b_val.is_contiguous());
+
+    const int m = static_cast<int>(a_val.size(0));
+    const int k = static_cast<int>(a_val.size(1)) * 2;  // packed: 2 elements per byte
+    const int n = static_cast<int>(b_val.size(0));
+    DG_HOST_ASSERT(static_cast<int>(b_val.size(1)) * 2 == k);
+    DG_HOST_ASSERT(static_cast<int>(d.size(0)) == m and static_cast<int>(d.size(1)) == n);
+
+    const auto arch_major = device_runtime->get_arch_major();
+    DG_HOST_ASSERT(arch_major == 10 and "MXFP4 GEMM requires SM100");
+    sm100_mxfp4_gemm(a_val, sfa, b_val, sfb, d, m, n, k);
+}
+
+static void nvfp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
+                          const std::pair<torch::Tensor, torch::Tensor>& b,
+                          const torch::Tensor& d,
+                          const float& a_global_scale,
+                          const float& b_global_scale) {
+    // Standalone packed NVFP4 x NVFP4 GEMM: `[M, K] @ [N, K].T -> [M, N]`.
+    // A/B packed E2M1 stored as int8 `[*, K/2]`; SFs are int32-packed E4M3 (gran-16);
+    // per-tensor global scales (CPU scalars) dequant the output: D = (A@B.T) * gs_a * gs_b.
+    const auto& [a_val, sfa] = a;
+    const auto& [b_val, sfb] = b;
+    DG_HOST_ASSERT(a_val.dim() == 2 and b_val.dim() == 2 and d.dim() == 2);
+    DG_HOST_ASSERT(a_val.is_contiguous() and b_val.is_contiguous());
+
+    const int m = static_cast<int>(a_val.size(0));
+    const int k = static_cast<int>(a_val.size(1)) * 2;  // packed: 2 elements per byte
+    const int n = static_cast<int>(b_val.size(0));
+    DG_HOST_ASSERT(static_cast<int>(b_val.size(1)) * 2 == k);
+    DG_HOST_ASSERT(static_cast<int>(d.size(0)) == m and static_cast<int>(d.size(1)) == n);
+
+    const auto arch_major = device_runtime->get_arch_major();
+    DG_HOST_ASSERT(arch_major == 10 and "NVFP4 GEMM requires SM100");
+    sm100_mxfp4_gemm(a_val, sfa, b_val, sfb, d, m, n, k, MmaKind::NVFP4, a_global_scale, b_global_scale);
 }
 
 static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, torch::Tensor>& a,
@@ -670,6 +716,11 @@ static void register_apis(pybind11::module_& m) {
           py::arg("recipe_a") = std::nullopt, py::arg("recipe_b") = std::nullopt,
           py::arg("compiled_dims") = "mn",
           py::arg("disable_ue8m0_cast") = false);
+    m.def("mxfp4_gemm_nt", &mxfp4_gemm_nt,
+          py::arg("a"), py::arg("b"), py::arg("d"));
+    m.def("nvfp4_gemm_nt", &nvfp4_gemm_nt,
+          py::arg("a"), py::arg("b"), py::arg("d"),
+          py::arg("a_global_scale"), py::arg("b_global_scale"));
     m.def("m_grouped_fp8_fp4_gemm_nt_contiguous", &m_grouped_fp8_fp4_gemm_nt_contiguous,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("grouped_layout"),
           py::arg("recipe") = std::nullopt,
