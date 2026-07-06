@@ -72,9 +72,7 @@ static MegaMoEConfig get_mxfp4_mega_moe_config(
     const int smem_cd_l2 = num_epilogue_warpgroups * store_block_m * block_n * static_cast<int>(sizeof(nv_bfloat16));
     const int smem_cd = align(std::max(smem_cd_l1, smem_cd_l2), kSmemAlignment);
 
-    // +1 for the cycle-chunking counted-arrival barrier (`shared_storage.cycle_barrier`),
-    // allocated always (8 B overhead) but initialized/used only when ring < num_min.
-    const int smem_barriers = (num_dispatch_warps + kNumEpilogueStages * 2 + num_epilogue_warps * 2 + 1) * 8;
+    const int smem_barriers = (num_dispatch_warps + kNumEpilogueStages * 2 + num_epilogue_warps * 2) * 8;
     const int smem_amax_reduction = store_block_m * num_epilogue_warps * static_cast<int>(sizeof(float));
     const int smem_tmem_ptr = 4;
 

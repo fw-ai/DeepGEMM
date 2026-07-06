@@ -245,8 +245,6 @@ sm100_mxfp4_mxfp4_mega_moe_impl(void* y,
         Barrier tmem_full_barriers[kNumEpilogueStages];
         Barrier tmem_empty_barriers[kNumEpilogueStages];
         Barrier combine_barriers[kNumEpilogueWarps * 2];
-        // Cycle-chunking counted-arrival barrier (all kNumThreads arrive once per cycle).
-        Barrier cycle_barrier;
         uint32_t tmem_ptr_in_smem;
     };
     constexpr uint32_t kNumReusableSmemBytes = offsetof(SharedStorage, dispatch_barriers);
@@ -312,9 +310,6 @@ sm100_mxfp4_mxfp4_mega_moe_impl(void* y,
             #pragma unroll
             for (uint32_t i = 0; i < kNumEpilogueWarps * 2; ++ i)
                 shared_storage.combine_barriers[i].init(1);
-            // Cycle-chunking counted-arrival barrier: all kNumThreads arrive once per cycle.
-            if constexpr (kNumRingTokens < kNumRanks * kNumMaxTokensPerRank)
-                shared_storage.cycle_barrier.init(kNumThreads);
         }
         cutlass::arch::fence_barrier_init();
     } else if (warp_idx == 3) {
@@ -1043,18 +1038,8 @@ sm100_mxfp4_mxfp4_mega_moe_impl(void* y,
                 const auto accum_phase_idx = ((current_iter_idx - 1) / kNumEpilogueStages) & 1;
                 shared_storage.tmem_empty_barriers[(current_iter_idx - 1) % kNumEpilogueStages].wait(accum_phase_idx);
             }
-        } else {
-            // Non-leader CTA's MMA warp: it doesn't issue MMA (leader-only), but it MUST call
-            // for_each_block so it participates in the cycle_barrier every cycle (otherwise the
-            // all-thread cycle sync faults). No-op body.
-            scheduler.for_each_block([&](const sched::BlockPhase& block_phase,
-                                         const uint32_t& local_expert_idx,
-                                         const uint32_t& num_k_blocks,
-                                         const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
-                (void) block_phase; (void) local_expert_idx; (void) num_k_blocks;
-                (void) m_block_idx; (void) n_block_idx;
-            });
         }
+        // Non-leader CTA's MMA warp: MMA is leader-only, so it has nothing to do here.
     } else if (warp_idx == kNumDispatchWarps + 3) {
         // Adjust registers
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
