@@ -245,6 +245,8 @@ sm100_mxfp4_mxfp4_mega_moe_impl(void* y,
         Barrier tmem_full_barriers[kNumEpilogueStages];
         Barrier tmem_empty_barriers[kNumEpilogueStages];
         Barrier combine_barriers[kNumEpilogueWarps * 2];
+        // Cycle-chunking counted-arrival barrier (all kNumThreads arrive once per cycle).
+        Barrier cycle_barrier;
         uint32_t tmem_ptr_in_smem;
     };
     constexpr uint32_t kNumReusableSmemBytes = offsetof(SharedStorage, dispatch_barriers);
@@ -310,6 +312,9 @@ sm100_mxfp4_mxfp4_mega_moe_impl(void* y,
             #pragma unroll
             for (uint32_t i = 0; i < kNumEpilogueWarps * 2; ++ i)
                 shared_storage.combine_barriers[i].init(1);
+            // Cycle-chunking counted-arrival barrier: all kNumThreads arrive once per cycle.
+            if constexpr (kNumRingTokens < kNumRanks * kNumMaxTokensPerRank)
+                shared_storage.cycle_barrier.init(kNumThreads);
         }
         cutlass::arch::fence_barrier_init();
     } else if (warp_idx == 3) {
@@ -327,7 +332,14 @@ sm100_mxfp4_mxfp4_mega_moe_impl(void* y,
         L2_SHAPE_N, L2_SHAPE_K,
         kNumExpertsPerRank,
         kNumExpertsPerWave,
-        kNumSMs, kNumRanks>(workspace);
+        kNumSMs, kNumRanks, kNumThreads>(workspace, sym_buffer, sm_idx, thread_idx);
+    // Cycle chunking: when the ring is smaller than one wave's worst case (num_min), enable
+    // per-cycle chunking (cap_blocks = kNumRingBlocks) so the kernel runs
+    // num_cycles = ceil(total_pool_blocks / kNumRingBlocks) dispatch rounds. Otherwise
+    // cap_blocks stays 0 and the single-cycle path reproduces the original behavior.
+    constexpr bool kChunking = (kNumRingTokens < kNumRanks * kNumMaxTokensPerRank);
+    if constexpr (kChunking) scheduler.set_cap_blocks(kNumRingBlocks);
+    if constexpr (kChunking) scheduler.set_cycle_barrier(&shared_storage.cycle_barrier);
 
     // MMA pipeline and TMA phases
     uint32_t stage_idx = 0, phase = 0;
@@ -459,6 +471,41 @@ sm100_mxfp4_mxfp4_mega_moe_impl(void* y,
         // Cache expert token counts in registers (same pattern as scheduler)
         scheduler.fetch_expert_recv_count();
 
+        // Cycle chunking: num_cycles = ceil(total_pool_blocks / kNumRingBlocks) where
+        // total_pool_blocks = sum of per-expert ceil(recv_tokens/BLOCK_M) (block-aligned with
+        // the scheduler). For ring >= num_min (kChunking false) this is 1. Also printed for
+        // instrumentation. (TODO: all-reduce max across ranks so cross-rank cycle barriers align.)
+        constexpr uint32_t kNumExpertsPerLane = math::constexpr_ceil_div(kNumExpertsPerRank, 32u);
+        uint32_t my_recv = 0;
+        #pragma unroll
+        for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i)
+            my_recv += scheduler.stored_num_tokens_per_expert[i];
+        const uint32_t total_recv = __reduce_add_sync(0xffffffff, my_recv);
+        const uint32_t total_pool_blocks = scheduler.get_pool_block_offset(kNumExpertsPerRank);
+        uint32_t num_cycles = total_pool_blocks == 0 ? 1u
+            : (total_pool_blocks + kNumRingBlocks - 1) / kNumRingBlocks;
+        if (sm_idx == 0 && warp_idx == 0 && lane_idx == 0)
+            printf("[mega_moe] rank=%u num_cycles=%u total_recv=%u cap=%u\n",
+                   sym_buffer.rank_idx, num_cycles, total_recv, kNumRingTokens);
+
+        // All-reduce num_cycles max across ranks (gather-based, no atomics): each rank writes
+        // its num_cycles to its own slot, NVLink-barrier, then every thread reads all ranks'
+        // slots and takes the max. Required so all ranks run the same number of cycle barriers.
+        if constexpr (kChunking) {
+            if (sm_idx == 0 && warp_idx == 0 && lane_idx == 0)
+                *workspace.get_num_cycles_max_ptr(sym_buffer.rank_idx) = num_cycles;
+            comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
+                                 kDispatchGridSyncIndex, /*tag*/ 4>(
+                workspace, sym_buffer, sm_idx, thread_idx,
+                [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); });
+            uint32_t num_cycles_max = 0;
+            #pragma unroll
+            for (uint32_t r = 0; r < kNumRanks; ++ r)
+                num_cycles_max = cute::max(num_cycles_max,
+                    *sym_buffer.map(workspace.get_num_cycles_max_ptr(r), r));
+            num_cycles = num_cycles_max;
+        }
+
         // Per-rank counts for current expert (re-loaded when expert changes)
         constexpr uint32_t kNumRanksPerLane = math::constexpr_ceil_div(kNumRanks, 32u);
         int current_expert_idx = -1;
@@ -467,7 +514,14 @@ sm100_mxfp4_mxfp4_mega_moe_impl(void* y,
         uint32_t expert_pool_block_offset = 0;
 
         constexpr uint32_t kNumGlobalWarps = kNumSMs * kNumDispatchWarps;
-        for (uint32_t token_idx = sm_idx * kNumDispatchWarps + warp_idx; ; token_idx += kNumGlobalWarps) {
+        // Cycle chunking: when `kChunking`, the pull is split into `num_cycles` rounds of
+        // kNumRingTokens pool tokens each, with a cross-warp/cross-rank barrier + ring reset
+        // between rounds. When `!kChunking`, the bound is unbounded (the original ring-wrap
+        // pull) and the cycle barrier/reset are skipped, so this is the original behavior.
+        uint32_t token_idx = sm_idx * kNumDispatchWarps + warp_idx;
+        for (uint32_t cycle = 0; cycle < num_cycles; ++ cycle) {
+        const uint32_t cycle_end_pool = kChunking ? (cycle + 1) * kNumRingTokens : 0xffffffffu;
+        for (;;) {
             // Advance expert until within the range
             int old_expert_idx = current_expert_idx;
             while (token_idx >= expert_end_idx) {
@@ -485,6 +539,17 @@ sm100_mxfp4_mxfp4_mega_moe_impl(void* y,
             // Finish all tokens
             if (current_expert_idx >= kNumExpertsPerRank)
                 break;
+
+            // Cycle chunking bound in POOL-BLOCK space (block-aligned with the scheduler's
+            // cycle_pool_block_end). Using pool_token_idx would misalign at expert boundaries
+            // (padding jumps), leaking the next cycle's tokens into this cycle's ring slots.
+            // No-op when `!kChunking` (cycle_end_pool = 0xffffffff).
+            if constexpr (kChunking) {
+                const uint32_t pool_token_idx = expert_pool_block_offset * BLOCK_M + (token_idx - expert_start_idx);
+                const uint32_t pool_block_idx = pool_token_idx / BLOCK_M;
+                if (pool_block_idx >= cycle_end_pool / BLOCK_M)
+                    break;
+            }
 
             // Load per-rank counts when expert changes
             if (old_expert_idx != current_expert_idx) {
@@ -637,6 +702,14 @@ sm100_mxfp4_mxfp4_mega_moe_impl(void* y,
                 );
             }
             __syncwarp();
+            token_idx += kNumGlobalWarps;
+        }
+        if constexpr (kChunking) {
+            scheduler.cycle_barrier();
+            if (sm_idx == 0 && warp_idx == 0 && lane_idx == 0)
+                printf("[mega_moe] rank=%u dispatch cycle=%u done\n", sym_buffer.rank_idx, cycle);
+            // Per-cycle ring reset (zero L1/L2 full/empty counts) wired up next.
+        }
         }
 
         // Clean workspace for the next usage, and also do cumulative stats

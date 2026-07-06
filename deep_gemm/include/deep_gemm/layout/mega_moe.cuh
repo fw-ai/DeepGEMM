@@ -102,6 +102,9 @@ struct Workspace {
         // Combine push source indices (full)
         num_bytes += num_max_pool_tokens * sizeof(TokenSrcMetadata);
 
+        // num_cycles all-reduce slot (per rank, for cross-rank cycle-barrier alignment)
+        num_bytes += num_ranks * sizeof(uint32_t);
+
         // Align to TMA descriptor requirements
         num_bytes = math::align<uint64_t>(num_bytes, 16);
         return num_bytes;
@@ -191,6 +194,15 @@ struct Workspace {
     TokenSrcMetadata* get_token_src_metadata_ptr(const uint32_t& pool_token_idx = 0) const {
         const auto base = reinterpret_cast<TokenSrcMetadata*>(get_src_token_topk_idx_ptr(num_experts_per_rank));
         return base + pool_token_idx;
+    }
+
+    // num_cycles all-reduce: per-rank slot holding the max num_cycles across ranks (for
+    // cross-rank cycle-barrier alignment). Each rank atomic-maxes its num_cycles into every
+    // rank's slot, then reads its own (= the global max).
+    CUTLASS_DEVICE
+    uint32_t* get_num_cycles_max_ptr(const uint32_t& rank_idx = 0) const {
+        const auto base = reinterpret_cast<uint32_t*>(get_token_src_metadata_ptr(num_max_pool_tokens));
+        return base + rank_idx;
     }
 };
 

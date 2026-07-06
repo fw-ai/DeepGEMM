@@ -43,7 +43,11 @@ get_symm_buffer_size_for_mega_moe(
     const auto [num_min_ring_tokens, num_max_ring_tokens] =
         get_ring_limit_for_mega_moe(num_max_tokens_per_rank, num_experts_per_rank, num_topk, num_ranks);
     DG_HOST_ASSERT(num_ring_tokens % layout::kLCMCandidateBlockM == 0);
-    DG_HOST_ASSERT(num_min_ring_tokens <= num_ring_tokens and num_ring_tokens <= num_max_ring_tokens);
+    // Chunking: when `num_ring_tokens < num_min` the ring holds one cycle (`ratio * tokens`)
+    // and the kernel runs `num_cycles = ceil(total_recv / num_ring_tokens)` dispatch rounds,
+    // so only the upper bound (one wave's max) + block alignment are required (no `num_min`).
+    DG_HOST_ASSERT(num_ring_tokens <= num_max_ring_tokens);
+    (void) num_min_ring_tokens;
 
     // Parse MMA type
     const auto mma_kind = parse_mma_kind(mma_type);

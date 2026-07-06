@@ -3,8 +3,11 @@
 #include <deep_gemm/common/cute_tie.cuh>
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/types.cuh>
+#include <deep_gemm/comm/barrier.cuh>
 #include <deep_gemm/layout/mega_moe.cuh>
+#include <deep_gemm/layout/sym_buffer.cuh>
 #include <deep_gemm/ptx/ld_st.cuh>
+#include <deep_gemm/ptx/tma.cuh>
 #include <deep_gemm/ptx/utils.cuh>
 
 namespace deep_gemm::sched {
@@ -21,7 +24,7 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t L2_SHAPE_N, uint32_t L2_SHAPE_K,
           uint32_t kNumExpertsPerRank,
           uint32_t kNumExpertsPerWave,
-          uint32_t kNumSMs, uint32_t kNumRanks,
+          uint32_t kNumSMs, uint32_t kNumRanks, uint32_t kNumThreads,
           uint32_t kNumExpertsPerLane = math::constexpr_ceil_div(kNumExpertsPerRank, 32u),
           uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N,
           uint32_t kNumL2BlockNs = L2_SHAPE_N / BLOCK_N,
@@ -42,6 +45,8 @@ struct MegaMoEScheduler {
 
     // Arrival counts
     const layout::Workspace& workspace;
+    const layout::SymBuffer<kNumRanks>& sym_buffer;
+    uint32_t sm_idx, thread_idx;
 
     // Scheduler state
     BlockPhase next_phase = BlockPhase::Linear1;
@@ -54,11 +59,32 @@ struct MegaMoEScheduler {
     uint32_t m_block_idx = 0;
     uint32_t n_block_idx = 0;
 
+    // Cycle chunking: exclusive pool-block end of the current dispatch cycle. The scheduler
+    // stops iterating and clamps the last expert's m-block count at this bound. Default is
+    // unbounded (the whole pool) so num_cycles == 1 reproduces the original behavior.
+    uint32_t cycle_pool_block_end = 0xffffffffu;
+    // Cycle chunking: per-cycle pool-block capacity (kNumRingBlocks) when chunking is enabled;
+    // 0 = single-cycle path (original behavior).
+    uint32_t cap_blocks = 0u;
+    // Set by fetch_next_l1/l2_block when it returns false BECAUSE the next block is beyond the
+    // cycle end (vs. because the wave's blocks are done). get_next_block uses this to break the
+    // cycle instead of transitioning L1->L2 / advancing the wave.
+    bool cycle_ended = false;
+    // Counted-arrival mbarrier for the cycle boundary (tolerates the pipelined for_each_block
+    // roles arriving at different times, unlike bar.sync which needs all threads simultaneously).
+    // Set by the kernel (`set_cycle_barrier`) to `&shared_storage.cycle_barrier` (init kNumThreads).
+    cutlass::arch::ClusterTransactionBarrier* cycle_barrier_ptr = nullptr;
+    uint32_t cycle_barrier_phase = 0;
+    CUTLASS_DEVICE void set_cycle_barrier(cutlass::arch::ClusterTransactionBarrier* b) { cycle_barrier_ptr = b; }
+
     // Pre-cached per-expert token counts (filled during `for_each_block` init)
     // Layout: `stored_num_tokens_per_expert[i]` holds expert (i * 32 + lane_idx)'s count
     uint32_t stored_num_tokens_per_expert[kNumExpertsPerLane] = {};
 
-    CUTLASS_DEVICE explicit MegaMoEScheduler(const layout::Workspace& workspace): workspace(workspace) {
+    CUTLASS_DEVICE explicit MegaMoEScheduler(const layout::Workspace& workspace,
+                                             const layout::SymBuffer<kNumRanks>& sym_buffer,
+                                             const uint32_t& sm_idx, const uint32_t& thread_idx)
+        : workspace(workspace), sym_buffer(sym_buffer), sm_idx(sm_idx), thread_idx(thread_idx) {
         block_idx = blockIdx.x;
     }
 
@@ -109,6 +135,23 @@ struct MegaMoEScheduler {
         return math::ceil_div(current_num_tokens, BLOCK_M);
     }
 
+    CUTLASS_DEVICE void set_cycle_pool_block_end(const uint32_t& end) { cycle_pool_block_end = end; }
+    CUTLASS_DEVICE void set_cap_blocks(const uint32_t& cap) { cap_blocks = cap; }
+
+    // Cycle-boundary barrier: sync all warp roles within the SM, then cross-rank via NVLink.
+    // All threads (kNumThreads) of every SM must call this once per cycle, in lockstep.
+    // Indices/tags are local constexprs (NVCC can't ODR-use static constexpr members in device code).
+    CUTLASS_DEVICE void cycle_barrier() {
+        // Cycle boundary: (1) intra-CTA counted-arrival mbarrier (all kNumThreads threads,
+        // tolerates the pipelined for_each_block roles arriving at different times), then
+        // (2) cross-CTA cluster_sync (the 2-CTA cluster). For multi-rank, a cross-rank NVLink
+        // barrier is also needed (TODO when testing multi-rank). No-op if no barrier is set.
+        if (cycle_barrier_ptr == nullptr) return;
+        ptx::mbarrier_arrive(cycle_barrier_ptr);
+        ptx::mbarrier_wait_and_flip_phase(cycle_barrier_ptr, cycle_barrier_phase);
+        comm::cluster_sync_with_relaxed_arrive();
+    }
+
     template <bool kDoUMMAAligned = false>
     CUTLASS_DEVICE uint32_t get_valid_m() const {
         const auto m = cute::min(current_num_tokens - m_block_idx * BLOCK_M, BLOCK_M);
@@ -120,13 +163,24 @@ struct MegaMoEScheduler {
         while (current_local_expert_idx < wave_end_expert_idx) {
             const auto num_m_blocks = get_current_num_m_blocks();
             m_block_idx = block_idx / kNumL1BlockNs;
-            if (m_block_idx < num_m_blocks)
+            // Cycle chunking: stop at the cycle's pool-block end (block-aligned). The block at
+            // `current_pool_block_offset + m_block_idx` is beyond this cycle -> return false so
+            // the cycle loop drains + barriers, then the next cycle continues this expert.
+            // No-op when `cycle_pool_block_end` is unbounded (num_cycles == 1).
+            if (current_pool_block_offset + m_block_idx >= cycle_pool_block_end) {
+                cycle_ended = true;
+                return false;
+            }
+            if (m_block_idx < num_m_blocks) {
+                cycle_ended = false;
                 return true;
+            }
 
             // Current expert is fully assigned, move to the next
             block_idx -= num_m_blocks * kNumL1BlockNs;
             advance_expert_idx();
         }
+        cycle_ended = false;
         return false;
     }
 
@@ -134,8 +188,14 @@ struct MegaMoEScheduler {
         const auto wave_end_expert_idx = get_wave_expert_end_idx();
         while (current_local_expert_idx < wave_end_expert_idx) {
             const auto num_m_blocks = get_current_num_m_blocks();
+            m_block_idx = block_idx / kNumL2BlockNs;
+            // Cycle chunking: stop at the cycle's pool-block end (see fetch_next_l1_block).
+            if (current_pool_block_offset + m_block_idx >= cycle_pool_block_end) {
+                cycle_ended = true;
+                return false;
+            }
             if (block_idx < num_m_blocks * kNumL2BlockNs) {
-                m_block_idx = block_idx / kNumL2BlockNs;
+                cycle_ended = false;
                 return true;
             }
 
@@ -143,6 +203,7 @@ struct MegaMoEScheduler {
             block_idx -= num_m_blocks * kNumL2BlockNs;
             advance_expert_idx();
         }
+        cycle_ended = false;
         return false;
     }
 
@@ -150,6 +211,10 @@ struct MegaMoEScheduler {
     CUTLASS_DEVICE cute::tuple<BlockPhase, uint32_t, uint32_t, uint32_t> get_next_block() {
         while (true) {
             if (current_local_expert_idx >= kNumExpertsPerRank)
+                break;
+            // Cycle chunking: stop once we've reached the current cycle's pool-block end.
+            // No-op when `cycle_pool_block_end` is unbounded (num_cycles == 1).
+            if (current_pool_block_offset >= cycle_pool_block_end)
                 break;
 
             if (next_phase == BlockPhase::Linear1) {
@@ -160,6 +225,10 @@ struct MegaMoEScheduler {
                     block_idx += kNumSMs;
                     return {BlockPhase::Linear1, current_local_expert_idx, m_block_idx, n_block_idx};
                 } else {
+                    // fetch returned false: either the wave's L1 is done, or the cycle ended
+                    // (cycle_ended flag distinguishes — set by the fetch's cycle-pool-block check).
+                    if (cycle_ended)
+                        break;  // cycle ended — stop, don't transition to L2
                     // L1 for the current wave is complete, transition to L2
                     next_phase = BlockPhase::Linear2;
                     set_expert_idx(math::align<uint32_t, false>(current_local_expert_idx - 1, kNumExpertsPerWave));
@@ -172,6 +241,8 @@ struct MegaMoEScheduler {
                     block_idx += kNumSMs;
                     return {BlockPhase::Linear2, current_local_expert_idx, m_block_idx, n_block_idx};
                 } else {
+                    if (cycle_ended)
+                        break;  // cycle ended — stop, don't advance to the next wave
                     // Move to L1 of the next wave
                     next_phase = BlockPhase::Linear1;
                 }
@@ -198,24 +269,57 @@ struct MegaMoEScheduler {
         __syncwarp();
     }
 
-    template <typename Func>
-    CUTLASS_DEVICE void for_each_block(Func&& func) {
+    template <typename Func, typename BarrierFunc>
+    CUTLASS_DEVICE void for_each_block_impl(Func&& func, BarrierFunc&& cycle_barrier, const uint32_t& cap_blocks) {
         // Wait for all expert counters to be finalized
         fetch_expert_recv_count();
+
+        // Cycle chunking: split the pool into `num_cycles` chunks of `cap_blocks` pool blocks
+        // each (the ring holds one cycle). `cap_blocks == 0` is the single-cycle sentinel
+        // (eff_cap = total_pool_blocks -> num_cycles == 1, reproducing the original behavior).
+        const uint32_t total_pool_blocks = get_pool_block_offset(kNumExpertsPerRank);
+        const uint32_t eff_cap_blocks = (cap_blocks == 0u) ? total_pool_blocks : cap_blocks;
+        const uint32_t num_cycles = total_pool_blocks == 0 ? 1u
+            : (total_pool_blocks + eff_cap_blocks - 1) / eff_cap_blocks;
 
         // Initialize current expert with 0
         set_expert_idx(0);
 
         // Iterate over all blocks
         // TODO: add swizzle within expert waves for better L2 cache utilization
-        while (true) {
-            CUTE_TIE_DECL(get_next_block(), block_phase, current_local_expert_idx, m_block_idx, n_block_idx);
-            if (block_phase == BlockPhase::None)
-                break;
+        for (uint32_t cycle = 0; cycle < num_cycles; ++ cycle) {
+            // Only activate the cycle-pool-block bound when actually chunking; the single-cycle
+            // path (cap_blocks == 0) leaves `cycle_pool_block_end` unbounded = original behavior.
+            if (cap_blocks != 0u)
+                set_cycle_pool_block_end(cute::min((cycle + 1) * eff_cap_blocks, total_pool_blocks));
+            // `block_idx` (and thus expert-relative `m_block_idx`) carries across cycles so
+            // `get_valid_m` stays correct; the cycle end is enforced inside fetch_next_l1/l2_block.
+            while (true) {
+                CUTE_TIE_DECL(get_next_block(), block_phase, current_local_expert_idx, m_block_idx, n_block_idx);
+                if (block_phase == BlockPhase::None)
+                    break;
 
-            func(block_phase, current_local_expert_idx,
-                 block_phase == BlockPhase::Linear2 ? kNumL2BlockKs : kNumL1BlockKs,
-                 m_block_idx, n_block_idx);
+                func(block_phase, current_local_expert_idx,
+                     block_phase == BlockPhase::Linear2 ? kNumL2BlockKs : kNumL1BlockKs,
+                     m_block_idx, n_block_idx);
+            }
+            // Cycle boundary: sync all warp roles + ranks (caller-supplied). MUST be called
+            // every cycle by every thread (even SMs with no blocks this cycle) so the barrier
+            // gets all kNumThreads arrivals — do NOT break early when an SM finishes its blocks.
+            cycle_barrier();
+        }
+    }
+
+    // Original single-cycle entry point. Uses the chunking path (with the cross-warp/cross-rank
+    // cycle barrier) when `cap_blocks > 0` has been set; otherwise the single-cycle no-op path
+    // (original behavior). Callers (the 5 warp-role for_each_block sites) are unchanged.
+    template <typename Func>
+    CUTLASS_DEVICE void for_each_block(Func&& func) {
+        if (cap_blocks > 0u) {
+            for_each_block_impl(std::forward<Func>(func), [this]() { cycle_barrier(); }, cap_blocks);
+        } else {
+            struct NoOpBarrier { CUTLASS_DEVICE void operator()() const {} };
+            for_each_block_impl(std::forward<Func>(func), NoOpBarrier{}, 0u);
         }
     }
 };
