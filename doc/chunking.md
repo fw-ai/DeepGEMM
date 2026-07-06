@@ -1,209 +1,139 @@
-# Mega-MoE dispatch cycle chunking — design, progress, and resume guide
+# Mega-MoE prefill: cycle-chunked dispatch pull
 
-## Goal
+## Status: WORKING (mxfp4 + nvfp4, 1-rank + multi-rank EP)
 
-Enable prefill (large seqlen) for the packed-FP4 mega-MoE kernel by chunking the
-dispatch so the per-rank token ring can be `ratio × max_seq_len` instead of
-`num_ranks × max_seq_len` (the `num_min` that forces a seqlen cliff ~98K/8 ranks,
-~49K/16 ranks). Add a cycle counter logged at kernel end. Verify correctness for
-`num_cycles > 1` and benchmark perf under different `chunk_ratio` values.
+The packed-FP4 mega-MoE kernel now supports prefill (large seqlen) with a token ring
+of `ratio × max_seq_len` instead of `num_ranks × max_seq_len` (the `num_min` that forced
+a seqlen cliff ~98K/8 ranks, ~49K/16 ranks). The dispatch PULL is split into
+`num_cycles = ceil(total_pool_blocks / kNumRingBlocks)` rounds; the GEMM follows via the
+ring full/empty counts. Verified correct (`diff < 0.05`) and benchmarked.
 
-Branch: `yingz/deepgemm-mem` in `~/DeepGEMM-worktrees/yingz-deepgemm-mem`.
-Approved plan: `/home/ipiszy/.claude/plans/lively-noodling-flurry.md`.
+Branch: `yingz/deepgemm-mem` in `~/DeepGEMM-worktrees/yingz-deepgemm-mem` (fw-ai/DeepGEMM).
 
-## Memory formulas (verified from `csrc/apis/mega.hpp`)
+## Design (final)
 
-- Ring (L1+L2 token+SF): `num_ring_tokens × (hidden+inter)×0.5` + SFs;
-  `num_sf_ring_tokens = 16 × num_ring_tokens` (worst-case `block_m=8` padding),
-  so SF pools ≈ data pools (NVFP4 SFs 2×).
-- `combine_token_buffer` (BF16): `num_topk × num_max_tokens × hidden × 2` —
-  **NO `num_ranks` factor** (per-rank, the token-owner's slots). Kept as-is.
-- Dispatch src idx pool: `E × num_ranks × tokens × 4` (linear in `num_ranks`).
-- `num_min_ring_tokens = num_ranks × num_max_tokens_per_rank` (one expert's
-  worst-case). The seqlen cliff: `num_min ≤ budget` (786K for prefill).
+**The cycle loop lives in the PULL only.** The GEMM roles run the ORIGINAL single-cycle
+`for_each_block` (`cap_blocks = 0`) and process all pool blocks continuously, gated by the
+ring full/empty counts — exactly the original ring-wrap pipeline. The pull's own cycle loop
+(`cycle_end_pool` bound) + a cross-CTA `grid_sync` at each cycle boundary keeps the global
+ring counts consistent across CTAs.
 
-## Commits (all on `yingz/deepgemm-mem`)
-
-- `4bb0397` — cycle-loop scaffolding (host `chunk_ratio` + relaxed assert, scheduler
-  cycle-bounds + `cycle_barrier()`, `for_each_block_impl` internal cycle loop, unified
-  cycle pull loop, gated wave-heuristic relaxation, `num_cycles` all-reduce + printf).
-  `kChunking=false` verified (baseline + 1-rank 16 cases).
-- `0eec18b` — two crash fixes found via `compute-sanitizer`: (1) smem OOB
-  (`Barrier cycle_barrier` not counted in `smem_barriers` → +1); (2) non-leader MMA
-  warp's `for_each_block` was leader-only → added no-op `for_each_block` else branch.
-- `f13b122` — mbarrier `cycle_barrier` (counted-arrival); cycle 0 works (all 16 warps
-  sync); cycle 1+ hangs on TMEM/TMA pipeline.
-- (uncommitted) — `for_each_block_single_cycle` + `get_num_cycles`/`get_total_pool_blocks`
-  helpers + A-load lambda-as-variable (in-progress restructure to "caller loops over
-  cycles with fresh pipeline state").
-
-## What works
-
-- `kChunking=false` (ring ≥ num_min, the original behavior): baseline + full 1-rank
-  matrix (16 cases) pass with diffs unchanged (mxfp4 0.00075 / nvfp4 0.00058).
-- `kChunking=true` cycle 0: the mbarrier `cycle_barrier` syncs all 16 warps on SM 0
-  (verified via `[cb]` printf). L1/L2 ring wrap counts verified consistent (empty-count
-  signals are +1 per N-block, so after cycle 0 `l1_empty_count[j] = kNumL1BlockNs`
-  matches the cycle-1 target).
-- `num_cycles` computation (pool-blocks-based: `ceil(total_pool_blocks / kNumRingBlocks)`)
-  + cross-rank all-reduce (gather-based) + printf — all working.
-- `compute-sanitizer` is available at `/usr/local/cuda/bin/compute-sanitizer` — NO torch
-  rebuild needed. Use `compute-sanitizer --tool memcheck python <probe>` for fault isolation.
-
-## Current blocker: cycle 1+ TMEM/TMA pipeline hang
-
-### Root cause (identified)
-
-The TMEM/TMA pipeline state — `stage_idx`, `phase` (line ~333), `current_iter_idx`
-(MMA line ~923, epilogue line ~1092), `accum_phase` — is declared BEFORE
-`for_each_block` in each warp-role branch and captured by the `for_each_block` lambda
-(`[&]`). The `for_each_block_impl` internal cycle loop reuses the SAME lambda across
-cycles, so the pipeline state **carries across the cycle boundary**. The
-`full_barriers`/`empty_barriers`/`tmem_full_barriers`/`tmem_empty_barriers` mbarriers
-are in whatever phase cycle 0 left them, and cycle 1's first block waits on a barrier
-phase that doesn't match → hang.
-
-The `[cb]` printf shows: cycle 0 — all 16 warps arrive at phase 0 (mbarrier releases).
-Cycle 1 — only 3 warps reach phase 1; the other 13 are stuck in the `for_each_block`
-while-loop (per-block callback), waiting on a TMEM/TMA mbarrier.
-
-### Fix direction (two options)
-
-**Option A (recommended): "caller loops over cycles with fresh pipeline state"**
-
-Instead of `for_each_block_impl`'s internal cycle loop, the CALLER (each warp-role
-branch) loops over cycles, resetting the pipeline state between cycles:
-
-```cpp
-// In each of the 5 for_each_block call sites (A-load 778, B-load 853, MMA 924,
-// 4th 1046, epilogue 1093):
-auto my_lambda = [&](const sched::BlockPhase& block_phase, ...) { ... };  // same body
-if constexpr (kChunking) {
-    const auto total_pb = scheduler.get_total_pool_blocks();
-    const auto nc = scheduler.get_num_cycles();
-    for (uint32_t cycle = 0; cycle < nc; ++cycle) {
-        scheduler.set_cycle_pool_block_end(cute::min((cycle + 1) * kNumRingBlocks, total_pb));
-        stage_idx = 0; phase = 0; current_iter_idx = 0;  // RESET pipeline state per cycle
-        scheduler.for_each_block_single_cycle(my_lambda);   // single-cycle, no internal loop
-        scheduler.cycle_barrier();
-    }
-} else {
-    scheduler.for_each_block(my_lambda);  // original single-cycle path
-}
+```
+# host: chunk_ratio (default None = original). When set:
+#   num_ring_tokens = align(ceil(chunk_ratio * num_max_tokens_per_rank), 384)
+#   clamped to num_max only (NOT num_min) -> permits ring < num_min.
+for cycle in range(num_cycles):                      # pull only
+    for token in this cycle's pool-block range:      # cycle_end_pool bound
+        wait ring slot empty (empty_count >= cycle drain target)
+        a2a-pull token -> ring slot
+    grid_sync (cross-CTA, dispatch warps)            # all CTAs' pulls at the cycle boundary
+# GEMM: original for_each_block (all pool blocks), gated by full_count per block.
+# Combine reduce: unchanged (post-cycle-loop).
 ```
 
-The `for_each_block_single_cycle(func)` method (ALREADY ADDED to the scheduler,
-uncommitted) iterates blocks up to `cycle_pool_block_end` with NO internal cycle loop
-and NO `cycle_barrier`. The caller sets `cycle_pool_block_end` per cycle + resets the
-pipeline state + calls `cycle_barrier`.
+**Why not a per-role GEMM cycle loop + shared cycle barrier?** The 5 GEMM roles are
+pipelined (A-load → B-load → MMA → 4th → epilogue), each processing the same blocks in
+sequence, so A-load is always AHEAD of the epilogue. They reach the cycle boundary at
+DIFFERENT cycles. A single mbarrier (counted-arrival) can't sync them — it counts arrivals
+across cycles, so a fast role's cycle-N+1 arrival completes a slow role's cycle-N round,
+desyncing them (confirmed by printf: the epilogue reached cycle 1 while A-load was still at
+cycle 0's mbarrier). The ring full/empty counts already sync the pipelined roles (A-load
+waits for `full_count`, the pull waits for `empty_count`), so no per-role cycle barrier is
+needed — the GEMM just follows the pull cycle-by-cycle via the counts.
 
-**What's done for Option A:**
-- `for_each_block_single_cycle` + `get_num_cycles` + `get_total_pool_blocks` added to
-  the scheduler (uncommitted).
-- A-load (778) partially changed: `scheduler.for_each_block([&]` → `auto load_a = [&]`
-  (the lambda is now a variable). The closing `});` → `};` + the `if constexpr` cycle
-  loop is NOT yet done.
+## Key fixes (in order of discovery)
 
-**What's remaining for Option A:**
-1. Finish the A-load (778): change the closing `});` (line ~847) to `};` + the
-   `if constexpr (kChunking) { cycle loop } else { scheduler.for_each_block(load_a); }`.
-2. Do the same for the other 4 call sites (B-load 853, MMA 924, 4th 1046, epilogue 1093).
-   - The MMA (924) + epilogue (1093) also need `current_iter_idx = 0` reset.
-   - The MMA (924) is leader-only (`if (is_leader_cta)`) — the non-leader's no-op
-     `for_each_block` (added in `0eec18b`) also needs the cycle loop.
-3. The dispatch pull already loops over cycles (the `for cycle` loop in the dispatch
-   warps) — but it should also reset its `pull_mbarrier_phase` per cycle (currently
-   carries). Check if needed.
-4. Test 1-rank `chunk_ratio=0.5` → expect `num_cycles=4`, `diff < 0.05`.
-5. Add cross-rank NVLink barrier to `cycle_barrier()` for multi-rank (currently
-   mbarrier + cluster_sync only; the `nvlink_barrier` with grid_sync index 2 timed out
-   when tried — needs investigation).
-6. Test 2-rank/8-rank → seqlen-cliff shape → perf-vs-`chunk_ratio` benchmark.
+1. **Scheduler `block_idx` carry (first deadlock)** — the persistent stripe counter
+   `block_idx` carried a large leftover across the cycle boundary, so
+   `m_block_idx = block_idx / kNumL1BlockNs` was a bogus large value for cycle 1's first
+   expert, and the cycle-end check `current_pool_block_offset + m_block_idx >= cycle_pool_block_end`
+   fired immediately — the GEMM did NO work for cycle >= 1 (the pull filled the ring but
+   nothing consumed it). Fixed by resetting `block_idx = blockIdx.x` per cycle AND adding a
+   `current_pool_block_offset >= cycle_pool_block_end` guard so the consume-walk stops at the
+   cycle boundary instead of overshooting. (This was for the GEMM-cycle-loop approach, which
+   was later abandoned for the pull-only approach — but the scheduler fetch logic is still
+   cycle-aware for safety.)
 
-**Option B: re-init the mbarriers per cycle**
+2. **Per-rank counts not reloaded across cycles (the REAL root cause)** — `stored_rank_count`
+   was only reloaded when the expert changed within a for-loop iteration
+   (`old_expert_idx != current_expert_idx`). CTAs that pulled 0 tokens in a cycle (broke at
+   the cycle bound before loading) carried stale/zero counts into the next cycle. With
+   `num_active_ranks = 0`, the round-robin rank-selection `while (true)` loop spun forever
+   (no progress) — a TRUE hang (no grid-sync timeout). Found by printf-isolating which CTAs
+   reached the cycle-1 grid_sync: CTAs 132-147 (the highest-numbered, whose token stripes
+   land in cycle 1) never reached it. Fixed by tracking `counts_loaded_expert` (the expert
+   the cached counts are loaded for) and reloading whenever
+   `current_expert_idx != counts_loaded_expert` — even across cycle boundaries.
 
-Re-init `full_barriers`/`empty_barriers`/`tmem_full_barriers`/`tmem_empty_barriers` at
-each cycle boundary (after the `cycle_barrier`) + reset `stage_idx`/`phase`/
-`current_iter_idx`. This requires a "cycle-start" callback in `for_each_block_impl`
-(since the pipeline state is in the lambda closure, not the scheduler). More complex
-than Option A. Not recommended.
+3. **Cross-CTA desync (grid_sync at the cycle boundary)** — without a cross-CTA sync, CTAs
+   desync across cycles (one CTA's cycle-N pull waits for another CTA's cycle-(N-1) GEMM
+   drain that never completes because that CTA raced ahead). Fixed with a
+   `comm::grid_sync<kNumSMs, kCycleGridSyncIndex=2>` at each cycle boundary, called by the
+   dispatch warps (all present at the pull's cycle end, so `sync_aligned(kNumDispatchThreads)`
+   is safe). The grid_sync counter (idx 2) alternates 0 ↔ kFinishSumTag mod 2³² across calls,
+   so repeated calls work without reset. For multi-rank, the ring counts are PER-RANK, so no
+   cross-RANK cycle barrier is needed — only the `num_cycles` all-reduce (cross-rank) ensures
+   all ranks run the same cycle count.
 
-## Key files (all in `~/DeepGEMM-worktrees/yingz-deepgemm-mem`)
+## Files (on `yingz/deepgemm-mem`)
 
-- `deep_gemm/include/deep_gemm/scheduler/mega_moe.cuh` — scheduler: `cycle_pool_block_end`,
-  `cap_blocks`, `cycle_ended`, `cycle_barrier()` (mbarrier + cluster_sync),
-  `for_each_block_impl` (internal cycle loop), `for_each_block` (no-arg, uses chunking
-  path when `cap_blocks > 0`), `for_each_block_single_cycle` (NEW, no cycle loop),
-  `get_num_cycles`/`get_total_pool_blocks` (NEW), `fetch_next_l1/l2_block` (cycle-end
-  stop + `cycle_ended` flag), `get_next_block` (cycle-end break via `cycle_ended`).
-- `deep_gemm/include/deep_gemm/impls/sm100_mxfp4_mxfp4_mega_moe.cuh` — kernel:
-  `kChunking` constexpr, scheduler construction with `kNumThreads` + sym_buffer/sm_idx/
-  thread_idx, `set_cap_blocks` + `set_cycle_barrier`, `num_cycles` computation + all-reduce
-  + printf, unified cycle pull loop, `shared_storage.cycle_barrier` (mbarrier),
-  `smem_barriers +1`, non-leader MMA no-op `for_each_block`, A-load lambda-as-variable
-  (in-progress).
-- `csrc/jit_kernels/heuristics/mega_moe.hpp` — wave heuristic: gated relaxation
-  (ring < num_min → force `num_experts_per_wave = 1`).
-- `csrc/jit_kernels/impls/sm100_mxfp4_mxfp4_mega_moe.hpp` — `smem_barriers +1` (cycle
-  barrier counted).
-- `csrc/apis/mega.hpp` — relaxed `num_min ≤ num_ring_tokens` assert; `num_cycles_max`
+- `deep_gemm/include/deep_gemm/impls/sm100_mxfp4_mxfp4_mega_moe.cuh` — `kChunking` constexpr;
+  pull's `for (cycle)` loop with `cycle_end_pool` bound + cross-CTA `grid_sync` per cycle;
+  `counts_loaded_expert` fix; `num_cycles` compute + cross-rank all-reduce + printf.
+- `deep_gemm/include/deep_gemm/scheduler/mega_moe.cuh` — `kNumThreads` template param;
+  cycle-aware fetch (no-op when `cap_blocks = 0`). (The cycle_barrier mbarrier machinery is
+  unused — the GEMM uses `cap_blocks = 0`.)
+- `csrc/jit_kernels/heuristics/mega_moe.hpp` — wave heuristic relaxation gated on
+  `ring >= num_min` (force `num_experts_per_wave = 1` when chunking).
+- `csrc/jit_kernels/impls/sm100_mxfp4_mxfp4_mega_moe.hpp` — `smem_barriers +1` (cycle_barrier
+  mbarrier counted; unused now but kept).
+- `csrc/apis/mega.hpp` — relaxed `num_min <= num_ring_tokens` assert; `num_cycles_max`
   workspace slot.
-- `deep_gemm/include/deep_gemm/layout/mega_moe.cuh` — `get_num_cycles_max_ptr` (all-reduce
-  slot).
-- `deep_gemm/mega/__init__.py` — `chunk_ratio` param (default None = original).
-- NOT yet applied to `sm100_fp8_fp4_mega_moe.cuh` (mirror later).
+- `deep_gemm/include/deep_gemm/layout/mega_moe.cuh` — `get_num_cycles_max_ptr` (all-reduce slot).
+- `deep_gemm/mega/__init__.py` — `chunk_ratio` param; `num_ring_tokens` sized per-ratio.
+- `tests/test_fp4_mega_moe.py` — `PREFILL_1RANK` + `PREFILL_MULTIRANK` shape matrices; `--scope prefill`.
+- `benchmarks/bench_packed_fp4.py` — `bench_mega_prefill` (chunk_ratio sweep: 1.3/1.5/2.0/baseline).
+- NOT yet applied to `sm100_fp8_fp4_mega_moe.cuh` (mirror is a follow-up).
 
-## Probe scripts (in `$CLAUDE_JOB_DIR/tmp/`, may be cleaned up — recreate if needed)
+## Verification
 
-- `chunk_1r.py` — 1-rank, `chunk_ratio=0.5`, tok=1024, (8,2,512,512):
-  `ring=768 < num_min=1024` → `kChunking=true`, `num_cycles=4`. The primary test.
-- `chunk_ep.py` — 8-rank, `chunk_ratio=1.3`, (8,32,4,1024,4096,1536).
-- `chunk_ep2.py` — 2-rank, `chunk_ratio=1.3`, (2,8,2,1024,512,512).
+- `python tests/test_fp4_mega_moe.py --scope baseline` — num_cycles=1, mxfp4 0.00075 / nvfp4 0.00058 (unchanged).
+- `python tests/test_fp4_mega_moe.py --scope 1rank` — all 1-rank cases pass (num_cycles=1).
+- `python tests/test_fp4_mega_moe.py --scope prefill --worlds 2,8`:
+  - 1-rank chunk_ratio=0.5 (tok=1024, ring=768 < num_min=1024) → num_cycles=4, diff=0.00079.
+  - EP2 chunk_ratio=1.3 (tok=1024, ring=1408 < num_min=2048) → num_cycles=2, diff=0.00079.
+  - EP8 chunk_ratio=1.3 (tok=1024, ring=1536 < num_min=8192) → num_cycles=3, diff=0.00064.
+- `python benchmarks/bench_packed_fp4.py --scope prefill --world 8 --tokens 1024`:
+  ```
+  ratio    ring  num_min |   lat us  peak GB
+   1.3    1536     8192 |    226.9     7.68
+   1.5    1920     8192 |    235.1     7.68
+   2.0    2304     8192 |    223.6     7.68
+   8.0    9216     8192 |    192.8     7.68   (baseline, ring >= num_min, no chunking)
+  ```
+  Cycle chunking costs ~15-20% latency at ratio 1.3 vs the un-chunked baseline, for the
+  memory savings (ring = ratio×tok instead of num_ranks×tok). At this shape the peak device
+  memory is dominated by the sym_buffer's a2a input buffers + combine_token_buffer (which
+  don't scale with the ring), so the ring savings are a small fraction of the total; the
+  ring size column shows the chunked allocation directly.
 
-## Resume steps (for a new session)
+## Debugging technique (lesson)
 
-1. `cd ~/DeepGEMM-worktrees/yingz-deepgemm-mem && git log --oneline -5` — confirm
-   the 3 commits + uncommitted changes.
-2. `bash develop.sh && python tests/test_fp4_mega_moe.py --scope baseline` — confirm
-   `kChunking=false` still works.
-3. Finish Option A: change the 5 `for_each_block` call sites to the caller-loops-over-
-   cycles pattern (A-load partially done; B-load, MMA, 4th, epilogue remaining).
-   - Use `auto my_lambda = [&](...) { ... };` + `if constexpr (kChunking) { cycle loop
-     with for_each_block_single_cycle + reset stage_idx/phase/current_iter_idx +
-     cycle_barrier } else { for_each_block(my_lambda) }`.
-   - The MMA (924) is leader-only — the non-leader's no-op `for_each_block` also needs
-     the cycle loop.
-4. `bash develop.sh && python $CLAUDE_JOB_DIR/tmp/chunk_1r.py` (or recreate) — test
-   1-rank `chunk_ratio=0.5`, expect `num_cycles=4`, `diff < 0.05`.
-5. If it passes: add cross-rank NVLink barrier to `cycle_barrier()` → test 2-rank/8-rank.
-6. Run `python tests/test_fp4_mega_moe.py --scope 1rank` — confirm no regression.
-7. Add prefill shapes to `tests/test_fp4_mega_moe.py` + perf-vs-`chunk_ratio` benchmark
-   to `benchmarks/bench_packed_fp4.py`.
-8. Mirror all changes to `sm100_fp8_fp4_mega_moe.cuh`.
-9. Commit + push to `fw-ai` (`yingz/deepgemm-mem`).
+The deadlock was isolated by printf: gate debug prints on `sm_idx` (one CTA) + `lane_idx == 0`
++ the cycle index, and print before/after each mbarrier/pipeline acquire/release. The CUDA
+printf fifo is ~1MB by default — bump it via `cudart.cudaDeviceSetLimit(1, 64*1024*1024)`
+(`cudaLimitPrintfFifoSize = 1`, NOT 5) before the kernel. Print only the relevant subset
+(e.g. `sm_idx >= 130` for the stuck CTAs) to avoid flooding. This pinpointed (a) the GEMM
+doing no work in cycle 1 (scheduler `block_idx` carry), (b) the mbarrier mixing arrivals
+across cycles (per-role cycle loop is wrong), and (c) CTAs 132-147 stuck in the round-robin
+(per-rank counts not reloaded).
 
-## Key subtleties (lessons learned)
+## Remaining / follow-up
 
-- `compute-sanitizer --tool memcheck` is the debugging tool (available, no torch rebuild).
-  It gives the faulting PC offset (e.g. `+0x900`, `+0xc470`) — cross-ref with SASS/PTX.
-- The smem allocation (`smem_barriers` in `sm100_mxfp4_mxfp4_mega_moe.hpp:75`) must
-  count ALL barriers in `SharedStorage` (adding `cycle_barrier` required `+1`).
-- The 2-CTA cluster: the MMA issue warp (`warp_idx == kNumDispatchWarps+2`) runs
-  leader-only (`if (is_leader_cta)`). Its `for_each_block` must be called by BOTH CTAs
-  (else the all-thread `cycle_barrier` faults). The non-leader needs a no-op
-  `for_each_block`.
-- `bar.sync` (sync_aligned) and `barrier.sync` (sync_unaligned) with `kNumThreads` both
-  fault if not all threads arrive. The counted-arrival mbarrier
-  (`ClusterTransactionBarrier` with `init(kNumThreads)` + `mbarrier_arrive` +
-  `mbarrier_wait_and_flip_phase`) tolerates staggered arrivals and works for cycle 0.
-- The `for_each_block_impl` internal cycle loop must NOT break early
-  (`if (current >= kNumExpertsPerRank) break`) — all threads must call `cycle_barrier`
-  every cycle.
-- `num_cycles` must be `ceil(total_pool_blocks / kNumRingBlocks)` (pool BLOCKS, not
-  tokens) — per-expert rounding means pool blocks ≠ `total_recv / BLOCK_M`.
-- The dispatch pull's cycle bound must be in POOL-BLOCK space (`pool_block_idx >=
-  (cycle+1)*kNumRingBlocks`), not token space, to stay block-aligned with the scheduler.
-- The `cycle_ended` flag (set by `fetch_next_l1/l2_block` when the cycle end is hit)
-  is used by `get_next_block` to distinguish cycle-end from wave-end (a stale
-  `m_block_idx` check was wrong — it false-positived when the wave's blocks were done
-  but the expert advanced).
+- Mirror the chunking changes to `sm100_fp8_fp4_mega_moe.cuh` (FP8xFP4 kernel).
+- Clean up the now-unused `cycle_barrier` mbarrier machinery in the scheduler + SharedStorage
+  + `smem_barriers +1` (the GEMM uses `cap_blocks = 0`, so the cycle_barrier is never called).
+- Right-size the SF ring (currently `16×` the data pool for `block_m=8` worst-case; prefill
+  uses `block_m=192`, so it's 24× oversized) — a separate memory follow-up.
+- Chunking the `combine_token_buffer` (push-direct `y_acc` or pull-mode) for very large
+  seqlen — explicitly out of scope here (kept as-is; scales with seqlen, no `num_ranks` factor).
