@@ -337,9 +337,17 @@ sm100_mxfp4_mxfp4_mega_moe_impl(void* y,
     // per-cycle chunking (cap_blocks = kNumRingBlocks) so the kernel runs
     // num_cycles = ceil(total_pool_blocks / kNumRingBlocks) dispatch rounds. Otherwise
     // cap_blocks stays 0 and the single-cycle path reproduces the original behavior.
+    // Cycle chunking: when the ring is smaller than one wave's worst case (num_min), the PULL is
+    // split into `num_cycles` rounds (the pull's own cycle loop, bounded by `cycle_end_pool` +
+    // the ring empty-count wait). The GEMM roles are NOT cycle-bounded — they run the ORIGINAL
+    // single-cycle `for_each_block` (cap_blocks = 0) and process all pool blocks continuously,
+    // gated by the ring full/empty counts (A-load waits for full_count per block, pull waits for
+    // empty_count per cycle). This mirrors the original ring-wrap pipeline: the pull fills cycle
+    // by cycle, the GEMM follows via the counts. A per-role GEMM cycle loop + shared cycle
+    // barrier does NOT work because the 5 GEMM roles are pipelined (A-load ahead of epilogue) and
+    // reach the cycle boundary at different cycles — a single mbarrier mixes their arrivals.
     constexpr bool kChunking = (kNumRingTokens < kNumRanks * kNumMaxTokensPerRank);
-    if constexpr (kChunking) scheduler.set_cap_blocks(kNumRingBlocks);
-    if constexpr (kChunking) scheduler.set_cycle_barrier(&shared_storage.cycle_barrier);
+    // NOTE: cap_blocks stays 0 -> GEMM `for_each_block` uses the original single-cycle path.
 
     // MMA pipeline and TMA phases
     uint32_t stage_idx = 0, phase = 0;
@@ -512,6 +520,12 @@ sm100_mxfp4_mxfp4_mega_moe_impl(void* y,
         uint32_t stored_rank_count[kNumRanksPerLane] = {};
         uint32_t expert_start_idx = 0, expert_end_idx = 0;
         uint32_t expert_pool_block_offset = 0;
+        // Track which expert `stored_rank_count` is loaded for. Unlike comparing against the
+        // per-iteration `old_expert_idx` (which resets to `current_expert_idx` each for-loop
+        // iteration, so it misses the case where a CTA pulled 0 tokens last cycle and broke
+        // before ever loading the counts), this stays -2 until the first load for an expert and
+        // forces a reload whenever the expert changes — even across cycle boundaries.
+        int counts_loaded_expert = -2;
 
         constexpr uint32_t kNumGlobalWarps = kNumSMs * kNumDispatchWarps;
         // Cycle chunking: when `kChunking`, the pull is split into `num_cycles` rounds of
@@ -523,7 +537,6 @@ sm100_mxfp4_mxfp4_mega_moe_impl(void* y,
         const uint32_t cycle_end_pool = kChunking ? (cycle + 1) * kNumRingTokens : 0xffffffffu;
         for (;;) {
             // Advance expert until within the range
-            int old_expert_idx = current_expert_idx;
             while (token_idx >= expert_end_idx) {
                 if (++ current_expert_idx >= kNumExpertsPerRank)
                     break;
@@ -551,9 +564,10 @@ sm100_mxfp4_mxfp4_mega_moe_impl(void* y,
                     break;
             }
 
-            // Load per-rank counts when expert changes
-            if (old_expert_idx != current_expert_idx) {
-                old_expert_idx = current_expert_idx;
+            // Load per-rank counts when the expert changes (or hasn't been loaded yet for this
+            // expert — happens when a CTA pulled 0 tokens in a prior cycle and broke before loading).
+            if (current_expert_idx != counts_loaded_expert) {
+                counts_loaded_expert = current_expert_idx;
                 #pragma unroll
                 for (uint32_t i = 0; i < kNumRanksPerLane; ++ i) {
                     const uint32_t j = i * 32 + lane_idx;
@@ -705,10 +719,16 @@ sm100_mxfp4_mxfp4_mega_moe_impl(void* y,
             token_idx += kNumGlobalWarps;
         }
         if constexpr (kChunking) {
-            scheduler.cycle_barrier();
-            if (sm_idx == 0 && warp_idx == 0 && lane_idx == 0)
-                printf("[mega_moe] rank=%u dispatch cycle=%u done\n", sym_buffer.rank_idx, cycle);
-            // Per-cycle ring reset (zero L1/L2 full/empty counts) wired up next.
+            // Cross-CTA grid sync at the cycle boundary (dispatch warps only — they're all
+            // present here, so sync_aligned(kNumDispatchThreads) is safe). Ensures every CTA's
+            // pull has finished this cycle before any CTA starts the next cycle's pull, so the
+            // global ring full/empty counts stay consistent across CTAs. The GEMM roles are NOT
+            // synced here — they follow the pull via the ring counts (no per-role cycle barrier).
+            constexpr uint32_t kCycleGridSyncIndex = 2u;   // 0=dispatch, 1=epilogue, 2=cycle
+            constexpr uint32_t kCyclePullBarrierIdx = 8u;  // free named barrier (0-2, 3+ epilogue WG)
+            comm::grid_sync<kNumSMs, kCycleGridSyncIndex>(
+                workspace, sm_idx, thread_idx,
+                [=]() { ptx::sync_aligned(kNumDispatchThreads, kCyclePullBarrierIdx); });
         }
         }
 
@@ -1108,8 +1128,6 @@ sm100_mxfp4_mxfp4_mega_moe_impl(void* y,
             const uint32_t ring_m_idx = ring_block_idx * BLOCK_M;  // Ring-buffer offset for reusable data buffers
             const uint32_t pool_m_idx = pool_block_idx * BLOCK_M;       // Full-pool offset for non-ring metadata
             uint32_t n_idx = n_block_idx * BLOCK_N;
-            if (sm_idx == 0 && epilogue_warp_idx == 0 && lane_idx == 0)
-                printf("[ep] phase=%d pool_blk=%u valid_m=%u iter=%u\n", (int)block_phase, pool_block_idx, valid_m, current_iter_idx - 1);
 
             // NVFP4: load per-expert global scales ONCE per block (hoisted out of the per-atom loops).
             float nv_gate_alpha = 1.0f, nv_up_alpha = 1.0f, nv_l2_in_gs = 1.0f, nv_down_alpha = 1.0f;

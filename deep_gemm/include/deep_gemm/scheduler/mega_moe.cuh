@@ -74,8 +74,17 @@ struct MegaMoEScheduler {
     // roles arriving at different times, unlike bar.sync which needs all threads simultaneously).
     // Set by the kernel (`set_cycle_barrier`) to `&shared_storage.cycle_barrier` (init kNumThreads).
     cutlass::arch::ClusterTransactionBarrier* cycle_barrier_ptr = nullptr;
-    uint32_t cycle_barrier_phase = 0;
+    // Init to 1: the mbarrier starts at parity 0, and `try_wait.parity(phase)` returns when
+    // parity == phase. To BLOCK until the first round of kNumThreads arrivals flips parity 0->1,
+    // the first wait must pass phase=1 (not 0, which would match the init parity and return
+    // immediately). `mbarrier_wait_and_flip_phase` flips this each call (1<->0).
+    uint32_t cycle_barrier_phase = 1;
     CUTLASS_DEVICE void set_cycle_barrier(cutlass::arch::ClusterTransactionBarrier* b) { cycle_barrier_ptr = b; }
+
+    // Current dispatch cycle index (set by for_each_block_impl per cycle). Read by the kernel's
+    // per-block lambdas to gate debug printf on cycle >= 1 (avoid flooding cycle 0's blocks).
+    uint32_t current_cycle = 0;
+    CUTLASS_DEVICE uint32_t get_current_cycle() const { return current_cycle; }
 
     // Pre-cached per-expert token counts (filled during `for_each_block` init)
     // Layout: `stored_num_tokens_per_expert[i]` holds expert (i * 32 + lane_idx)'s count
@@ -138,15 +147,39 @@ struct MegaMoEScheduler {
     CUTLASS_DEVICE void set_cycle_pool_block_end(const uint32_t& end) { cycle_pool_block_end = end; }
     CUTLASS_DEVICE void set_cap_blocks(const uint32_t& cap) { cap_blocks = cap; }
 
-    // Cycle-boundary barrier: sync all warp roles within the SM, then cross-rank via NVLink.
-    // All threads (kNumThreads) of every SM must call this once per cycle, in lockstep.
-    // Indices/tags are local constexprs (NVCC can't ODR-use static constexpr members in device code).
+    // Cycle-boundary barrier, three steps:
+    //  (1) Within-SM counted-arrival mbarrier: all 16 warps (5 pipelined for_each_block roles +
+    //      the dispatch pull) arrive once. Tolerates staggered arrivals (unlike bar.sync). This
+    //      guarantees the SM's GEMM+pull for this cycle are done before signalling cross-SM.
+    //  (2) Cross-SM grid_sync driven by ONLY warp 0 (one atomic-add per SM), so all SMs reach the
+    //      same cycle boundary before any SM starts the next cycle's pull. Without this, SMs
+    //      desync across cycles and the global ring full/empty counts deadlock.
+    //  (3) Within-SM mbarrier again: warps 1-15 wait for warp 0's grid_sync to complete before
+    //      proceeding to the next cycle.
+    // Each thread calls this once per cycle (via its role's for_each_block / the pull loop). Only
+    // warp 0 does the cross-SM atomic; the others skip (2) and wait at (3).
     CUTLASS_DEVICE void cycle_barrier() {
         if (cycle_barrier_ptr == nullptr) return;
-        if (sm_idx == 0 && ptx::get_lane_idx() == 0)
-            printf("[cb] SM0 warp=%u phase=%u\n", thread_idx / 32, cycle_barrier_phase);
+        const uint32_t warp_idx_local = thread_idx / 32;
+        if (sm_idx == 0u && ptx::get_lane_idx() == 0u && (warp_idx_local == 0u || warp_idx_local == 4u))
+            printf("[cb] c=%u w=%u pre-mbar ph=%u\n", current_cycle, warp_idx_local, cycle_barrier_phase);
+        // (1) Within-SM counted-arrival mbarrier: all 16 warps arrive ONCE per cycle.
         ptx::mbarrier_arrive(cycle_barrier_ptr);
         ptx::mbarrier_wait_and_flip_phase(cycle_barrier_ptr, cycle_barrier_phase);
+        if (sm_idx == 0u && ptx::get_lane_idx() == 0u && (warp_idx_local == 0u || warp_idx_local == 4u))
+            printf("[cb] c=%u w=%u post-mbar ph=%u\n", current_cycle, warp_idx_local, cycle_barrier_phase);
+        // (2) Cross-SM grid sync, driven by warp 0 only.
+        if (warp_idx_local == 0u) {
+            if (sm_idx == 0u && ptx::get_lane_idx() == 0u)
+                printf("[cb] c=%u w=0 pre-grid\n", current_cycle);
+            constexpr uint32_t kCycleGridSyncIndex = 2u;   // 0=dispatch, 1=epilogue, 2=cycle
+            constexpr uint32_t kCycleBarrierIdx = 8u;      // free named barrier (0-2, 3+ epilogue WG)
+            comm::grid_sync<kNumSMs, kCycleGridSyncIndex>(
+                workspace, sm_idx, thread_idx,
+                [=]() { ptx::sync_aligned(32u, kCycleBarrierIdx); });
+            if (sm_idx == 0u && ptx::get_lane_idx() == 0u)
+                printf("[cb] c=%u w=0 post-grid\n", current_cycle);
+        }
     }
 
     template <bool kDoUMMAAligned = false>
@@ -158,17 +191,24 @@ struct MegaMoEScheduler {
     CUTLASS_DEVICE bool fetch_next_l1_block() {
         const auto wave_end_expert_idx = get_wave_expert_end_idx();
         while (current_local_expert_idx < wave_end_expert_idx) {
-            const auto num_m_blocks = get_current_num_m_blocks();
-            m_block_idx = block_idx / kNumL1BlockNs;
-            // Cycle chunking: stop at the cycle's pool-block end (block-aligned). The block at
-            // `current_pool_block_offset + m_block_idx` is beyond this cycle -> return false so
-            // the cycle loop drains + barriers, then the next cycle continues this expert.
-            // No-op when `cycle_pool_block_end` is unbounded (num_cycles == 1).
-            if (current_pool_block_offset + m_block_idx >= cycle_pool_block_end) {
+            // Cycle chunking: if this expert's pool-block start is already at/after the cycle end,
+            // the cycle is done for this SM. This stops the consume-walk from overshooting the
+            // cycle boundary when the stripe counter (`block_idx`) has no real block in this cycle
+            // (e.g. SM 0 got one block early, then the consume-walk advances through experts whose
+            // pool range is beyond this cycle). No-op when unbounded (num_cycles == 1).
+            if (current_pool_block_offset >= cycle_pool_block_end) {
                 cycle_ended = true;
                 return false;
             }
+            const auto num_m_blocks = get_current_num_m_blocks();
+            m_block_idx = block_idx / kNumL1BlockNs;
             if (m_block_idx < num_m_blocks) {
+                // Real block within the expert — check it's within the cycle's pool-block range.
+                // No-op when `cycle_pool_block_end` is unbounded (num_cycles == 1).
+                if (current_pool_block_offset + m_block_idx >= cycle_pool_block_end) {
+                    cycle_ended = true;
+                    return false;
+                }
                 cycle_ended = false;
                 return true;
             }
@@ -184,14 +224,18 @@ struct MegaMoEScheduler {
     CUTLASS_DEVICE bool fetch_next_l2_block() {
         const auto wave_end_expert_idx = get_wave_expert_end_idx();
         while (current_local_expert_idx < wave_end_expert_idx) {
-            const auto num_m_blocks = get_current_num_m_blocks();
-            m_block_idx = block_idx / kNumL2BlockNs;
-            // Cycle chunking: stop at the cycle's pool-block end (see fetch_next_l1_block).
-            if (current_pool_block_offset + m_block_idx >= cycle_pool_block_end) {
+            // Cycle chunking: see fetch_next_l1_block.
+            if (current_pool_block_offset >= cycle_pool_block_end) {
                 cycle_ended = true;
                 return false;
             }
+            const auto num_m_blocks = get_current_num_m_blocks();
+            m_block_idx = block_idx / kNumL2BlockNs;
             if (block_idx < num_m_blocks * kNumL2BlockNs) {
+                if (current_pool_block_offset + m_block_idx >= cycle_pool_block_end) {
+                    cycle_ended = true;
+                    return false;
+                }
                 cycle_ended = false;
                 return true;
             }
@@ -285,12 +329,18 @@ struct MegaMoEScheduler {
         // Iterate over all blocks
         // TODO: add swizzle within expert waves for better L2 cache utilization
         for (uint32_t cycle = 0; cycle < num_cycles; ++ cycle) {
+            current_cycle = cycle;
             // Only activate the cycle-pool-block bound when actually chunking; the single-cycle
             // path (cap_blocks == 0) leaves `cycle_pool_block_end` unbounded = original behavior.
             if (cap_blocks != 0u)
                 set_cycle_pool_block_end(cute::min((cycle + 1) * eff_cap_blocks, total_pool_blocks));
-            // `block_idx` (and thus expert-relative `m_block_idx`) carries across cycles so
-            // `get_valid_m` stays correct; the cycle end is enforced inside fetch_next_l1/l2_block.
+            // Reset the persistent stripe counter per cycle. The expert/pool-offset state carries
+            // across cycles (so we resume at the right expert), but `block_idx` must restart at
+            // `blockIdx.x` for each cycle's range — otherwise the leftover stripe value from the
+            // previous cycle's consume-walk yields a bogus large `m_block_idx` that trips the
+            // cycle-end check before any real block is found (GEMM did no work for cycle >= 1).
+            block_idx = blockIdx.x;
+            // The cycle end is enforced inside fetch_next_l1/l2_block.
             while (true) {
                 CUTE_TIE_DECL(get_next_block(), block_phase, current_local_expert_idx, m_block_idx, n_block_idx);
                 if (block_phase == BlockPhase::None)
