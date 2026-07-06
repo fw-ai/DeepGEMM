@@ -319,6 +319,33 @@ struct MegaMoEScheduler {
             for_each_block_impl(std::forward<Func>(func), NoOpBarrier{}, 0u);
         }
     }
+
+    // Single-cycle iteration: iterate blocks up to `cycle_pool_block_end` (set by the caller),
+    // NO internal cycle loop, NO cycle_barrier. Used by the "caller loops over cycles" chunking
+    // pattern so the caller can reset the pipeline state (stage_idx/phase/current_iter_idx)
+    // between cycles. Calls fetch_expert_recv_count + set_expert_idx(0) once.
+    template <typename Func>
+    CUTLASS_DEVICE void for_each_block_single_cycle(Func&& func) {
+        fetch_expert_recv_count();
+        set_expert_idx(0);
+        while (true) {
+            CUTE_TIE_DECL(get_next_block(), block_phase, current_local_expert_idx, m_block_idx, n_block_idx);
+            if (block_phase == BlockPhase::None)
+                break;
+            func(block_phase, current_local_expert_idx,
+                 block_phase == BlockPhase::Linear2 ? kNumL2BlockKs : kNumL1BlockKs,
+                 m_block_idx, n_block_idx);
+        }
+    }
+
+    CUTLASS_DEVICE uint32_t get_total_pool_blocks() {
+        return get_pool_block_offset(kNumExpertsPerRank);
+    }
+    CUTLASS_DEVICE uint32_t get_num_cycles() {
+        const auto total = get_total_pool_blocks();
+        const auto cap = (cap_blocks == 0u) ? total : cap_blocks;
+        return total == 0 ? 1u : (total + cap - 1) / cap;
+    }
 };
 
 } // namespace deep_gemm::sched
