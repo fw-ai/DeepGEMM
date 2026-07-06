@@ -8,7 +8,12 @@ Both run the *same* MoE problem (identical shapes + identical routing) so the
 comparison is apples-to-apples at the op level. We report end-to-end device
 time (CUDA events), which includes all sub-kernels (FlashInfer dispatches
 moe_sort + gemm1 + gemm2/finalize; DeepGEMM is a single mega kernel).
+
+With ``--breakdown``, instead of the timing table we print a per-kernel
+device-time breakdown (launches/iter + us/iter per kernel) for each backend,
+so you can see how many kernels each launches and where the time goes.
 """
+import argparse
 import os
 import sys
 import torch
@@ -115,6 +120,45 @@ def cuda_time(fn, warmup=10, iters=50):
         return _time_events(fn, iters), 'eager'
 
 
+def kernel_breakdown(run, warmup=10, iters=50):
+    """Profile `run` and return per-kernel (name, launches/iter, us/iter), sorted by us/iter."""
+    for _ in range(warmup):
+        run()
+    torch.cuda.synchronize()
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
+        for _ in range(iters):
+            run()
+        torch.cuda.synchronize()
+    rows = []
+    for evt in prof.key_averages():
+        dev = getattr(evt, 'self_device_time_total', None) or getattr(evt, 'self_cuda_time_total', 0.0)
+        if dev and dev > 0:
+            rows.append((evt.key, evt.count / iters, dev / iters))  # name, launches/iter, us/iter
+    rows.sort(key=lambda r: -r[2])
+    return rows
+
+
+def show_breakdown(title, builder, *, is_tuple=False):
+    """Build a backend, profile its run closure, and print the per-kernel device-time
+    breakdown (launches/iter + us/iter per kernel)."""
+    print(f'\n===== {title} =====')
+    try:
+        out = builder()
+        run = out[0] if is_tuple else out
+        rows = kernel_breakdown(run)
+        if is_tuple:
+            out[1].destroy()
+    except Exception as ex:
+        print(f'  ERROR: {str(ex).splitlines()[-1][:120]}')
+        return
+    total = sum(r[2] for r in rows)
+    n_launches = sum(r[1] for r in rows)
+    print(f'  {len(rows)} distinct kernels, {n_launches:.0f} launches/iter, total device {total:.1f} us/iter')
+    print(f'  {"#/it":>5} {"us/it":>8}  kernel')
+    for name, cnt, us in rows:
+        print(f'  {cnt:>5.0f} {us:>8.1f}  {name[:88]}')
+
+
 def _interleave_gate(x, group_size=64, dim=1):
     sizes = x.size()
     dim = dim % x.dim()
@@ -211,7 +255,7 @@ def build_deepgemm_nvfp4(group, x_bf16, w1_bf16, w2_bf16, sel, rw, num_experts, 
     return run, buf
 
 
-def bench_one(group, num_tokens, hidden, inter, num_experts, top_k):
+def bench_one(group, num_tokens, hidden, inter, num_experts, top_k, breakdown=False):
     torch.manual_seed(0)
     dev = 'cuda'
     x_bf16 = torch.randn(num_tokens, hidden, dtype=torch.bfloat16, device=dev) / 10
@@ -223,6 +267,26 @@ def bench_one(group, num_tokens, hidden, inter, num_experts, top_k):
     rw, sel = torch.topk(probs, top_k, dim=-1)
     rw = (rw / rw.sum(-1, keepdim=True)).float()
     sel = sel.to(torch.int64)
+
+    if breakdown:
+        print(f'\n### shape: tokens={num_tokens} experts={num_experts} top_k={top_k} '
+              f'hidden={hidden} inter={inter} ###')
+        show_breakdown('DeepGEMM fp8xfp4 mega',
+                       lambda: build_deepgemm(group, x_bf16, w1_bf16, w2_bf16, sel, rw,
+                                              num_experts, top_k, hidden, inter), is_tuple=True)
+        show_breakdown('DeepGEMM nvfp4 mega',
+                       lambda: build_deepgemm_nvfp4(group, x_bf16, w1_bf16, w2_bf16, sel, rw,
+                                                    num_experts, top_k, hidden, inter), is_tuple=True)
+        show_breakdown('FlashInfer nvfp4 (cute_dsl)',
+                       lambda: build_flashinfer(x_bf16, w1_bf16, w2_bf16, sel, rw,
+                                                num_experts, top_k, hidden, inter))
+        show_breakdown('FlashInfer nvfp4 (cutlass)',
+                       lambda: build_flashinfer_cutlass(x_bf16, w1_bf16, w2_bf16, sel, rw,
+                                                        num_experts, top_k, hidden, inter))
+        show_breakdown('FlashInfer nvfp4 (trtllm-gen)',
+                       lambda: build_flashinfer_trtllm(x_bf16, w1_bf16, w2_bf16,
+                                                       num_experts, top_k, hidden, inter))
+        return
 
     res = {}
 
@@ -261,15 +325,26 @@ def bench_one(group, num_tokens, hidden, inter, num_experts, top_k):
 
 
 def main():
+    parser = argparse.ArgumentParser(
+        description='Single-device DeepGEMM vs FlashInfer NVFP4 MoE benchmark.')
+    parser.add_argument('--breakdown', action='store_true',
+                        help='Print the per-kernel device-time breakdown for each backend '
+                             'instead of the end-to-end timing table')
+    args = parser.parse_args()
+
     os.environ.setdefault('MASTER_ADDR', '127.0.0.1')
     os.environ.setdefault('MASTER_PORT', '12566')
     dist.init_process_group('nccl', rank=0, world_size=1)
     group = dist.group.WORLD
 
     print(f'torch {torch.__version__}, flashinfer {flashinfer.__version__}, {torch.cuda.get_device_name(0)}')
-    print('DeepGEMM mega-MoE (fp8xfp4 / nvfp4)  vs  FlashInfer NVFP4 MoE backends  (device us, CUDA graph; g=graph e=eager)')
-    print(f'{"tok":>5} {"exp":>4} {"tk":>3} {"hid":>5} {"int":>5} | {"dg_fp8":>9} | {"dg_nvfp4":>9} | '
-          f'{"fi_cutedsl":>9} | {"fi_cutlass":>9} | {"fi_trtllm":>9}')
+    if args.breakdown:
+        print('Per-kernel device-time breakdown per backend (torch.profiler, single device)')
+    else:
+        print('DeepGEMM mega-MoE (fp8xfp4 / nvfp4)  vs  FlashInfer NVFP4 MoE backends  '
+              '(device us, CUDA graph; g=graph e=eager)')
+        print(f'{"tok":>5} {"exp":>4} {"tk":>3} {"hid":>5} {"int":>5} | {"dg_fp8":>9} | {"dg_nvfp4":>9} | '
+              f'{"fi_cutedsl":>9} | {"fi_cutlass":>9} | {"fi_trtllm":>9}')
     for cfg in (
         (128, 2048, 2048, 32, 4),
         (512, 2048, 2048, 32, 4),
@@ -277,7 +352,7 @@ def main():
         # inter=2304 is nvfp4-only (fp8xfp4 needs inter % 512 == 0)
         (32, 4608, 2304, 256, 16),
     ):
-        bench_one(group, *cfg)
+        bench_one(group, *cfg, breakdown=args.breakdown)
     dist.destroy_process_group()
 
 
