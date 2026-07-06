@@ -271,8 +271,22 @@ SHAPES_MULTIRANK = [
     (2, 8, 2, 128, 512, 512, 0.3),   # masked EP
 ]
 
+# Prefill (cycle-chunked) coverage: shapes where `chunk_ratio * num_max < num_ranks * num_max`
+# so the kernel runs `num_cycles > 1` dispatch rounds (ring < num_min). (chunk_ratio, shape)
+# 1-rank shapes use chunk_ratio < 1 to force chunking on a small shape; multi-rank shapes use
+# a realistic prefill ratio (1.3) where num_ranks * seqlen would exceed the ring budget.
+PREFILL_1RANK = [
+    (0.5, (1024, 8, 2, 512, 512, 0.0)),    # ring=768 < num_min=1024 -> num_cycles=4
+    (0.5, (1024, 32, 4, 4096, 1536, 0.0)), # large prefill shape, ring < num_min
+    (1.3, (1024, 8, 2, 512, 512, 0.0)),    # ratio 1.3 but 1-rank num_min=tok -> no chunk (sanity)
+]
+PREFILL_MULTIRANK = [
+    (1.3, (2, 8, 2, 1024, 512, 512, 0.0)),   # ring=1408 < num_min=2048 -> num_cycles=2
+    (1.3, (8, 32, 4, 1024, 4096, 1536, 0.0)), # ring=1536 < num_min=8192 -> num_cycles=3
+]
 
-def _build_s(spec, shape, rank, world, group) -> SimpleNamespace:
+
+def _build_s(spec, shape, rank, world, group, chunk_ratio=None) -> SimpleNamespace:
     num_tokens, num_experts, num_topk, hidden, inter, masked_ratio = shape
     assert num_experts % world == 0, f'num_experts={num_experts} not divisible by world={world}'
     assert hidden % 128 == 0 and inter % 128 == 0, assert_msg
@@ -282,7 +296,8 @@ def _build_s(spec, shape, rank, world, group) -> SimpleNamespace:
     # num_max_tokens is aligned up to 384 internally; num_tokens may be any value <= it.
     num_max_tokens = max(num_tokens, 1)
     buf = deep_gemm.get_symm_buffer_for_mega_moe(group, num_experts, num_max_tokens, num_topk,
-                                                 hidden, inter, mma_type=spec.mma_type)
+                                                 hidden, inter, mma_type=spec.mma_type,
+                                                 chunk_ratio=chunk_ratio)
 
     # Replicated inputs across ranks (same seed) -> every rank computes the same full
     # reference; each rank passes only its local expert shard to the kernel.
@@ -306,9 +321,9 @@ def _build_s(spec, shape, rank, world, group) -> SimpleNamespace:
     )
 
 
-def _run_one(spec, shape, rank, world, group):
+def _run_one(spec, shape, rank, world, group, chunk_ratio=None):
     """Build the shape, run the kernel + reference, return (y, ref, diff)."""
-    s = _build_s(spec, shape, rank, world, group)
+    s = _build_s(spec, shape, rank, world, group, chunk_ratio=chunk_ratio)
     try:
         y = spec.run(s)
         ref = spec.reference(s)
@@ -414,9 +429,59 @@ def test_fp4_mega_moe_multirank(world: int = 2) -> None:
     print()
 
 
+def test_fp4_mega_moe_prefill_1rank(fmt: str = 'mxfp4') -> None:
+    """1-rank prefill shapes that force `num_cycles > 1` via a small `chunk_ratio`."""
+    assert fmt in FP4_MOE, f'unknown FP4 format {fmt!r}; expected one of {list(FP4_MOE)}'
+    _ensure_master(13801)
+    rank, world, group = init_dist(0, 1)
+    spec = FP4_MOE[fmt]
+    print(f'=== prefill 1-rank {fmt.upper()} ({len(PREFILL_1RANK)} shapes) ===')
+    try:
+        for chunk_ratio, shape in PREFILL_1RANK:
+            y, ref, diff, s = _run_one(spec, shape, rank, world, group, chunk_ratio=chunk_ratio)
+            try:
+                tag = f'{_shape_tag(shape)} ratio={chunk_ratio}'
+                _check_and_print(tag, fmt, diff, y, ref)
+            finally:
+                s.buf.destroy()
+        print(f'All prefill 1-rank {fmt.upper()} cases passed.\n')
+    finally:
+        dist.destroy_process_group()
+
+
+def _prefill_multirank_worker(local_rank, num_local_ranks, cases):
+    """Spawned per-rank worker for prefill multi-rank shapes (with chunk_ratio)."""
+    rank, world, group = init_dist(local_rank, num_local_ranks)
+    try:
+        for fmt, chunk_ratio, shape in cases:
+            _w, exp, topk, tok, h, i, m = shape
+            inner = (tok, exp, topk, h, i, m)
+            spec = FP4_MOE[fmt]
+            y, ref, diff, s = _run_one(spec, inner, rank, world, group, chunk_ratio=chunk_ratio)
+            try:
+                _check_and_print(f'{_shape_tag(shape, world)} ratio={chunk_ratio}', fmt, diff, y, ref)
+            finally:
+                s.buf.destroy()
+        dist_print(f'All prefill EP{world} cases passed.', once_in_node=True)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_fp4_mega_moe_prefill_multirank(world: int = 2) -> None:
+    """Multi-rank prefill shapes (chunk_ratio=1.3, ring < num_min -> num_cycles > 1)."""
+    cases = [(fmt, cr, shape) for cr, shape in PREFILL_MULTIRANK if shape[0] == world for fmt in FP4_MOE]
+    if not cases:
+        print(f'No prefill multi-rank shapes for world={world}; skipping.')
+        return
+    _ensure_master(13900 + world)
+    print(f'=== prefill multi-rank EP (world={world}, {len(cases)} cases) ===', flush=True)
+    torch.multiprocessing.spawn(_prefill_multirank_worker, args=(world, cases), nprocs=world)
+    print()
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Packed FP4 mega-MoE correctness (1-rank + multi-rank EP)')
-    parser.add_argument('--scope', choices=['all', '1rank', 'multirank', 'baseline'],
+    parser.add_argument('--scope', choices=['all', '1rank', 'multirank', 'baseline', 'prefill'],
                         default='all', help='Test scope (default: all)')
     parser.add_argument('--worlds', type=str, default='2,4,8',
                         help='Comma-separated world sizes for the multi-rank scope')
@@ -431,3 +496,8 @@ if __name__ == '__main__':
     if args.scope in ('all', 'multirank'):
         for w in [int(x) for x in args.worlds.split(',') if x.strip()]:
             test_fp4_mega_moe_multirank(w)
+    if args.scope in ('all', 'prefill'):
+        for fmt in FP4_MOE:
+            test_fp4_mega_moe_prefill_1rank(fmt)
+        for w in [int(x) for x in args.worlds.split(',') if x.strip()]:
+            test_fp4_mega_moe_prefill_multirank(w)
