@@ -21,8 +21,13 @@ from deep_gemm.utils.math import (
 )
 
 sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'tests'))
 from bench_packed_fp4 import _cast_w_mxfp4
-from test_nvfp4_mega_moe import _cast_l1_w, _cast_l2_w, GRAN_K
+from test_fp4_mega_moe import (
+    _cast_l1_w_nvfp4 as _cast_l1_w,
+    _cast_l2_w_nvfp4 as _cast_l2_w,
+    NVFP4_GRAN_K as GRAN_K,
+)
 
 import flashinfer
 from flashinfer import fused_moe

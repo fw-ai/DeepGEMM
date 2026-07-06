@@ -18,8 +18,8 @@ shard); each shard holds `num_tokens` local tokens; top_k routing.
 We report the worst-rank average latency (max over ranks).
 
 Run:
-    python tests/bench_ep_multi_gpu.py --num-processes 4
-    python tests/bench_ep_multi_gpu.py --num-processes 8
+    python benchmarks/bench_ep_multi_gpu.py --num-processes 4
+    python benchmarks/bench_ep_multi_gpu.py --num-processes 8
 """
 import argparse
 import os
@@ -35,7 +35,12 @@ from deep_gemm.utils.dist import init_dist, dist_print
 from deep_gemm.utils.math import per_token_cast_to_nvfp4, nvfp4_global_scale, per_token_cast_to_fp8
 
 sys.path.insert(0, os.path.dirname(__file__))
-from test_nvfp4_mega_moe import _cast_l1_w, _cast_l2_w, GRAN_K
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'tests'))
+from test_fp4_mega_moe import (
+    _cast_l1_w_nvfp4 as _cast_l1_w,
+    _cast_l2_w_nvfp4 as _cast_l2_w,
+    NVFP4_GRAN_K as GRAN_K,
+)
 from bench_flashinfer_vs_deepgemm import build_flashinfer, build_flashinfer_cutlass
 from fi_trtllm import build_flashinfer_trtllm
 from bench_packed_fp4 import _cast_w_mxfp4

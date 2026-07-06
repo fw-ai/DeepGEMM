@@ -1,7 +1,7 @@
 # Handoff: Packed MXFP4 × MXFP4 for SM100 (Mega MoE)
 
 Status: **DONE. Packed MXFP4 × MXFP4 mega-MoE kernel PASSES end-to-end on B200
-(`tests/test_mxfp4_mega_moe.py`, `diff = 0.00075`).** Standalone GEMM also validated.
+(`tests/test_fp4_mega_moe.py`, `diff = 0.00075`).** Standalone GEMM also validated.
 
 ## Update (final) — mega-MoE FIXED end-to-end
 
@@ -19,7 +19,7 @@ Two fixes closed it out:
    `lane_idx < 4` (b==0), so the existing UE8M0 SF code is correct as-is.
    Isolation (`/tmp/iso2.py`, identity L2 weights): `diff 0.98 -> 0.00078`.
 
-Run: `python tests/test_mxfp4_mega_moe.py` -> `diff = 0.00075  MXFP4 mega MoE passed.`
+Run: `python tests/test_fp4_mega_moe.py` -> `diff = 0.00075  MXFP4 mega MoE passed.`
 
 ### Update — TRUE 2-CTA `cta_group::2` multicast TMA (standalone + mega)
 
@@ -40,7 +40,7 @@ CUTLASS kernel** (example 72b forced to a 2x1 cluster, `-DDG_TMA_LOG` printf in
   while the non-leader's `full` expects only its own SF; both CTAs' transposer/sync warps wait
   their own `full` and arrive on the leader's `with_sf`.
 
-Standalone `tests/test_mxfp4_gemm.py`: all sizes `diff=0.0`. Mega `diff=0.00075`. Perf
+Standalone `tests/test_fp4_gemm.py`: all sizes `diff=0.0`. Mega `diff=0.00075`. Perf
 unchanged vs the per-CTA path (2x1 has no multicast bandwidth saving) — still ~1.12-1.23x
 over FP8xFP4. Bug that caused the earlier hang: full-box+shared-coord + under-counted
 `expect_tx`; fixed by per-CTA box/coord + correct `2x data + own SF` accounting.
@@ -93,7 +93,7 @@ The long-standing 2-CTA TMA **deadlock is resolved**. Root cause + fix:
     `csrc/jit_kernels/heuristics/mega_moe.hpp` (this was the illegal-access cause
     after enlarging `SharedStorage`).
 
-Result: `python tests/test_mxfp4_mega_moe.py` runs the kernel cleanly; output
+Result: `python tests/test_fp4_mega_moe.py` runs the kernel cleanly; output
 magnitude is sane (`y~0.23` vs `ref~0.19`) but **`diff≈0.99`** (values scrambled).
 
 ### Remaining task: L1 packed-FP4 swap-AB epilogue transpose (numerics)
@@ -139,7 +139,7 @@ What now exists and passes:
   A/B tensormaps (`make_tma_2d_desc(..., fp4_unpacked_smem=false)` → `16U4_ALIGN8B`),
   UE8M0 SF descriptors, BF16 D, smem sizing, cluster-2 launch. Registered in
   `csrc/apis/gemm.hpp` as `mxfp4_gemm_nt` (+ pybind), exported in `deep_gemm/__init__.py`.
-- `tests/test_mxfp4_gemm.py` — quantizes A/B to packed E2M1 + UE8M0 SF (gran-32, via
+- `tests/test_fp4_gemm.py` — quantizes A/B to packed E2M1 + UE8M0 SF (gran-32, via
   `per_token_cast_to_fp4` + `get_mn_major_tma_aligned_packed_ue8m0_tensor`), runs the
   kernel, compares to a dequant reference. All cases `diff == 0.0`.
 
@@ -151,7 +151,7 @@ fixed during bring-up:
    (the descriptor's smem box already spans the full packed `BLOCK_K`); the `tma::copy`
    atom-splitter assumes byte-sized elems and overruns the smem stage for sub-byte FP4.
 
-Run it: `PYTHONPATH=$PWD python tests/test_mxfp4_gemm.py` (after `./develop.sh`).
+Run it: `PYTHONPATH=$PWD python tests/test_fp4_gemm.py` (after `./develop.sh`).
 
 ### Current standalone limitations (intentional for the de-risk)
 - Hardcoded config: `BLOCK_M=BLOCK_N=BLOCK_K=128`, `kNumStages=4`, swap-AB,
@@ -245,7 +245,7 @@ Other likely tuning points: epilogue STSM swizzle/`STORE_BLOCK_M`, register spli
 
 1. ~~Toolchain~~ — DONE (CUDA 13.0 + B200; submodules initialized).
 2. ~~Host runtime + JIT wiring~~ — DONE (`sm100_mxfp4_gemm.hpp`).
-3. ~~Python entry + test~~ — DONE (`mxfp4_gemm_nt`, `tests/test_mxfp4_gemm.py`).
+3. ~~Python entry + test~~ — DONE (`mxfp4_gemm_nt`, `tests/test_fp4_gemm.py`).
 4. ~~Iterate the `// VALIDATE` spots on B200~~ — DONE (all confirmed, `diff == 0.0`).
 ## Mega-MoE port — STAGE 1 done (compiles + launches on B200), STAGE 2 = numerics
 
@@ -274,7 +274,7 @@ certainly doesn't match the L2 `mxf4` TMA read-back, and there may be dispatch/b
 interplay to debug.
 
 STAGE 2 (in progress):
-- DONE: single-rank **torch MoE reference** at `tests/test_mxfp4_mega_moe.py`
+- DONE: single-rank **torch MoE reference** at `tests/test_fp4_mega_moe.py`
   (FP4 quant → grouped L1×W1 → clamp+SwiGLU×weight → per-32 UE8M0 FP4 requant →
   grouped L2×W2 → top-k combine). Single-rank harness: `/tmp/mega_compile.py`.
 - DONE: confirmed the **FP8 mega kernel runs in the same single-rank harness** (so the
@@ -416,7 +416,7 @@ exists; needs a manual transpose/pack) whose layout matches the L2 `mxf4` TMA re
 (`swizzle = BLOCK_K/2`), and verify the L2 arrival mask reaches `0xFF`. Then validate against
 the torch reference and add a `mxfp4xmxfp4` case to `tests/test_mega_moe.py`. Debug loop:
 `DG_JIT_WITH_LINEINFO=1 cuda-gdb --batch -ex run -ex 'info cuda threads' --args python -u
-tests/test_mxfp4_mega_moe.py` (interrupt with `timeout -s INT`); inspect the workspace
+tests/test_fp4_mega_moe.py` (interrupt with `timeout -s INT`); inspect the workspace
 `l2_arrival_mask` value for a stuck pool block.
 
 ### (superseded) original step 5

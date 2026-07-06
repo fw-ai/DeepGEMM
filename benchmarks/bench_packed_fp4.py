@@ -15,9 +15,14 @@ from deep_gemm.utils.math import (
 )
 
 sys.path.insert(0, os.path.dirname(__file__))
-from test_mxfp4_gemm import _prepare as _prep_mxfp4_gemm
-from test_nvfp4_gemm import _prepare as _prep_nvfp4_gemm
-from test_nvfp4_mega_moe import _cast_l1_w, _cast_l2_w, _estimate_l2act_gs, GRAN_K
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'tests'))
+from test_fp4_gemm import _prepare_mxfp4 as _prep_mxfp4_gemm, _prepare_nvfp4 as _prep_nvfp4_gemm
+from test_fp4_mega_moe import (
+    _cast_l1_w_nvfp4 as _cast_l1_w,
+    _cast_l2_w_nvfp4 as _cast_l2_w,
+    _estimate_l2act_gs,
+    NVFP4_GRAN_K as GRAN_K,
+)
 
 
 def bench_gemm():
@@ -29,14 +34,14 @@ def bench_gemm():
         d = torch.empty((m, n), device='cuda', dtype=torch.bfloat16)
         flops = 2.0 * m * n * k
 
-        ap, asf, _ = _prep_mxfp4_gemm(a)
-        bp, bsf, _ = _prep_mxfp4_gemm(b)
+        ap, asf, _, _ = _prep_mxfp4_gemm(a)
+        bp, bsf, _, _ = _prep_mxfp4_gemm(b)
         t_mx = bench_kineto(lambda: deep_gemm.mxfp4_gemm_nt((ap, asf), (bp, bsf), d),
                             'mxfp4_gemm', suppress_kineto_output=True)
 
         gsa, gsb = nvfp4_global_scale(a), nvfp4_global_scale(b)
-        ap2, asf2, _ = _prep_nvfp4_gemm(a, gsa)
-        bp2, bsf2, _ = _prep_nvfp4_gemm(b, gsb)
+        ap2, asf2, _, _ = _prep_nvfp4_gemm(a)
+        bp2, bsf2, _, _ = _prep_nvfp4_gemm(b)
         t_nv = bench_kineto(lambda: deep_gemm.nvfp4_gemm_nt((ap2, asf2), (bp2, bsf2), d, a_global_scale=gsa, b_global_scale=gsb),
                             'mxfp4_gemm', suppress_kineto_output=True)
 
