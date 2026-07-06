@@ -1023,6 +1023,17 @@ sm100_mxfp4_mxfp4_mega_moe_impl(void* y,
                 const auto accum_phase_idx = ((current_iter_idx - 1) / kNumEpilogueStages) & 1;
                 shared_storage.tmem_empty_barriers[(current_iter_idx - 1) % kNumEpilogueStages].wait(accum_phase_idx);
             }
+        } else {
+            // Non-leader CTA's MMA warp: it doesn't issue MMA (leader-only), but it MUST call
+            // for_each_block so it participates in the cycle_barrier every cycle (otherwise the
+            // all-thread cycle sync faults). No-op body.
+            scheduler.for_each_block([&](const sched::BlockPhase& block_phase,
+                                         const uint32_t& local_expert_idx,
+                                         const uint32_t& num_k_blocks,
+                                         const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
+                (void) block_phase; (void) local_expert_idx; (void) num_k_blocks;
+                (void) m_block_idx; (void) n_block_idx;
+            });
         }
     } else if (warp_idx == kNumDispatchWarps + 3) {
         // Adjust registers

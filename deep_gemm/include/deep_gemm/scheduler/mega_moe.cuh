@@ -142,13 +142,10 @@ struct MegaMoEScheduler {
     // All threads (kNumThreads) of every SM must call this once per cycle, in lockstep.
     // Indices/tags are local constexprs (NVCC can't ODR-use static constexpr members in device code).
     CUTLASS_DEVICE void cycle_barrier() {
-        // Cycle boundary: (1) intra-CTA counted-arrival mbarrier (all kNumThreads threads,
-        // tolerates the pipelined for_each_block roles arriving at different times), then
-        // (2) cross-CTA cluster_sync (the 2-CTA cluster). For multi-rank, a cross-rank NVLink
-        // barrier is also needed (TODO when testing multi-rank). No-op if no barrier is set.
-        if (cycle_barrier_ptr == nullptr) return;
-        ptx::mbarrier_arrive(cycle_barrier_ptr);
-        ptx::mbarrier_wait_and_flip_phase(cycle_barrier_ptr, cycle_barrier_phase);
+        // Cycle boundary: intra-CTA bar.sync on a dedicated named barrier (idx 4, avoids
+        // conflict with barrier 0 used by the dispatch setup) + cross-CTA cluster_sync.
+        constexpr uint32_t kCycleBarrierIdx = 4;
+        ptx::sync_aligned(kNumThreads, kCycleBarrierIdx);
         comm::cluster_sync_with_relaxed_arrive();
     }
 
