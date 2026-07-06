@@ -20,6 +20,7 @@ from test_fp4_gemm import _prepare_mxfp4 as _prep_mxfp4_gemm, _prepare_nvfp4 as 
 from test_fp4_mega_moe import (
     _cast_l1_w_nvfp4 as _cast_l1_w,
     _cast_l2_w_nvfp4 as _cast_l2_w,
+    _cast_w_mxfp4,
     _estimate_l2act_gs,
     NVFP4_GRAN_K as GRAN_K,
 )
@@ -132,7 +133,82 @@ def bench_mega():
     print()
 
 
-if __name__ == '__main__':
+def _prefill_worker(local_rank, num_local_ranks, shape, ratios):
+    """Per-rank worker: benchmark mxfp4 mega-MoE under several chunk_ratio values."""
+    import os
+    os.environ.setdefault('MASTER_ADDR', '127.0.0.1')
+    os.environ['MASTER_PORT'] = os.environ.get('MASTER_PORT', '12534')
+    dist.init_process_group('nccl', rank=local_rank, world_size=num_local_ranks)
+    group = dist.group.WORLD
+    torch.cuda.set_device(local_rank)
+    clamp = 10.0
+    world, num_experts, num_topk, num_tokens, hidden, inter = shape
+    local_experts = num_experts // world
+    local_offset = local_rank * local_experts
+    num_max_tokens = max(num_tokens, 1)
+
     torch.manual_seed(0)
-    bench_gemm()
-    bench_mega()
+    x = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+    # Only the local expert shard lives on this rank (realistic per-rank memory).
+    l1w = torch.randn((local_experts, inter * 2, hidden), dtype=torch.bfloat16, device='cuda') / (hidden ** 0.5)
+    l2w = torch.randn((local_experts, hidden, inter), dtype=torch.bfloat16, device='cuda') / (inter ** 0.5)
+    scores = torch.randn((num_tokens, num_experts), dtype=torch.float, device='cuda')
+    topk_weights, topk_idx = torch.topk(scores.softmax(-1), num_topk, dim=-1)
+    y = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+    xp, xsf = per_token_cast_to_fp4(x, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
+    tl1, tl2 = deep_gemm.transform_weights_for_mega_moe(_cast_w_mxfp4(l1w), _cast_w_mxfp4(l2w))
+
+    # Baseline ring size (num_min = world * num_max) for reference memory.
+    num_min = world * num_max_tokens
+    rows = []
+    for ratio in ratios:
+        buf = deep_gemm.get_symm_buffer_for_mega_moe(
+            group, num_experts, num_max_tokens, num_topk, hidden, inter,
+            mma_type='mxfp4xmxfp4', chunk_ratio=ratio)
+        buf.x[:num_tokens].copy_(xp); buf.x_sf[:num_tokens].copy_(xsf)
+        buf.topk_idx[:num_tokens].copy_(topk_idx); buf.topk_weights[:num_tokens].copy_(topk_weights)
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+        t = bench_kineto(lambda: deep_gemm.mxfp4_mxfp4_mega_moe(
+            y=y, l1_weights=tl1, l2_weights=tl2, sym_buffer=buf,
+            activation_clamp=clamp, fast_math=True), 'mega_moe', suppress_kineto_output=True)
+        peak_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
+        ring_tok = int(buf.num_ring_tokens) if hasattr(buf, 'num_ring_tokens') else 0
+        rows.append((ratio, ring_tok, num_min, t * 1e6, peak_gb))
+        buf.destroy()
+
+    if local_rank == 0:
+        print(f'\n=== prefill mega-MoE chunk_ratio sweep (EP{world}, tok={num_tokens}, '
+              f'E={num_experts}, topk={num_topk}, h={hidden}, inter={inter}) ===')
+        print(f'{"ratio":>6} {"ring":>7} {"num_min":>8} | {"lat us":>8} {"peak GB":>8}')
+        for ratio, ring_tok, nmin, us, peak in rows:
+            print(f'{str(ratio):>6} {ring_tok:>7} {nmin:>8} | {us:>8.1f} {peak:>8.2f}')
+    dist.destroy_process_group()
+
+
+def bench_mega_prefill(world: int = 8, num_tokens: int = 1024):
+    """Benchmark mxfp4 mega-MoE prefill under several chunk_ratio values (memory vs latency).
+
+    Reports ring size, latency, and peak device memory for each ratio. The baseline
+    (ratio = num_min / num_max = world) reproduces the original un-chunked ring.
+    """
+    shape = (world, 32, 4, num_tokens, 4096, 1536)
+    ratios = [1.3, 1.5, 2.0, float(world)]  # last = baseline (ring = num_min, no chunking)
+    torch.multiprocessing.spawn(_prefill_worker, args=(world, shape, ratios), nprocs=world)
+
+
+if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser(description='Packed FP4 GEMM + mega-MoE benchmarks')
+    parser.add_argument('--scope', choices=['all', 'gemm', 'mega', 'prefill'], default='all')
+    parser.add_argument('--world', type=int, default=8, help='World size for the prefill bench')
+    parser.add_argument('--tokens', type=int, default=1024, help='num_tokens for the prefill bench')
+    args = parser.parse_args()
+
+    torch.manual_seed(0)
+    if args.scope in ('all', 'gemm'):
+        bench_gemm()
+    if args.scope in ('all', 'mega'):
+        bench_mega()
+    if args.scope in ('all', 'prefill'):
+        bench_mega_prefill(world=args.world, num_tokens=args.tokens)
