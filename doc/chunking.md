@@ -22,6 +22,8 @@ ring counts consistent across CTAs.
 # host: chunk_ratio (default None = original). When set:
 #   num_ring_tokens = align(ceil(chunk_ratio * num_max_tokens_per_rank), 384)
 #   clamped to num_max only (NOT num_min) -> permits ring < num_min.
+# num_cycles = (!kChunking || total_pool_blocks==0) ? 1 : ceil(total_pool_blocks/kNumRingBlocks)
+#   -> big-enough ratio (ring >= num_min) runs exactly 1 cycle (no wasteful empty tail cycles).
 for cycle in range(num_cycles):                      # pull only
     for token in this cycle's pool-block range:      # cycle_end_pool bound
         wait ring slot empty (empty_count >= cycle drain target)
@@ -99,10 +101,13 @@ needed — the GEMM just follows the pull cycle-by-cycle via the counts.
 
 - `python tests/test_fp4_mega_moe.py --scope baseline` — num_cycles=1, mxfp4 0.00075 / nvfp4 0.00058 (unchanged).
 - `python tests/test_fp4_mega_moe.py --scope 1rank` — all 1-rank cases pass (num_cycles=1).
-- `python tests/test_fp4_mega_moe.py --scope prefill --worlds 2,8`:
-  - 1-rank chunk_ratio=0.5 (tok=1024, ring=768 < num_min=1024) → num_cycles=4, diff=0.00079.
-  - EP2 chunk_ratio=1.3 (tok=1024, ring=1408 < num_min=2048) → num_cycles=2, diff=0.00079.
-  - EP8 chunk_ratio=1.3 (tok=1024, ring=1536 < num_min=8192) → num_cycles=3, diff=0.00064.
+- `python tests/test_fp4_mega_moe.py --scope prefill --worlds 2,4,8` sweeps
+  `chunk_ratio` across `[0.5, 1, 1.5, 2, 5]` for 3 1-rank shapes + EP2/EP4/EP8 (60 cases
+  total, both formats). Captures the kernel's `num_cycles` printf and asserts:
+  `ring >= num_min` → `num_cycles == 1` (big-enough ratio); `ring < num_min && ratio <= 1`
+  → `num_cycles >= 2` (chunking happens); otherwise `num_cycles >= 1`. All pass
+  (mxfp4 0.00079 / nvfp4 0.00064). Sample `num_cycles`: ratio 0.5 → 3-8, ratio 1.0 → 1-4,
+  ratio 5.0 → 1.
 - `python benchmarks/bench_packed_fp4.py --scope prefill --world 8 --tokens 1024`:
   ```
   ratio    ring  num_min |   lat us  peak GB
