@@ -142,11 +142,11 @@ struct MegaMoEScheduler {
     // All threads (kNumThreads) of every SM must call this once per cycle, in lockstep.
     // Indices/tags are local constexprs (NVCC can't ODR-use static constexpr members in device code).
     CUTLASS_DEVICE void cycle_barrier() {
-        // Cycle boundary: intra-CTA bar.sync on a dedicated named barrier (idx 4, avoids
-        // conflict with barrier 0 used by the dispatch setup) + cross-CTA cluster_sync.
-        constexpr uint32_t kCycleBarrierIdx = 4;
-        ptx::sync_aligned(kNumThreads, kCycleBarrierIdx);
-        comm::cluster_sync_with_relaxed_arrive();
+        if (cycle_barrier_ptr == nullptr) return;
+        if (sm_idx == 0 && ptx::get_lane_idx() == 0)
+            printf("[cb] SM0 warp=%u phase=%u\n", thread_idx / 32, cycle_barrier_phase);
+        ptx::mbarrier_arrive(cycle_barrier_ptr);
+        ptx::mbarrier_wait_and_flip_phase(cycle_barrier_ptr, cycle_barrier_phase);
     }
 
     template <bool kDoUMMAAligned = false>

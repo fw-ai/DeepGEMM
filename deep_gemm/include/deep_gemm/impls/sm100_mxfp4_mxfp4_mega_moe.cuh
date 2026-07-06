@@ -1108,6 +1108,8 @@ sm100_mxfp4_mxfp4_mega_moe_impl(void* y,
             const uint32_t ring_m_idx = ring_block_idx * BLOCK_M;  // Ring-buffer offset for reusable data buffers
             const uint32_t pool_m_idx = pool_block_idx * BLOCK_M;       // Full-pool offset for non-ring metadata
             uint32_t n_idx = n_block_idx * BLOCK_N;
+            if (sm_idx == 0 && epilogue_warp_idx == 0 && lane_idx == 0)
+                printf("[ep] phase=%d pool_blk=%u valid_m=%u iter=%u\n", (int)block_phase, pool_block_idx, valid_m, current_iter_idx - 1);
 
             // NVFP4: load per-expert global scales ONCE per block (hoisted out of the per-atom loops).
             float nv_gate_alpha = 1.0f, nv_up_alpha = 1.0f, nv_l2_in_gs = 1.0f, nv_down_alpha = 1.0f;
