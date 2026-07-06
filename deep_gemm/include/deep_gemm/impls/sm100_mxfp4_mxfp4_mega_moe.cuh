@@ -485,7 +485,11 @@ sm100_mxfp4_mxfp4_mega_moe_impl(void* y,
             my_recv += scheduler.stored_num_tokens_per_expert[i];
         const uint32_t total_recv = __reduce_add_sync(0xffffffff, my_recv);
         const uint32_t total_pool_blocks = scheduler.get_pool_block_offset(kNumExpertsPerRank);
-        uint32_t num_cycles = total_pool_blocks == 0 ? 1u
+        // num_cycles = 1 when not chunking (ring >= num_min, the original single-cycle path).
+        // Only when chunking (ring < num_min) do we split the pool into ceil(total/kNumRingBlocks)
+        // rounds. Gating on kChunking avoids wasteful empty tail cycles + extra grid_syncs when
+        // the ring already holds the whole pool.
+        uint32_t num_cycles = (!kChunking or total_pool_blocks == 0u) ? 1u
             : (total_pool_blocks + kNumRingBlocks - 1) / kNumRingBlocks;
         if (sm_idx == 0 && warp_idx == 0 && lane_idx == 0)
             printf("[mega_moe] rank=%u num_cycles=%u total_recv=%u cap=%u\n",

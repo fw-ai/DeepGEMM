@@ -1,5 +1,7 @@
 import argparse
 import os
+import re
+import tempfile
 from types import SimpleNamespace
 
 import torch
@@ -19,6 +21,34 @@ from deep_gemm.utils.math import (
 )
 
 DIFF_TOL = 0.05
+
+
+def capture_num_cycles(run_fn):
+    """Run ``run_fn`` (which launches the mega-MoE kernel), capture the kernel's
+    ``[mega_moe] rank=%u num_cycles=%u ...`` printf, and return ``(num_cycles, result, raw)``.
+
+    CUDA printf writes to the C-level stdout (fd 1), not Python's ``sys.stdout``, so we
+    redirect fd 1 to a temp file around the launch + ``torch.cuda.synchronize`` (the CUDA
+    printf fifo is flushed at kernel exit / sync). ``result`` is ``run_fn``'s return value.
+    """
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix='.mega_moe.log')
+    os.close(tmp_fd)
+    saved_stdout = os.dup(1)
+    fd = os.open(tmp_path, os.O_WRONLY | os.O_TRUNC)
+    os.dup2(fd, 1)
+    result = None
+    try:
+        result = run_fn()
+        torch.cuda.synchronize()
+    finally:
+        os.dup2(saved_stdout, 1)
+        os.close(fd)
+        os.close(saved_stdout)
+    with open(tmp_path) as f:
+        raw = f.read()
+    os.unlink(tmp_path)
+    m = re.search(r'num_cycles=(\d+)', raw)
+    return (int(m.group(1)) if m else None), result, raw
 
 MXFP4_GRAN_K = 32
 NVFP4_GRAN_K = 16
@@ -271,18 +301,22 @@ SHAPES_MULTIRANK = [
     (2, 8, 2, 128, 512, 512, 0.3),   # masked EP
 ]
 
-# Prefill (cycle-chunked) coverage: shapes where `chunk_ratio * num_max < num_ranks * num_max`
-# so the kernel runs `num_cycles > 1` dispatch rounds (ring < num_min). (chunk_ratio, shape)
-# 1-rank shapes use chunk_ratio < 1 to force chunking on a small shape; multi-rank shapes use
-# a realistic prefill ratio (1.3) where num_ranks * seqlen would exceed the ring budget.
-PREFILL_1RANK = [
-    (0.5, (1024, 8, 2, 512, 512, 0.0)),    # ring=768 < num_min=1024 -> num_cycles=4
-    (0.5, (1024, 32, 4, 4096, 1536, 0.0)), # large prefill shape, ring < num_min
-    (1.3, (1024, 8, 2, 512, 512, 0.0)),    # ratio 1.3 but 1-rank num_min=tok -> no chunk (sanity)
+# Prefill (cycle-chunked) coverage: sweep chunk_ratio across [0.5, 1, 1.5, 2, 5] for each
+# shape. When `chunk_ratio * num_max >= num_ranks * num_max` (ratio >= world), the ring is
+# >= num_min and the kernel runs a single cycle (num_cycles == 1); when ratio < world, the
+# ring is < num_min and the kernel runs num_cycles >= 2 dispatch rounds. We assert both the
+# correctness (diff < DIFF_TOL) and the num_cycles behavior (captured from the kernel printf).
+PREFILL_RATIOS = [0.5, 1.0, 1.5, 2.0, 5.0]
+PREFILL_1RANK_SHAPES = [
+    (1024, 8, 2, 512, 512, 0.0),
+    (1024, 32, 4, 4096, 1536, 0.0),
+    (512, 8, 2, 2048, 2048, 0.0),
 ]
-PREFILL_MULTIRANK = [
-    (1.3, (2, 8, 2, 1024, 512, 512, 0.0)),   # ring=1408 < num_min=2048 -> num_cycles=2
-    (1.3, (8, 32, 4, 1024, 4096, 1536, 0.0)), # ring=1536 < num_min=8192 -> num_cycles=3
+# (world, total_experts, num_topk, num_tokens, hidden, inter, masked_ratio)
+PREFILL_MULTIRANK_SHAPES = [
+    (2, 8, 2, 1024, 512, 512, 0.0),
+    (4, 32, 4, 1024, 4096, 1536, 0.0),
+    (8, 32, 4, 1024, 4096, 1536, 0.0),
 ]
 
 
@@ -429,37 +463,76 @@ def test_fp4_mega_moe_multirank(world: int = 2) -> None:
     print()
 
 
+def _run_one_captured(spec, shape, rank, world, group, chunk_ratio):
+    """Like _run_one but also captures the kernel's num_cycles printf and the ring size."""
+    s = _build_s(spec, shape, rank, world, group, chunk_ratio=chunk_ratio)
+    ring = s.buf.num_ring_tokens
+    try:
+        num_cycles, y, _ = capture_num_cycles(lambda: spec.run(s))
+        ref = spec.reference(s)
+        return y, ref, calc_diff(y, ref), s, num_cycles, ring
+    except Exception:
+        s.buf.destroy()
+        raise
+
+
+def _check_num_cycles(num_cycles, world, num_max, ring, ratio, label):
+    """Assert num_cycles behavior:
+    - ring >= num_min (worst-case bound) -> the ring holds the whole pool -> num_cycles == 1
+      ("big enough ratio = 1 cycle").
+    - ring < num_min AND ratio <= 1 -> chunking definitely happens -> num_cycles >= 2.
+    - ring < num_min AND ratio > 1 -> the ring may or may not hold the actual (smaller) pool
+      -> num_cycles >= 1 (no over-constraint; correctness is already guarded by diff<DIFF_TOL).
+    """
+    align_m = deep_gemm._C.get_token_alignment_for_mega_moe()
+    num_min = world * align(num_max, align_m)
+    assert num_cycles is not None and num_cycles >= 1, f'{label}: num_cycles missing/got {num_cycles}'
+    if ring >= num_min:
+        assert num_cycles == 1, (
+            f'{label}: expected num_cycles==1 (ring={ring} >= num_min={num_min}), got {num_cycles}')
+    elif ratio <= 1.0:
+        assert num_cycles >= 2, (
+            f'{label}: expected num_cycles>=2 (ring={ring} < num_min={num_min}, ratio={ratio}), got {num_cycles}')
+
+
 def test_fp4_mega_moe_prefill_1rank(fmt: str = 'mxfp4') -> None:
-    """1-rank prefill shapes that force `num_cycles > 1` via a small `chunk_ratio`."""
+    """1-rank prefill: sweep chunk_ratio, assert diff<DIFF_TOL and num_cycles behavior."""
     assert fmt in FP4_MOE, f'unknown FP4 format {fmt!r}; expected one of {list(FP4_MOE)}'
     _ensure_master(13801)
     rank, world, group = init_dist(0, 1)
     spec = FP4_MOE[fmt]
-    print(f'=== prefill 1-rank {fmt.upper()} ({len(PREFILL_1RANK)} shapes) ===')
+    n_cases = len(PREFILL_1RANK_SHAPES) * len(PREFILL_RATIOS)
+    print(f'=== prefill 1-rank {fmt.upper()} ({n_cases} cases: {len(PREFILL_1RANK_SHAPES)} shapes x {PREFILL_RATIOS}) ===')
     try:
-        for chunk_ratio, shape in PREFILL_1RANK:
-            y, ref, diff, s = _run_one(spec, shape, rank, world, group, chunk_ratio=chunk_ratio)
-            try:
-                tag = f'{_shape_tag(shape)} ratio={chunk_ratio}'
-                _check_and_print(tag, fmt, diff, y, ref)
-            finally:
-                s.buf.destroy()
+        for shape in PREFILL_1RANK_SHAPES:
+            num_max = max(shape[0], 1)
+            for ratio in PREFILL_RATIOS:
+                y, ref, diff, s, num_cycles, ring = _run_one_captured(spec, shape, rank, world, group, ratio)
+                try:
+                    tag = f'{_shape_tag(shape)} ratio={ratio} ring={ring} nc={num_cycles}'
+                    _check_and_print(tag, fmt, diff, y, ref)
+                    _check_num_cycles(num_cycles, world, num_max, ring, ratio, tag)
+                finally:
+                    s.buf.destroy()
         print(f'All prefill 1-rank {fmt.upper()} cases passed.\n')
     finally:
         dist.destroy_process_group()
 
 
 def _prefill_multirank_worker(local_rank, num_local_ranks, cases):
-    """Spawned per-rank worker for prefill multi-rank shapes (with chunk_ratio)."""
+    """Spawned per-rank worker: sweep (fmt, shape, ratio), assert diff + num_cycles per rank."""
     rank, world, group = init_dist(local_rank, num_local_ranks)
     try:
-        for fmt, chunk_ratio, shape in cases:
+        for fmt, shape, ratio in cases:
             _w, exp, topk, tok, h, i, m = shape
             inner = (tok, exp, topk, h, i, m)
+            num_max = max(tok, 1)
             spec = FP4_MOE[fmt]
-            y, ref, diff, s = _run_one(spec, inner, rank, world, group, chunk_ratio=chunk_ratio)
+            y, ref, diff, s, num_cycles, ring = _run_one_captured(spec, inner, rank, world, group, ratio)
             try:
-                _check_and_print(f'{_shape_tag(shape, world)} ratio={chunk_ratio}', fmt, diff, y, ref)
+                tag = f'{_shape_tag(shape, world)} ratio={ratio} ring={ring} nc={num_cycles}'
+                _check_and_print(tag, fmt, diff, y, ref)
+                _check_num_cycles(num_cycles, world, num_max, ring, ratio, tag)
             finally:
                 s.buf.destroy()
         dist_print(f'All prefill EP{world} cases passed.', once_in_node=True)
@@ -468,13 +541,16 @@ def _prefill_multirank_worker(local_rank, num_local_ranks, cases):
 
 
 def test_fp4_mega_moe_prefill_multirank(world: int = 2) -> None:
-    """Multi-rank prefill shapes (chunk_ratio=1.3, ring < num_min -> num_cycles > 1)."""
-    cases = [(fmt, cr, shape) for cr, shape in PREFILL_MULTIRANK if shape[0] == world for fmt in FP4_MOE]
+    """Multi-rank prefill: sweep chunk_ratio across shapes for a given world size."""
+    cases = [(fmt, shape, ratio) for shape in PREFILL_MULTIRANK_SHAPES if shape[0] == world
+             for ratio in PREFILL_RATIOS for fmt in FP4_MOE]
     if not cases:
         print(f'No prefill multi-rank shapes for world={world}; skipping.')
         return
     _ensure_master(13900 + world)
-    print(f'=== prefill multi-rank EP (world={world}, {len(cases)} cases) ===', flush=True)
+    n_shapes = sum(1 for s in PREFILL_MULTIRANK_SHAPES if s[0] == world)
+    print(f'=== prefill multi-rank EP (world={world}, {len(cases)} cases: {n_shapes} shapes x '
+          f'{PREFILL_RATIOS} x {len(FP4_MOE)} fmts) ===', flush=True)
     torch.multiprocessing.spawn(_prefill_multirank_worker, args=(world, cases), nprocs=world)
     print()
 
