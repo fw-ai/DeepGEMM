@@ -719,10 +719,15 @@ sm100_mxfp4_mxfp4_mega_moe_impl(void* y,
         }
         if constexpr (kChunking) {
             // Cross-CTA grid sync at the cycle boundary (dispatch warps only — they're all
-            // present here, so sync_aligned(kNumDispatchThreads) is safe). Ensures every CTA's
-            // pull has finished this cycle before any CTA starts the next cycle's pull, so the
-            // global ring full/empty counts stay consistent across CTAs. The GEMM roles are NOT
-            // synced here — they follow the pull via the ring counts (no per-role cycle barrier).
+            // present here, so sync_aligned(kNumDispatchThreads) is safe). Required on EVERY
+            // cycle, including the last: (1) between cycles it prevents CTAs from desyncing
+            // (one CTA's cycle-N pull waits on another's cycle-(N-1) GEMM drain -> ring count
+            // deadlock for world>=4); (2) on the last cycle it ensures every CTA's pull is done
+            // before the post-loop cleanup zeroes the ring counts (else a slow CTA's pull is
+            // still writing full_count when the cleanup zeros it -> the GEMM hangs waiting for
+            // full_count). The GEMM roles are NOT synced here — they follow the pull via the
+            // ring counts; the GEMM's for_each_block exits before the cleanup and its drain
+            // doesn't touch the ring counts.
             constexpr uint32_t kCycleGridSyncIndex = 2u;   // 0=dispatch, 1=epilogue, 2=cycle
             constexpr uint32_t kCyclePullBarrierIdx = 8u;  // free named barrier (0-2, 3+ epilogue WG)
             comm::grid_sync<kNumSMs, kCycleGridSyncIndex>(

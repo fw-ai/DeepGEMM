@@ -97,6 +97,38 @@ needed — the GEMM just follows the pull cycle-by-cycle via the counts.
 - `benchmarks/bench_packed_fp4.py` — `bench_mega_prefill` (chunk_ratio sweep: 1.3/1.5/2.0/baseline).
 - NOT yet applied to `sm100_fp8_fp4_mega_moe.cuh` (mirror is a follow-up).
 
+## Perf analysis (num_cycles=1 / chunking overhead)
+
+The cycle `grid_sync` overhead is **negligible (~0%)**. Measured on the large prefill shape
+(EP4, E=512, topk=16, M=16384, h=inter=4096, `total_recv`≈262K tokens/rank):
+
+| ratio | ring | nc | lat us | wraps? |
+|-------|------|----|--------|--------|
+| 1.3 | 21504 | 13 | 10139 | yes (cycle wrap) |
+| 1.5 | 24960 | 11 | 10144 | yes |
+| 2.0 | 33024 | 9 | 10141 | yes |
+| 4.0 | 66048 | 1 | 10136 | yes (ring < total_recv, 4× wrap) |
+| 16 | 264192 | 1 | 9894 | **no** (ring ≥ total_recv) |
+| baseline (None) | 786432 | 1 | 9898 | no |
+
+Key observations:
+- **ratio 16 (ring=264K ≥ total_recv=262K, no wrap) ≈ baseline** (9894 vs 9898 us). No regression
+  when the ring doesn't wrap.
+- **ratio 1.3 (13 cycles + 13 grid_syncs) ≈ ratio 4.0 (1 cycle, 0 grid_syncs, 4 wraps)** (10139
+  vs 10136 us). So the grid_sync/cycle overhead is ~0%; the 2.4% gap vs baseline is entirely the
+  **ring-wrap stall** (the pull waits for `empty_count` at each wrap when the ring is smaller than
+  `total_recv`).
+- The grid_sync is **required on every cycle** (incl. the last): between cycles it prevents
+  cross-CTA desync deadlock (world≥4); on the last cycle it prevents the post-loop cleanup
+  (which zeroes the ring counts) from racing with a slow CTA's still-running pull. Skipping it
+  on the last cycle was tested and deadlocks EP4.
+
+**Takeaway:** there is no chunking regression. The 2.4% is the ring-wrap stall from choosing a
+ring smaller than `total_recv` (= M×topk worst case). To avoid it, use `chunk_ratio ≥ topk`
+(ring ≥ M×topk, no wrap) — ratio 16 matches the un-chunked baseline. For `chunk_ratio < topk`,
+the ring wraps, which is the memory/perf trade-off (smaller ring = less sym-buffer + wrap stall).
+The `grid_sync` itself is free.
+
 ## Verification
 
 - `python tests/test_fp4_mega_moe.py --scope baseline` — num_cycles=1, mxfp4 0.00075 / nvfp4 0.00058 (unchanged).

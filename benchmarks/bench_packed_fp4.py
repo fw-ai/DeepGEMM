@@ -227,8 +227,9 @@ def bench_mega_prefill(world: int = 8, num_experts: int = 512, num_topk: int = 1
     """
     shape = (world, num_experts, num_topk, num_tokens, hidden, inter)
     # None = original kernel (pre-change); world = ring=num_min (un-chunked, min ring);
-    # < world = chunked. Dedup (world may coincide with a sweep value).
-    ratios = [1.3, 1.5, 2.0, 4.0, float(world), None]
+    # < world = chunked. Include ratio=topk (ring >= M*topk = worst-case total_recv, no wrap).
+    # Dedup (world/topk may coincide with sweep values).
+    ratios = [1.3, 1.5, 2.0, 4.0, float(world), float(num_topk), None]
     seen = set()
     ratios = [r for r in ratios if not (r in seen or seen.add(r))]
     torch.multiprocessing.spawn(_prefill_worker, args=(world, shape, ratios), nprocs=world)
