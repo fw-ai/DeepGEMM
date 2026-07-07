@@ -1,3 +1,4 @@
+import math
 import torch
 import types
 import warnings
@@ -71,29 +72,57 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
                                  hidden: int, intermediate_hidden: int,
                                  use_fp8_dispatch: Union[bool, None] = None,
                                  mma_type: str = 'fp8xfp4',
-                                 activation: str = 'swiglu') -> SymmBuffer:
+                                 activation: str = 'swiglu',
+                                 chunk_ratio: Union[float, str, None] = None) -> SymmBuffer:
     # Align token count
     num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
 
-    # To save buffer size, we enable ring buffer
-    # TODO: move the wave concept into kernel and dynamically schedule
-    # TODO: currently decoding may consume more memory than prefill
-    # TODO: finer-grained wave
+    # Ring capacity. Without chunking, the ring must hold one wave
+    # (num_min = num_ranks * num_max_tokens_per_rank), which blows up for large prefill
+    # and clamps max seqlen. With `chunk_ratio`, the ring holds `ratio * tokens` and the
+    # kernel runs multiple dispatch cycles (num_cycles = ceil(total_recv / num_ring_tokens)).
+    #
+    # `chunk_ratio='auto'` sizes the ring to the no-wrap minimum: `num_max * num_topk` (the
+    # worst-case total_recv per rank = every token's topk experts land here). This avoids
+    # ring-wrap stalls (the pull waiting on empty_count at each wrap) with minimal memory —
+    # matching the un-chunked baseline's latency. A manually-set float ratio < topk yields a
+    # ring smaller than total_recv, which wraps and costs ~2-3% latency (the memory/perf trade).
+    no_wrap_ring_tokens = align(num_max_tokens_per_rank * num_topk,
+                                _C.get_token_alignment_for_mega_moe())
+    chunk_auto = isinstance(chunk_ratio, str) and chunk_ratio == 'auto'
+    chunk_enabled = chunk_ratio is not None
     num_min_ring_tokens, num_max_ring_tokens = \
         _C.get_ring_limit_for_mega_moe(num_max_tokens_per_rank, num_experts // group.size(), num_topk, group.size())
-    if num_max_tokens_per_rank >= 6144:
+    if chunk_enabled:
+        if chunk_auto:
+            # No-wrap minimum: ring holds the worst-case total_recv (num_max * topk). Clamp to
+            # the device ring limits. This matches the un-chunked baseline's latency (no wrap)
+            # with the smallest ring that achieves it.
+            num_ring_tokens = min(no_wrap_ring_tokens, num_max_ring_tokens)
+            num_ring_tokens = max(num_ring_tokens, num_min_ring_tokens)
+        else:
+            num_ring_tokens = align(int(math.ceil(chunk_ratio * num_max_tokens_per_rank)),
+                                    _C.get_token_alignment_for_mega_moe())
+            # Chunking permits num_ring_tokens < num_min; only clamp to the upper bound.
+            num_ring_tokens = min(num_ring_tokens, num_max_ring_tokens)
+            # Intentionally no warning when the ring wraps (ring < num_max*num_topk): reducing
+            # memory is the whole point of setting chunk_ratio, and the ~2-3% wrap stall is the
+            # accepted trade-off. 'auto' is available for users who want no-wrap baseline perf.
+    elif num_max_tokens_per_rank >= 6144:
         # We assume must be prefill (decode cannot have such size)
         # We try to give ~8 GB budget (within V4 Pro config)
         # And batch size is mostly stable, to save buffer size, we use 1 expert per wave
         num_ring_tokens = align(768 * 1024, _C.get_token_alignment_for_mega_moe())
+        num_ring_tokens = max(num_ring_tokens, num_min_ring_tokens)
+        num_ring_tokens = min(num_ring_tokens, num_max_ring_tokens)
     else:
         # Otherwise, we must ensure, like for EP64, 4K decoding batch size,
         # the wave heuristics can select the best number of experts per wave
         # In this case, the budget is roughly ~18 GB
         num_ring_tokens = _C.get_ring_limit_for_mega_moe(
             align(4096, _C.get_token_alignment_for_mega_moe()), 432 // 72, 6, 72)[1]
-    num_ring_tokens = max(num_ring_tokens, num_min_ring_tokens)
-    num_ring_tokens = min(num_ring_tokens, num_max_ring_tokens)
+        num_ring_tokens = max(num_ring_tokens, num_min_ring_tokens)
+        num_ring_tokens = min(num_ring_tokens, num_max_ring_tokens)
 
     # Backward compat: derive `mma_type` from `use_fp8_dispatch` if provided
     if use_fp8_dispatch is not None:

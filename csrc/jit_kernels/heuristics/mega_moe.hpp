@@ -142,12 +142,23 @@ static int get_num_experts_per_wave_for_mega_moe(
     const int& intermediate_hidden, const int& block_m, const int& block_n, const int& num_sms,
     const int& num_ring_tokens, const int& num_max_tokens_per_rank, const int& num_ranks) {
     
-    // Get max experts per wave limitation
+    // Get max experts per wave limitation.
+    // With dispatch cycle chunking (ring < num_min), a wave's pool tokens may exceed the ring
+    // (the kernel runs `num_cycles = ceil(total_pool_blocks / kNumRingBlocks)` cycles, each
+    // holding one ring), so we don't clamp `num_max_experts_per_wave` to the ring. The
+    // single-cycle path (ring >= num_min) keeps the original ring constraint.
     int num_max_experts_per_wave = num_experts_per_rank;
-    while (num_max_experts_per_wave > 0 and
-           get_num_wave_pool_tokens(num_ranks, num_topk, num_max_tokens_per_rank, num_max_experts_per_wave, block_m) > num_ring_tokens)
-        num_max_experts_per_wave --;
-    DG_HOST_ASSERT(num_max_experts_per_wave > 0 and "Buffer size is too small");
+    const uint32_t num_min_wave_tokens = get_num_wave_pool_tokens(num_ranks, num_topk, num_max_tokens_per_rank, 1, block_m);
+    if (num_ring_tokens >= num_min_wave_tokens) {
+        while (num_max_experts_per_wave > 0 and
+               get_num_wave_pool_tokens(num_ranks, num_topk, num_max_tokens_per_rank, num_max_experts_per_wave, block_m) > num_ring_tokens)
+            num_max_experts_per_wave --;
+        DG_HOST_ASSERT(num_max_experts_per_wave > 0 and "Buffer size is too small");
+    } else {
+        // Cycle chunking: one expert per wave so each cycle only ever splits a single expert's
+        // tokens (avoids the multi-expert-wave x cycle-boundary interaction in the scheduler).
+        return 1;
+    }
 
     // Reduce per-expert block count by this factor since uneven routing leaves some experts with fewer tokens
     constexpr int kImbalanceFactor = 2;

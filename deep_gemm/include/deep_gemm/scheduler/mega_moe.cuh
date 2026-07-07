@@ -3,8 +3,11 @@
 #include <deep_gemm/common/cute_tie.cuh>
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/types.cuh>
+#include <deep_gemm/comm/barrier.cuh>
 #include <deep_gemm/layout/mega_moe.cuh>
+#include <deep_gemm/layout/sym_buffer.cuh>
 #include <deep_gemm/ptx/ld_st.cuh>
+#include <deep_gemm/ptx/tma.cuh>
 #include <deep_gemm/ptx/utils.cuh>
 
 namespace deep_gemm::sched {
@@ -21,7 +24,7 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t L2_SHAPE_N, uint32_t L2_SHAPE_K,
           uint32_t kNumExpertsPerRank,
           uint32_t kNumExpertsPerWave,
-          uint32_t kNumSMs, uint32_t kNumRanks,
+          uint32_t kNumSMs, uint32_t kNumRanks, uint32_t kNumThreads,
           uint32_t kNumExpertsPerLane = math::constexpr_ceil_div(kNumExpertsPerRank, 32u),
           uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N,
           uint32_t kNumL2BlockNs = L2_SHAPE_N / BLOCK_N,
@@ -42,6 +45,8 @@ struct MegaMoEScheduler {
 
     // Arrival counts
     const layout::Workspace& workspace;
+    const layout::SymBuffer<kNumRanks>& sym_buffer;
+    uint32_t sm_idx, thread_idx;
 
     // Scheduler state
     BlockPhase next_phase = BlockPhase::Linear1;
@@ -58,7 +63,10 @@ struct MegaMoEScheduler {
     // Layout: `stored_num_tokens_per_expert[i]` holds expert (i * 32 + lane_idx)'s count
     uint32_t stored_num_tokens_per_expert[kNumExpertsPerLane] = {};
 
-    CUTLASS_DEVICE explicit MegaMoEScheduler(const layout::Workspace& workspace): workspace(workspace) {
+    CUTLASS_DEVICE explicit MegaMoEScheduler(const layout::Workspace& workspace,
+                                             const layout::SymBuffer<kNumRanks>& sym_buffer,
+                                             const uint32_t& sm_idx, const uint32_t& thread_idx)
+        : workspace(workspace), sym_buffer(sym_buffer), sm_idx(sm_idx), thread_idx(thread_idx) {
         block_idx = blockIdx.x;
     }
 
@@ -120,8 +128,9 @@ struct MegaMoEScheduler {
         while (current_local_expert_idx < wave_end_expert_idx) {
             const auto num_m_blocks = get_current_num_m_blocks();
             m_block_idx = block_idx / kNumL1BlockNs;
-            if (m_block_idx < num_m_blocks)
+            if (m_block_idx < num_m_blocks) {
                 return true;
+            }
 
             // Current expert is fully assigned, move to the next
             block_idx -= num_m_blocks * kNumL1BlockNs;
@@ -134,8 +143,8 @@ struct MegaMoEScheduler {
         const auto wave_end_expert_idx = get_wave_expert_end_idx();
         while (current_local_expert_idx < wave_end_expert_idx) {
             const auto num_m_blocks = get_current_num_m_blocks();
+            m_block_idx = block_idx / kNumL2BlockNs;
             if (block_idx < num_m_blocks * kNumL2BlockNs) {
-                m_block_idx = block_idx / kNumL2BlockNs;
                 return true;
             }
 
@@ -199,7 +208,7 @@ struct MegaMoEScheduler {
     }
 
     template <typename Func>
-    CUTLASS_DEVICE void for_each_block(Func&& func) {
+    CUTLASS_DEVICE void for_each_block_impl(Func&& func) {
         // Wait for all expert counters to be finalized
         fetch_expert_recv_count();
 
@@ -217,6 +226,12 @@ struct MegaMoEScheduler {
                  block_phase == BlockPhase::Linear2 ? kNumL2BlockKs : kNumL1BlockKs,
                  m_block_idx, n_block_idx);
         }
+    }
+
+    // Original single-cycle entry point. Callers (the 5 warp-role for_each_block sites) are unchanged.
+    template <typename Func>
+    CUTLASS_DEVICE void for_each_block(Func&& func) {
+        for_each_block_impl(std::forward<Func>(func));
     }
 };
 
