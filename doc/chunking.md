@@ -130,10 +130,10 @@ ring smaller than `total_recv` (= M×topk worst case). The `grid_sync` itself is
 sizes the ring to `num_max × num_topk` (the worst-case `total_recv` per rank = every token's topk
 experts land here) — the smallest ring that avoids wraps. This matches the un-chunked baseline's
 latency (no wrap) with minimal memory. Measured: `auto` (ring=264K) = 9924us ≈ baseline (786K)
-= 9982us, sym-buffer 4.21GB vs 8.19GB (49% saved). A manually-set float `chunk_ratio` that yields
-a ring `< num_max×num_topk` emits a `UserWarning` (the ring will wrap, ~2-3% stall; use
-`chunk_ratio >= num_topk` or `'auto'` for no-wrap). Use `chunk_ratio < num_topk` only when the
-memory saving is worth the ~2-3% wrap stall.
+= 9982us, sym-buffer 4.21GB vs 8.19GB (49% saved). A manually-set float `chunk_ratio < num_topk`
+intentionally wraps (reducing memory is the point of chunking; the ~2-3% wrap stall is the
+accepted trade-off) — no warning is emitted. Use `'auto'` when no-wrap baseline-equivalent latency
+is wanted.
 
 ## Verification
 

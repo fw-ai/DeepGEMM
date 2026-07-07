@@ -105,16 +105,9 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
                                     _C.get_token_alignment_for_mega_moe())
             # Chunking permits num_ring_tokens < num_min; only clamp to the upper bound.
             num_ring_tokens = min(num_ring_tokens, num_max_ring_tokens)
-            # Warn if the chosen ring is smaller than the no-wrap minimum: the ring will wrap
-            # (num_cycles may still be 1 if ring >= num_min, but the pull stalls on empty_count
-            # at each wrap -> ~2-3% latency). Use chunk_ratio >= num_topk (or 'auto') to avoid.
-            if num_ring_tokens < no_wrap_ring_tokens:
-                warnings.warn(
-                    f'chunk_ratio={chunk_ratio} -> ring={num_ring_tokens} < no-wrap minimum '
-                    f'{no_wrap_ring_tokens} (num_max*num_topk); the ring will wrap and incur a '
-                    f'~2-3% latency stall. Use chunk_ratio>=num_topk ({num_topk}) or "auto" '
-                    f'for no-wrap baseline-equivalent latency.',
-                    UserWarning, stacklevel=3)
+            # Intentionally no warning when the ring wraps (ring < num_max*num_topk): reducing
+            # memory is the whole point of setting chunk_ratio, and the ~2-3% wrap stall is the
+            # accepted trade-off. 'auto' is available for users who want no-wrap baseline perf.
     elif num_max_tokens_per_rank >= 6144:
         # We assume must be prefill (decode cannot have such size)
         # We try to give ~8 GB budget (within V4 Pro config)
