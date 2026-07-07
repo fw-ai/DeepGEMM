@@ -306,7 +306,7 @@ SHAPES_MULTIRANK = [
 # >= num_min and the kernel runs a single cycle (num_cycles == 1); when ratio < world, the
 # ring is < num_min and the kernel runs num_cycles >= 2 dispatch rounds. We assert both the
 # correctness (diff < DIFF_TOL) and the num_cycles behavior (captured from the kernel printf).
-PREFILL_RATIOS = [0.5, 1.0, 1.5, 2.0, 5.0]
+PREFILL_RATIOS = [0.5, 1.0, 1.5, 2.0, 5.0, 'auto']
 PREFILL_1RANK_SHAPES = [
     (1024, 8, 2, 512, 512, 0.0),
     (1024, 32, 4, 4096, 1536, 0.0),
@@ -483,11 +483,16 @@ def _check_num_cycles(num_cycles, world, num_max, ring, ratio, label):
     - ring < num_min AND ratio <= 1 -> chunking definitely happens -> num_cycles >= 2.
     - ring < num_min AND ratio > 1 -> the ring may or may not hold the actual (smaller) pool
       -> num_cycles >= 1 (no over-constraint; correctness is already guarded by diff<DIFF_TOL).
+    - 'auto' -> ring = num_max*num_topk (no-wrap minimum) -> num_cycles == 1.
     """
     align_m = deep_gemm._C.get_token_alignment_for_mega_moe()
     num_min = world * align(num_max, align_m)
     assert num_cycles is not None and num_cycles >= 1, f'{label}: num_cycles missing/got {num_cycles}'
-    if ring >= num_min:
+    if ratio == 'auto':
+        # 'auto' sizes the ring to num_max*num_topk (no-wrap minimum) -> num_cycles == 1.
+        assert num_cycles == 1, (
+            f'{label}: auto should give no-wrap num_cycles==1 (ring={ring}), got {num_cycles}')
+    elif ring >= num_min:
         assert num_cycles == 1, (
             f'{label}: expected num_cycles==1 (ring={ring} >= num_min={num_min}), got {num_cycles}')
     elif ratio <= 1.0:

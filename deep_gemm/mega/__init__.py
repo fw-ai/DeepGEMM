@@ -73,7 +73,7 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
                                  use_fp8_dispatch: Union[bool, None] = None,
                                  mma_type: str = 'fp8xfp4',
                                  activation: str = 'swiglu',
-                                 chunk_ratio: Union[float, None] = None) -> SymmBuffer:
+                                 chunk_ratio: Union[float, str, None] = None) -> SymmBuffer:
     # Align token count
     num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
 
@@ -81,14 +81,40 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
     # (num_min = num_ranks * num_max_tokens_per_rank), which blows up for large prefill
     # and clamps max seqlen. With `chunk_ratio`, the ring holds `ratio * tokens` and the
     # kernel runs multiple dispatch cycles (num_cycles = ceil(total_recv / num_ring_tokens)).
+    #
+    # `chunk_ratio='auto'` sizes the ring to the no-wrap minimum: `num_max * num_topk` (the
+    # worst-case total_recv per rank = every token's topk experts land here). This avoids
+    # ring-wrap stalls (the pull waiting on empty_count at each wrap) with minimal memory —
+    # matching the un-chunked baseline's latency. A manually-set float ratio < topk yields a
+    # ring smaller than total_recv, which wraps and costs ~2-3% latency (the memory/perf trade).
+    no_wrap_ring_tokens = align(num_max_tokens_per_rank * num_topk,
+                                _C.get_token_alignment_for_mega_moe())
+    chunk_auto = isinstance(chunk_ratio, str) and chunk_ratio == 'auto'
     chunk_enabled = chunk_ratio is not None
     num_min_ring_tokens, num_max_ring_tokens = \
         _C.get_ring_limit_for_mega_moe(num_max_tokens_per_rank, num_experts // group.size(), num_topk, group.size())
     if chunk_enabled:
-        num_ring_tokens = align(int(math.ceil(chunk_ratio * num_max_tokens_per_rank)),
-                                _C.get_token_alignment_for_mega_moe())
-        # Chunking permits num_ring_tokens < num_min; only clamp to the upper bound.
-        num_ring_tokens = min(num_ring_tokens, num_max_ring_tokens)
+        if chunk_auto:
+            # No-wrap minimum: ring holds the worst-case total_recv (num_max * topk). Clamp to
+            # the device ring limits. This matches the un-chunked baseline's latency (no wrap)
+            # with the smallest ring that achieves it.
+            num_ring_tokens = min(no_wrap_ring_tokens, num_max_ring_tokens)
+            num_ring_tokens = max(num_ring_tokens, num_min_ring_tokens)
+        else:
+            num_ring_tokens = align(int(math.ceil(chunk_ratio * num_max_tokens_per_rank)),
+                                    _C.get_token_alignment_for_mega_moe())
+            # Chunking permits num_ring_tokens < num_min; only clamp to the upper bound.
+            num_ring_tokens = min(num_ring_tokens, num_max_ring_tokens)
+            # Warn if the chosen ring is smaller than the no-wrap minimum: the ring will wrap
+            # (num_cycles may still be 1 if ring >= num_min, but the pull stalls on empty_count
+            # at each wrap -> ~2-3% latency). Use chunk_ratio >= num_topk (or 'auto') to avoid.
+            if num_ring_tokens < no_wrap_ring_tokens:
+                warnings.warn(
+                    f'chunk_ratio={chunk_ratio} -> ring={num_ring_tokens} < no-wrap minimum '
+                    f'{no_wrap_ring_tokens} (num_max*num_topk); the ring will wrap and incur a '
+                    f'~2-3% latency stall. Use chunk_ratio>=num_topk ({num_topk}) or "auto" '
+                    f'for no-wrap baseline-equivalent latency.',
+                    UserWarning, stacklevel=3)
     elif num_max_tokens_per_rank >= 6144:
         # We assume must be prefill (decode cannot have such size)
         # We try to give ~8 GB budget (within V4 Pro config)

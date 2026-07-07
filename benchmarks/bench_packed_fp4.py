@@ -143,7 +143,9 @@ def _sym_buffer_size_gb(group, num_experts, num_max, num_topk, hidden, inter, mm
     nmt = align(num_max, am)
     world = group.size()
     nmin, nmax = deep_gemm._C.get_ring_limit_for_mega_moe(nmt, num_experts // world, num_topk, world)
-    if chunk_ratio is not None:
+    if chunk_ratio == 'auto':
+        ring = min(max(align(nmt * num_topk, am), nmin), nmax)
+    elif chunk_ratio is not None:
         ring = align(int(math.ceil(chunk_ratio * nmt)), am)
         ring = min(ring, nmax)
     elif nmt >= 6144:
@@ -211,7 +213,7 @@ def _prefill_worker(local_rank, num_local_ranks, shape, ratios):
         print(f'{"ratio":>8} {"ring":>8} {"num_min":>8} {"nc":>4} | {"lat us":>9} '
               f'{"sym GB":>7} {"peak GB":>8}')
         for ratio, ring_tok, nmin, nc, us, peak, sym in rows:
-            rstr = 'baseline' if ratio is None else f'{ratio:g}'
+            rstr = 'baseline' if ratio is None else ('auto' if ratio == 'auto' else f'{ratio:g}')
             print(f'{rstr:>8} {ring_tok:>8} {nmin:>8} {nc:>4} | {us:>9.1f} {sym:>7.2f} {peak:>8.2f}')
     dist.destroy_process_group()
 
@@ -227,9 +229,10 @@ def bench_mega_prefill(world: int = 8, num_experts: int = 512, num_topk: int = 1
     """
     shape = (world, num_experts, num_topk, num_tokens, hidden, inter)
     # None = original kernel (pre-change); world = ring=num_min (un-chunked, min ring);
-    # < world = chunked. Include ratio=topk (ring >= M*topk = worst-case total_recv, no wrap).
+    # < world = chunked. Include ratio=topk (ring >= M*topk = worst-case total_recv, no wrap)
+    # and 'auto' (host sizes the ring to the no-wrap minimum M*topk automatically).
     # Dedup (world/topk may coincide with sweep values).
-    ratios = [1.3, 1.5, 2.0, 4.0, float(world), float(num_topk), None]
+    ratios = [1.3, 1.5, 2.0, 4.0, float(world), float(num_topk), 'auto', None]
     seen = set()
     ratios = [r for r in ratios if not (r in seen or seen.add(r))]
     torch.multiprocessing.spawn(_prefill_worker, args=(world, shape, ratios), nprocs=world)

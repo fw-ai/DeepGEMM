@@ -124,10 +124,16 @@ Key observations:
   on the last cycle was tested and deadlocks EP4.
 
 **Takeaway:** there is no chunking regression. The 2.4% is the ring-wrap stall from choosing a
-ring smaller than `total_recv` (= M×topk worst case). To avoid it, use `chunk_ratio ≥ topk`
-(ring ≥ M×topk, no wrap) — ratio 16 matches the un-chunked baseline. For `chunk_ratio < topk`,
-the ring wraps, which is the memory/perf trade-off (smaller ring = less sym-buffer + wrap stall).
-The `grid_sync` itself is free.
+ring smaller than `total_recv` (= M×topk worst case). The `grid_sync` itself is free.
+
+**Fix (no-wrap mode):** `get_symm_buffer_for_mega_moe` now supports `chunk_ratio='auto'`, which
+sizes the ring to `num_max × num_topk` (the worst-case `total_recv` per rank = every token's topk
+experts land here) — the smallest ring that avoids wraps. This matches the un-chunked baseline's
+latency (no wrap) with minimal memory. Measured: `auto` (ring=264K) = 9924us ≈ baseline (786K)
+= 9982us, sym-buffer 4.21GB vs 8.19GB (49% saved). A manually-set float `chunk_ratio` that yields
+a ring `< num_max×num_topk` emits a `UserWarning` (the ring will wrap, ~2-3% stall; use
+`chunk_ratio >= num_topk` or `'auto'` for no-wrap). Use `chunk_ratio < num_topk` only when the
+memory saving is worth the ~2-3% wrap stall.
 
 ## Verification
 
