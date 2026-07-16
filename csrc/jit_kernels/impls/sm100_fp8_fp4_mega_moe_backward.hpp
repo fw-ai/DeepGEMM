@@ -1,0 +1,594 @@
+#pragma once
+
+#include <algorithm>
+#include <atomic>
+
+#include <torch/python.h>
+
+#include "../../jit/compiler.hpp"
+#include "../../jit/device_runtime.hpp"
+#include "../../jit/kernel_runtime.hpp"
+#include "../../utils/exception.hpp"
+#include "../../utils/format.hpp"
+#include "../../utils/math.hpp"
+#include "runtime_utils.hpp"
+
+#include <deep_gemm/layout/mega_moe.cuh>
+#include <deep_gemm/layout/sym_buffer.cuh>
+
+namespace deep_gemm {
+
+class SM100FP8FP4MegaMoEBackwardWaveRuntime final
+    : public LaunchRuntime<SM100FP8FP4MegaMoEBackwardWaveRuntime> {
+public:
+    struct Args {
+        int hidden;
+        int intermediate_hidden;
+        int num_experts;
+        int num_pool_rows;
+        int num_sf_pool_rows;
+        int block_m;
+        int block_n;
+        int block_k;
+        int sf_block_m;
+        int sf_block_n;
+        int num_stages;
+        int num_sms;
+        int num_ranks;
+
+        const int* expert_counts;
+        layout::SymBuffer<> backward_sym_buffer;
+        layout::Workspace backward_workspace;
+        const cutlass::bfloat16_t* backward_grad_y;
+        const float* backward_topk_weights;
+        const layout::TokenSrcMetadata* token_src_metadata;
+        uint32_t num_topk;
+        uint32_t acts_sf_stride;
+        CUtensorMap tensor_map_acts;
+        CUtensorMap tensor_map_acts_sf;
+        CUtensorMap tensor_map_weights;
+        CUtensorMap tensor_map_weights_sf;
+        CUtensorMap tensor_map_output;
+        CUtensorMap tensor_map_grad_ye;
+        CUtensorMap tensor_map_w2_dequant;
+        CUtensorMap tensor_map_w2_weights;
+        CUtensorMap tensor_map_w2_scales;
+        CUtensorMap tensor_map_w13_dequant;
+        CUtensorMap tensor_map_w13_weights;
+        CUtensorMap tensor_map_w13_scales;
+        CUtensorMap tensor_map_grad_gate_up;
+        const cutlass::float_e4m3_t* acts_ptr;
+        const uint32_t* acts_sf_ptr;
+        const int8_t* w2_weights;
+        const float* w2_scales;
+        cutlass::bfloat16_t* w2_dequant_scratch;
+        const int8_t* w13_weights;
+        const float* w13_scales;
+        cutlass::bfloat16_t* w13_dequant_scratch;
+        const cutlass::bfloat16_t* gate_up_output;
+        cutlass::bfloat16_t* grad_ye_output;
+        cutlass::bfloat16_t* route_weights;
+        cutlass::bfloat16_t* grad_h_output;
+        cutlass::bfloat16_t* grad_gate_up_output;
+        cutlass::bfloat16_t* h_act_output;
+        cutlass::bfloat16_t* h_weighted_output;
+        cutlass::bfloat16_t* x_pool_output;
+        cutlass::bfloat16_t* grad_x_pool_output;
+        uint32_t* grid_sync_counter;
+        uint32_t launch_epoch;
+        float activation_limit;
+        bool compute_w13_dgrad;
+        bool direct_remote_grad_x;
+        bool write_grad_x_pool;
+        bool clear_wgrad_padding;
+        LaunchArgs launch_args;
+    };
+
+    static std::string generate_impl(const Args& args) {
+        return fmt::format(R"(
+#include <deep_gemm/impls/sm100_fp8_fp4_mega_moe_backward.cuh>
+
+using namespace deep_gemm;
+
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(
+        &sm100_fp8_fp4_mega_moe_backward_wave_impl<
+            {}, {},
+            {},
+            {}, {}, {},
+            {}, {},
+            {},
+            {},
+            {},
+            {}
+        >);
+}};
+)",
+            args.hidden, args.intermediate_hidden,
+            args.num_experts,
+            args.block_m, args.block_n, args.block_k,
+            args.sf_block_m, args.sf_block_n,
+            args.num_stages,
+            args.num_sms,
+            args.num_ranks,
+            args.compute_w13_dgrad ? "true" : "false");
+    }
+
+    static void launch_impl(
+        const KernelHandle& kernel,
+        const LaunchConfigHandle& config,
+        Args args) {
+        DG_CUDA_UNIFIED_CHECK(launch_kernel(
+            kernel, config,
+            args.expert_counts,
+            args.backward_sym_buffer,
+            args.backward_workspace,
+            args.backward_grad_y,
+            args.backward_topk_weights,
+            args.token_src_metadata,
+            args.num_topk,
+            args.acts_sf_stride,
+            args.tensor_map_acts,
+            args.tensor_map_acts_sf,
+            args.tensor_map_weights,
+            args.tensor_map_weights_sf,
+            args.tensor_map_output,
+            args.tensor_map_grad_ye,
+            args.tensor_map_w2_dequant,
+            args.tensor_map_w2_weights,
+            args.tensor_map_w2_scales,
+            args.tensor_map_w13_dequant,
+            args.tensor_map_w13_weights,
+            args.tensor_map_w13_scales,
+            args.tensor_map_grad_gate_up,
+            args.acts_ptr,
+            args.acts_sf_ptr,
+            args.w2_weights,
+            args.w2_scales,
+            args.w2_dequant_scratch,
+            args.w13_weights,
+            args.w13_scales,
+            args.w13_dequant_scratch,
+            args.gate_up_output,
+            args.grad_ye_output,
+            args.route_weights,
+            args.grad_h_output,
+            args.grad_gate_up_output,
+            args.h_act_output,
+            args.h_weighted_output,
+            args.x_pool_output,
+            args.grad_x_pool_output,
+            args.grid_sync_counter,
+            args.launch_epoch,
+            args.activation_limit,
+            args.compute_w13_dgrad,
+            args.direct_remote_grad_x,
+            args.write_grad_x_pool,
+            args.clear_wgrad_padding));
+    }
+};
+
+static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
+    const torch::Tensor& gate_up_output,
+    const torch::Tensor& grad_h_output,
+    const torch::Tensor& grad_gate_up_output,
+    const torch::Tensor& h_act_output,
+    const torch::Tensor& h_weighted_output,
+    const torch::Tensor& x_pool_output,
+    const torch::Tensor& grad_x_pool_output,
+    const torch::Tensor& acts,
+    const torch::Tensor& acts_sf,
+    const torch::Tensor& l1_weights,
+    const torch::Tensor& l1_weights_sf,
+    const torch::Tensor& grad_ye,
+    const torch::Tensor& route_weights,
+    const torch::Tensor& w2_weights,
+    const torch::Tensor& w2_scales,
+    const torch::Tensor& w2_dequant_scratch,
+    const torch::Tensor& w13_weights,
+    const torch::Tensor& w13_scales,
+    const torch::Tensor& w13_dequant_scratch,
+    const torch::Tensor& expert_counts,
+    const torch::Tensor& grid_sync_counter,
+    const float& activation_limit,
+    const bool& compute_w13_dgrad,
+    const bool& direct_remote_grad_x,
+    const bool& write_grad_x_pool,
+    const bool& clear_wgrad_padding,
+    const int& block_m,
+    const std::vector<int64_t>& backward_sym_buffer_ptrs = {},
+    const int& backward_rank = 0,
+    const int& num_max_tokens_per_rank = 0,
+    const int& num_topk = 0,
+    const std::optional<torch::Tensor>& backward_grad_y = std::nullopt,
+    const std::optional<torch::Tensor>& backward_topk_weights = std::nullopt,
+    const std::optional<torch::Tensor>& token_src_metadata = std::nullopt) {
+    constexpr int block_n = 128;
+    constexpr int block_k = 128;
+    constexpr int dgrad_block_k = 64;
+    constexpr int store_block_m = 16;
+    constexpr int gran_k = 32;
+    constexpr int smem_capacity = 232448;
+    constexpr int num_epilogue_stages = 2;
+    constexpr int num_tma_store_stages = 2;
+
+    const auto [num_experts, intermediate_hidden_2, hidden] =
+        check_grouped_ab_fp8_fp4(
+            l1_weights, cute::UMMA::Major::K,
+            device_runtime->get_arch_major());
+    const int intermediate_hidden = intermediate_hidden_2 / 2;
+    const int num_pool_rows = static_cast<int>(grad_ye.size(0));
+    const int num_acts_rows = static_cast<int>(acts.size(0));
+    const int num_sf_pool_rows = static_cast<int>(acts_sf.size(0));
+    const int sf_block_m = align(block_m, 128);
+    const int sf_block_n = block_n;
+    const int load_block_m = block_m / 2;
+    const int load_block_n = block_n;
+    const int num_ranks = backward_sym_buffer_ptrs.empty()
+        ? 1
+        : static_cast<int>(backward_sym_buffer_ptrs.size());
+    const int num_dispatch_warps = num_ranks > 1 ? 4 : 0;
+
+    DG_HOST_ASSERT(device_runtime->get_arch_major() == 10);
+    DG_HOST_ASSERT(num_ranks >= 1);
+    DG_HOST_ASSERT(num_ranks == 1 ||
+                   (backward_rank >= 0 && backward_rank < num_ranks));
+    DG_HOST_ASSERT(block_m % 16 == 0);
+    DG_HOST_ASSERT(hidden % block_k == 0);
+    DG_HOST_ASSERT(hidden % dgrad_block_k == 0);
+    DG_HOST_ASSERT(intermediate_hidden_2 % block_n == 0);
+    DG_HOST_ASSERT(acts.dim() == 2 and acts.size(1) == hidden);
+    DG_HOST_ASSERT(num_acts_rows > 0 && num_acts_rows <= num_pool_rows);
+    DG_HOST_ASSERT(num_sf_pool_rows > 0);
+    DG_HOST_ASSERT(grad_ye.dim() == 2);
+    DG_HOST_ASSERT(grad_ye.size(0) == num_pool_rows);
+    DG_HOST_ASSERT(grad_ye.size(1) == hidden);
+    DG_HOST_ASSERT(grad_ye.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(grad_ye.is_contiguous());
+    DG_HOST_ASSERT(
+        gate_up_output.sizes() ==
+        torch::IntArrayRef({num_pool_rows, intermediate_hidden_2}));
+    DG_HOST_ASSERT(grad_gate_up_output.sizes() ==
+                   gate_up_output.sizes());
+    DG_HOST_ASSERT(grad_h_output.sizes() ==
+                   torch::IntArrayRef({num_pool_rows, intermediate_hidden}));
+    DG_HOST_ASSERT(h_act_output.sizes() == grad_h_output.sizes());
+    DG_HOST_ASSERT(h_weighted_output.sizes() == grad_h_output.sizes());
+    DG_HOST_ASSERT(
+        x_pool_output.sizes() ==
+        torch::IntArrayRef({num_pool_rows, hidden}));
+    DG_HOST_ASSERT(grad_x_pool_output.sizes() ==
+                   torch::IntArrayRef({num_pool_rows, hidden}));
+    DG_HOST_ASSERT(gate_up_output.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(grad_h_output.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(grad_gate_up_output.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(h_act_output.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(
+        h_weighted_output.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(x_pool_output.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(grad_x_pool_output.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(gate_up_output.is_contiguous());
+    DG_HOST_ASSERT(grad_h_output.is_contiguous());
+    DG_HOST_ASSERT(grad_gate_up_output.is_contiguous());
+    DG_HOST_ASSERT(h_act_output.is_contiguous());
+    DG_HOST_ASSERT(h_weighted_output.is_contiguous());
+    DG_HOST_ASSERT(x_pool_output.is_contiguous());
+    DG_HOST_ASSERT(grad_x_pool_output.is_contiguous());
+    DG_HOST_ASSERT(route_weights.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(route_weights.numel() == num_pool_rows);
+    DG_HOST_ASSERT(route_weights.is_contiguous());
+    DG_HOST_ASSERT(
+        w2_weights.scalar_type() ==
+        torch::kFloat8_e4m3fn);
+    DG_HOST_ASSERT(w2_weights.dim() == 3);
+    DG_HOST_ASSERT(w2_weights.size(0) == num_experts);
+    DG_HOST_ASSERT(w2_weights.size(1) == hidden);
+    DG_HOST_ASSERT(w2_weights.size(2) == intermediate_hidden / 2);
+    DG_HOST_ASSERT(w2_weights.is_contiguous());
+    DG_HOST_ASSERT(w2_scales.scalar_type() == torch::kFloat);
+    DG_HOST_ASSERT(w2_scales.dim() == 3);
+    DG_HOST_ASSERT(w2_scales.size(0) == num_experts);
+    DG_HOST_ASSERT(w2_scales.size(1) == hidden);
+    DG_HOST_ASSERT(w2_scales.size(2) == intermediate_hidden / gran_k);
+    DG_HOST_ASSERT(w2_scales.is_contiguous());
+    DG_HOST_ASSERT(
+        w2_dequant_scratch.sizes() ==
+        torch::IntArrayRef(
+            {num_experts, hidden, intermediate_hidden}));
+    DG_HOST_ASSERT(
+        w2_dequant_scratch.scalar_type() ==
+        torch::kBFloat16);
+    DG_HOST_ASSERT(w2_dequant_scratch.is_contiguous());
+    DG_HOST_ASSERT(
+        w13_weights.scalar_type() ==
+        torch::kFloat8_e4m3fn);
+    DG_HOST_ASSERT(w13_weights.dim() == 3);
+    DG_HOST_ASSERT(w13_weights.size(0) == 2 * num_experts);
+    DG_HOST_ASSERT(w13_weights.size(1) == intermediate_hidden);
+    DG_HOST_ASSERT(w13_weights.size(2) == hidden / 2);
+    DG_HOST_ASSERT(w13_weights.is_contiguous());
+    DG_HOST_ASSERT(w13_scales.scalar_type() == torch::kFloat);
+    DG_HOST_ASSERT(w13_scales.dim() == 3);
+    DG_HOST_ASSERT(w13_scales.size(0) == 2 * num_experts);
+    DG_HOST_ASSERT(w13_scales.size(1) == intermediate_hidden);
+    DG_HOST_ASSERT(w13_scales.size(2) == hidden / gran_k);
+    DG_HOST_ASSERT(w13_scales.is_contiguous());
+    DG_HOST_ASSERT(
+        w13_dequant_scratch.sizes() ==
+        torch::IntArrayRef(
+            {num_experts, intermediate_hidden_2, hidden}));
+    DG_HOST_ASSERT(
+        w13_dequant_scratch.scalar_type() ==
+        torch::kBFloat16);
+    DG_HOST_ASSERT(w13_dequant_scratch.is_contiguous());
+    DG_HOST_ASSERT(expert_counts.scalar_type() == torch::kInt);
+    DG_HOST_ASSERT(expert_counts.numel() == num_experts);
+    DG_HOST_ASSERT(expert_counts.is_contiguous());
+    DG_HOST_ASSERT(grid_sync_counter.scalar_type() == torch::kInt);
+    DG_HOST_ASSERT(
+        grid_sync_counter.numel() >=
+        num_experts *
+            ((hidden / dgrad_block_k) *
+                 (intermediate_hidden / block_n) +
+             (intermediate_hidden_2 / dgrad_block_k) *
+                 (hidden / block_n)) +
+            2);
+    DG_HOST_ASSERT(grid_sync_counter.is_contiguous());
+    DG_HOST_ASSERT(write_grad_x_pool || direct_remote_grad_x);
+    if (direct_remote_grad_x) {
+        DG_HOST_ASSERT(compute_w13_dgrad);
+        DG_HOST_ASSERT(num_ranks > 1);
+    }
+    if (num_ranks > 1) {
+        DG_HOST_ASSERT(backward_grad_y.has_value());
+        DG_HOST_ASSERT(backward_topk_weights.has_value());
+        DG_HOST_ASSERT(token_src_metadata.has_value());
+        DG_HOST_ASSERT(num_max_tokens_per_rank > 0);
+        DG_HOST_ASSERT(num_topk > 0);
+        DG_HOST_ASSERT(
+            backward_grad_y->scalar_type() == torch::kBFloat16);
+        DG_HOST_ASSERT(backward_grad_y->dim() == 2);
+        DG_HOST_ASSERT(backward_grad_y->size(0) >= num_max_tokens_per_rank);
+        DG_HOST_ASSERT(backward_grad_y->size(1) == hidden);
+        DG_HOST_ASSERT(backward_grad_y->is_contiguous());
+        DG_HOST_ASSERT(
+            backward_topk_weights->scalar_type() == torch::kFloat);
+        DG_HOST_ASSERT(backward_topk_weights->dim() == 2);
+        DG_HOST_ASSERT(backward_topk_weights->size(0) >=
+                       num_max_tokens_per_rank);
+        DG_HOST_ASSERT(backward_topk_weights->size(1) == num_topk);
+        DG_HOST_ASSERT(backward_topk_weights->is_contiguous());
+        DG_HOST_ASSERT(
+            token_src_metadata->scalar_type() == torch::kInt);
+        DG_HOST_ASSERT(token_src_metadata->dim() == 2);
+        // Metadata is an immutable active-layout snapshot. Bucket-only output
+        // rows are never visited because expert_counts guards every access.
+        DG_HOST_ASSERT(token_src_metadata->size(0) >= num_acts_rows);
+        DG_HOST_ASSERT(token_src_metadata->size(1) == 3);
+        DG_HOST_ASSERT(token_src_metadata->is_contiguous());
+    }
+
+    check_sf_layout(
+        l1_weights_sf, intermediate_hidden_2, hidden,
+        1, gran_k, num_experts, true, false, torch::kInt);
+
+    const int smem_cd =
+        store_block_m * block_n *
+        static_cast<int>(sizeof(cutlass::bfloat16_t)) *
+        num_tma_store_stages;
+    const int smem_per_stage =
+        load_block_m * block_k +
+        load_block_n * block_k +
+        sf_block_m * static_cast<int>(sizeof(uint32_t)) +
+        sf_block_n * static_cast<int>(sizeof(uint32_t)) +
+        2 * static_cast<int>(sizeof(uint64_t));
+    const int smem_fixed =
+        num_dispatch_warps * hidden *
+            static_cast<int>(sizeof(cutlass::bfloat16_t)) +
+        smem_cd +
+        2 * num_epilogue_stages *
+            static_cast<int>(sizeof(uint64_t)) +
+        num_dispatch_warps *
+            static_cast<int>(sizeof(uint64_t)) +
+        static_cast<int>(sizeof(uint32_t));
+    const int num_stages =
+        std::min(32, (smem_capacity - smem_fixed) / smem_per_stage);
+    const int smem_size =
+        align(smem_fixed + num_stages * smem_per_stage, 1024);
+    DG_HOST_ASSERT(num_stages >= 2);
+
+    const auto tensor_map_acts = make_tma_2d_desc(
+        acts, hidden, num_acts_rows,
+        block_k, load_block_m,
+        static_cast<int>(acts.stride(-2)), 128);
+    const auto tensor_map_acts_sf = make_tma_sf_desc(
+        cute::UMMA::Major::MN, acts_sf,
+        num_sf_pool_rows, hidden,
+        sf_block_m, gran_k, 1, 0);
+    const auto tensor_map_l1_weights = make_tma_2d_desc(
+        l1_weights, hidden, num_experts * intermediate_hidden_2,
+        block_k, load_block_n,
+        static_cast<int>(l1_weights.stride(-2)), 128);
+    const auto tensor_map_l1_weights_sf = make_tma_sf_desc(
+        cute::UMMA::Major::MN, l1_weights_sf,
+        intermediate_hidden_2, hidden,
+        block_n, gran_k, num_experts, 0);
+    const auto tensor_map_gate_up = make_tma_2d_desc(
+        gate_up_output, intermediate_hidden_2, num_pool_rows,
+        block_n, store_block_m,
+        static_cast<int>(gate_up_output.stride(-2)), 128);
+    const auto tensor_map_grad_ye = make_tma_2d_desc(
+        grad_ye, hidden, num_pool_rows,
+        dgrad_block_k, load_block_m,
+        static_cast<int>(grad_ye.stride(-2)), 128);
+    const auto tensor_map_w2_dequant = make_tma_2d_desc(
+        w2_dequant_scratch, intermediate_hidden,
+        num_experts * hidden,
+        load_block_n, dgrad_block_k,
+        intermediate_hidden, 128);
+    const auto tensor_map_w2_weights = make_tma_2d_desc(
+        w2_weights, intermediate_hidden / 2,
+        num_experts * hidden,
+        load_block_n / 2, 256,
+        intermediate_hidden / 2, 0);
+    const auto tensor_map_w2_scales = make_tma_2d_desc(
+        w2_scales, intermediate_hidden / gran_k,
+        num_experts * hidden,
+        load_block_n / gran_k, 256,
+        intermediate_hidden / gran_k, 0);
+    const auto tensor_map_w13_dequant = make_tma_2d_desc(
+        w13_dequant_scratch, hidden,
+        num_experts * intermediate_hidden_2,
+        load_block_n, dgrad_block_k,
+        hidden, 128);
+    const auto tensor_map_w13_weights = make_tma_2d_desc(
+        w13_weights, hidden / 2,
+        num_experts * intermediate_hidden_2,
+        load_block_n / 2, 256,
+        hidden / 2, 0);
+    const auto tensor_map_w13_scales = make_tma_2d_desc(
+        w13_scales, hidden / gran_k,
+        num_experts * intermediate_hidden_2,
+        load_block_n / gran_k, 256,
+        hidden / gran_k, 0);
+    const auto tensor_map_grad_gate_up = make_tma_2d_desc(
+        grad_gate_up_output, intermediate_hidden_2,
+        num_pool_rows,
+        dgrad_block_k, load_block_m,
+        static_cast<int>(grad_gate_up_output.stride(-2)), 128);
+    // Each launch gets a unique readiness epoch; no host memset is required.
+    const int num_sms = device_runtime->get_num_sms();
+    DG_HOST_ASSERT(num_sms % 2 == 0);
+    static std::atomic<uint32_t> next_launch_epoch{1};
+    uint32_t launch_epoch =
+        next_launch_epoch.fetch_add(1, std::memory_order_relaxed);
+    if (launch_epoch == 0)
+        launch_epoch =
+            next_launch_epoch.fetch_add(1, std::memory_order_relaxed);
+    layout::SymBuffer<> backward_sym_buffer{};
+    void* backward_workspace_base = nullptr;
+    if (num_ranks > 1) {
+        backward_sym_buffer =
+            layout::SymBuffer<>(
+                backward_sym_buffer_ptrs, backward_rank);
+        backward_workspace_base =
+            reinterpret_cast<void*>(
+                backward_sym_buffer_ptrs[backward_rank]);
+    }
+    const auto backward_workspace = layout::Workspace(
+        backward_workspace_base, num_ranks,
+        num_experts * num_ranks,
+        std::max(num_max_tokens_per_rank, 1),
+        std::max(num_topk, 1),
+        layout::kMinCandidateBlockM);
+    const SM100FP8FP4MegaMoEBackwardWaveRuntime::Args args = {
+        .hidden = hidden,
+        .intermediate_hidden = intermediate_hidden,
+        .num_experts = num_experts,
+        .num_pool_rows = num_pool_rows,
+        .num_sf_pool_rows = num_sf_pool_rows,
+        .block_m = block_m,
+        .block_n = block_n,
+        .block_k = block_k,
+        .sf_block_m = sf_block_m,
+        .sf_block_n = sf_block_n,
+        .num_stages = num_stages,
+        .num_sms = num_sms,
+        .num_ranks = num_ranks,
+        .expert_counts = expert_counts.data_ptr<int>(),
+        .backward_sym_buffer = backward_sym_buffer,
+        .backward_workspace = backward_workspace,
+        .backward_grad_y = num_ranks > 1
+            ? reinterpret_cast<const cutlass::bfloat16_t*>(
+                  backward_grad_y->data_ptr<at::BFloat16>())
+            : nullptr,
+        .backward_topk_weights = num_ranks > 1
+            ? backward_topk_weights->data_ptr<float>()
+            : nullptr,
+        .token_src_metadata = num_ranks > 1
+            ? reinterpret_cast<const layout::TokenSrcMetadata*>(
+                  token_src_metadata->data_ptr<int>())
+            : nullptr,
+        .num_topk = static_cast<uint32_t>(num_topk),
+        .acts_sf_stride =
+            static_cast<uint32_t>(acts_sf.stride(1)),
+        .tensor_map_acts = tensor_map_acts,
+        .tensor_map_acts_sf = tensor_map_acts_sf,
+        .tensor_map_weights = tensor_map_l1_weights,
+        .tensor_map_weights_sf = tensor_map_l1_weights_sf,
+        .tensor_map_output = tensor_map_gate_up,
+        .tensor_map_grad_ye = tensor_map_grad_ye,
+        .tensor_map_w2_dequant = tensor_map_w2_dequant,
+        .tensor_map_w2_weights = tensor_map_w2_weights,
+        .tensor_map_w2_scales = tensor_map_w2_scales,
+        .tensor_map_w13_dequant = tensor_map_w13_dequant,
+        .tensor_map_w13_weights = tensor_map_w13_weights,
+        .tensor_map_w13_scales = tensor_map_w13_scales,
+        .tensor_map_grad_gate_up = tensor_map_grad_gate_up,
+        .acts_ptr =
+            reinterpret_cast<const cutlass::float_e4m3_t*>(
+                acts.data_ptr()),
+        .acts_sf_ptr =
+            reinterpret_cast<const uint32_t*>(
+                acts_sf.data_ptr<int>()),
+        .w2_weights =
+            reinterpret_cast<const int8_t*>(
+                w2_weights.data_ptr()),
+        .w2_scales = w2_scales.data_ptr<float>(),
+        .w2_dequant_scratch =
+            reinterpret_cast<cutlass::bfloat16_t*>(
+                w2_dequant_scratch.data_ptr<at::BFloat16>()),
+        .w13_weights =
+            reinterpret_cast<const int8_t*>(
+                w13_weights.data_ptr()),
+        .w13_scales = w13_scales.data_ptr<float>(),
+        .w13_dequant_scratch =
+            reinterpret_cast<cutlass::bfloat16_t*>(
+                w13_dequant_scratch.data_ptr<at::BFloat16>()),
+        .gate_up_output =
+            reinterpret_cast<const cutlass::bfloat16_t*>(
+                gate_up_output.data_ptr<at::BFloat16>()),
+        .grad_ye_output =
+            reinterpret_cast<cutlass::bfloat16_t*>(
+                grad_ye.data_ptr<at::BFloat16>()),
+        .route_weights =
+            reinterpret_cast<cutlass::bfloat16_t*>(
+                route_weights.data_ptr<at::BFloat16>()),
+        .grad_h_output =
+            reinterpret_cast<cutlass::bfloat16_t*>(
+                grad_h_output.data_ptr<at::BFloat16>()),
+        .grad_gate_up_output =
+            reinterpret_cast<cutlass::bfloat16_t*>(
+                grad_gate_up_output.data_ptr<at::BFloat16>()),
+        .h_act_output =
+            reinterpret_cast<cutlass::bfloat16_t*>(
+                h_act_output.data_ptr<at::BFloat16>()),
+        .h_weighted_output =
+            reinterpret_cast<cutlass::bfloat16_t*>(
+                h_weighted_output.data_ptr<at::BFloat16>()),
+        .x_pool_output =
+            reinterpret_cast<cutlass::bfloat16_t*>(
+                x_pool_output.data_ptr<at::BFloat16>()),
+        .grad_x_pool_output =
+            reinterpret_cast<cutlass::bfloat16_t*>(
+                grad_x_pool_output.data_ptr<at::BFloat16>()),
+        .grid_sync_counter =
+            reinterpret_cast<uint32_t*>(
+                grid_sync_counter.data_ptr<int>()),
+        .launch_epoch = launch_epoch,
+        .activation_limit = activation_limit,
+        .compute_w13_dgrad = compute_w13_dgrad,
+        .direct_remote_grad_x = direct_remote_grad_x,
+        .write_grad_x_pool = write_grad_x_pool,
+        .clear_wgrad_padding = clear_wgrad_padding,
+        .launch_args = LaunchArgs(
+            num_sms, 1024, smem_size, 2),
+    };
+    const auto code =
+        SM100FP8FP4MegaMoEBackwardWaveRuntime::generate(args);
+    const auto runtime = compiler->build(
+        "sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu", code);
+    SM100FP8FP4MegaMoEBackwardWaveRuntime::launch(runtime, args);
+}
+
+}  // namespace deep_gemm

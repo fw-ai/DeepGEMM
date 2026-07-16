@@ -36,10 +36,12 @@ public:
         float activation_clamp;
         bool fast_math;
         std::string activation;
+        bool save_l1_preact;
         MegaMoEConfig config;
 
         // Runtime arguments
         void* y;
+        void* saved_l1_preact;
         int* cumulative_local_expert_recv_stats;
         int num_tokens;
         layout::SymBuffer<> sym_buffer_ptrs;
@@ -82,6 +84,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {},
         {},
+        {},
         {}
     >);
 }};
@@ -100,13 +103,15 @@ static void __instantiate_kernel() {{
     args.launch_args.grid_dim.first, args.num_ranks,
     to_string(args.activation_clamp),
     args.fast_math ? "true" : "false",
-    get_activation_type_name(args.activation));
+    get_activation_type_name(args.activation),
+    args.save_l1_preact ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
         // TODO: optimize `args` copy
         DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
             args.y,
+            args.saved_l1_preact,
             args.cumulative_local_expert_recv_stats,
             args.num_tokens,
             args.sym_buffer_ptrs,
@@ -125,6 +130,7 @@ static void __instantiate_kernel() {{
 
 static void sm100_fp8_fp4_mega_moe(
     const torch::Tensor& y,
+    const std::optional<torch::Tensor>& saved_l1_preact,
     const torch::Tensor& l1_acts, const torch::Tensor& l1_acts_sf,
     const torch::Tensor& l2_acts, const torch::Tensor& l2_acts_sf,
     const torch::Tensor& l1_weights, const torch::Tensor& l2_weights,
@@ -150,6 +156,16 @@ static void sm100_fp8_fp4_mega_moe(
         num_max_tokens_per_rank, num_tokens, num_topk, hidden, intermediate_hidden,
         num_ring_tokens, num_sf_ring_tokens,
         MmaKind::MXFP8FP4);
+    if (saved_l1_preact.has_value()) {
+        const auto num_max_pool_tokens = layout::get_num_max_pool_tokens(
+            num_ranks, num_max_tokens_per_rank, num_topk, num_experts_per_rank);
+        DG_HOST_ASSERT(saved_l1_preact->scalar_type() == torch::kBFloat16);
+        DG_HOST_ASSERT(saved_l1_preact->is_contiguous());
+        DG_HOST_ASSERT(saved_l1_preact->sizes() ==
+                       torch::IntArrayRef(
+                           {num_max_pool_tokens,
+                            2 * intermediate_hidden}));
+    }
 
     // Make tensormap
     constexpr int kGranK = 32;
@@ -218,8 +234,12 @@ static void sm100_fp8_fp4_mega_moe(
         .activation_clamp = activation_clamp,
         .fast_math = fast_math,
         .activation = activation,
+        .save_l1_preact = saved_l1_preact.has_value(),
         .config = config,
         .y = y.data_ptr(),
+        .saved_l1_preact = saved_l1_preact.has_value()
+            ? saved_l1_preact->data_ptr()
+            : nullptr,
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,
         .num_tokens = num_tokens,
         .sym_buffer_ptrs = layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),

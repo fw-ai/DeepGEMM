@@ -37,6 +37,7 @@ template <
     float kActivationClamp,
     bool kFastMath,
     ActivationType kActivationType,
+    bool kSaveL1Preact,
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
     uint32_t L2_SHAPE_N = kHidden,
@@ -52,6 +53,7 @@ template <
 >
 CUTLASS_GLOBAL __launch_bounds__(kNumThreads, 1) void
 sm100_fp8_fp4_mega_moe_impl(void* y,
+                            nv_bfloat16* saved_l1_preact,
                             int* cumulative_local_expert_recv_stats,
                             const uint32_t num_tokens,
                             const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
@@ -999,6 +1001,76 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         for (uint32_t k = 0; k < 2; ++ k) {
                             auto bf16_gate = __float22bfloat162_rn(fp32_values[k * 2 + 0]);
                             auto bf16_up =   __float22bfloat162_rn(fp32_values[k * 2 + 1]);
+
+                            if constexpr (kSaveL1Preact) {
+                                // Each lane owns two rows and two adjacent
+                                // hidden columns. Persist the exact BF16 bits
+                                // before clamp without adding a staged path.
+                                const uint32_t hidden_col =
+                                    warp_idx_in_wg * 16 +
+                                    (lane_idx / 4) * 2 + k;
+                                const uint32_t chunk = hidden_col / 8;
+                                const uint32_t in_chunk =
+                                    hidden_col & 7;
+                                const uint32_t gate_col =
+                                    chunk * 16 + in_chunk;
+                                const uint32_t up_col =
+                                    gate_col + 8;
+                                const auto output_col =
+                                    [=](uint32_t col) {
+                                        const uint32_t low =
+                                            col & 31;
+                                        return n_idx +
+                                            (col & ~31u) +
+                                            ((low & 1) << 4) +
+                                            ((low >> 1) & 3) +
+                                            (low & 8) +
+                                            ((low & 16) >> 2);
+                                    };
+                                const uint32_t row_base =
+                                    pool_m_idx +
+                                    epilogue_wg_idx * WG_BLOCK_M +
+                                    s * STORE_BLOCK_M +
+                                    i * ATOM_M +
+                                    (lane_idx % 4) * 2;
+                                const uint32_t gate_bits =
+                                    *reinterpret_cast<
+                                        const uint32_t*>(
+                                        &bf16_gate);
+                                const uint32_t up_bits =
+                                    *reinterpret_cast<
+                                        const uint32_t*>(
+                                        &bf16_up);
+                                #pragma unroll
+                                for (uint32_t r = 0; r < 2;
+                                     ++r) {
+                                    const uint32_t m_out =
+                                        row_base + r;
+                                    if (m_out <
+                                        pool_m_idx + valid_m) {
+                                        auto* dst =
+                                            reinterpret_cast<
+                                                uint16_t*>(
+                                                saved_l1_preact +
+                                                static_cast<
+                                                    uint64_t>(
+                                                    m_out) *
+                                                    (2 *
+                                                     kIntermediateHidden));
+                                        dst[output_col(
+                                            gate_col)] =
+                                            static_cast<
+                                                uint16_t>(
+                                                gate_bits >>
+                                                (r * 16));
+                                        dst[output_col(up_col)] =
+                                            static_cast<
+                                                uint16_t>(
+                                                up_bits >>
+                                                (r * 16));
+                                    }
+                                }
+                            }
 
                             // Clamp
                             if constexpr (kActivationClamp != cute::numeric_limits<float>::infinity()) {

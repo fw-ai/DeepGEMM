@@ -1,0 +1,165 @@
+#pragma once
+
+#include "sm100_bf16_gemm.hpp"
+
+namespace deep_gemm {
+
+struct MegaMoEBackwardCombineArgs {
+    bool enabled = false;
+    int num_ranks = 1;
+    layout::SymBuffer<> sym_buffer{};
+    layout::Workspace workspace{nullptr, 1, 1, 1, 1, 1};
+    cutlass::bfloat16_t* grad_x_output = nullptr;
+    cutlass::bfloat16_t* combine_buffer = nullptr;
+    uint32_t num_tokens = 0;
+    uint32_t num_max_tokens = 0;
+    uint32_t num_topk = 0;
+    uint32_t hidden = 0;
+    bool reduce = false;
+};
+
+// Dedicated single-CTA specialization for MegaMoE local expert wgrad.
+// Kernel A stores each expert in a BLOCK_M-padded contiguous pool; callers pass
+// those padded counts as grouped_layout so zero tail rows participate harmlessly.
+static void sm100_bf16_mega_moe_wgrad_1sm(
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& d,
+    const torch::Tensor& padded_expert_counts,
+    const MegaMoEBackwardCombineArgs& combine = {}) {
+    const auto [num_groups, m, n] = get_shape<3>(d);
+    const auto [pool_rows_a, m_] = get_shape<2>(a);
+    const auto [pool_rows_b, n_] = get_shape<2>(b);
+    DG_HOST_ASSERT(m == m_ and n == n_);
+    DG_HOST_ASSERT(pool_rows_a == pool_rows_b);
+    DG_HOST_ASSERT(
+        padded_expert_counts.numel() == num_groups and
+        padded_expert_counts.scalar_type() == torch::kInt);
+    DG_HOST_ASSERT(
+        a.scalar_type() == torch::kBFloat16 and
+        b.scalar_type() == torch::kBFloat16 and
+        d.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(a.is_contiguous() and b.is_contiguous() and d.is_contiguous());
+
+    constexpr int kBlockM = 128;
+    // Amortize each A tile and scheduler assignment across twice as much
+    // tensor-core work whenever the output width permits a full 256-column
+    // tile. Keep the 128-column fallback for non-divisible model dimensions.
+    const int kBlockN = n % 256 == 0 ? 256 : 128;
+    constexpr int kBlockK = 64;
+    constexpr int kNumStages = 4;
+    constexpr int kSwizzle = 128;
+    constexpr int kStoreBlockN = 64;
+    constexpr int kNumNonEpilogueThreads = 128;
+    constexpr int kNumEpilogueThreads = 128;
+    // Production combine always uses four warps: the two original non-MMA
+    // warps plus two appended warps that leave existing warp IDs unchanged.
+    const int num_extra_combine_threads = combine.enabled ? 64 : 0;
+    const int num_threads =
+        kNumNonEpilogueThreads + kNumEpilogueThreads +
+        num_extra_combine_threads;
+    const int kSmemSize =
+        2 * kBlockM * kStoreBlockN * sizeof(cutlass::bfloat16_t) +
+        kNumStages * (kBlockM + kBlockN) * kBlockK *
+            sizeof(cutlass::bfloat16_t) +
+        1024;
+
+    const int num_sms = device_runtime->get_num_sms();
+    const auto desc = GemmDesc{
+        .gemm_type = GemmType::KGroupedContiguous,
+        .kernel_type = KernelType::KernelNoSF,
+        .m = m,
+        .n = n,
+        .k = pool_rows_a,
+        .num_groups = num_groups,
+        .a_dtype = a.scalar_type(),
+        .b_dtype = b.scalar_type(),
+        .cd_dtype = d.scalar_type(),
+        .major_a = cute::UMMA::Major::MN,
+        .major_b = cute::UMMA::Major::MN,
+        .with_accumulation = false,
+        .num_sms = num_sms,
+        .tc_util = 100,
+        .compiled_dims = "mn",
+        .expected_m = m,
+        .expected_n = n,
+        .expected_k = pool_rows_a,
+        .expected_num_groups = num_groups,
+    };
+    const auto config = GemmConfig{
+        .layout =
+            Layout{
+                .swap_ab = false,
+                .block_m = kBlockM,
+                .block_n = kBlockN,
+                .block_k = kBlockK,
+                .cluster_m = 1,
+                .cluster_n = 1,
+            },
+        .storage_config =
+            StorageConfig{
+                .load_block_m = kBlockM,
+                .load_block_n = kBlockN,
+                .store_block_m = kBlockM,
+                .store_block_n = kStoreBlockN,
+                .swizzle_a_mode = kSwizzle,
+                .swizzle_b_mode = kSwizzle,
+                .swizzle_cd_mode = kSwizzle,
+            },
+        .pipeline_config =
+            PipelineConfig{
+                .smem_size = kSmemSize,
+                .num_stages = kNumStages,
+            },
+        .launch_config =
+            LaunchConfig{
+                .num_sms = num_sms,
+                .num_sms_per_cluster = 1,
+                .num_threads = num_threads,
+                .num_tma_threads = 32,
+                .num_math_threads = 32,
+                .num_non_epilogue_threads = kNumNonEpilogueThreads,
+                .num_epilogue_threads = kNumEpilogueThreads,
+            },
+    };
+
+    const auto tensor_map_a = make_tma_a_desc(
+        cute::UMMA::Major::MN, a, m, pool_rows_a,
+        kBlockM, kBlockK, static_cast<int>(a.stride(0)), 1, kSwizzle);
+    const auto tensor_map_b = make_tma_b_desc(
+        cute::UMMA::Major::MN, b, n, pool_rows_b,
+        kBlockN, kBlockK, static_cast<int>(b.stride(0)), 1, kSwizzle);
+    const auto tensor_map_d = make_tma_cd_desc(
+        d, m, n, kBlockM, kStoreBlockN,
+        static_cast<int>(d.stride(1)), num_groups, kSwizzle);
+
+    const SM100BF16GemmRuntime::Args args = {
+        .gemm_desc = desc,
+        .gemm_config = config,
+        .launch_args =
+            LaunchArgs(num_sms, num_threads, kSmemSize, 1),
+        .grouped_layout = padded_expert_counts.data_ptr(),
+        .tensor_map_a = tensor_map_a,
+        .tensor_map_b = tensor_map_b,
+        .tensor_map_cd = tensor_map_d,
+        .combine_num_ranks = combine.num_ranks,
+        .fuse_combine = combine.enabled,
+        .combine_sym_buffer = combine.sym_buffer,
+        .combine_workspace = combine.workspace,
+        .grad_x_output = combine.grad_x_output,
+        .combine_buffer = combine.combine_buffer,
+        .combine_num_tokens = combine.num_tokens,
+        .combine_num_max_tokens = combine.num_max_tokens,
+        .combine_num_topk = combine.num_topk,
+        .combine_hidden = combine.hidden,
+        .combine_reduce = combine.reduce,
+        .combine_num_extra_threads =
+            static_cast<uint32_t>(num_extra_combine_threads),
+    };
+    const auto code = SM100BF16GemmRuntime::generate(args);
+    const auto runtime =
+        compiler->build("sm100_bf16_mega_moe_wgrad_1sm", code);
+    SM100BF16GemmRuntime::launch(runtime, args);
+}
+
+}  // namespace deep_gemm

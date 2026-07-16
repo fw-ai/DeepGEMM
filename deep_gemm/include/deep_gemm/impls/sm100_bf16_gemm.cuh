@@ -15,6 +15,9 @@
 #include <deep_gemm/mma/sm100.cuh>
 #include <deep_gemm/ptx/tcgen05.cuh>
 #include <deep_gemm/ptx/utils.cuh>
+#include <deep_gemm/comm/barrier.cuh>
+#include <deep_gemm/layout/sym_buffer.cuh>
+#include <deep_gemm/layout/mega_moe.cuh>
 
 namespace deep_gemm {
 
@@ -30,13 +33,27 @@ template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
           uint32_t kKAlignment,
           bool kSwapAB, bool kEnsureZeroPadding,
           GemmType kGemmType, bool kWithAccumulation, typename cd_dtype_t,
-          uint64_t kTensorCoreUtilControl>
-CUTLASS_GLOBAL void __launch_bounds__(kNumNonEpilogueThreads + kNumEpilogueThreads, 1)
+          uint64_t kTensorCoreUtilControl,
+          uint32_t kCombineNumRanks, bool kFuseCombine,
+          uint32_t kNumExtraCombineThreads>
+CUTLASS_GLOBAL void __launch_bounds__(
+    kNumNonEpilogueThreads + kNumEpilogueThreads +
+        kNumExtraCombineThreads,
+    1)
 sm100_bf16_gemm_impl(int* grouped_layout,
                      uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
                      const __grid_constant__ cute::TmaDescriptor tensor_map_a,
                      const __grid_constant__ cute::TmaDescriptor tensor_map_b,
-                     const __grid_constant__ cute::TmaDescriptor tensor_map_cd) {
+                     const __grid_constant__ cute::TmaDescriptor tensor_map_cd,
+                     const __grid_constant__ layout::SymBuffer<kCombineNumRanks> combine_sym_buffer,
+                     const __grid_constant__ layout::Workspace combine_workspace,
+                     cutlass::bfloat16_t* grad_x_output,
+                     cutlass::bfloat16_t* combine_buffer,
+                     uint32_t combine_num_tokens,
+                     uint32_t combine_num_max_tokens,
+                     uint32_t combine_num_topk,
+                     uint32_t combine_hidden,
+                     bool combine_reduce) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     // Enlarge `BLOCK_K` for some cases
     // NOTES: this is for reducing the `umma_arrive()` overhead
@@ -394,6 +411,144 @@ sm100_bf16_gemm_impl(int* grouped_layout,
         if (kNumMulticast > 1 and iter_idx >= 0) {
             const auto accum_phase_idx = (iter_idx / kNumEpilogueStages) & 1;
             tmem_empty_barriers[iter_idx % kNumEpilogueStages]->wait(accum_phase_idx);
+        }
+    } else if (
+        kFuseCombine and
+        ((warp_idx >= 2 and
+          warp_idx < kNumNonEpilogueThreads / 32) or
+         (warp_idx >=
+              (kNumNonEpilogueThreads +
+               kNumEpilogueThreads) /
+                  32 and
+          warp_idx <
+              (kNumNonEpilogueThreads +
+               kNumEpilogueThreads +
+               kNumExtraCombineThreads) /
+                  32))) {
+        if constexpr (kFuseCombine) {
+            constexpr uint32_t kNumCombineThreads =
+                kNumNonEpilogueThreads - 64 +
+                kNumExtraCombineThreads;
+            DG_STATIC_ASSERT(
+                kNumCombineThreads == 64 or
+                    kNumCombineThreads == 128,
+                "Fused combine requires two or four warps");
+            constexpr uint32_t kCombineNamedBarrierIdx = 15;
+            constexpr uint32_t kBeforeCombineReuseGridSyncIdx = 2;
+            constexpr uint32_t kBeforeCombineReuseTag = 7;
+            constexpr uint32_t kExtraCombineWarpBegin =
+                (kNumNonEpilogueThreads +
+                 kNumEpilogueThreads) /
+                32;
+            const uint32_t combine_thread_idx =
+                warp_idx < kNumNonEpilogueThreads / 32
+                    ? (warp_idx - 2) * 32 + lane_idx
+                    : kNumNonEpilogueThreads - 64 +
+                          (warp_idx -
+                           kExtraCombineWarpBegin) *
+                              32 +
+                          lane_idx;
+            const auto combine_sync = [=]() {
+                ptx::sync_aligned(
+                    kNumCombineThreads,
+                    kCombineNamedBarrierIdx);
+            };
+
+            constexpr uint32_t kValuesPerVec =
+                sizeof(uint4) /
+                sizeof(cutlass::bfloat16_t);
+
+            if (!combine_reduce) {
+                // Kernel A remotely pulls grad-y from this same symmetric
+                // region. W2's combine warps protect its reuse while the
+                // independent W2 tensor-core work runs.
+                comm::nvlink_barrier<
+                    kCombineNumRanks, kNumSMs,
+                    kNumCombineThreads,
+                    kBeforeCombineReuseGridSyncIdx,
+                    kBeforeCombineReuseTag>(
+                    combine_workspace, combine_sym_buffer,
+                    blockIdx.x, combine_thread_idx,
+                    combine_sync);
+            } else {
+                // Kernel A has already written every remote top-k plane.
+                // W13's combine warps reduce those planes while the
+                // independent W13 tensor-core work runs.
+                constexpr uint32_t kReduceValuesPerVec =
+                    2 * kValuesPerVec;
+                const uint64_t num_output_vecs =
+                    static_cast<uint64_t>(
+                        combine_num_tokens) *
+                    combine_hidden / kReduceValuesPerVec;
+                for (uint64_t linear =
+                         static_cast<uint64_t>(blockIdx.x) *
+                             kNumCombineThreads +
+                         combine_thread_idx;
+                     linear < num_output_vecs;
+                     linear +=
+                         static_cast<uint64_t>(kNumSMs) *
+                         kNumCombineThreads) {
+                    const uint32_t num_vecs_per_token =
+                        combine_hidden /
+                        kReduceValuesPerVec;
+                    const uint32_t token_idx =
+                        linear / num_vecs_per_token;
+                    const uint32_t vec_idx =
+                        linear -
+                        static_cast<uint64_t>(token_idx) *
+                            num_vecs_per_token;
+                    float values[kReduceValuesPerVec] = {
+                        0.0f};
+                    #pragma unroll
+                    for (uint32_t topk_idx = 0;
+                         topk_idx < combine_num_topk;
+                         ++topk_idx) {
+                        const uint64_t packed_idx =
+                            ((static_cast<uint64_t>(
+                                  topk_idx) *
+                                  combine_num_max_tokens +
+                              token_idx) *
+                                 num_vecs_per_token +
+                             vec_idx) *
+                            2;
+                        uint4 packed[2];
+                        packed[0] =
+                            reinterpret_cast<const uint4*>(
+                                combine_buffer)[
+                                packed_idx];
+                        packed[1] =
+                            reinterpret_cast<const uint4*>(
+                                combine_buffer)[
+                                packed_idx + 1];
+                        const auto* packed_values =
+                            reinterpret_cast<
+                                const cutlass::bfloat16_t*>(
+                                packed);
+                        #pragma unroll
+                        for (uint32_t i = 0;
+                             i < kReduceValuesPerVec; ++i)
+                            values[i] +=
+                                static_cast<float>(
+                                    packed_values[i]);
+                    }
+                    uint4 packed_output[2];
+                    auto* output_values =
+                        reinterpret_cast<
+                            cutlass::bfloat16_t*>(
+                            packed_output);
+                    #pragma unroll
+                    for (uint32_t i = 0;
+                         i < kReduceValuesPerVec; ++i)
+                        output_values[i] =
+                            cutlass::bfloat16_t(values[i]);
+                    auto* output =
+                        reinterpret_cast<uint4*>(
+                            grad_x_output) +
+                        linear * 2;
+                    output[0] = packed_output[0];
+                    output[1] = packed_output[1];
+                }
+            }
         }
     } else if (warp_idx >= kNumNonEpilogueThreads / 32 and warp_idx < (kNumNonEpilogueThreads + kNumUMMAStoreThreads) / 32) {
         // Epilogue warp groups

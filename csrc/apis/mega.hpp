@@ -27,7 +27,7 @@ static std::pair<int, int> get_ring_limit_for_mega_moe(
     };
 }
 
-static std::tuple<int64_t, std::function<std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(const torch::Tensor&)>>
+static std::tuple<int64_t, std::function<std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(const torch::Tensor&)>>
 get_symm_buffer_size_for_mega_moe(
     const int& num_ranks, const int& num_experts,
     const int& num_max_tokens_per_rank, const int& num_topk,
@@ -153,7 +153,26 @@ get_symm_buffer_size_for_mega_moe(
             {num_sf_ring_tokens, intermediate_hidden / 128},
             {1, num_sf_ring_tokens},
             torch::TensorOptions().dtype(torch::kInt).device(buffer.device())) : torch::Tensor();
-        return std::make_tuple(x, x_sf, topk_idx, topk_weights, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf);
+        // Training-backward metadata (Workspace region, base of the buffer):
+        //   `token_src_metadata`: per pool-token (rank_idx, token_idx, topk_idx)
+        //       source mapping for combine write-back -> lets the backward scatter
+        //       per-expert grads back to source tokens/top-k slots without
+        //       reverse-engineering the (swizzled) pool packing. Every populated
+        //       pool row self-describes its source token + top-k slot.
+        // `workspace` above is nullptr-based, so its (now HOST_DEVICE) accessor
+        // returns a byte offset into the symmetric buffer.
+        auto token_src_metadata = torch::from_blob(
+            math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(workspace.get_token_src_metadata_ptr(0))),
+            {static_cast<int64_t>(workspace.num_max_pool_tokens), 3},
+            torch::TensorOptions().dtype(torch::kInt).device(buffer.device()));
+        // The combine region is dead after the forward returns. Reuse its first
+        // token plane as the symmetric BF16 grad-y source for backward dispatch.
+        auto backward_grad_y = torch::from_blob(
+            math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(combine_token_buffer.base)),
+            {num_max_tokens_per_rank, hidden},
+            torch::TensorOptions().dtype(torch::kBFloat16).device(buffer.device()));
+        return std::make_tuple(x, x_sf, topk_idx, topk_weights, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf,
+                               token_src_metadata, backward_grad_y);
     };
     return {reinterpret_cast<int64_t>(combine_token_buffer.get_end_ptr()), slice_input_buffers};
 }
@@ -171,7 +190,8 @@ static void fp8_fp4_mega_moe(
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
     const bool& fast_math,
-    const int& num_ring_tokens
+    const int& num_ring_tokens,
+    const std::optional<torch::Tensor>& saved_l1_preact
 ) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
@@ -227,11 +247,13 @@ static void fp8_fp4_mega_moe(
     DG_HOST_ASSERT(num_experts == num_experts_);
 
     // Already registered tensors
-    const auto [x, x_sf, topk_idx, topk_weights, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf] = slice(sym_buffer);
+    const auto [x, x_sf, topk_idx, topk_weights, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf,
+                token_src_metadata, backward_grad_y] = slice(sym_buffer);
 
     // Dispatch into different architectures
     if (arch_major == 10) {
         sm100_fp8_fp4_mega_moe(y,
+                               saved_l1_preact,
                                l1_acts, l1_acts_sf,
                                l2_acts, l2_acts_sf,
                                l1_weights, l2_weights,
@@ -309,7 +331,8 @@ static void bf16_mega_moe(
     DG_HOST_ASSERT(num_experts == num_experts_);
 
     // Already registered tensors
-    const auto [x, _x_sf, topk_idx, topk_weights, l1_acts, _l1_acts_sf, l2_acts, _l2_acts_sf] = slice(sym_buffer);
+    const auto [x, _x_sf, topk_idx, topk_weights, l1_acts, _l1_acts_sf, l2_acts, _l2_acts_sf,
+                _token_src_metadata, _backward_grad_y] = slice(sym_buffer);
 
     // Dispatch into different architectures
     if (arch_major == 10) {

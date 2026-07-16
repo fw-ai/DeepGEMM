@@ -10,7 +10,9 @@ try:
     import torch.distributed._symmetric_memory as symm_mem
     import torch.distributed as dist
 except Exception as exception:
-    print(f'Failed to load mega kernels, please check your PyTorch version: {exception}')
+    print(
+        f"Failed to load mega kernels, please check your PyTorch version: {exception}"
+    )
 
 from .. import _C
 
@@ -52,10 +54,21 @@ class SymmBuffer:
         torch.cuda.synchronize()
 
         # Create input buffer views
-        (self.x, self.x_sf,
-         self.topk_idx, self.topk_weights,
-         self.l1_acts, self.l1_acts_sf,
-         self.l2_acts, self.l2_acts_sf) = slice_input_buffers(self.buffer)
+        # `token_src_metadata` exposes the Workspace combine source mapping
+        # (rank_idx, token_idx, topk_idx) per pool row, needed by the training
+        # backward to scatter per-expert grads back to source tokens/top-k slots.
+        (
+            self.x,
+            self.x_sf,
+            self.topk_idx,
+            self.topk_weights,
+            self.l1_acts,
+            self.l1_acts_sf,
+            self.l2_acts,
+            self.l2_acts_sf,
+            self.token_src_metadata,
+            self.backward_grad_y,
+        ) = slice_input_buffers(self.buffer)
 
     def destroy(self):
         self.handle = None
@@ -63,6 +76,8 @@ class SymmBuffer:
         self.group = None
         self.x = None
         self.x_sf = None
+        self.token_src_metadata = None
+        self.backward_grad_y = None
 
 
 def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
@@ -124,9 +139,11 @@ def _interleave_weights(t: torch.Tensor, gran: int = 8) -> torch.Tensor:
 def _transpose_sf_for_utccp(sf: torch.Tensor) -> torch.Tensor:
     num_groups, mn, packed_sf_k = sf.shape
     assert sf.dtype == torch.int and mn % 128 == 0
-    result = (sf.reshape(num_groups, -1, 4, 32, packed_sf_k)
-                .transpose(2, 3)
-                .reshape(num_groups, mn, packed_sf_k))
+    result = (
+        sf.reshape(num_groups, -1, 4, 32, packed_sf_k)
+        .transpose(2, 3)
+        .reshape(num_groups, mn, packed_sf_k)
+    )
     return torch.empty_like(sf).copy_(result)
 
 
@@ -152,28 +169,34 @@ def transform_weights_for_mega_moe(
     return l1_transformed, l2_transformed
 
 
-
-def fp8_fp4_mega_moe(y: torch.Tensor,
-                     l1_weights: Tuple[torch.Tensor, torch.Tensor],
-                     l2_weights: Tuple[torch.Tensor, torch.Tensor],
-                     sym_buffer: SymmBuffer,
-                     cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
-                     recipe: Tuple[int, int, int] = (1, 1, 32),
-                     activation: str = 'swiglu',
-                     activation_clamp: Optional[float] = None,
-                     fast_math: bool = True):
+def fp8_fp4_mega_moe(
+    y: torch.Tensor,
+    l1_weights: Tuple[torch.Tensor, torch.Tensor],
+    l2_weights: Tuple[torch.Tensor, torch.Tensor],
+    sym_buffer: SymmBuffer,
+    cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+    recipe: Tuple[int, int, int] = (1, 1, 32),
+    activation: str = "swiglu",
+    activation_clamp: Optional[float] = None,
+    fast_math: bool = True,
+    saved_l1_preact: Optional[torch.Tensor] = None,
+):
     _C.fp8_fp4_mega_moe(
         y,
-        l1_weights, l2_weights,
+        l1_weights,
+        l2_weights,
         cumulative_local_expert_recv_stats,
         sym_buffer.buffer,
-        sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
+        sym_buffer.handle.buffer_ptrs,
+        sym_buffer.group.rank(),
         sym_buffer.num_max_tokens_per_rank,
-        sym_buffer.num_experts, sym_buffer.num_topk,
+        sym_buffer.num_experts,
+        sym_buffer.num_topk,
         recipe,
         activation, activation_clamp,
         fast_math,
-        sym_buffer.num_ring_tokens
+        sym_buffer.num_ring_tokens,
+        saved_l1_preact
     )
 
 def bf16_mega_moe(y: torch.Tensor,
