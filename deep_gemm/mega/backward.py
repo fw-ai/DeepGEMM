@@ -101,6 +101,19 @@ def bf16_mega_moe_backward_dgrad(
             grad_y_unweighted_output = grad_ye
         if down_unweighted_output is None:
             down_unweighted_output = grad_ye
+    if sym_buffer.group.size() > 1:
+        # BLOCK_M determines the persistent grid shape and therefore every
+        # grid/NVLink barrier's participant count. A rank with no source
+        # tokens may choose a smaller local bucket than its peers; launching
+        # those different specializations deadlocks at the first grid sync.
+        # Canonicalize at the API boundary so every caller is safe.
+        rank_uniform_block_m = torch.tensor(
+            block_m, dtype=torch.int32, device=grad_y.device)
+        dist.all_reduce(
+            rank_uniform_block_m,
+            op=dist.ReduceOp.MAX,
+            group=sym_buffer.group)
+        block_m = int(rank_uniform_block_m.item())
     num_tokens = grad_y.shape[0]
     backward_grad_y = sym_buffer.backward_grad_y
     if direct_remote_grad_x:

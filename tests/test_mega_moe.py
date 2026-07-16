@@ -411,12 +411,35 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         ] = route_output.float()
         if num_ranks > 1:
             dist.all_reduce(route_planes, group=group)
-        combined = torch.zeros(
+        slot_combined = torch.zeros(
             (num_tokens, hidden), dtype=torch.float32, device='cuda')
         for slot in range(num_topk):
-            combined += route_planes[
+            slot_combined += route_planes[
                 rank_idx, :num_tokens, slot]
-        return combined.to(torch.bfloat16)
+        slot_combined = slot_combined.to(torch.bfloat16)
+
+        # The non-EP DSV4 bridge accumulates already expert-sorted output in
+        # increasing expert-id order. This is intentionally only local: EP
+        # uses DeepEP's combine rather than this eager expert loop.
+        expert_combined = None
+        if num_ranks == 1:
+            expert_combined_fp32 = torch.zeros(
+                (num_tokens, hidden),
+                dtype=torch.float32,
+                device='cuda')
+            start = 0
+            for count in counts.tolist():
+                end = start + int(count)
+                if end > start:
+                    expert_combined_fp32[
+                        source_tokens[start:end]
+                    ] += route_output[start:end].float()
+                start = end
+            expert_combined = expert_combined_fp32.to(torch.bfloat16)
+
+        reference_stages['final_slot'] = slot_combined
+        reference_stages['final_expert'] = expert_combined
+        return slot_combined
 
     def run_reference():
         assert is_bf16xbf16 or num_ranks == 1, (
@@ -546,6 +569,11 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     ) -> None:
         final_mismatches = report_bf16_parity(
             'Stage final', fused_y, ref_y)
+        if reference_stages['final_expert'] is not None:
+            report_bf16_parity(
+                'Stage final (native expert order)',
+                fused_y,
+                reference_stages['final_expert'])
         if saved_l1_preact is None:
             assert final_mismatches == 0, (
                 'native grouped-MM final output must be bitwise equal')
