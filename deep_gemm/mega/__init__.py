@@ -215,19 +215,22 @@ def bf16_mega_moe(y: torch.Tensor,
                   fast_math: bool = True,
                   saved_l1_preact: Optional[torch.Tensor] = None,
                   route_weight_mode: RouteWeightMode = RouteWeightMode.PRE_DOWN,
+                  saved_h_unweighted: Optional[torch.Tensor] = None,
+                  saved_h_weighted: Optional[torch.Tensor] = None,
                   saved_down_unweighted: Optional[torch.Tensor] = None):
     """Run BF16 MegaMoE with an explicit route-weight boundary.
 
-    ``saved_down_unweighted`` is a post-down training save used to compute the
-    exact router gradient.
+    The optional stage saves expose unweighted/weighted activation and W2
+    output boundaries for strict parity checks. ``saved_down_unweighted`` is
+    also used by post-down backward for the exact router gradient.
     """
     route_weight_mode = RouteWeightMode(route_weight_mode)
     if (
-        saved_down_unweighted is not None and
-        route_weight_mode is not RouteWeightMode.POST_DOWN
+        (saved_h_unweighted is None) !=
+        (saved_h_weighted is None)
     ):
         raise ValueError(
-            "saved_down_unweighted is only valid for post_down")
+            "both activation stage outputs must be provided together")
     _C.bf16_mega_moe(
         y,
         l1_weights,
@@ -244,5 +247,7 @@ def bf16_mega_moe(y: torch.Tensor,
         sym_buffer.num_ring_tokens,
         saved_l1_preact,
         route_weight_mode.value,
+        saved_h_unweighted,
+        saved_h_weighted,
         saved_down_unweighted,
     )

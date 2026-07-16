@@ -36,6 +36,7 @@ template <
     bool kFastMath,
     ActivationType kActivationType,
     bool kSaveL1Preact,
+    bool kSaveStageActivations,
     RouteWeightMode kRouteWeightMode,
     bool kSaveDownUnweighted,
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
@@ -54,6 +55,8 @@ template <
 CUTLASS_GLOBAL __launch_bounds__(kNumThreads, 1) void
 sm100_bf16_mega_moe_impl(void* y,
                          nv_bfloat16* saved_l1_preact,
+                         nv_bfloat16* saved_h_unweighted,
+                         nv_bfloat16* saved_h_weighted,
                          int* cumulative_local_expert_recv_stats,
                          const uint32_t num_tokens,
                          const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
@@ -1019,17 +1022,85 @@ sm100_bf16_mega_moe_impl(void* y,
                             const auto h_bf16 =
                                 __float22bfloat162_rn(
                                     __fmul2_rn(activated, up));
+                            const auto h_weighted_bf16 =
+                                __float22bfloat162_rn(
+                                    __fmul2_rn(
+                                        __bfloat1622float2(h_bf16),
+                                        weights));
                             if constexpr (
                                 kRouteWeightMode ==
                                 RouteWeightMode::PreDown) {
                                 bf16x2_output[i * 2 + k] =
-                                    __float22bfloat162_rn(
-                                        __fmul2_rn(
-                                            __bfloat1622float2(h_bf16),
-                                            weights));
+                                    h_weighted_bf16;
                             } else {
                                 bf16x2_output[i * 2 + k] =
                                     h_bf16;
+                            }
+
+                            if constexpr (kSaveStageActivations) {
+                                const uint32_t hidden_col =
+                                    warp_idx_in_wg * 16 +
+                                    (lane_idx / 4) * 2 + k;
+                                const uint32_t chunk =
+                                    hidden_col / 8;
+                                const uint32_t in_chunk =
+                                    hidden_col & 7;
+                                const uint32_t interleaved_col =
+                                    chunk * 16 + in_chunk;
+                                const uint32_t low =
+                                    interleaved_col & 31;
+                                const uint32_t physical_col =
+                                    n_idx +
+                                    (interleaved_col & ~31u) +
+                                    ((low & 1) << 4) +
+                                    ((low >> 1) & 3) +
+                                    (low & 8) +
+                                    ((low & 16) >> 2);
+                                const uint32_t canonical_col =
+                                    (physical_col / 16) * 8 +
+                                    (physical_col & 7);
+                                const uint32_t row_base =
+                                    pool_m_idx +
+                                    epilogue_wg_idx * WG_BLOCK_M +
+                                    s * STORE_BLOCK_M +
+                                    i * ATOM_M +
+                                    (lane_idx % 4) * 2;
+                                const uint32_t h_bits =
+                                    *reinterpret_cast<
+                                        const uint32_t*>(
+                                        &h_bf16);
+                                const uint32_t weighted_bits =
+                                    *reinterpret_cast<
+                                        const uint32_t*>(
+                                        &h_weighted_bf16);
+                                #pragma unroll
+                                for (uint32_t r = 0;
+                                     r < 2; ++r) {
+                                    const uint32_t m_out =
+                                        row_base + r;
+                                    if (m_out <
+                                        pool_m_idx + valid_m) {
+                                        const uint64_t output_idx =
+                                            static_cast<uint64_t>(
+                                                m_out) *
+                                                kIntermediateHidden +
+                                            canonical_col;
+                                        *reinterpret_cast<
+                                            uint16_t*>(
+                                            saved_h_unweighted +
+                                            output_idx) =
+                                            static_cast<uint16_t>(
+                                                h_bits >>
+                                                (r * 16));
+                                        *reinterpret_cast<
+                                            uint16_t*>(
+                                            saved_h_weighted +
+                                            output_idx) =
+                                            static_cast<uint16_t>(
+                                                weighted_bits >>
+                                                (r * 16));
+                                    }
+                                }
                             }
                         }
                     }

@@ -45,6 +45,7 @@ public:
         bool fast_math;
         std::string activation;
         bool save_l1_preact;
+        bool save_stage_activations;
         std::string route_weight_mode;
         bool save_down_unweighted;
         MegaMoEConfig config;
@@ -52,6 +53,8 @@ public:
         // Runtime arguments
         void* y;
         void* saved_l1_preact;
+        void* saved_h_unweighted;
+        void* saved_h_weighted;
         int* cumulative_local_expert_recv_stats;
         int num_tokens;
         layout::SymBuffer<> sym_buffer_ptrs;
@@ -92,6 +95,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
         {}
     >);
 }};
@@ -110,6 +114,7 @@ static void __instantiate_kernel() {{
     args.fast_math ? "true" : "false",
     get_bf16_activation_type_name(args.activation),
     args.save_l1_preact ? "true" : "false",
+    args.save_stage_activations ? "true" : "false",
     get_route_weight_mode_name(args.route_weight_mode),
     args.save_down_unweighted ? "true" : "false");
     }
@@ -119,6 +124,8 @@ static void __instantiate_kernel() {{
         DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
             args.y,
             args.saved_l1_preact,
+            args.saved_h_unweighted,
+            args.saved_h_weighted,
             args.cumulative_local_expert_recv_stats,
             args.num_tokens,
             args.sym_buffer_ptrs,
@@ -147,6 +154,8 @@ static void sm100_bf16_mega_moe(
     const float& activation_clamp,
     const bool& fast_math,
     const std::string& route_weight_mode,
+    const std::optional<torch::Tensor>& saved_h_unweighted,
+    const std::optional<torch::Tensor>& saved_h_weighted,
     const std::optional<torch::Tensor>& saved_down_unweighted
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
@@ -173,8 +182,23 @@ static void sm100_bf16_mega_moe(
         route_weight_mode == "pre_down" ||
         route_weight_mode == "post_down");
     DG_HOST_ASSERT(
-        not saved_down_unweighted.has_value() ||
-        route_weight_mode == "post_down");
+        saved_h_unweighted.has_value() ==
+        saved_h_weighted.has_value());
+    if (saved_h_unweighted.has_value()) {
+        const auto num_max_pool_tokens =
+            layout::get_num_max_pool_tokens(
+                num_ranks, num_max_tokens_per_rank, num_topk,
+                num_experts_per_rank);
+        for (const auto* saved :
+             {&*saved_h_unweighted, &*saved_h_weighted}) {
+            DG_HOST_ASSERT(
+                saved->scalar_type() == torch::kBFloat16);
+            DG_HOST_ASSERT(saved->is_contiguous());
+            DG_HOST_ASSERT(
+                saved->sizes() == torch::IntArrayRef(
+                    {num_max_pool_tokens, intermediate_hidden}));
+        }
+    }
     if (saved_down_unweighted.has_value()) {
         const auto num_max_pool_tokens = layout::get_num_max_pool_tokens(
             num_ranks, num_max_tokens_per_rank, num_topk,
@@ -239,6 +263,8 @@ static void sm100_bf16_mega_moe(
         .fast_math = fast_math,
         .activation = activation,
         .save_l1_preact = saved_l1_preact.has_value(),
+        .save_stage_activations =
+            saved_h_unweighted.has_value(),
         .route_weight_mode = route_weight_mode,
         .save_down_unweighted =
             saved_down_unweighted.has_value(),
@@ -246,6 +272,14 @@ static void sm100_bf16_mega_moe(
         .y = y.data_ptr(),
         .saved_l1_preact = saved_l1_preact.has_value()
             ? saved_l1_preact->data_ptr()
+            : nullptr,
+        .saved_h_unweighted =
+            saved_h_unweighted.has_value()
+            ? saved_h_unweighted->data_ptr()
+            : nullptr,
+        .saved_h_weighted =
+            saved_h_weighted.has_value()
+            ? saved_h_weighted->data_ptr()
             : nullptr,
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,
         .num_tokens = num_tokens,

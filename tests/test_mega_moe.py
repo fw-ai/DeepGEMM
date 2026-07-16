@@ -117,7 +117,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     def create_inputs():
         global x, topk_idx, topk_weights, l1_weights, l2_weights, transformed_l1_weights, transformed_l2_weights
         global l1_weights_bf16, l2_weights_bf16
-        global saved_l1_preact, saved_down_unweighted
+        global saved_l1_preact, saved_h_unweighted
+        global saved_h_weighted, saved_down_unweighted
         global cumulative_local_expert_recv_stats_fused
         global cumulative_local_expert_recv_stats_baseline
         x = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
@@ -169,6 +170,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             deep_gemm.transform_weights_for_mega_moe(
                 l1_weights, l2_weights, activation=args.activation))
         saved_l1_preact = None
+        saved_h_unweighted = None
+        saved_h_weighted = None
         saved_down_unweighted = None
         if is_bf16xbf16 and (
             args.save_l1_preact or args.test_backward
@@ -176,10 +179,21 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             saved_l1_preact = torch.full(
                 (buffer.token_src_metadata.size(0), 2 * intermediate_hidden),
                 float('nan'), dtype=torch.bfloat16, device='cuda')
+        if is_bf16xbf16 and args.save_l1_preact:
+            saved_h_unweighted = torch.full(
+                (buffer.token_src_metadata.size(0), intermediate_hidden),
+                float('nan'), dtype=torch.bfloat16, device='cuda')
+            saved_h_weighted = torch.full_like(
+                saved_h_unweighted, float('nan'))
         if (
             is_bf16xbf16 and
-            args.route_weight_mode == 'post_down' and
-            args.test_backward
+            (
+                args.save_l1_preact or
+                (
+                    args.route_weight_mode == 'post_down' and
+                    args.test_backward
+                )
+            )
         ):
             saved_down_unweighted = torch.full(
                 (buffer.token_src_metadata.size(0), hidden),
@@ -209,6 +223,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             kernel_kwargs.update(
                 route_weight_mode=deep_gemm.RouteWeightMode(
                     args.route_weight_mode),
+                saved_h_unweighted=saved_h_unweighted,
+                saved_h_weighted=saved_h_weighted,
                 saved_down_unweighted=saved_down_unweighted)
         (deep_gemm.bf16_mega_moe if is_bf16xbf16 else deep_gemm.fp8_fp4_mega_moe)(**kernel_kwargs)
         return y, cumulative_local_expert_recv_stats_fused
@@ -237,6 +253,20 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         dist.all_gather(gathered, padded, group=group)
         return torch.stack(gathered)
 
+    reference_stages = {}
+
+    def native_bf16_grouped_mm(
+        lhs: torch.Tensor,
+        rhs: torch.Tensor,
+    ) -> torch.Tensor:
+        offsets = torch.tensor(
+            [lhs.size(0)], dtype=torch.int32,
+            device=lhs.device)
+        return torch._grouped_mm(
+            lhs.contiguous(),
+            rhs.unsqueeze(0).transpose(-2, -1),
+            offs=offsets)
+
     def run_reference():
         assert is_bf16xbf16 or num_ranks == 1, (
             'Distributed numerical reference only supports BF16')
@@ -264,7 +294,10 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 xt = x_deq[mask]
 
                 # L1 GEMM then split into gate/up (first/second half of the output)
-                acc1 = xt @ l1_w[e].t()
+                acc1 = (
+                    native_bf16_grouped_mm(xt, l1_w[e])
+                    if is_bf16xbf16
+                    else xt @ l1_w[e].t())
                 gate = acc1[:, :intermediate_hidden].to(torch.bfloat16)
                 up = acc1[:, intermediate_hidden:].to(torch.bfloat16)
                 if clamp != float('inf'):
@@ -282,18 +315,33 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                     # multiplication then occurs at its mode-specific BF16
                     # boundary.
                     h = act.to(torch.bfloat16)
+                    h_weighted = (
+                        h.float() *
+                        weight[mask].unsqueeze(1)
+                    ).to(torch.bfloat16)
                     if args.route_weight_mode == 'pre_down':
-                        w2_input = (
-                            h.float() *
-                            weight[mask].unsqueeze(1)
-                        ).to(torch.bfloat16)
-                        l2_out = w2_input @ l2_w[e].t()
+                        w2_input = h_weighted
+                        l2_out = native_bf16_grouped_mm(
+                            w2_input, l2_w[e])
+                        down = l2_out
                     else:
-                        down = h @ l2_w[e].t()
+                        down = native_bf16_grouped_mm(
+                            h, l2_w[e])
                         l2_out = (
                             down.float() *
                             weight[mask].unsqueeze(1)
                         ).to(torch.bfloat16)
+                    if (
+                        num_ranks == 1 and num_tokens == 1 and
+                        num_topk == 1 and num_experts == 1
+                    ):
+                        reference_stages.update({
+                            'w13': acc1.to(torch.bfloat16),
+                            'h': h,
+                            'h_weighted': h_weighted,
+                            'down': down,
+                            'final': l2_out,
+                        })
                 else:
                     # Requantize to FP8 (per-32 UE8M0), matching the
                     # quantized kernel's L1 output.
@@ -311,7 +359,148 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 y[mask] += l2_out.float()
         return y.to(torch.bfloat16)
 
+    def report_single_token_stage_parity(
+        fused_y: torch.Tensor,
+    ):
+        if not (
+            is_bf16xbf16 and num_ranks == 1 and
+            num_tokens == num_topk == num_experts == 1 and
+            saved_l1_preact is not None
+        ):
+            return
+
+        valid_rows = torch.isfinite(
+            saved_l1_preact.float()).all(dim=1)
+        pool_row = int(valid_rows.nonzero()[0].item())
+        actual_stages = {
+            'w13': saved_l1_preact[pool_row].unsqueeze(0),
+            'h': saved_h_unweighted[pool_row].unsqueeze(0),
+            'h_weighted': (
+                saved_h_weighted[pool_row].unsqueeze(0)),
+            'final': fused_y,
+            'down': (
+                saved_down_unweighted[pool_row].unsqueeze(0)),
+        }
+
+        first_difference = None
+        for stage in ('w13', 'h', 'h_weighted', 'down', 'final'):
+            if stage not in actual_stages:
+                continue
+            actual = actual_stages[stage]
+            expected = reference_stages[stage]
+            mismatch = actual != expected
+            mismatch_count = int(mismatch.sum().item())
+            abs_error = (actual.float() - expected.float()).abs()
+            max_abs = float(abs_error.max().item())
+            denominator = expected.float().abs().clamp_min(
+                torch.finfo(torch.float32).tiny)
+            max_relative = float(
+                (abs_error / denominator).max().item())
+            actual_bits = (
+                actual.view(torch.int16).to(torch.int32) &
+                0xffff)
+            expected_bits = (
+                expected.view(torch.int16).to(torch.int32) &
+                0xffff)
+            max_ulp = int(
+                (actual_bits - expected_bits).abs().max().item())
+            max_scale = float(expected.float().abs().max().item())
+            if mismatch_count and first_difference is None:
+                first_difference = stage
+            dist_print(
+                f' > Stage {stage}: mismatches={mismatch_count}/'
+                f'{actual.numel()}, max_abs={max_abs:.9g}, '
+                f'max_rel={max_relative:.9g}, max_ulp={max_ulp}, '
+                f'reference_max_abs={max_scale:.9g}',
+                once_in_node=True)
+        dist_print(
+            f' > First differing stage: {first_difference}',
+            once_in_node=True)
+
+        # Control comparison: plain torch.matmul may choose a different
+        # tensor-core reduction tree than FireTitan's production
+        # torch._grouped_mm path. Report it to make accumulation-order
+        # differences explicit instead of attributing them to MegaMoE.
+        matmul_w13 = (
+            x[:1] @ l1_weights_bf16[0].t())
+        gate = matmul_w13[:, :intermediate_hidden]
+        up = matmul_w13[:, intermediate_hidden:]
+        clamp = float(args.activation_clamp)
+        gate = torch.clamp(gate, max=clamp)
+        up = torch.clamp(up, min=-clamp, max=clamp)
+        matmul_h = (
+            _apply_gate_activation(
+                gate.float(), args.activation) *
+            up.float()).to(torch.bfloat16)
+        route = topk_weights[0, 0].float()
+        matmul_h_weighted = (
+            matmul_h.float() * route
+        ).to(torch.bfloat16)
+        matmul_down = (
+            (
+                matmul_h_weighted
+                if args.route_weight_mode == 'pre_down'
+                else matmul_h
+            ) @ l2_weights_bf16[0].t())
+        matmul_final = (
+            matmul_down
+            if args.route_weight_mode == 'pre_down'
+            else (
+                matmul_down.float() * route
+            ).to(torch.bfloat16))
+        matmul_stages = {
+            'w13': matmul_w13,
+            'h': matmul_h,
+            'h_weighted': matmul_h_weighted,
+            'down': matmul_down,
+            'final': matmul_final,
+        }
+        control_first_difference = None
+        for stage in ('w13', 'h', 'h_weighted', 'down', 'final'):
+            control = matmul_stages[stage]
+            native = reference_stages[stage]
+            mismatch_count = int((control != native).sum().item())
+            abs_error = (control.float() - native.float()).abs()
+            max_abs = float(abs_error.max().item())
+            max_relative = float(
+                (
+                    abs_error /
+                    native.float().abs().clamp_min(
+                        torch.finfo(torch.float32).tiny)
+                ).max().item())
+            control_bits = (
+                control.view(torch.int16).to(torch.int32) &
+                0xffff)
+            native_bits = (
+                native.view(torch.int16).to(torch.int32) &
+                0xffff)
+            max_ulp = int(
+                (control_bits - native_bits).abs().max().item())
+            native_scale = float(
+                native.float().abs().max().item())
+            normalized_max_abs = (
+                max_abs / native_scale
+                if native_scale else 0.0)
+            if (
+                mismatch_count and
+                control_first_difference is None
+            ):
+                control_first_difference = stage
+            dist_print(
+                f' > Matmul control {stage}: '
+                f'mismatches={mismatch_count}/{control.numel()}, '
+                f'max_abs={max_abs:.9g}, '
+                f'normalized_max_abs={normalized_max_abs:.9g}, '
+                f'max_rel={max_relative:.9g}, '
+                f'max_ulp={max_ulp}',
+                once_in_node=True)
+        dist_print(
+            ' > Matmul control first differing stage: '
+            f'{control_first_difference}',
+            once_in_node=True)
+
     def check_bf16_parity(fused_y: torch.Tensor, ref_y: torch.Tensor):
+        report_single_token_stage_parity(fused_y)
         assert torch.isfinite(fused_y.float()).all()
         assert torch.isfinite(ref_y.float()).all()
         if fused_y.numel() > 0 and torch.count_nonzero(ref_y):
@@ -551,8 +740,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                     h.float() * route.float().unsqueeze(1)
                 ).to(torch.bfloat16)
                 grad_w2_input = gye
-                grad_h_w2 = (
-                    gye @ l2_weights_bf16[expert_idx])
+                grad_h_w2 = native_bf16_grouped_mm(
+                    gye,
+                    l2_weights_bf16[expert_idx].t())
                 gh = (
                     grad_h_w2.float() *
                     route.float().unsqueeze(1)
@@ -565,12 +755,12 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                     gye.float() *
                     route.float().unsqueeze(1)
                 ).to(torch.bfloat16)
-                grad_h_w2 = (
-                    grad_w2_input @
-                    l2_weights_bf16[expert_idx])
+                grad_h_w2 = native_bf16_grouped_mm(
+                    grad_w2_input,
+                    l2_weights_bf16[expert_idx].t())
                 gh = grad_h_w2
-                down = (
-                    h @ l2_weights_bf16[expert_idx].t())
+                down = native_bf16_grouped_mm(
+                    h, l2_weights_bf16[expert_idx])
                 grad_route = ordered_fp32_dot(gye, down)
                 torch.testing.assert_close(
                     saved_down_unweighted[rows], down,
@@ -595,9 +785,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             grad_gu = torch.cat(
                 [grad_gate, grad_up], dim=1
             ).to(torch.bfloat16)
-            grad_xe = (
-                grad_gu @ l1_weights_bf16[expert_idx]
-            )
+            grad_xe = native_bf16_grouped_mm(
+                grad_gu,
+                l1_weights_bf16[expert_idx].t())
 
             ref_grad_ye[rows] = grad_w2_input
             ref_grad_y_unweighted[rows] = gye
@@ -629,7 +819,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             source_token = source_tokens[selected]
             source_slot = source_slots[selected]
             xe = autograd_x[source_rank, source_token]
-            preact = xe @ autograd_w13[expert_idx].t()
+            preact = native_bf16_grouped_mm(
+                xe, autograd_w13[expert_idx])
             gate = preact[:, :intermediate_hidden]
             up = preact[:, intermediate_hidden:]
             clamp = float(args.activation_clamp)
@@ -647,11 +838,12 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                     h.float() * route.float().unsqueeze(1)
                 ).to(torch.bfloat16)
                 ye = (
-                    h_weighted_ref @
-                    autograd_w2[expert_idx].t())
+                    native_bf16_grouped_mm(
+                        h_weighted_ref,
+                        autograd_w2[expert_idx]))
             else:
-                down = (
-                    h @ autograd_w2[expert_idx].t())
+                down = native_bf16_grouped_mm(
+                    h, autograd_w2[expert_idx])
                 ye = (
                     down.float() *
                     route.float().unsqueeze(1)

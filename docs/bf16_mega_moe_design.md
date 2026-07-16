@@ -21,6 +21,25 @@ multiplies that output by the route weight, and materializes BF16 again before
 combine. These two rounding boundaries are intentionally not algebraically
 interchanged.
 
+### Native BF16 reference and stage diagnostics
+
+FireTitan's production BF16 expert path uses `torch._grouped_mm`, not
+`torch.matmul`. Strict MegaMoE parity therefore uses the original contiguous
+BF16 master weights with `_grouped_mm`; only the kernel operand is transformed
+to the gate/up-interleaved MegaMoE layout. On SM100, plain matmul may select a
+different tensor-core K-reduction tree. Both perform BF16 GEMM with FP32
+accumulation, but values near a BF16 rounding midpoint can differ even for one
+token. Such differences are not evidence of a MegaMoE layout or arithmetic
+error.
+
+The BF16 forward API has optional full-pool stage captures for raw W13
+gate/up, unweighted activation, route-weighted activation, and unweighted W2
+output. The production-width one-token test compares those captures plus final
+combine against `_grouped_mm`, reporting mismatch count, maximum absolute and
+relative error, BF16 ULP distance, and output-scale-normalized absolute error.
+It also prints a matmul control comparison to identify reduction-order
+differences. Fast math is disabled for these gates.
+
 ## Architecture
 
 ```mermaid
