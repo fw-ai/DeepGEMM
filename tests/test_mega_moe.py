@@ -542,6 +542,63 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 gh_unweighted.float() * h.float()
             ).sum(dim=1)
 
+        # Independently differentiate the native BF16 route computation. Keep
+        # each rank's local experts but retain global source-token leaves so
+        # distributed input and router gradients can be reduced below.
+        autograd_x = all_x.detach().clone().requires_grad_(True)
+        autograd_routes = (
+            all_topk_weights.detach().clone().requires_grad_(True))
+        autograd_w13 = (
+            l1_weights_bf16.detach().clone().requires_grad_(True))
+        autograd_w2 = (
+            l2_weights_bf16.detach().clone().requires_grad_(True))
+        autograd_loss = None
+        for expert_idx in range(num_experts_per_rank):
+            selected = local_experts == expert_idx
+            if not bool(selected.any()):
+                continue
+            source_rank = source_ranks[selected]
+            source_token = source_tokens[selected]
+            source_slot = source_slots[selected]
+            xe = autograd_x[source_rank, source_token]
+            preact = xe @ autograd_w13[expert_idx].t()
+            gate = preact[:, :intermediate_hidden]
+            up = preact[:, intermediate_hidden:]
+            clamp = float(args.activation_clamp)
+            gate = torch.clamp(gate, max=clamp)
+            up = torch.clamp(up, min=-clamp, max=clamp)
+            h = (
+                _apply_gate_activation(
+                    gate.float(), args.activation) *
+                up.float()
+            ).to(torch.bfloat16)
+            route = autograd_routes[
+                source_rank, source_token, source_slot]
+            h_weighted_ref = (
+                h.float() * route.float().unsqueeze(1)
+            ).to(torch.bfloat16)
+            ye = h_weighted_ref @ autograd_w2[expert_idx].t()
+            loss = (
+                ye.float() *
+                all_grad_y[source_rank, source_token].float()
+            ).sum()
+            autograd_loss = (
+                loss if autograd_loss is None
+                else autograd_loss + loss)
+        if autograd_loss is not None:
+            autograd_loss.backward()
+
+        def grad_or_zeros(tensor: torch.Tensor) -> torch.Tensor:
+            return (
+                tensor.grad.detach()
+                if tensor.grad is not None
+                else torch.zeros_like(tensor))
+
+        autograd_grad_x = grad_or_zeros(autograd_x)
+        autograd_grad_routes = grad_or_zeros(autograd_routes)
+        autograd_grad_w13 = grad_or_zeros(autograd_w13)
+        autograd_grad_w2 = grad_or_zeros(autograd_w2)
+
         def assert_gradient_close(
             actual: torch.Tensor,
             expected: torch.Tensor,
@@ -633,6 +690,12 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             grad_w2, ref_grad_w2, 'grad_w2')
         assert_gradient_close(
             grad_w13, ref_grad_w13, 'grad_w13')
+        assert_gradient_close(
+            grad_w2, autograd_grad_w2,
+            'grad_w2_autograd')
+        assert_gradient_close(
+            grad_w13, autograd_grad_w13,
+            'grad_w13_autograd')
 
         if num_ranks > 1:
             ref_grad_x_planes = torch.zeros(
@@ -657,6 +720,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             dist.all_reduce(ref_grad_x_planes, group=group)
             dist.all_reduce(actual_route_planes, group=group)
             dist.all_reduce(ref_route_planes, group=group)
+            dist.all_reduce(autograd_grad_x, group=group)
+            dist.all_reduce(autograd_grad_routes, group=group)
             ref_grad_x = ref_grad_x_planes[
                 rank_idx, :num_tokens
             ].float().sum(dim=1).to(torch.bfloat16)
@@ -667,6 +732,14 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 actual_route_planes[rank_idx, :num_tokens],
                 ref_route_planes[rank_idx, :num_tokens],
                 'grad_route_source')
+            assert_gradient_close(
+                grad_x_combined,
+                autograd_grad_x[rank_idx, :num_tokens],
+                'grad_x_autograd')
+            assert_gradient_close(
+                actual_route_planes[rank_idx, :num_tokens],
+                autograd_grad_routes[rank_idx, :num_tokens],
+                'grad_route_autograd')
 
     dist_print('Config:', once_in_node=True)
     dist_print(f' > MMA: {args.mma_type}', once_in_node=True)
