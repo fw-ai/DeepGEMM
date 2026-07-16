@@ -206,7 +206,8 @@ def bf16_mega_moe(y: torch.Tensor,
                   cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
                   activation: str = 'swiglu',
                   activation_clamp: Optional[float] = None,
-                  fast_math: bool = True):
+                  fast_math: bool = True,
+                  saved_l1_preact: Optional[torch.Tensor] = None):
     _C.bf16_mega_moe(
         y,
         l1_weights,
@@ -220,5 +221,6 @@ def bf16_mega_moe(y: torch.Tensor,
         sym_buffer.num_topk,
         activation, activation_clamp,
         fast_math,
-        sym_buffer.num_ring_tokens
+        sym_buffer.num_ring_tokens,
+        saved_l1_preact
     )

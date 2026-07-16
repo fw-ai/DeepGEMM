@@ -287,11 +287,12 @@ static void bf16_mega_moe(
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
     const bool& fast_math,
-    const int& num_ring_tokens
+    const int& num_ring_tokens,
+    const std::optional<torch::Tensor>& saved_l1_preact
 ) {
     // Config checks
     const auto num_tokens = static_cast<int>(y.size(0));
-    DG_HOST_ASSERT(activation == "swiglu");
+    DG_HOST_ASSERT(activation == "swiglu" or activation == "geglu");
 
     // Activation checks
     const auto activation_clamp =
@@ -306,6 +307,9 @@ static void bf16_mega_moe(
     const auto [num_experts_per_rank_, hidden_, intermediate_hidden] = get_shape<3>(l2_weights);
     DG_HOST_ASSERT(l1_weights.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(l2_weights.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(y.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(y.is_contiguous());
+    DG_HOST_ASSERT(y.sizes() == torch::IntArrayRef({num_tokens, hidden}));
     DG_HOST_ASSERT(num_tokens <= num_max_tokens_per_rank);
     DG_HOST_ASSERT(num_experts_per_rank == num_experts_per_rank_);
     DG_HOST_ASSERT(hidden == hidden_);
@@ -337,6 +341,7 @@ static void bf16_mega_moe(
     // Dispatch into different architectures
     if (arch_major == 10) {
         sm100_bf16_mega_moe(y,
+                            saved_l1_preact,
                             l1_acts, l2_acts, 
                             l1_weights, l2_weights,
                             cumulative_local_expert_recv_stats,
@@ -345,6 +350,7 @@ static void bf16_mega_moe(
                             num_experts_per_rank,
                             num_tokens, num_topk,
                             hidden, intermediate_hidden,
+                            activation,
                             activation_clamp, fast_math);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");

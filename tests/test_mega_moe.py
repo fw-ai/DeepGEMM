@@ -80,8 +80,14 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     # Settings
     is_bf16xbf16 = args.mma_type == 'bf16xbf16'
     num_max_tokens_per_rank = args.num_max_tokens_per_rank
-    num_tokens = max(0, args.num_max_tokens_per_rank - random.randint(0, args.num_max_removed_tokens)) \
+    num_tokens = (
+        0 if args.zero_tokens or args.zero_rank == rank_idx else
+        max(
+            0,
+            args.num_max_tokens_per_rank -
+            random.randint(0, args.num_max_removed_tokens))
         if args.num_tokens == 0 else args.num_tokens
+    )
     hidden, intermediate_hidden = args.hidden, args.intermediate_hidden
     num_experts, num_topk = args.num_experts, args.num_topk
     num_experts_per_rank = num_experts // num_ranks
@@ -111,6 +117,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     def create_inputs():
         global x, topk_idx, topk_weights, l1_weights, l2_weights, transformed_l1_weights, transformed_l2_weights
         global l1_weights_bf16, l2_weights_bf16
+        global saved_l1_preact
         global cumulative_local_expert_recv_stats_fused
         global cumulative_local_expert_recv_stats_baseline
         x = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
@@ -122,6 +129,27 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         l1_weights_bf16, l2_weights_bf16 = l1_weights, l2_weights
         scores = torch.randn((num_tokens, num_experts), dtype=torch.float, device='cuda')
         topk_weights, topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=False)
+        if args.routing == 'balanced':
+            token_ids = torch.arange(
+                num_tokens, device='cuda', dtype=torch.long).unsqueeze(1)
+            slots = torch.arange(
+                num_topk, device='cuda', dtype=torch.long).unsqueeze(0)
+            topk_idx = (token_ids * num_topk + slots) % num_experts
+        elif args.routing == 'skew':
+            token_ids = torch.arange(
+                num_tokens, device='cuda', dtype=torch.long).unsqueeze(1)
+            slots = torch.arange(
+                num_topk, device='cuda', dtype=torch.long).unsqueeze(0)
+            tail = token_ids >= max(1, (num_tokens * 7) // 8)
+            topk_idx = torch.where(
+                tail,
+                (token_ids * num_topk + slots) % num_experts,
+                slots % num_experts)
+        elif args.routing == 'extreme':
+            assert num_topk <= num_experts
+            topk_idx = torch.arange(
+                num_topk, device='cuda', dtype=torch.long
+            ).expand(num_tokens, -1).clone()
         cumulative_local_expert_recv_stats_fused = torch.randint(
             0, 100, (num_experts_per_rank, ), dtype=torch.int, device='cuda')
         cumulative_local_expert_recv_stats_baseline = cumulative_local_expert_recv_stats_fused.clone()
@@ -138,7 +166,13 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             l2_weights = _cast_weights_to_fp4(l2_weights)
 
         transformed_l1_weights, transformed_l2_weights = (
-            deep_gemm.transform_weights_for_mega_moe(l1_weights, l2_weights))
+            deep_gemm.transform_weights_for_mega_moe(
+                l1_weights, l2_weights, activation=args.activation))
+        saved_l1_preact = None
+        if is_bf16xbf16 and args.save_l1_preact:
+            saved_l1_preact = torch.full(
+                (buffer.token_src_metadata.size(0), 2 * intermediate_hidden),
+                float('nan'), dtype=torch.bfloat16, device='cuda')
 
     # Run fused mega MoE
     # NOTES: copy x into buffer before each call because debug mode zeros the entire buffer
@@ -158,25 +192,56 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats_fused,
             activation=args.activation,
             activation_clamp=args.activation_clamp,
-            fast_math=bool(args.fast_math))
+            fast_math=bool(args.fast_math),
+            saved_l1_preact=saved_l1_preact)
         (deep_gemm.bf16_mega_moe if is_bf16xbf16 else deep_gemm.fp8_fp4_mega_moe)(**kernel_kwargs)
         return y, cumulative_local_expert_recv_stats_fused
 
-    # Self-contained PyTorch reference (single-rank only: routing/combine is local)
-    # Mirrors the fused pipeline: L1 GEMM -> gated activation (* topk weight) ->
-    # per-32 UE8M0 FP8 requantization -> L2 GEMM -> top-k combine (plain sum).
+    # Self-contained PyTorch reference. Distributed routing/combine is modeled
+    # for BF16; the quantized reference remains single-rank.
+    def gather_expert_weights(local_weights: torch.Tensor) -> torch.Tensor:
+        if num_ranks == 1:
+            return local_weights
+        gathered = [torch.empty_like(local_weights) for _ in range(num_ranks)]
+        dist.all_gather(gathered, local_weights.contiguous(), group=group)
+        return torch.cat(gathered, dim=0)
+
+    def gather_rank_padded(
+        local_tensor: torch.Tensor, fill_value: float
+    ) -> torch.Tensor:
+        padded_shape = (
+            buffer.num_max_tokens_per_rank, *local_tensor.shape[1:])
+        padded = torch.full(
+            padded_shape, fill_value,
+            dtype=local_tensor.dtype, device=local_tensor.device)
+        padded[:local_tensor.size(0)].copy_(local_tensor)
+        if num_ranks == 1:
+            return padded.unsqueeze(0)
+        gathered = [torch.empty_like(padded) for _ in range(num_ranks)]
+        dist.all_gather(gathered, padded, group=group)
+        return torch.stack(gathered)
+
     def run_reference():
-        assert num_ranks == 1, 'Reference only supports a single rank'
+        assert is_bf16xbf16 or num_ranks == 1, (
+            'Distributed numerical reference only supports BF16')
         clamp = float(args.activation_clamp)
-        x_deq = _dequant_x_fp8(x[0][:num_tokens], x[1][:num_tokens])
-        l1_w = _dequant_weight_fp4(l1_weights_bf16)
-        l2_w = _dequant_weight_fp4(l2_weights_bf16)
+        if is_bf16xbf16:
+            x_deq = x[:num_tokens]
+            l1_w = gather_expert_weights(l1_weights_bf16)
+            l2_w = gather_expert_weights(l2_weights_bf16)
+            num_reference_experts = num_experts
+        else:
+            x_deq = _dequant_x_fp8(
+                x[0][:num_tokens], x[1][:num_tokens])
+            l1_w = _dequant_weight_fp4(l1_weights_bf16)
+            l2_w = _dequant_weight_fp4(l2_weights_bf16)
+            num_reference_experts = num_experts_per_rank
 
         y = torch.zeros((num_tokens, hidden), dtype=torch.float32, device='cuda')
         for slot in range(num_topk):
             expert_idx = topk_idx[:num_tokens, slot]
             weight = topk_weights[:num_tokens, slot].float()
-            for e in range(num_experts_per_rank):
+            for e in range(num_reference_experts):
                 mask = expert_idx == e
                 if not bool(mask.any()):
                     continue
@@ -194,15 +259,95 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 act = _apply_gate_activation(gate.float(), args.activation) * up.float()
                 act = act * weight[mask].unsqueeze(1)
 
-                # Requantize to FP8 (per-32 UE8M0), matching the kernel's L1 output
-                act_fp8, act_sf = per_token_cast_to_fp8(act, use_ue8m0=True, gran_k=32)
-                n_groups = intermediate_hidden // 32
-                act_deq = (act_fp8.float().view(-1, n_groups, 32) * act_sf[:, :n_groups].unsqueeze(2)
-                           ).view(-1, intermediate_hidden)
+                if is_bf16xbf16:
+                    # Native BF16 contract: round the activation output before
+                    # W2, then round W2 before the FP32 top-k reduction.
+                    act_deq = act.to(torch.bfloat16)
+                    l2_out = act_deq @ l2_w[e].t()
+                else:
+                    # Requantize to FP8 (per-32 UE8M0), matching the
+                    # quantized kernel's L1 output.
+                    act_fp8, act_sf = per_token_cast_to_fp8(
+                        act, use_ue8m0=True, gran_k=32)
+                    n_groups = intermediate_hidden // 32
+                    act_deq = (
+                        act_fp8.float().view(-1, n_groups, 32) *
+                        act_sf[:, :n_groups].unsqueeze(2)
+                    ).view(-1, intermediate_hidden)
+                    l2_out = act_deq @ l2_w[e].t()
 
                 # L2 GEMM, accumulate across the top-k experts
-                y[mask] += act_deq @ l2_w[e].t()
+                y[mask] += l2_out.float()
         return y.to(torch.bfloat16)
+
+    def check_bf16_parity(fused_y: torch.Tensor, ref_y: torch.Tensor):
+        assert torch.isfinite(fused_y.float()).all()
+        assert torch.isfinite(ref_y.float()).all()
+        if fused_y.numel() > 0 and torch.count_nonzero(ref_y):
+            cosine = torch.nn.functional.cosine_similarity(
+                fused_y.float().flatten(),
+                ref_y.float().flatten(),
+                dim=0).item()
+            assert cosine >= 0.999999, f'BF16 cosine too small: {cosine}'
+        torch.testing.assert_close(
+            fused_y, ref_y, rtol=2 ** -7, atol=2 ** -7)
+        if num_ranks == 1 and num_tokens == num_topk == num_experts == 1:
+            assert torch.equal(
+                fused_y, ref_y), 'deterministic 1x1 route must be bitwise equal'
+
+        expected_stats = cumulative_local_expert_recv_stats_baseline.clone()
+        all_topk_idx = gather_rank_padded(topk_idx, -1)
+        local_expert_start = rank_idx * num_experts_per_rank
+        valid_experts = all_topk_idx[
+            (all_topk_idx >= local_expert_start) &
+            (all_topk_idx < local_expert_start + num_experts_per_rank)
+        ] - local_expert_start
+        if valid_experts.numel():
+            expected_stats += torch.bincount(
+                valid_experts, minlength=num_experts_per_rank).to(torch.int)
+        assert torch.equal(
+            cumulative_local_expert_recv_stats_fused, expected_stats)
+
+        if saved_l1_preact is None:
+            return
+
+        finite = torch.isfinite(saved_l1_preact.float())
+        valid_rows = finite.all(dim=1)
+        assert torch.equal(valid_rows, finite.any(dim=1)), (
+            'saved pre-clamp rows must be either complete or untouched')
+        assert valid_rows.sum().item() == valid_experts.numel()
+        metadata = buffer.token_src_metadata[valid_rows].long()
+        all_x = gather_rank_padded(x, 0)
+        global_l1_weights = gather_expert_weights(l1_weights_bf16)
+        if metadata.numel() == 0:
+            return
+        assert (
+            (metadata[:, 0] >= 0) &
+            (metadata[:, 0] < num_ranks)
+        ).all()
+        source_ranks = metadata[:, 0]
+        token_ids, topk_slots = metadata[:, 1], metadata[:, 2]
+        expert_ids = all_topk_idx[source_ranks, token_ids, topk_slots]
+        expected_preact = torch.empty(
+            (metadata.size(0), 2 * intermediate_hidden),
+            dtype=torch.bfloat16, device='cuda')
+        for expert_idx in range(num_experts):
+            mask = expert_ids == expert_idx
+            if bool(mask.any()):
+                expected_preact[mask] = (
+                    all_x[source_ranks[mask], token_ids[mask]] @
+                    global_l1_weights[expert_idx].t())
+        actual_preact = saved_l1_preact[valid_rows]
+        assert torch.isfinite(actual_preact.float()).all()
+        preact_cosine = torch.nn.functional.cosine_similarity(
+            actual_preact.float().flatten(),
+            expected_preact.float().flatten(),
+            dim=0).item()
+        assert preact_cosine >= 0.999999, (
+            f'pre-clamp cosine too small: {preact_cosine}')
+        torch.testing.assert_close(
+            actual_preact, expected_preact,
+            rtol=2 ** -7, atol=2 ** -7)
 
     dist_print('Config:', once_in_node=True)
     dist_print(f' > MMA: {args.mma_type}', once_in_node=True)
@@ -293,9 +438,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     num_correctness_tests = 1 if args.num_correctness_tests is None else args.num_correctness_tests
     # The legacy tilelang baseline is bitwise-identical but only implements SwiGLU
     use_legacy_baseline = is_legacy_loaded and args.activation == 'swiglu'
-    # The self-contained numerical reference covers any activation but only the
-    # single-rank FP8 path (it models the kernel's FP8 L1-output requantization)
-    use_numerical_reference = num_ranks == 1 and not is_bf16xbf16
+    # The self-contained reference models the native BF16 boundaries and the
+    # quantized FP8/FP4 boundaries, but only local routing/combine.
+    use_numerical_reference = is_bf16xbf16 or num_ranks == 1
     ran_correctness = False
 
     # noinspection PyBroadException
@@ -318,8 +463,12 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             create_inputs()
             fused_y, _ = run_fused()
             ref_y = run_reference()
-            diff = calc_diff(fused_y, ref_y)
-            assert diff < max_diff, f'{args.activation} diff too large: {diff:.5f} >= {max_diff}'
+            if is_bf16xbf16:
+                check_bf16_parity(fused_y, ref_y)
+                diff = calc_diff(fused_y, ref_y)
+            else:
+                diff = calc_diff(fused_y, ref_y)
+                assert diff < max_diff, f'{args.activation} diff too large: {diff:.5f} >= {max_diff}'
             if (i + 1) % 100 == 0 or i == num_correctness_tests - 1:
                 dist_print(f' > Correctness test #{i + 1}/{num_correctness_tests} passed (diff {diff:.5f})', once_in_node=True)
         dist_print(once_in_node=True)
@@ -395,6 +544,8 @@ if __name__ == '__main__':
     # Model settings
     parser.add_argument('--num-max-tokens-per-rank', type=int, default=8192, help='Number of maximum tokens per rank')
     parser.add_argument('--num-tokens', type=int, default=0, help='Number of tokens per rank (follow max minus removed if 0)')
+    parser.add_argument('--zero-tokens', action='store_true', help='Launch a rank with exactly zero tokens')
+    parser.add_argument('--zero-rank', type=int, default=-1, help='Rank that launches with zero tokens')
     parser.add_argument('--num-max-removed-tokens', type=int, default=0, help='Maximum number of tokens to remove')
     parser.add_argument('--hidden', type=int, default=7168, help='Hidden size')
     parser.add_argument('--intermediate-hidden', type=int, default=3072, help='Intermediate hidden size')
@@ -403,8 +554,10 @@ if __name__ == '__main__':
     parser.add_argument('--num-experts', type=int, default=384, help='Number of experts')
     parser.add_argument('--num-topk', type=int, default=6, help='Number of expert selections')
     parser.add_argument('--masked-ratio', type=float, default=0.0, help='Mask some expert selections')
+    parser.add_argument('--routing', choices=['random', 'balanced', 'skew', 'extreme'], default='random')
     parser.add_argument('--fast-math', type=int, default=1, help='Enable fast math (0 or 1, default: 1)')
     parser.add_argument('--mma-type', type=str, default='fp8xfp4', help='MMA type: fp8xfp4 or bf16xbf16')
+    parser.add_argument('--save-l1-preact', action='store_true', help='Validate optional exact BF16 W13 output')
 
     # Test settings
     parser.add_argument('--num-correctness-tests', type=int, default=None, help='Pressure test')

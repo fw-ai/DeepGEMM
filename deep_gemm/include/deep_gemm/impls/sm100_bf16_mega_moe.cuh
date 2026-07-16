@@ -6,6 +6,7 @@
 
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/tma_copy.cuh>
+#include <deep_gemm/common/types.cuh>
 #include <deep_gemm/common/utils.cuh>
 #include <deep_gemm/comm/barrier.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
@@ -33,6 +34,8 @@ template <
     uint32_t kNumSMs, uint32_t kNumRanks,
     float kActivationClamp,
     bool kFastMath,
+    ActivationType kActivationType,
+    bool kSaveL1Preact,
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
     uint32_t L2_SHAPE_N = kHidden,
@@ -48,6 +51,7 @@ template <
 >
 CUTLASS_GLOBAL __launch_bounds__(kNumThreads, 1) void
 sm100_bf16_mega_moe_impl(void* y,
+                         nv_bfloat16* saved_l1_preact,
                          int* cumulative_local_expert_recv_stats,
                          const uint32_t num_tokens,
                          const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
@@ -846,7 +850,8 @@ sm100_bf16_mega_moe_impl(void* y,
                 const auto num_expected_blocks = (L2_SHAPE_N / BLOCK_N) * (pool_block_idx / kNumRingBlocks);
                 while (ptx::ld_acq(l2_empty_ptr) != num_expected_blocks);
 
-                // Unified L1 epilogue: SwiGLU in-place using granularity 8 interleaved weights
+                // Unified L1 epilogue: gated activation in-place using
+                // granularity 8 interleaved weights.
                 // With `SM100_TMEM_LOAD_16dp256b1x`, gate/up pairs are:
                 //   (values[0], values[2]), (values[1], values[3]),
                 //   (values[4], values[6]), (values[5], values[7])
@@ -898,13 +903,67 @@ sm100_bf16_mega_moe_impl(void* y,
                             shared_storage.tmem_empty_barriers[accum_stage_idx].arrive(0u);
                         }
 
-                        // Apply SwiGLU: silu(gate) * up
+                        // Apply gated activation: act(gate) * up.
                         // Gate/up pairs: (0, 2), (1, 3), (4, 6), (5, 7)
                         auto fp32_values = reinterpret_cast<float*>(values);
                         #pragma unroll
                         for (uint32_t k = 0; k < 2; ++ k) {
                             auto bf16_gate = __float22bfloat162_rn(make_float2(fp32_values[k * 4], fp32_values[k * 4 + 1]));
                             auto bf16_up = __float22bfloat162_rn(make_float2(fp32_values[k * 4 + 2], fp32_values[k * 4 + 3]));
+
+                            if constexpr (kSaveL1Preact) {
+                                // Persist exact BF16 W13 output before clamp in
+                                // the caller-owned full-pool tensor. Convert
+                                // from the interleaved MMA column order back to
+                                // [gate | up].
+                                const uint32_t hidden_col =
+                                    warp_idx_in_wg * 16 +
+                                    (lane_idx / 4) * 2 + k;
+                                const uint32_t chunk = hidden_col / 8;
+                                const uint32_t in_chunk = hidden_col & 7;
+                                const uint32_t gate_col =
+                                    chunk * 16 + in_chunk;
+                                const auto output_col = [=](uint32_t col) {
+                                    const uint32_t low = col & 31;
+                                    return n_idx + (col & ~31u) +
+                                        ((low & 1) << 4) +
+                                        ((low >> 1) & 3) +
+                                        (low & 8) +
+                                        ((low & 16) >> 2);
+                                };
+                                const uint32_t physical_gate_col =
+                                    output_col(gate_col);
+                                const uint32_t deinterleaved_col =
+                                    (physical_gate_col / 16) * 8 +
+                                    (physical_gate_col & 7);
+                                const uint32_t row_base =
+                                    pool_m_idx +
+                                    epilogue_wg_idx * WG_BLOCK_M +
+                                    s * STORE_BLOCK_M +
+                                    i * ATOM_M +
+                                    (lane_idx % 4) * 2;
+                                const uint32_t gate_bits =
+                                    *reinterpret_cast<const uint32_t*>(&bf16_gate);
+                                const uint32_t up_bits =
+                                    *reinterpret_cast<const uint32_t*>(&bf16_up);
+                                #pragma unroll
+                                for (uint32_t r = 0; r < 2; ++ r) {
+                                    const uint32_t m_out = row_base + r;
+                                    if (m_out < pool_m_idx + valid_m) {
+                                        auto* dst = reinterpret_cast<uint16_t*>(
+                                            saved_l1_preact +
+                                            static_cast<uint64_t>(m_out) *
+                                                (2 * kIntermediateHidden));
+                                        dst[deinterleaved_col] =
+                                            static_cast<uint16_t>(
+                                                gate_bits >> (r * 16));
+                                        dst[kIntermediateHidden +
+                                            deinterleaved_col] =
+                                            static_cast<uint16_t>(
+                                                up_bits >> (r * 16));
+                                    }
+                                }
+                            }
 
                             // Clamp
                             if constexpr (kActivationClamp != cute::numeric_limits<float>::infinity()) {
@@ -913,20 +972,44 @@ sm100_bf16_mega_moe_impl(void* y,
                                 bf16_up = __hmin2(bf16_up, {kActivationClamp, kActivationClamp});
                             }
 
-                            // SwiGLU
-                            auto gate = __bfloat1622float2(bf16_gate);
-                            auto neg_gate_exp = make_float2(
-                                kFastMath ? __expf(-gate.x) : expf(-gate.x),
-                                kFastMath ? __expf(-gate.y) : expf(-gate.y));
-                            const auto denom = __fadd2_rn({1.0f, 1.0f}, neg_gate_exp);
-                            if constexpr (kFastMath) {
-                                gate = __fmul2_rn(gate, {math::fast_rcp(denom.x), math::fast_rcp(denom.y)});
-                            } else {
-                                gate = {gate.x / denom.x, gate.y / denom.y};
-                            }
+                            const auto gate = __bfloat1622float2(bf16_gate);
                             const auto up = __bfloat1622float2(bf16_up);
+                            float2 z;
+                            if constexpr (kActivationType == ActivationType::GeGLU) {
+                                constexpr float kAlpha = 1.5957691216057308f;
+                                constexpr float kBeta = 0.044715f;
+                                const auto gate_sq = __fmul2_rn(gate, gate);
+                                z = __fmul2_rn(
+                                    {kAlpha, kAlpha},
+                                    __fmul2_rn(
+                                        gate,
+                                        __fadd2_rn(
+                                            {1.0f, 1.0f},
+                                            __fmul2_rn(
+                                                {kBeta, kBeta}, gate_sq))));
+                            } else {
+                                z = gate;
+                            }
+
+                            const auto neg_exp = make_float2(
+                                kFastMath ? __expf(-z.x) : expf(-z.x),
+                                kFastMath ? __expf(-z.y) : expf(-z.y));
+                            const auto denom =
+                                __fadd2_rn({1.0f, 1.0f}, neg_exp);
+                            float2 activated;
+                            if constexpr (kFastMath) {
+                                activated = __fmul2_rn(
+                                    gate,
+                                    {math::fast_rcp(denom.x),
+                                     math::fast_rcp(denom.y)});
+                            } else {
+                                activated = {
+                                    gate.x / denom.x,
+                                    gate.y / denom.y};
+                            }
                             bf16x2_output[i * 2 + k] = __float22bfloat162_rn(
-                                __fmul2_rn(__fmul2_rn(gate, up), weights));
+                                __fmul2_rn(
+                                    __fmul2_rn(activated, up), weights));
                         }
                     }
 
