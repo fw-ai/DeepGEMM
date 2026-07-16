@@ -296,7 +296,8 @@ static void bf16_mega_moe(
     const std::string& route_weight_mode,
     const std::optional<torch::Tensor>& saved_h_unweighted,
     const std::optional<torch::Tensor>& saved_h_weighted,
-    const std::optional<torch::Tensor>& saved_down_unweighted
+    const std::optional<torch::Tensor>& saved_down_unweighted,
+    const int& num_config_tokens
 ) {
     // Config checks
     const auto num_tokens = static_cast<int>(y.size(0));
@@ -322,6 +323,8 @@ static void bf16_mega_moe(
     DG_HOST_ASSERT(y.is_contiguous());
     DG_HOST_ASSERT(y.sizes() == torch::IntArrayRef({num_tokens, hidden}));
     DG_HOST_ASSERT(num_tokens <= num_max_tokens_per_rank);
+    DG_HOST_ASSERT(num_config_tokens >= num_tokens);
+    DG_HOST_ASSERT(num_config_tokens <= num_max_tokens_per_rank);
     DG_HOST_ASSERT(num_experts_per_rank == num_experts_per_rank_);
     DG_HOST_ASSERT(hidden == hidden_);
     DG_HOST_ASSERT(intermediate_hidden_2 == 2 * intermediate_hidden);
@@ -359,7 +362,7 @@ static void bf16_mega_moe(
                             sym_buffer_ptrs,
                             rank_idx, num_max_tokens_per_rank,
                             num_experts_per_rank,
-                            num_tokens, num_topk,
+                            num_tokens, num_config_tokens, num_topk,
                             hidden, intermediate_hidden,
                             activation,
                             activation_clamp, fast_math,

@@ -231,6 +231,18 @@ def bf16_mega_moe(y: torch.Tensor,
     ):
         raise ValueError(
             "both activation stage outputs must be provided together")
+    num_config_tokens = y.size(0)
+    if sym_buffer.group.size() > 1:
+        # The config selects BLOCK_M, which defines the persistent launch and
+        # pool packing. Empty source ranks can still receive expert rows, so
+        # every rank must select the config from the same source-token extent.
+        rank_uniform_num_tokens = torch.tensor(
+            num_config_tokens, dtype=torch.int32, device=y.device)
+        dist.all_reduce(
+            rank_uniform_num_tokens,
+            op=dist.ReduceOp.MAX,
+            group=sym_buffer.group)
+        num_config_tokens = int(rank_uniform_num_tokens.item())
     _C.bf16_mega_moe(
         y,
         l1_weights,
@@ -250,4 +262,5 @@ def bf16_mega_moe(y: torch.Tensor,
         saved_h_unweighted,
         saved_h_weighted,
         saved_down_unweighted,
+        num_config_tokens,
     )

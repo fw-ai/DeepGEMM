@@ -602,7 +602,11 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         actual_stages = {
             'w13': saved_l1_preact[native_pool_indices],
             'h': saved_h_unweighted[native_pool_indices],
-            activation_stage: saved_h_weighted[native_pool_indices],
+            activation_stage: (
+                saved_h_weighted[native_pool_indices]
+                if args.route_weight_mode == 'pre_down'
+                else saved_h_unweighted[native_pool_indices]
+            ),
             'down': saved_down_unweighted[native_pool_indices],
         }
         first_difference = (
@@ -728,8 +732,16 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             assert valid_rows.sum().item() == valid_experts.numel()
 
     def run_bf16_backward_test():
+        config_num_tokens = torch.tensor(
+            num_tokens, dtype=torch.int32, device='cuda')
+        if num_ranks > 1:
+            dist.all_reduce(
+                config_num_tokens,
+                op=dist.ReduceOp.MAX,
+                group=group)
         expected_tokens_per_expert = (
-            num_tokens * num_ranks * num_topk / num_experts)
+            int(config_num_tokens.item()) *
+            num_ranks * num_topk / num_experts)
         if expected_tokens_per_expert <= 8.5:
             block_m = 16
         elif expected_tokens_per_expert <= 16.5:
@@ -791,6 +803,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             2)
         grid_sync_counter = torch.zeros(
             num_grid_states, dtype=torch.int, device='cuda')
+        metadata_before_backward = buffer.token_src_metadata.clone()
 
         deep_gemm.bf16_mega_moe_backward_dgrad(
             gate_up_output=saved_l1_preact,
@@ -820,6 +833,25 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             direct_remote_grad_x=num_ranks > 1,
             write_grad_x_pool=True,
             clear_wgrad_padding=True)
+        actual_direct_grad_x_planes = None
+        if num_ranks > 1:
+            actual_direct_grad_x_planes = torch.as_strided(
+                buffer.backward_grad_y,
+                size=(
+                    num_topk,
+                    buffer.num_max_tokens_per_rank,
+                    hidden,
+                ),
+                stride=(
+                    buffer.num_max_tokens_per_rank * hidden,
+                    hidden,
+                    1,
+                ),
+            ).clone()
+        assert torch.equal(
+            buffer.token_src_metadata,
+            metadata_before_backward), (
+                'backward must preserve forward source-route metadata')
         valid_rows = torch.isfinite(
             saved_l1_preact.float()).all(dim=1)
         metadata = buffer.token_src_metadata[valid_rows].long()
@@ -941,13 +973,13 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             offsets,
             rhs_needs_transpose=False))
 
-        ref_grad_ye[pool_indices] = grad_w2_input
+        ref_grad_ye[actual_pool_indices] = grad_w2_input
         ref_grad_y_unweighted[pool_indices] = gye
         ref_grad_h[pool_indices] = grad_h_w2
-        ref_grad_gate_up[pool_indices] = grad_gu
+        ref_grad_gate_up[actual_pool_indices] = grad_gu
         ref_h_act[pool_indices] = h
-        ref_h_weighted[pool_indices] = w2_input
-        ref_x_pool[pool_indices] = xe
+        ref_h_weighted[actual_pool_indices] = w2_input
+        ref_x_pool[actual_pool_indices] = xe
         ref_grad_x_pool[pool_indices] = grad_xe
         ref_route_weights[pool_indices] = route
         ref_grad_route[pool_indices] = grad_route
@@ -1061,13 +1093,13 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             deep_gemm.bf16_mega_moe_backward_w13(
                 grad_w13, grad_gate_up, x_pool,
                 padded_expert_counts)
-        compact_grad_ye = ref_grad_ye[pool_indices]
-        compact_h_weighted = ref_h_weighted[pool_indices]
+        compact_grad_ye = ref_grad_ye[actual_pool_indices]
+        compact_h_weighted = ref_h_weighted[actual_pool_indices]
         compact_grad_gate = ref_grad_gate_up[
-            pool_indices, :intermediate_hidden]
+            actual_pool_indices, :intermediate_hidden]
         compact_grad_up = ref_grad_gate_up[
-            pool_indices, intermediate_hidden:]
-        compact_x = ref_x_pool[pool_indices]
+            actual_pool_indices, intermediate_hidden:]
+        compact_x = ref_x_pool[actual_pool_indices]
         # These are the exact native FireTitan transposed-LHS grouped-MM
         # calls. They preserve the native K-group boundaries and BF16 output
         # rounding; no per-expert Python matmul participates in parity.
@@ -1132,11 +1164,11 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
         if num_ranks > 1:
             ref_grad_x_planes = torch.zeros(
-                (num_ranks, num_max_tokens_per_rank,
+                (num_ranks, buffer.num_max_tokens_per_rank,
                  num_topk, hidden),
                 dtype=torch.bfloat16, device='cuda')
             actual_route_planes = torch.zeros(
-                (num_ranks, num_max_tokens_per_rank,
+                (num_ranks, buffer.num_max_tokens_per_rank,
                  num_topk),
                 dtype=torch.float, device='cuda')
             ref_route_planes = torch.zeros_like(
@@ -1153,6 +1185,37 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             dist.all_reduce(ref_grad_x_planes, group=group)
             dist.all_reduce(actual_route_planes, group=group)
             dist.all_reduce(ref_route_planes, group=group)
+            assert actual_direct_grad_x_planes is not None
+            direct_expected = ref_grad_x_planes[
+                rank_idx, :num_tokens
+            ].permute(1, 0, 2)
+            if not torch.equal(
+                actual_direct_grad_x_planes[:, :num_tokens],
+                direct_expected,
+            ):
+                cross_slot_mismatches = [
+                    [
+                        int((
+                            actual_direct_grad_x_planes[
+                                actual_slot, :num_tokens
+                            ] != direct_expected[expected_slot]
+                        ).sum().item())
+                        for expected_slot in range(num_topk)
+                    ]
+                    for actual_slot in range(num_topk)
+                ]
+                dist_print(
+                    f' > grad_x source slot cross-mismatches: '
+                    f'{cross_slot_mismatches}',
+                    once_in_node=True)
+            assert_gradient_close(
+                actual_direct_grad_x_planes[
+                    :, :num_tokens
+                ].permute(1, 0, 2),
+                ref_grad_x_planes[
+                    rank_idx, :num_tokens
+                ],
+                'grad_x_source_planes')
             ref_grad_x_fp32 = torch.zeros(
                 (num_tokens, hidden),
                 dtype=torch.float32,

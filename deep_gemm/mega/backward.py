@@ -47,7 +47,7 @@ def _sort_bf16_pool_in_deepep_order(
         return
 
     seen_ptrs = set()
-    for tensor in (*tensors, token_src_metadata):
+    for tensor in tensors:
         ptr = tensor.data_ptr()
         if ptr in seen_ptrs:
             continue
@@ -235,7 +235,16 @@ def bf16_mega_moe_backward_dgrad(
         native_grad_x_planes[
             metadata[:, 0], metadata[:, 1], metadata[:, 2]
         ] = native_grad_x
-        sym_buffer._native_grad_x_planes = native_grad_x_planes
+        dist.all_reduce(native_grad_x_planes, group=sym_buffer.group)
+        # Install the corrected values into the real slot-major symmetric
+        # planes before the fused W13 combine. Reducing a shadow tensor after
+        # combine masks destination/slot bugs and leaves direct-plane users
+        # observing the fused W13 dgrad's different accumulation boundary.
+        backward_grad_y.copy_(
+            native_grad_x_planes[
+                sym_buffer.group.rank()
+            ].permute(1, 0, 2)
+        )
 
     # MegaMoE's communication scheduler deliberately interleaves source
     # ranks, while DeepEP's native grouped wgrads consume stable
@@ -243,18 +252,10 @@ def bf16_mega_moe_backward_dgrad(
     # standalone wgrad kernels so their K traversal matches FireTitan.
     _sort_bf16_pool_in_deepep_order(
         (
-            gate_up_output,
-            grad_h_output,
             grad_gate_up_output,
-            h_act_output,
             h_weighted_output,
             x_pool_output,
-            grad_x_pool_output,
-            grad_route_output,
             grad_ye,
-            grad_y_unweighted_output,
-            route_weights,
-            down_unweighted_output,
         ),
         sym_buffer.token_src_metadata,
         valid_rows,
@@ -441,21 +442,3 @@ def bf16_mega_moe_backward_w13_combine(
         sym_buffer.num_max_tokens_per_rank,
         sym_buffer.num_topk,
     )
-    native_grad_x_planes = getattr(
-        sym_buffer, "_native_grad_x_planes", None)
-    if native_grad_x_planes is not None:
-        dist.all_reduce(native_grad_x_planes, group=sym_buffer.group)
-        grad_x_fp32 = torch.zeros(
-            grad_x_output.shape,
-            dtype=torch.float32,
-            device=grad_x_output.device,
-        )
-        for slot in range(sym_buffer.num_topk):
-            grad_x_fp32.add_(
-                native_grad_x_planes[
-                    sym_buffer.group.rank(),
-                    :grad_x_output.size(0),
-                    slot,
-                ].float())
-        grad_x_output.copy_(grad_x_fp32.to(grad_x_output.dtype))
-        del sym_buffer._native_grad_x_planes

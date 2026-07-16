@@ -148,7 +148,8 @@ static void sm100_bf16_mega_moe(
     const std::vector<int64_t>& sym_buffer_ptrs,
     const int& rank_idx, const int& num_max_tokens_per_rank,
     const int& num_experts_per_rank,
-    const int& num_tokens, const int& num_topk,
+    const int& num_tokens, const int& num_config_tokens,
+    const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const std::string& activation,
     const float& activation_clamp,
@@ -165,7 +166,8 @@ static void sm100_bf16_mega_moe(
     // Heuristics
     const auto config = get_mega_moe_config(
         num_ranks, num_experts, num_experts_per_rank,
-        num_max_tokens_per_rank, num_tokens, num_topk, hidden, intermediate_hidden,
+        num_max_tokens_per_rank, num_config_tokens, num_topk,
+        hidden, intermediate_hidden,
         num_ring_tokens, 0, MmaKind::BF16);
     if (saved_l1_preact.has_value()) {
         const auto num_max_pool_tokens = layout::get_num_max_pool_tokens(
