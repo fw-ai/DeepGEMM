@@ -165,12 +165,16 @@ get_symm_buffer_size_for_mega_moe(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(workspace.get_token_src_metadata_ptr(0))),
             {static_cast<int64_t>(workspace.num_max_pool_tokens), 3},
             torch::TensorOptions().dtype(torch::kInt).device(buffer.device()));
-        // The combine region is dead after the forward returns. Reuse its first
-        // token plane as the symmetric BF16 grad-y source for backward dispatch.
-        auto backward_grad_y = torch::from_blob(
+        // The combine region is dead after the forward returns. Keep the public
+        // grad-y view two-dimensional, but retain storage for every top-k plane
+        // so BF16 backward can reuse the region for direct grad-x write-back.
+        // MXFP4 callers continue to observe the original [tokens, hidden] view.
+        auto backward_combine_planes = torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(combine_token_buffer.base)),
-            {num_max_tokens_per_rank, hidden},
+            {num_topk * num_max_tokens_per_rank, hidden},
             torch::TensorOptions().dtype(torch::kBFloat16).device(buffer.device()));
+        auto backward_grad_y = backward_combine_planes.narrow(
+            0, 0, num_max_tokens_per_rank);
         return std::make_tuple(x, x_sf, topk_idx, topk_weights, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf,
                                token_src_metadata, backward_grad_y);
     };

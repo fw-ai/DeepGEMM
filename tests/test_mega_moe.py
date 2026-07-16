@@ -169,7 +169,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             deep_gemm.transform_weights_for_mega_moe(
                 l1_weights, l2_weights, activation=args.activation))
         saved_l1_preact = None
-        if is_bf16xbf16 and args.save_l1_preact:
+        if is_bf16xbf16 and (
+            args.save_l1_preact or args.test_backward
+        ):
             saved_l1_preact = torch.full(
                 (buffer.token_src_metadata.size(0), 2 * intermediate_hidden),
                 float('nan'), dtype=torch.bfloat16, device='cuda')
@@ -349,6 +351,323 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             actual_preact, expected_preact,
             rtol=2 ** -7, atol=2 ** -7)
 
+    def run_bf16_backward_test():
+        expected_tokens_per_expert = (
+            num_tokens * num_ranks * num_topk / num_experts)
+        if expected_tokens_per_expert <= 8.5:
+            block_m = 16
+        elif expected_tokens_per_expert <= 16.5:
+            block_m = 32
+        elif expected_tokens_per_expert <= 32.5:
+            block_m = 64
+        elif expected_tokens_per_expert <= 64.5:
+            block_m = 96
+        elif expected_tokens_per_expert <= 96.5:
+            block_m = 128
+        else:
+            block_m = 192
+
+        all_topk_idx = gather_rank_padded(topk_idx, -1)
+        all_topk_weights = gather_rank_padded(topk_weights, 0)
+        local_expert_start = rank_idx * num_experts_per_rank
+        local_route_mask = (
+            (all_topk_idx >= local_expert_start) &
+            (all_topk_idx <
+             local_expert_start + num_experts_per_rank))
+        local_expert_ids = (
+            all_topk_idx[local_route_mask] - local_expert_start)
+        expert_counts = torch.bincount(
+            local_expert_ids,
+            minlength=num_experts_per_rank).to(torch.int)
+        padded_expert_counts = (
+            (expert_counts + block_m - 1) // block_m * block_m)
+
+        pool_rows = saved_l1_preact.size(0)
+        grad_y = torch.randn(
+            (num_tokens, hidden),
+            dtype=torch.bfloat16, device='cuda')
+        all_grad_y = gather_rank_padded(grad_y, 0)
+        all_x = gather_rank_padded(x, 0)
+
+        grad_ye = torch.zeros(
+            (pool_rows, hidden),
+            dtype=torch.bfloat16, device='cuda')
+        grad_h = torch.zeros(
+            (pool_rows, intermediate_hidden),
+            dtype=torch.bfloat16, device='cuda')
+        grad_gate_up = torch.zeros(
+            (pool_rows, 2 * intermediate_hidden),
+            dtype=torch.bfloat16, device='cuda')
+        h_act = torch.zeros_like(grad_h)
+        h_weighted = torch.zeros_like(grad_h)
+        x_pool = torch.zeros_like(grad_ye)
+        grad_x_pool = torch.zeros_like(grad_ye)
+        route_weights_pool = torch.zeros(
+            pool_rows, dtype=torch.float, device='cuda')
+        grad_route_pool = torch.zeros_like(route_weights_pool)
+        num_grid_states = (
+            num_experts_per_rank *
+            ((hidden // 64) *
+             (intermediate_hidden // 128) +
+             ((2 * intermediate_hidden) // 64) *
+             (hidden // 128)) +
+            2)
+        grid_sync_counter = torch.zeros(
+            num_grid_states, dtype=torch.int, device='cuda')
+
+        deep_gemm.bf16_mega_moe_backward_dgrad(
+            gate_up_output=saved_l1_preact,
+            grad_h_output=grad_h,
+            grad_gate_up_output=grad_gate_up,
+            h_act_output=h_act,
+            h_weighted_output=h_weighted,
+            x_pool_output=x_pool,
+            grad_x_pool_output=grad_x_pool,
+            grad_route_output=grad_route_pool,
+            grad_ye=grad_ye,
+            route_weights=route_weights_pool,
+            w2_weights=l2_weights_bf16,
+            w13_weights=l1_weights_bf16,
+            expert_counts=expert_counts,
+            grid_sync_counter=grid_sync_counter,
+            grad_y=grad_y,
+            sym_buffer=buffer,
+            activation_limit=float(args.activation_clamp),
+            block_m=block_m,
+            activation=args.activation,
+            fast_math=bool(args.fast_math),
+            direct_remote_grad_x=num_ranks > 1,
+            write_grad_x_pool=True,
+            clear_wgrad_padding=True)
+        valid_rows = torch.isfinite(
+            saved_l1_preact.float()).all(dim=1)
+        metadata = buffer.token_src_metadata[valid_rows].long()
+        pool_indices = valid_rows.nonzero().flatten()
+        source_ranks = metadata[:, 0]
+        source_tokens = metadata[:, 1]
+        source_slots = metadata[:, 2]
+        global_experts = all_topk_idx[
+            source_ranks, source_tokens, source_slots]
+        local_experts = global_experts - local_expert_start
+
+        ref_grad_ye = torch.zeros_like(grad_ye)
+        ref_grad_h = torch.zeros_like(grad_h)
+        ref_grad_gate_up = torch.zeros_like(grad_gate_up)
+        ref_h_act = torch.zeros_like(h_act)
+        ref_h_weighted = torch.zeros_like(h_weighted)
+        ref_x_pool = torch.zeros_like(x_pool)
+        ref_grad_x_pool = torch.zeros_like(grad_x_pool)
+        ref_route_weights = torch.zeros_like(route_weights_pool)
+        ref_grad_route = torch.zeros_like(grad_route_pool)
+
+        for expert_idx in range(num_experts_per_rank):
+            selected = local_experts == expert_idx
+            if not bool(selected.any()):
+                continue
+            rows = pool_indices[selected]
+            source_rank = source_ranks[selected]
+            source_token = source_tokens[selected]
+            source_slot = source_slots[selected]
+            xe = all_x[source_rank, source_token]
+            gye = all_grad_y[source_rank, source_token]
+            route = all_topk_weights[
+                source_rank, source_token, source_slot]
+            preact = saved_l1_preact[rows]
+            gate = preact[:, :intermediate_hidden]
+            up = preact[:, intermediate_hidden:]
+            clamp = float(args.activation_clamp)
+            gate_clamped = torch.clamp(gate, max=clamp)
+            up_clamped = torch.clamp(
+                up, min=-clamp, max=clamp)
+            gate_fp32 = gate_clamped.float()
+            up_fp32 = up_clamped.float()
+            if args.activation == 'geglu':
+                alpha = 1.5957691216057308
+                beta = 0.044715
+                z = alpha * (
+                    gate_fp32 +
+                    beta * gate_fp32 ** 3)
+                dz = alpha * (
+                    1 + 3 * beta * gate_fp32 ** 2)
+            else:
+                z = gate_fp32
+                dz = torch.ones_like(gate_fp32)
+            sig = torch.sigmoid(z)
+            activated_gate = gate_fp32 * sig
+            h = (activated_gate * up_fp32).to(
+                torch.bfloat16)
+            hw = (
+                h.float() * route.float().unsqueeze(1)
+            ).to(torch.bfloat16)
+            gh_unweighted = (
+                gye @ l2_weights_bf16[expert_idx]
+            )
+            gh = (
+                gh_unweighted.float() *
+                route.float().unsqueeze(1)
+            ).to(torch.bfloat16)
+            activation_grad = (
+                sig +
+                gate_fp32 * sig * (1 - sig) * dz)
+            grad_gate = (
+                gh.float() * up_fp32 *
+                activation_grad)
+            grad_gate = torch.where(
+                gate.float() <= clamp,
+                grad_gate,
+                torch.zeros_like(grad_gate))
+            grad_up = (
+                gh.float() * activated_gate)
+            grad_up = torch.where(
+                (up.float() >= -clamp) &
+                (up.float() <= clamp),
+                grad_up,
+                torch.zeros_like(grad_up))
+            grad_gu = torch.cat(
+                [grad_gate, grad_up], dim=1
+            ).to(torch.bfloat16)
+            grad_xe = (
+                grad_gu @ l1_weights_bf16[expert_idx]
+            )
+
+            ref_grad_ye[rows] = gye
+            ref_grad_h[rows] = gh_unweighted
+            ref_grad_gate_up[rows] = grad_gu
+            ref_h_act[rows] = h
+            ref_h_weighted[rows] = hw
+            ref_x_pool[rows] = xe
+            ref_grad_x_pool[rows] = grad_xe
+            ref_route_weights[rows] = route
+            ref_grad_route[rows] = (
+                gh_unweighted.float() * h.float()
+            ).sum(dim=1)
+
+        def assert_gradient_close(
+            actual: torch.Tensor,
+            expected: torch.Tensor,
+            name: str,
+        ):
+            assert torch.isfinite(actual.float()).all(), name
+            if (
+                num_ranks == 1 and
+                num_tokens == 1 and
+                num_experts == 1 and
+                num_topk == 1
+            ):
+                assert torch.equal(actual, expected), (
+                    f'{name} must be bitwise equal in the '
+                    'single-token/single-expert case')
+                return
+            if torch.count_nonzero(expected):
+                cosine = torch.nn.functional.cosine_similarity(
+                    actual.float().flatten(),
+                    expected.float().flatten(),
+                    dim=0).item()
+                assert cosine >= 0.999999, (
+                    f'{name} cosine too small: {cosine}')
+            # Allow two BF16 ULPs for valid FP32 tensor-core reduction-order
+            # differences before the required BF16 output rounding.
+            torch.testing.assert_close(
+                actual, expected,
+                rtol=2 ** -6, atol=2 ** -6,
+                msg=lambda msg: f'{name}: {msg}')
+
+        assert_gradient_close(grad_ye, ref_grad_ye, 'grad_ye')
+        assert_gradient_close(grad_h, ref_grad_h, 'grad_h')
+        assert_gradient_close(
+            grad_gate_up, ref_grad_gate_up,
+            'grad_gate_up')
+        assert_gradient_close(h_act, ref_h_act, 'h_act')
+        assert_gradient_close(
+            h_weighted, ref_h_weighted,
+            'h_weighted')
+        assert_gradient_close(x_pool, ref_x_pool, 'x_pool')
+        assert_gradient_close(
+            grad_x_pool, ref_grad_x_pool,
+            'grad_x_pool')
+        assert_gradient_close(
+            route_weights_pool, ref_route_weights,
+            'route_weights_pool')
+        assert_gradient_close(
+            grad_route_pool, ref_grad_route,
+            'grad_route_pool')
+
+        grad_w2 = torch.zeros_like(l2_weights_bf16)
+        grad_w13 = torch.zeros_like(l1_weights_bf16)
+        grad_x_combined = None
+        if num_ranks > 1:
+            grad_x_combined = torch.zeros(
+                (num_tokens, hidden),
+                dtype=torch.bfloat16, device='cuda')
+            deep_gemm.bf16_mega_moe_backward_w2_combine(
+                grad_w2, grad_ye, h_weighted,
+                padded_expert_counts, grad_x_combined,
+                buffer)
+            deep_gemm.bf16_mega_moe_backward_w13_combine(
+                grad_w13, grad_gate_up, x_pool,
+                padded_expert_counts, grad_x_combined,
+                buffer)
+        else:
+            deep_gemm.bf16_mega_moe_backward_w2(
+                grad_w2, grad_ye, h_weighted,
+                padded_expert_counts)
+            deep_gemm.bf16_mega_moe_backward_w13(
+                grad_w13, grad_gate_up, x_pool,
+                padded_expert_counts)
+        ref_grad_w2 = torch.zeros_like(grad_w2)
+        ref_grad_w13 = torch.zeros_like(grad_w13)
+        pool_offset = 0
+        for expert_idx in range(num_experts_per_rank):
+            count = int(expert_counts[expert_idx].item())
+            rows = slice(pool_offset, pool_offset + count)
+            if count:
+                ref_grad_w2[expert_idx] = (
+                    ref_grad_ye[rows].t() @
+                    ref_h_weighted[rows])
+                ref_grad_w13[expert_idx] = (
+                    ref_grad_gate_up[rows].t() @
+                    ref_x_pool[rows])
+            pool_offset += int(
+                padded_expert_counts[expert_idx].item())
+        assert_gradient_close(
+            grad_w2, ref_grad_w2, 'grad_w2')
+        assert_gradient_close(
+            grad_w13, ref_grad_w13, 'grad_w13')
+
+        if num_ranks > 1:
+            ref_grad_x_planes = torch.zeros(
+                (num_ranks, num_max_tokens_per_rank,
+                 num_topk, hidden),
+                dtype=torch.bfloat16, device='cuda')
+            actual_route_planes = torch.zeros(
+                (num_ranks, num_max_tokens_per_rank,
+                 num_topk),
+                dtype=torch.float, device='cuda')
+            ref_route_planes = torch.zeros_like(
+                actual_route_planes)
+            ref_grad_x_planes[
+                source_ranks, source_tokens, source_slots
+            ] = ref_grad_x_pool[pool_indices]
+            actual_route_planes[
+                source_ranks, source_tokens, source_slots
+            ] = grad_route_pool[pool_indices]
+            ref_route_planes[
+                source_ranks, source_tokens, source_slots
+            ] = ref_grad_route[pool_indices]
+            dist.all_reduce(ref_grad_x_planes, group=group)
+            dist.all_reduce(actual_route_planes, group=group)
+            dist.all_reduce(ref_route_planes, group=group)
+            ref_grad_x = ref_grad_x_planes[
+                rank_idx, :num_tokens
+            ].float().sum(dim=1).to(torch.bfloat16)
+            assert_gradient_close(
+                grad_x_combined, ref_grad_x,
+                'grad_x_combined')
+            assert_gradient_close(
+                actual_route_planes[rank_idx, :num_tokens],
+                ref_route_planes[rank_idx, :num_tokens],
+                'grad_route_source')
+
     dist_print('Config:', once_in_node=True)
     dist_print(f' > MMA: {args.mma_type}', once_in_node=True)
     dist_print(f' > Tokens: {num_tokens}/{num_max_tokens_per_rank}', once_in_node=True)
@@ -465,6 +784,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             ref_y = run_reference()
             if is_bf16xbf16:
                 check_bf16_parity(fused_y, ref_y)
+                if args.test_backward:
+                    run_bf16_backward_test()
                 diff = calc_diff(fused_y, ref_y)
             else:
                 diff = calc_diff(fused_y, ref_y)
@@ -558,6 +879,7 @@ if __name__ == '__main__':
     parser.add_argument('--fast-math', type=int, default=1, help='Enable fast math (0 or 1, default: 1)')
     parser.add_argument('--mma-type', type=str, default='fp8xfp4', help='MMA type: fp8xfp4 or bf16xbf16')
     parser.add_argument('--save-l1-preact', action='store_true', help='Validate optional exact BF16 W13 output')
+    parser.add_argument('--test-backward', action='store_true', help='Validate BF16 dgrad and grouped wgrad')
 
     # Test settings
     parser.add_argument('--num-correctness-tests', type=int, default=None, help='Pressure test')

@@ -5,6 +5,97 @@ import torch
 from .. import _C
 
 
+def bf16_mega_moe_backward_dgrad(
+    gate_up_output: torch.Tensor,
+    grad_h_output: torch.Tensor,
+    grad_gate_up_output: torch.Tensor,
+    h_act_output: torch.Tensor,
+    h_weighted_output: torch.Tensor,
+    x_pool_output: torch.Tensor,
+    grad_x_pool_output: torch.Tensor,
+    grad_route_output: torch.Tensor,
+    grad_ye: torch.Tensor,
+    route_weights: torch.Tensor,
+    w2_weights: torch.Tensor,
+    w13_weights: torch.Tensor,
+    expert_counts: torch.Tensor,
+    grid_sync_counter: torch.Tensor,
+    grad_y: torch.Tensor,
+    sym_buffer: Any,
+    activation_limit: float,
+    block_m: int,
+    activation: str = "swiglu",
+    fast_math: bool = False,
+    direct_remote_grad_x: bool = True,
+    write_grad_x_pool: bool = True,
+    clear_wgrad_padding: bool = True,
+) -> None:
+    """Run BF16 reverse dispatch, dgrad, activation, and direct grad-x."""
+    if activation not in ("swiglu", "geglu"):
+        raise ValueError(f"unsupported activation: {activation}")
+    if not write_grad_x_pool and not direct_remote_grad_x:
+        raise ValueError("grad-x requires a local or direct remote output")
+    num_tokens = grad_y.shape[0]
+    backward_grad_y = sym_buffer.backward_grad_y
+    if direct_remote_grad_x:
+        # Kernel A reuses this region as [topk, token, hidden] direct-write
+        # planes after every rank has pulled grad-y from plane zero. Clear all
+        # planes so masked routes and repeated backward calls reduce as zero.
+        backward_grad_y = torch.as_strided(
+            backward_grad_y,
+            size=(
+                sym_buffer.num_topk,
+                sym_buffer.num_max_tokens_per_rank,
+                sym_buffer.hidden,
+            ),
+            stride=(
+                sym_buffer.num_max_tokens_per_rank * sym_buffer.hidden,
+                sym_buffer.hidden,
+                1,
+            ),
+        )
+        backward_grad_y.zero_()
+        backward_grad_y[0, :num_tokens].copy_(
+            grad_y.to(torch.bfloat16).contiguous()
+        )
+    else:
+        backward_grad_y[:num_tokens].copy_(
+            grad_y.to(torch.bfloat16).contiguous()
+        )
+    grad_route_output.zero_()
+    _C.bf16_mega_moe_backward_dgrad(
+        gate_up_output,
+        grad_h_output,
+        grad_gate_up_output,
+        h_act_output,
+        h_weighted_output,
+        x_pool_output,
+        grad_x_pool_output,
+        grad_route_output,
+        grad_ye,
+        route_weights,
+        w2_weights,
+        w13_weights,
+        expert_counts,
+        grid_sync_counter,
+        activation_limit,
+        activation,
+        fast_math,
+        block_m,
+        direct_remote_grad_x,
+        write_grad_x_pool,
+        clear_wgrad_padding,
+        sym_buffer.backward_grad_y,
+        sym_buffer.x,
+        sym_buffer.topk_weights,
+        sym_buffer.token_src_metadata,
+        sym_buffer.handle.buffer_ptrs,
+        sym_buffer.group.rank(),
+        sym_buffer.num_max_tokens_per_rank,
+        sym_buffer.num_topk,
+    )
+
+
 def fp8_fp4_mega_moe_backward_dgrad_swiglu(
     gate_up_output: torch.Tensor,
     grad_h_output: torch.Tensor,

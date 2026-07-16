@@ -33,6 +33,9 @@ template <
     uint32_t kNumSMs,
     uint32_t kNumRanks = 1,
     bool kCompileW13Dgrad = true,
+    bool kBF16Mode = false,
+    ActivationType kActivationType = ActivationType::SwiGLU,
+    bool kFastMath = false,
     uint32_t kNumNonEpilogueThreads = 128,
     uint32_t kNumEpilogueThreads = 128,
     uint32_t kNumThreads =
@@ -44,6 +47,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
     const __grid_constant__ layout::SymBuffer<kNumRanks> backward_sym_buffer,
     const __grid_constant__ layout::Workspace backward_workspace,
     const cutlass::bfloat16_t* backward_grad_y,
+    const cutlass::bfloat16_t* backward_x,
     const float* backward_topk_weights,
     const layout::TokenSrcMetadata* token_src_metadata,
     const uint32_t num_topk,
@@ -72,12 +76,14 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
     const cutlass::bfloat16_t* gate_up_output,
     cutlass::bfloat16_t* grad_ye_output,
     cutlass::bfloat16_t* route_weights,
+    float* route_weights_fp32,
     cutlass::bfloat16_t* grad_h_output,
     cutlass::bfloat16_t* grad_gate_up_output,
     cutlass::bfloat16_t* h_act_output,
     cutlass::bfloat16_t* h_weighted_output,
     cutlass::bfloat16_t* x_pool_output,
     cutlass::bfloat16_t* grad_x_pool_output,
+    float* grad_route_output,
     uint32_t* weight_tile_states,
     const uint32_t launch_epoch,
     const float activation_limit,
@@ -258,7 +264,8 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
         kNumAccumTmemCols + kNumSFATmemCols;
     DG_STATIC_ASSERT(kNumTmemCols <= 512, "Backward recompute exceeds TMEM");
 
-    // Dequantize W2 exactly once per launch into an ephemeral
+    if constexpr (!kBF16Mode) {
+        // Dequantize W2 exactly once per launch into an ephemeral
         // [expert, dim, H] BF16 workspace.  Keeping the source orientation
         // makes both packed-FP4 reads and BF16 writes coalesced; dgrad consumes
         // it as an MN-major transposed operand.
@@ -604,6 +611,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                 w13_dequant_phase ^= 1;
             }
         }
+    }
     comm::cluster_sync_with_relaxed_arrive();
     if (warp_idx == 0 && cute::elect_one_sync()) {
         #pragma unroll
@@ -669,7 +677,8 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
     constexpr uint32_t kNumProducerRegisters = 40;
     constexpr uint32_t kNumEpilogueRegisters = 208;
 
-    if (warp_idx == 0) {
+    if constexpr (!kBF16Mode) {
+      if (warp_idx == 0) {
         cutlass::arch::warpgroup_reg_dealloc<kNumProducerRegisters>();
         for_each_block([&](const uint32_t&, const uint32_t& pool_block_offset,
                            const uint32_t& m_block_idx, const uint32_t&,
@@ -905,12 +914,15 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
         if (epilogue_warp_idx == 0)
             cute::tma_store_wait<0>();
         __syncwarp();
-    } else if (
+      }
+    }
+    if (
         warp_idx >= kDispatchWarpStart &&
         warp_idx < kDispatchWarpStart + kNumDispatchWarps) {
         // The 1024-thread dgrad launch already reserves extra warps. Reuse one
         // warpgroup as the third role instead of increasing the launch size.
-        constexpr uint32_t kNumDispatchRegisters = 48;
+        constexpr uint32_t kNumDispatchRegisters =
+            kBF16Mode ? 40 : 48;
         cutlass::arch::warpgroup_reg_dealloc<kNumDispatchRegisters>();
         if constexpr (kNumRanks > 1) {
             const uint32_t dispatch_warp_idx =
@@ -987,8 +999,13 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                         num_topk +
                                     metadata.topk_idx,
                                 metadata.rank_idx);
-                        route_weights[pool_row] =
-                            cd_dtype_t(*remote_weight);
+                        if constexpr (kBF16Mode) {
+                            route_weights_fp32[pool_row] =
+                                *remote_weight;
+                        } else {
+                            route_weights[pool_row] =
+                                cd_dtype_t(*remote_weight);
+                        }
 
                         ptx::mbarrier_arrive_and_set_tx(
                             pull_mbarrier,
@@ -1063,30 +1080,71 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                         pool_block * BLOCK_M + row;
                     cd_dtype_t value = cd_dtype_t(0.0f);
                     if (row < valid_m) {
-                        const uint32_t idx = row % BLOCK_M;
-                        const uint32_t sf_token =
-                            pool_block * SF_BLOCK_M +
-                            (idx & ~127u) + (idx & 31u) * 4 +
-                            ((idx >> 5) & 3u);
-                        const uint32_t sf_group = col / 128;
-                        const uint32_t sf_byte = (col / 32) & 3u;
-                        const uint32_t packed_sf =
-                            acts_sf_ptr[
-                                sf_group * acts_sf_stride + sf_token];
-                        const uint32_t exponent =
-                            (packed_sf >> (sf_byte * 8)) & 0xffu;
-                        const uint32_t scale_bits =
-                            exponent << 23;
-                        const float scale =
-                            *reinterpret_cast<const float*>(
-                                &scale_bits);
-                        value = cd_dtype_t(
-                            static_cast<float>(
-                                acts_ptr[
+                        if constexpr (kBF16Mode) {
+                            const auto metadata =
+                                token_src_metadata[pool_row];
+                            value = *backward_sym_buffer.map(
+                                backward_x +
+                                    static_cast<uint64_t>(
+                                        metadata.token_idx) *
+                                        kHidden +
+                                    col,
+                                metadata.rank_idx);
+                            if constexpr (kNumRanks == 1) {
+                                grad_ye_output[
                                     static_cast<uint64_t>(pool_row) *
                                         kHidden +
-                                    col]) *
-                            scale);
+                                    col] =
+                                    *backward_sym_buffer.map(
+                                        backward_grad_y +
+                                            static_cast<uint64_t>(
+                                                metadata.token_idx) *
+                                                kHidden +
+                                            col,
+                                        metadata.rank_idx);
+                                if (col == 0) {
+                                    const float weight =
+                                        *backward_sym_buffer.map(
+                                            backward_topk_weights +
+                                                static_cast<uint64_t>(
+                                                    metadata.token_idx) *
+                                                    num_topk +
+                                                metadata.topk_idx,
+                                            metadata.rank_idx);
+                                    route_weights_fp32[pool_row] =
+                                        weight;
+                                }
+                            }
+                        } else {
+                            const uint32_t idx = row % BLOCK_M;
+                            const uint32_t sf_token =
+                                pool_block * SF_BLOCK_M +
+                                (idx & ~127u) +
+                                (idx & 31u) * 4 +
+                                ((idx >> 5) & 3u);
+                            const uint32_t sf_group = col / 128;
+                            const uint32_t sf_byte = (col / 32) & 3u;
+                            const uint32_t packed_sf =
+                                acts_sf_ptr[
+                                    sf_group * acts_sf_stride +
+                                    sf_token];
+                            const uint32_t exponent =
+                                (packed_sf >> (sf_byte * 8)) &
+                                0xffu;
+                            const uint32_t scale_bits =
+                                exponent << 23;
+                            const float scale =
+                                *reinterpret_cast<const float*>(
+                                    &scale_bits);
+                            value = cd_dtype_t(
+                                static_cast<float>(
+                                    acts_ptr[
+                                        static_cast<uint64_t>(
+                                            pool_row) *
+                                            kHidden +
+                                        col]) *
+                                scale);
+                        }
                     }
                     x_pool_output[
                         static_cast<uint64_t>(pool_row) * kHidden +
@@ -1101,6 +1159,17 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
 
     {
         __syncthreads();
+        if constexpr (kBF16Mode && kNumRanks == 1) {
+            // In single-rank BF16 mode the x-pool warps also stage grad-y.
+            // Their pool-block assignment is independent of the dgrad tile
+            // assignment, so a cluster barrier is insufficient before W2
+            // dgrad starts consuming the completed expert pool.
+            constexpr uint32_t kLocalDispatchDoneGridSyncIndex = 1;
+            comm::grid_sync<
+                kNumSMs, kLocalDispatchDoneGridSyncIndex>(
+                backward_workspace, blockIdx.x, threadIdx.x,
+                []() { __syncthreads(); });
+        }
         if constexpr (kNumRanks > 1) {
             if (direct_remote_grad_x) {
                 // backward_grad_y aliases combine plane zero. All ranks must
@@ -1112,6 +1181,39 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                     kNumRanks, kNumSMs, kNumThreads,
                     kBeforeDirectGradXGridSyncIndex,
                     kBeforeDirectGradXBarrierTag>(
+                    backward_workspace, backward_sym_buffer,
+                    blockIdx.x, threadIdx.x,
+                    []() { __syncthreads(); });
+
+                // Plane zero held grad-y during reverse dispatch. Clear it
+                // after every rank has completed its pulls; otherwise masked
+                // top-k slot zero would contribute stale grad-y to grad-x.
+                auto* combine_buffer = const_cast<cd_dtype_t*>(
+                    backward_grad_y);
+                const uint64_t num_plane_values =
+                    static_cast<uint64_t>(
+                        backward_workspace
+                            .num_max_tokens_per_rank) *
+                    kHidden;
+                for (uint64_t linear =
+                         static_cast<uint64_t>(blockIdx.x) *
+                             kNumThreads +
+                         threadIdx.x;
+                     linear < num_plane_values;
+                     linear +=
+                         static_cast<uint64_t>(kNumSMs) *
+                         kNumThreads) {
+                    combine_buffer[linear] = cd_dtype_t(0.0f);
+                }
+
+                // Do not let a rank remotely write direct grad-x until every
+                // destination rank has finished clearing its local plane.
+                constexpr uint32_t kAfterGradYClearGridSyncIndex = 3;
+                constexpr uint32_t kAfterGradYClearBarrierTag = 8;
+                comm::nvlink_barrier<
+                    kNumRanks, kNumSMs, kNumThreads,
+                    kAfterGradYClearGridSyncIndex,
+                    kAfterGradYClearBarrierTag>(
                     backward_workspace, backward_sym_buffer,
                     blockIdx.x, threadIdx.x,
                     []() { __syncthreads(); });
@@ -1250,10 +1352,12 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                              k_block_idx) *
                                 kNumDgradBlockNs +
                             n_block_idx;
-                        while (ptx::ld_acq(
-                                   weight_tile_states +
-                                   weight_tile_idx) !=
-                               launch_epoch) {
+                        if constexpr (!kBF16Mode) {
+                            while (ptx::ld_acq(
+                                       weight_tile_states +
+                                       weight_tile_idx) !=
+                                   launch_epoch) {
+                            }
                         }
                         constexpr bool weight_tile_ready = true;
                         empty_barriers[stage_idx]->wait(phase ^ 1);
@@ -1664,11 +1768,15 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                 local_m;
                             const uint32_t hidden_col =
                                 n_block_idx * BLOCK_N + n;
+                            const float route_weight =
+                                kBF16Mode
+                                ? route_weights_fp32[pool_row]
+                                : static_cast<float>(
+                                      route_weights[pool_row]);
                             const cd_dtype_t grad_h_bf16 =
                                 cd_dtype_t(
                                 grad_h_unweighted *
-                                static_cast<float>(
-                                    route_weights[pool_row]));
+                                route_weight);
                             // Match fused_backward_core: torch grouped_mm and
                             // route weighting materialize BF16 grad_h before
                             // the activation derivative consumes it.
@@ -1689,9 +1797,14 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                             const uint32_t in_chunk =
                                 hidden_col & 7;
                             const uint32_t gate_col =
-                                chunk * 16 + in_chunk;
+                                kBF16Mode
+                                ? hidden_col
+                                : chunk * 16 + in_chunk;
                             const uint32_t up_col =
-                                gate_col + 8;
+                                kBF16Mode
+                                ? kIntermediateHidden +
+                                      hidden_col
+                                : gate_col + 8;
                             const float gate_unclamped =
                                 static_cast<float>(
                                     gate_up_output[
@@ -1709,64 +1822,95 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                              kIntermediateHidden) +
                                         up_col]);
 
+                            const bool has_activation_clamp =
+                                kBF16Mode
+                                ? activation_limit !=
+                                      cute::numeric_limits<
+                                          float>::infinity()
+                                : activation_limit > 0.0f;
                             const bool gate_in_range =
-                                activation_limit <= 0.0f ||
+                                !has_activation_clamp ||
                                 gate_unclamped <=
                                     activation_limit;
                             const bool up_in_range =
-                                activation_limit <= 0.0f ||
+                                !has_activation_clamp ||
                                 (up_unclamped >=
                                      -activation_limit &&
                                  up_unclamped <=
                                      activation_limit);
                             const float gate =
-                                activation_limit > 0.0f
+                                has_activation_clamp
                                 ? cute::min(
                                       gate_unclamped,
                                       activation_limit)
                                 : gate_unclamped;
                             const float up =
-                                activation_limit > 0.0f
+                                has_activation_clamp
                                 ? cute::min(
                                       cute::max(
                                           up_unclamped,
                                           -activation_limit),
                                       activation_limit)
                                 : up_unclamped;
+                            float z;
+                            float dz_dgate;
+                            if constexpr (
+                                kActivationType ==
+                                ActivationType::GeGLU) {
+                                constexpr float kAlpha =
+                                    1.5957691216057308f;
+                                constexpr float kBeta = 0.044715f;
+                                const float gate_sq = gate * gate;
+                                z = kAlpha * gate *
+                                    (1.0f + kBeta * gate_sq);
+                                dz_dgate = kAlpha *
+                                    (1.0f +
+                                     3.0f * kBeta * gate_sq);
+                            } else {
+                                z = gate;
+                                dz_dgate = 1.0f;
+                            }
+                            const float neg_exp =
+                                !kBF16Mode || kFastMath
+                                ? __expf(-z)
+                                : expf(-z);
                             const float sig =
-                                1.0f /
-                                (1.0f +
-                                 __expf(-gate));
-                            const float silu_gate = gate * sig;
+                                1.0f / (1.0f + neg_exp);
+                            const float activated_gate =
+                                gate * sig;
                             const float h_act =
-                                silu_gate * up;
+                                activated_gate * up;
+                            const float activation_grad =
+                                sig +
+                                gate * sig *
+                                    (1.0f - sig) *
+                                    dz_dgate;
                             const float grad_gate =
                                 gate_in_range
-                                ? grad_h * up * sig *
-                                      (1.0f +
-                                       gate *
-                                           (1.0f - sig))
+                                ? grad_h * up *
+                                      activation_grad
                                 : 0.0f;
                             const float grad_up =
                                 up_in_range
-                                ? grad_h * silu_gate
+                                ? grad_h * activated_gate
                                 : 0.0f;
-
+                            const cd_dtype_t h_act_bf16 =
+                                cd_dtype_t(h_act);
                             h_act_output[
                                 static_cast<uint64_t>(
                                     pool_row) *
                                     kIntermediateHidden +
                                 hidden_col] =
-                                cd_dtype_t(h_act);
+                                h_act_bf16;
                             h_weighted_output[
                                 static_cast<uint64_t>(
                                     pool_row) *
                                     kIntermediateHidden +
                                 hidden_col] =
                                 cd_dtype_t(
-                                    h_act *
                                     static_cast<float>(
-                                        route_weights[pool_row]));
+                                        h_act_bf16) *
+                                    route_weight);
                             grad_gate_up_output[
                                 static_cast<uint64_t>(
                                     pool_row) *
@@ -1821,6 +1965,55 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                 }
             }
             __syncthreads();
+
+            if constexpr (kBF16Mode) {
+                // The activation epilogue spans multiple N-tile CTAs. Reduce
+                // each route term only after all tiles are visible so the
+                // router gradient has a fixed FP32 summation order instead of
+                // depending on cross-CTA atomic arrival order.
+                uint32_t route_pool_block_offset = 0;
+                #pragma unroll
+                for (uint32_t expert_idx = 0;
+                     expert_idx < kNumExperts; ++expert_idx) {
+                    const uint32_t num_tokens =
+                        static_cast<uint32_t>(
+                            __ldg(expert_counts + expert_idx));
+                    for (uint32_t token_idx =
+                             blockIdx.x * kNumThreads +
+                             threadIdx.x;
+                         token_idx < num_tokens;
+                         token_idx += kNumSMs * kNumThreads) {
+                        const uint32_t pool_row =
+                            route_pool_block_offset * BLOCK_M +
+                            token_idx;
+                        float grad_route = 0.0f;
+                        for (uint32_t col = 0;
+                             col < kIntermediateHidden; ++col) {
+                            const float grad_h =
+                                static_cast<float>(
+                                    grad_h_output[
+                                        static_cast<uint64_t>(
+                                            pool_row) *
+                                            kIntermediateHidden +
+                                        col]);
+                            const float h_act =
+                                static_cast<float>(
+                                    h_act_output[
+                                        static_cast<uint64_t>(
+                                            pool_row) *
+                                            kIntermediateHidden +
+                                        col]);
+                            grad_route = __fadd_rn(
+                                grad_route,
+                                __fmul_rn(grad_h, h_act));
+                        }
+                        grad_route_output[pool_row] =
+                            grad_route;
+                    }
+                    route_pool_block_offset +=
+                        math::ceil_div(num_tokens, BLOCK_M);
+                }
+            }
 
             // Phase 3: dequantize canonical [W1; W3] once per launch, then
             // consume it as the transposed BF16 operand for W13 dgrad.  This
@@ -2005,11 +2198,13 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                      k_block_idx) *
                                         kNumW13DgradBlockNs +
                                     n_block_idx;
-                            while (ptx::ld_acq(
-                                       weight_tile_states +
-                                       kNumW2WeightTileStates +
-                                       weight_tile_idx) !=
-                                   w13_launch_epoch) {
+                            if constexpr (!kBF16Mode) {
+                                while (ptx::ld_acq(
+                                           weight_tile_states +
+                                           kNumW2WeightTileStates +
+                                           weight_tile_idx) !=
+                                       w13_launch_epoch) {
+                                }
                             }
                             empty_barriers[stage_idx]
                                 ->wait(phase ^ 1);

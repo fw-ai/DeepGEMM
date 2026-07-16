@@ -98,6 +98,7 @@ from .mega import (
     bf16_mega_moe,
 )
 from .mega.backward import (
+    bf16_mega_moe_backward_dgrad,
     bf16_mega_moe_backward_w13,
     bf16_mega_moe_backward_w13_combine,
     bf16_mega_moe_backward_w2,
