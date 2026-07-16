@@ -117,6 +117,8 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
     constexpr uint32_t kNumBlockNs = (2 * kIntermediateHidden) / BLOCK_N;
     constexpr uint32_t kNumDgradBlockNs = kIntermediateHidden / BLOCK_N;
     constexpr uint32_t kNumW13DgradBlockNs = kHidden / BLOCK_N;
+    constexpr uint32_t kNumW13DgradSplits =
+        kBF16Mode ? 2 : 1;
     constexpr uint32_t LAYOUT_AD_M = 128;
     constexpr uint32_t UMMA_M = LAYOUT_AD_M * 2;
     constexpr uint32_t UMMA_N = BLOCK_M;
@@ -1919,6 +1921,11 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                 constexpr float kAlpha =
                                     1.5957691216057308f;
                                 constexpr float kBeta = 0.044715f;
+                                // Python evaluates 3.0 * beta in FP64 before
+                                // converting the scalar to FP32. Multiplying
+                                // the already-rounded kBeta by 3.0f is one ULP
+                                // lower and changes BF16 ties in GeGLU dgate.
+                                constexpr float kThreeBeta = 0.134145f;
                                 const float gate_sq =
                                     __fmul_rn(gate, gate);
                                 z = __fmul_rn(
@@ -1932,7 +1939,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                     __fadd_rn(
                                         1.0f,
                                         __fmul_rn(
-                                            3.0f * kBeta,
+                                            kThreeBeta,
                                             gate_sq)));
                             } else {
                                 z = gate;
@@ -1942,46 +1949,143 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                 !kBF16Mode || kFastMath
                                 ? __expf(-z)
                                 : expf(-z);
+                            const float denom =
+                                __fadd_rn(1.0f, neg_exp);
                             const float sig =
-                                1.0f / (1.0f + neg_exp);
-                            const float activated_gate =
-                                __fmul_rn(gate, sig);
-                            const float h_act =
-                                __fmul_rn(activated_gate, up);
-                            // Match the eager FireTitan FP32 expression one
-                            // operation at a time. Plain C++ arithmetic here
-                            // lets nvcc contract/reassociate the derivative,
-                            // which changes rare BF16 round-to-nearest ties.
-                            const float one_minus_sig =
-                                __fsub_rn(1.0f, sig);
-                            const float gate_sig =
-                                __fmul_rn(gate, sig);
-                            const float sigmoid_derivative =
-                                __fmul_rn(
-                                    gate_sig,
-                                    one_minus_sig);
-                            const float activation_grad =
-                                __fadd_rn(
-                                    sig,
-                                    __fmul_rn(
-                                        sigmoid_derivative,
-                                        dz_dgate));
-                            const float grad_gate =
-                                gate_in_range
-                                ? __fmul_rn(
-                                      __fmul_rn(
-                                          grad_h,
-                                          up),
-                                      activation_grad)
-                                : 0.0f;
-                            const float grad_up =
-                                up_in_range
-                                ? __fmul_rn(
-                                      grad_h,
-                                      activated_gate)
-                                : 0.0f;
-                            const cd_dtype_t h_act_bf16 =
-                                cd_dtype_t(h_act);
+                                1.0f / denom;
+                            cd_dtype_t h_act_bf16;
+                            cd_dtype_t grad_gate_bf16;
+                            cd_dtype_t grad_up_bf16;
+                            if constexpr (
+                                kBF16Mode &&
+                                kActivationType ==
+                                    ActivationType::SwiGLU) {
+                                if (!has_activation_clamp) {
+                                    // Native grouped experts materialize
+                                    // BF16 SiLU, BF16 SiLU*up, and BF16
+                                    // grad_h*up before aten::silu_backward.
+                                    const cd_dtype_t silu_bf16 =
+                                        cd_dtype_t(
+                                            gate / denom);
+                                    h_act_bf16 =
+                                        cd_dtype_t(
+                                            __fmul_rn(
+                                                static_cast<
+                                                    float>(
+                                                    silu_bf16),
+                                                up));
+                                    const cd_dtype_t
+                                        grad_silu_bf16 =
+                                            cd_dtype_t(
+                                                __fmul_rn(
+                                                    grad_h,
+                                                    up));
+                                    const float
+                                        one_minus_sig =
+                                            __fsub_rn(
+                                                1.0f, sig);
+                                    const float
+                                        silu_grad =
+                                            __fmul_rn(
+                                                sig,
+                                                __fadd_rn(
+                                                    1.0f,
+                                                    __fmul_rn(
+                                                        gate,
+                                                        one_minus_sig)));
+                                    grad_gate_bf16 =
+                                        cd_dtype_t(
+                                            __fmul_rn(
+                                                static_cast<
+                                                    float>(
+                                                    grad_silu_bf16),
+                                                silu_grad));
+                                    grad_up_bf16 =
+                                        cd_dtype_t(
+                                            __fmul_rn(
+                                                grad_h,
+                                                static_cast<
+                                                    float>(
+                                                    silu_bf16)));
+                                } else {
+                                    const float
+                                        activated_gate =
+                                            __fmul_rn(
+                                                gate, sig);
+                                    h_act_bf16 =
+                                        cd_dtype_t(
+                                            __fmul_rn(
+                                                activated_gate,
+                                                up));
+                                    const float
+                                        one_minus_sig =
+                                            __fsub_rn(
+                                                1.0f, sig);
+                                    const float gate_sig =
+                                        __fmul_rn(
+                                            gate, sig);
+                                    const float
+                                        activation_grad =
+                                            __fadd_rn(
+                                                sig,
+                                                __fmul_rn(
+                                                    __fmul_rn(
+                                                        gate_sig,
+                                                        one_minus_sig),
+                                                    dz_dgate));
+                                    grad_gate_bf16 =
+                                        cd_dtype_t(
+                                            gate_in_range
+                                            ? __fmul_rn(
+                                                  __fmul_rn(
+                                                      grad_h,
+                                                      up),
+                                                  activation_grad)
+                                            : 0.0f);
+                                    grad_up_bf16 =
+                                        cd_dtype_t(
+                                            up_in_range
+                                            ? __fmul_rn(
+                                                  grad_h,
+                                                  activated_gate)
+                                            : 0.0f);
+                                }
+                            } else {
+                                const float activated_gate =
+                                    __fmul_rn(gate, sig);
+                                h_act_bf16 =
+                                    cd_dtype_t(
+                                        __fmul_rn(
+                                            activated_gate, up));
+                                const float one_minus_sig =
+                                    __fsub_rn(1.0f, sig);
+                                const float gate_sig =
+                                    __fmul_rn(gate, sig);
+                                const float activation_grad =
+                                    __fadd_rn(
+                                        sig,
+                                        __fmul_rn(
+                                            __fmul_rn(
+                                                gate_sig,
+                                                one_minus_sig),
+                                            dz_dgate));
+                                grad_gate_bf16 =
+                                    cd_dtype_t(
+                                        gate_in_range
+                                        ? __fmul_rn(
+                                              __fmul_rn(
+                                                  grad_h,
+                                                  up),
+                                              activation_grad)
+                                        : 0.0f);
+                                grad_up_bf16 =
+                                    cd_dtype_t(
+                                        up_in_range
+                                        ? __fmul_rn(
+                                              grad_h,
+                                              activated_gate)
+                                        : 0.0f);
+                            }
                             h_act_output[
                                 static_cast<uint64_t>(
                                     pool_row) *
@@ -2007,7 +2111,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                     (2 *
                                      kIntermediateHidden) +
                                 hidden_col] =
-                                cd_dtype_t(grad_gate);
+                                grad_gate_bf16;
                             grad_gate_up_output[
                                 static_cast<uint64_t>(
                                     pool_row) *
@@ -2015,7 +2119,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                      kIntermediateHidden) +
                                 kIntermediateHidden +
                                 hidden_col] =
-                                cd_dtype_t(grad_up);
+                                grad_up_bf16;
                         }
                     }
                     ptx::tcgen05_before_thread_sync();
@@ -2060,7 +2164,80 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                 // The activation epilogue spans multiple N-tile CTAs. Reduce
                 // each route term only after all tiles are visible so the
                 // router gradient has a fixed FP32 summation order instead of
-                // depending on cross-CTA atomic arrival order.
+                // depending on cross-CTA atomic arrival order. PyTorch's
+                // contiguous FP32 sum chooses a power-of-two block width from
+                // both the reduction width and the number of output rows. It
+                // then uses four independent accumulators per lane, shared
+                // reductions down to 32 lanes, and a warp shuffle tree.
+                constexpr uint32_t kRouteColumns =
+                    kRouteWeightMode ==
+                            RouteWeightMode::PostDown
+                        ? kHidden
+                        : kIntermediateHidden;
+                constexpr uint32_t kRouteInputPow2 = [] {
+                    uint32_t value = 1;
+                    const uint32_t vectorized_columns =
+                        kRouteColumns / 4;
+                    while (value < 512 &&
+                           (value << 1) <=
+                               vectorized_columns)
+                        value <<= 1;
+                    return value;
+                }();
+                auto* route_lane_sums =
+                    reinterpret_cast<float*>(smem_gemm_base);
+                auto* route_control =
+                    reinterpret_cast<uint32_t*>(smem_gemm_base);
+                if (threadIdx.x == 0) {
+                    uint32_t total_route_rows = 0;
+                    #pragma unroll
+                    for (uint32_t expert_idx = 0;
+                         expert_idx < kNumExperts;
+                         ++expert_idx) {
+                        total_route_rows +=
+                            static_cast<uint32_t>(
+                                __ldg(
+                                    expert_counts +
+                                    expert_idx));
+                    }
+                    route_control[0] =
+                        total_route_rows;
+                }
+                __syncthreads();
+                const uint32_t total_route_rows =
+                    route_control[0];
+                const uint32_t route_output_pow2 =
+                    total_route_rows > 0
+                    ? 1u << (31 - __clz(
+                                 total_route_rows))
+                    : 1u;
+                constexpr uint32_t
+                    kInitialRouteGroupThreads =
+                        cute::min(
+                            kRouteInputPow2, 32u);
+                const uint32_t route_block_height =
+                    cute::min(
+                        route_output_pow2,
+                        512u /
+                            kInitialRouteGroupThreads);
+                const uint32_t route_group_threads =
+                    cute::min(
+                        kRouteInputPow2,
+                        512u / route_block_height);
+                const uint32_t num_route_groups_per_cta =
+                    kNumThreads / route_group_threads;
+                const uint32_t route_group_idx =
+                    threadIdx.x / route_group_threads;
+                const uint32_t route_group_lane_idx =
+                    threadIdx.x &
+                    (route_group_threads - 1);
+                const uint32_t global_route_group =
+                    blockIdx.x *
+                        num_route_groups_per_cta +
+                    route_group_idx;
+                const uint32_t num_route_groups =
+                    kNumSMs *
+                    num_route_groups_per_cta;
                 uint32_t route_pool_block_offset = 0;
                 #pragma unroll
                 for (uint32_t expert_idx = 0;
@@ -2068,63 +2245,140 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                     const uint32_t num_tokens =
                         static_cast<uint32_t>(
                             __ldg(expert_counts + expert_idx));
-                    for (uint32_t token_idx =
-                             blockIdx.x * kNumThreads +
-                             threadIdx.x;
+                    for (uint32_t token_idx = global_route_group;
                          token_idx < num_tokens;
-                         token_idx += kNumSMs * kNumThreads) {
+                         token_idx += num_route_groups) {
                         const uint32_t pool_row =
                             route_pool_block_offset * BLOCK_M +
                             token_idx;
-                        float grad_route = 0.0f;
+                        float lane_sums[4] = {
+                            0.0f, 0.0f, 0.0f, 0.0f};
                         if constexpr (
                             kRouteWeightMode ==
                             RouteWeightMode::PostDown) {
-                            for (uint32_t col = 0;
-                                 col < kHidden; ++col) {
-                                const float grad_y =
-                                    static_cast<float>(
-                                        grad_y_unweighted_output[
-                                            static_cast<uint64_t>(
-                                                pool_row) *
-                                                kHidden +
-                                            col]);
-                                const float down =
-                                    static_cast<float>(
-                                        down_unweighted_output[
-                                            static_cast<uint64_t>(
-                                                pool_row) *
-                                                kHidden +
-                                            col]);
-                                grad_route = __fadd_rn(
-                                    grad_route,
-                                    __fmul_rn(grad_y, down));
+                            for (uint32_t col_base =
+                                     route_group_lane_idx * 4;
+                                 col_base < kHidden;
+                                 col_base +=
+                                     route_group_threads * 4) {
+                                #pragma unroll
+                                for (uint32_t i = 0; i < 4; ++i) {
+                                    const uint32_t col =
+                                        col_base + i;
+                                    const float grad_y =
+                                        static_cast<float>(
+                                            grad_y_unweighted_output[
+                                                static_cast<uint64_t>(
+                                                    pool_row) *
+                                                    kHidden +
+                                                col]);
+                                    const float down =
+                                        static_cast<float>(
+                                            down_unweighted_output[
+                                                static_cast<uint64_t>(
+                                                    pool_row) *
+                                                    kHidden +
+                                                col]);
+                                    lane_sums[i] =
+                                        __fadd_rn(
+                                            lane_sums[i],
+                                            __fmul_rn(
+                                                grad_y,
+                                                down));
+                                }
                             }
                         } else {
-                            for (uint32_t col = 0;
-                                 col < kIntermediateHidden;
-                                 ++col) {
-                                const float grad_h =
-                                    static_cast<float>(
-                                        grad_h_output[
-                                            static_cast<uint64_t>(
-                                                pool_row) *
-                                                kIntermediateHidden +
-                                            col]);
-                                const float h_act =
-                                    static_cast<float>(
-                                        h_act_output[
-                                            static_cast<uint64_t>(
-                                                pool_row) *
-                                                kIntermediateHidden +
-                                            col]);
-                                grad_route = __fadd_rn(
-                                    grad_route,
-                                    __fmul_rn(grad_h, h_act));
+                            for (uint32_t col_base =
+                                     route_group_lane_idx * 4;
+                                 col_base <
+                                     kIntermediateHidden;
+                                 col_base +=
+                                     route_group_threads * 4) {
+                                #pragma unroll
+                                for (uint32_t i = 0; i < 4; ++i) {
+                                    const uint32_t col =
+                                        col_base + i;
+                                    const float grad_h =
+                                        static_cast<float>(
+                                            grad_h_output[
+                                                static_cast<uint64_t>(
+                                                    pool_row) *
+                                                    kIntermediateHidden +
+                                                col]);
+                                    const float h_act =
+                                        static_cast<float>(
+                                            h_act_output[
+                                                static_cast<uint64_t>(
+                                                    pool_row) *
+                                                    kIntermediateHidden +
+                                                col]);
+                                    lane_sums[i] =
+                                        __fadd_rn(
+                                            lane_sums[i],
+                                            __fmul_rn(
+                                                grad_h,
+                                                h_act));
+                                }
                             }
                         }
-                        grad_route_output[pool_row] =
+                        float grad_route =
+                            __fadd_rn(
+                                __fadd_rn(
+                                    lane_sums[0],
+                                    lane_sums[1]),
+                                lane_sums[2]);
+                        grad_route =
+                            __fadd_rn(
+                                grad_route, lane_sums[3]);
+                        route_lane_sums[threadIdx.x] =
                             grad_route;
+                        if (route_group_threads > 32) {
+                            for (uint32_t offset =
+                                     route_group_threads /
+                                     2;
+                                 offset >= 32;
+                                 offset >>= 1) {
+                                ptx::sync_aligned(
+                                    route_group_threads,
+                                    route_group_idx);
+                                if (route_group_lane_idx <
+                                    offset) {
+                                    grad_route =
+                                        __fadd_rn(
+                                            grad_route,
+                                            route_lane_sums[
+                                                threadIdx.x +
+                                                offset]);
+                                    route_lane_sums[
+                                        threadIdx.x] =
+                                        grad_route;
+                                }
+                            }
+                        }
+                        if (route_group_lane_idx < 32) {
+                            #pragma unroll
+                            for (uint32_t offset = 16;
+                                 offset > 0;
+                                 offset >>= 1) {
+                                grad_route =
+                                    __fadd_rn(
+                                        grad_route,
+                                        __shfl_down_sync(
+                                            0xffffffff,
+                                            grad_route,
+                                            offset));
+                            }
+                        }
+                        if (route_group_lane_idx == 0)
+                            grad_route_output[pool_row] =
+                                grad_route;
+                        if (route_group_threads > 32) {
+                            ptx::sync_aligned(
+                                route_group_threads,
+                                route_group_idx);
+                        } else {
+                            __syncwarp();
+                        }
                     }
                     route_pool_block_offset +=
                         math::ceil_div(num_tokens, BLOCK_M);
@@ -2238,54 +2492,64 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                         const uint32_t pool_block_idx =
                             pool_block_offset +
                             m_block_idx;
-                        #pragma unroll 1
-                        for (uint32_t k_block_idx =
-                                 0;
-                             k_block_idx <
-                                 (2 *
-                                  kIntermediateHidden) /
-                                     DGRAD_BLOCK_K;
-                             advance_pipeline(
-                                 k_block_idx)) {
-                            empty_barriers[stage_idx]
-                                ->wait(phase ^ 1);
-                            uint32_t m_idx =
-                                pool_block_idx *
-                                BLOCK_M;
-                            if (!is_leader_cta)
-                                m_idx +=
-                                    math::align(
-                                        valid_m, 16u) /
-                                    2;
-                            if (cute::elect_one_sync()) {
-                                tma::copy<
-                                    DGRAD_BLOCK_K,
-                                    LOAD_BLOCK_M,
-                                    DGRAD_BLOCK_K *
-                                        sizeof(
-                                            cd_dtype_t),
-                                    cd_dtype_t>(
-                                    &tensor_map_grad_gate_up,
-                                    full_barriers[
-                                        stage_idx],
-                                    smem_dgrad_a[
-                                        stage_idx],
-                                    k_block_idx *
+                        #pragma unroll
+                        for (uint32_t split_idx = 0;
+                             split_idx <
+                                 kNumW13DgradSplits;
+                             ++split_idx) {
+                            #pragma unroll 1
+                            for (uint32_t k_block_idx = 0;
+                                 k_block_idx <
+                                     (2 *
+                                      kIntermediateHidden) /
+                                         (DGRAD_BLOCK_K *
+                                          kNumW13DgradSplits);
+                                 advance_pipeline(
+                                     k_block_idx)) {
+                                empty_barriers[stage_idx]
+                                    ->wait(phase ^ 1);
+                                uint32_t m_idx =
+                                    pool_block_idx *
+                                    BLOCK_M;
+                                if (!is_leader_cta)
+                                    m_idx +=
+                                        math::align(
+                                            valid_m, 16u) /
+                                        2;
+                                if (cute::elect_one_sync()) {
+                                    tma::copy<
                                         DGRAD_BLOCK_K,
-                                    m_idx, 2);
-                                if (is_leader_cta) {
-                                    full_barriers[
-                                        stage_idx]
-                                        ->arrive_and_expect_tx(
-                                            SMEM_A_SIZE_PER_STAGE *
-                                            2);
-                                } else {
-                                    full_barriers[
-                                        stage_idx]
-                                        ->arrive(0u);
+                                        LOAD_BLOCK_M,
+                                        DGRAD_BLOCK_K *
+                                            sizeof(
+                                                cd_dtype_t),
+                                        cd_dtype_t>(
+                                        &tensor_map_grad_gate_up,
+                                        full_barriers[
+                                            stage_idx],
+                                        smem_dgrad_a[
+                                            stage_idx],
+                                        split_idx *
+                                                ((2 *
+                                                  kIntermediateHidden) /
+                                                 kNumW13DgradSplits) +
+                                            k_block_idx *
+                                                DGRAD_BLOCK_K,
+                                        m_idx, 2);
+                                    if (is_leader_cta) {
+                                        full_barriers[
+                                            stage_idx]
+                                            ->arrive_and_expect_tx(
+                                                SMEM_A_SIZE_PER_STAGE *
+                                                2);
+                                    } else {
+                                        full_barriers[
+                                            stage_idx]
+                                            ->arrive(0u);
+                                    }
                                 }
+                                __syncwarp();
                             }
-                            __syncwarp();
                         }
                     });
             } else if (warp_idx == 1) {
@@ -2296,68 +2560,82 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                         const uint32_t&
                             n_block_idx,
                         const uint32_t&) {
-                        #pragma unroll 1
-                        for (uint32_t k_block_idx =
-                                 0;
-                             k_block_idx <
-                                 (2 *
-                                  kIntermediateHidden) /
-                                     DGRAD_BLOCK_K;
-                             advance_pipeline(
-                                 k_block_idx)) {
-                            const uint32_t
-                                weight_tile_idx =
-                                    (expert_idx *
-                                         ((2 *
-                                           kIntermediateHidden) /
-                                          DGRAD_BLOCK_K) +
-                                     k_block_idx) *
-                                        kNumW13DgradBlockNs +
-                                    n_block_idx;
-                            if constexpr (!kBF16Mode) {
-                                while (ptx::ld_acq(
-                                           weight_tile_states +
-                                           kNumW2WeightTileStates +
-                                           weight_tile_idx) !=
-                                       w13_launch_epoch) {
+                        #pragma unroll
+                        for (uint32_t split_idx = 0;
+                             split_idx <
+                                 kNumW13DgradSplits;
+                             ++split_idx) {
+                            #pragma unroll 1
+                            for (uint32_t k_block_idx = 0;
+                                 k_block_idx <
+                                     (2 *
+                                      kIntermediateHidden) /
+                                         (DGRAD_BLOCK_K *
+                                          kNumW13DgradSplits);
+                                 advance_pipeline(
+                                     k_block_idx)) {
+                                const uint32_t
+                                    global_k_block_idx =
+                                        split_idx *
+                                            ((2 *
+                                              kIntermediateHidden) /
+                                             (DGRAD_BLOCK_K *
+                                              kNumW13DgradSplits)) +
+                                        k_block_idx;
+                                const uint32_t
+                                    weight_tile_idx =
+                                        (expert_idx *
+                                             ((2 *
+                                               kIntermediateHidden) /
+                                              DGRAD_BLOCK_K) +
+                                         global_k_block_idx) *
+                                            kNumW13DgradBlockNs +
+                                        n_block_idx;
+                                if constexpr (!kBF16Mode) {
+                                    while (ptx::ld_acq(
+                                               weight_tile_states +
+                                               kNumW2WeightTileStates +
+                                               weight_tile_idx) !=
+                                           w13_launch_epoch) {
+                                    }
                                 }
-                            }
-                            empty_barriers[stage_idx]
-                                ->wait(phase ^ 1);
-                            if (cute::elect_one_sync()) {
-                                tma::copy<
-                                    LOAD_BLOCK_N,
-                                    DGRAD_BLOCK_K,
-                                    DGRAD_BLOCK_K *
-                                        sizeof(
-                                            dgrad_b_dtype_t),
-                                    dgrad_b_dtype_t>(
-                                    &tensor_map_w13_dequant,
-                                    full_barriers[
-                                        stage_idx],
-                                    smem_dgrad_b[
-                                        stage_idx],
-                                    n_block_idx *
-                                        BLOCK_N,
-                                    expert_idx *
-                                            (2 *
-                                             kIntermediateHidden) +
-                                        k_block_idx *
-                                            DGRAD_BLOCK_K,
-                                    2);
-                                if (is_leader_cta) {
-                                    full_barriers[
-                                        stage_idx]
-                                        ->arrive_and_expect_tx(
-                                            SMEM_B_SIZE_PER_STAGE *
-                                            2);
-                                } else {
-                                    full_barriers[
-                                        stage_idx]
-                                        ->arrive(0u);
+                                empty_barriers[stage_idx]
+                                    ->wait(phase ^ 1);
+                                if (cute::elect_one_sync()) {
+                                    tma::copy<
+                                        LOAD_BLOCK_N,
+                                        DGRAD_BLOCK_K,
+                                        DGRAD_BLOCK_K *
+                                            sizeof(
+                                                dgrad_b_dtype_t),
+                                        dgrad_b_dtype_t>(
+                                        &tensor_map_w13_dequant,
+                                        full_barriers[
+                                            stage_idx],
+                                        smem_dgrad_b[
+                                            stage_idx],
+                                        n_block_idx *
+                                            BLOCK_N,
+                                        expert_idx *
+                                                (2 *
+                                                 kIntermediateHidden) +
+                                            global_k_block_idx *
+                                                DGRAD_BLOCK_K,
+                                        2);
+                                    if (is_leader_cta) {
+                                        full_barriers[
+                                            stage_idx]
+                                            ->arrive_and_expect_tx(
+                                                SMEM_B_SIZE_PER_STAGE *
+                                                2);
+                                    } else {
+                                        full_barriers[
+                                            stage_idx]
+                                            ->arrive(0u);
+                                    }
                                 }
+                                __syncwarp();
                             }
-                            __syncwarp();
                         }
                     });
             } else if (warp_idx == 2) {
@@ -2419,112 +2697,120 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                     cute::UMMA::
                                         make_runtime_instr_desc(
                                             instr_desc);
-                            const uint32_t accum_stage =
-                                current_iter %
-                                kNumEpilogueStages;
-                            const uint32_t accum_phase =
-                                (current_iter++ /
-                                 kNumEpilogueStages) &
-                                1;
-                            tmem_empty_barriers[
-                                accum_stage]
-                                ->wait(
-                                    accum_phase ^ 1);
-                            ptx::tcgen05_after_thread_sync();
-
-                            #pragma unroll 1
-                            for (uint32_t
-                                     k_block_idx = 0;
-                                 k_block_idx <
-                                     (2 *
-                                      kIntermediateHidden) /
-                                         DGRAD_BLOCK_K;
-                                 advance_pipeline(
-                                     k_block_idx)) {
-                                full_barriers[
-                                    stage_idx]
-                                    ->wait(phase);
+                            #pragma unroll
+                            for (uint32_t split_idx = 0;
+                                 split_idx <
+                                     kNumW13DgradSplits;
+                                 ++split_idx) {
+                                const uint32_t accum_stage =
+                                    current_iter %
+                                    kNumEpilogueStages;
+                                const uint32_t accum_phase =
+                                    (current_iter++ /
+                                     kNumEpilogueStages) &
+                                    1;
+                                tmem_empty_barriers[
+                                    accum_stage]
+                                    ->wait(
+                                        accum_phase ^ 1);
                                 ptx::tcgen05_after_thread_sync();
-                                const uint32_t
-                                    a_desc_base =
-                                        ptx::exchange(
-                                            a_desc_lo,
-                                            stage_idx);
-                                const uint32_t
-                                    b_desc_base =
-                                        ptx::exchange(
-                                            b_desc_lo,
-                                            stage_idx);
-                                if (cute::elect_one_sync()) {
-                                    #pragma unroll
-                                    for (uint32_t k = 0;
-                                         k <
-                                             DGRAD_BLOCK_K /
-                                                 DGRAD_UMMA_K;
-                                         ++k) {
-                                        a_desc.lo =
-                                            mma::sm100::
-                                                advance_umma_desc_lo<
-                                                    cute::UMMA::Major::K,
-                                                    LOAD_BLOCK_M,
-                                                    DGRAD_BLOCK_K *
-                                                        sizeof(
-                                                            cd_dtype_t),
-                                                    cd_dtype_t>(
-                                                    a_desc_base,
-                                                    0,
-                                                    k *
-                                                        DGRAD_UMMA_K);
-                                        b_desc.lo =
-                                            mma::sm100::
-                                                advance_umma_desc_lo<
-                                                    cute::UMMA::Major::MN,
-                                                    LOAD_BLOCK_N,
-                                                    DGRAD_BLOCK_K *
-                                                        sizeof(
-                                                            dgrad_b_dtype_t),
-                                                    dgrad_b_dtype_t>(
-                                                    b_desc_base,
-                                                    0,
-                                                    k *
-                                                        DGRAD_UMMA_K);
-                                        ptx::
-                                            SM100_MMA_F16BF16_2x1SM_SS::
-                                                fma(
-                                                    b_desc,
-                                                    a_desc,
-                                                    accum_stage *
-                                                        UMMA_N,
-                                                    k_block_idx >
-                                                            0 ||
-                                                        k > 0,
-                                                    runtime_instr_desc);
+
+                                #pragma unroll 1
+                                for (uint32_t
+                                         k_block_idx = 0;
+                                     k_block_idx <
+                                         (2 *
+                                          kIntermediateHidden) /
+                                             (DGRAD_BLOCK_K *
+                                              kNumW13DgradSplits);
+                                     advance_pipeline(
+                                         k_block_idx)) {
+                                    full_barriers[
+                                        stage_idx]
+                                        ->wait(phase);
+                                    ptx::tcgen05_after_thread_sync();
+                                    const uint32_t
+                                        a_desc_base =
+                                            ptx::exchange(
+                                                a_desc_lo,
+                                                stage_idx);
+                                    const uint32_t
+                                        b_desc_base =
+                                            ptx::exchange(
+                                                b_desc_lo,
+                                                stage_idx);
+                                    if (cute::elect_one_sync()) {
+                                        #pragma unroll
+                                        for (uint32_t k = 0;
+                                             k <
+                                                 DGRAD_BLOCK_K /
+                                                     DGRAD_UMMA_K;
+                                             ++k) {
+                                            a_desc.lo =
+                                                mma::sm100::
+                                                    advance_umma_desc_lo<
+                                                        cute::UMMA::Major::K,
+                                                        LOAD_BLOCK_M,
+                                                        DGRAD_BLOCK_K *
+                                                            sizeof(
+                                                                cd_dtype_t),
+                                                        cd_dtype_t>(
+                                                        a_desc_base,
+                                                        0,
+                                                        k *
+                                                            DGRAD_UMMA_K);
+                                            b_desc.lo =
+                                                mma::sm100::
+                                                    advance_umma_desc_lo<
+                                                        cute::UMMA::Major::MN,
+                                                        LOAD_BLOCK_N,
+                                                        DGRAD_BLOCK_K *
+                                                            sizeof(
+                                                                dgrad_b_dtype_t),
+                                                        dgrad_b_dtype_t>(
+                                                        b_desc_base,
+                                                        0,
+                                                        k *
+                                                            DGRAD_UMMA_K);
+                                            ptx::
+                                                SM100_MMA_F16BF16_2x1SM_SS::
+                                                    fma(
+                                                        b_desc,
+                                                        a_desc,
+                                                        accum_stage *
+                                                            UMMA_N,
+                                                        k_block_idx >
+                                                                0 ||
+                                                            k > 0,
+                                                        runtime_instr_desc);
+                                        }
                                     }
-                                }
-                                __syncwarp();
-                                constexpr uint16_t
-                                    kCTAMask = 0x3;
-                                cutlass::arch::
-                                    umma_arrive_multicast_2x1SM(
-                                        reinterpret_cast<
-                                            uint64_t*>(
-                                            empty_barriers[
-                                                stage_idx]),
-                                        kCTAMask);
-                                if (k_block_idx ==
-                                    (2 *
-                                     kIntermediateHidden) /
-                                            DGRAD_BLOCK_K -
-                                        1) {
+                                    __syncwarp();
+                                    constexpr uint16_t
+                                        kCTAMask = 0x3;
                                     cutlass::arch::
                                         umma_arrive_multicast_2x1SM(
                                             reinterpret_cast<
                                                 uint64_t*>(
-                                                tmem_full_barriers[
-                                                    accum_stage]),
+                                                empty_barriers[
+                                                    stage_idx]),
                                             kCTAMask);
+                                    if (k_block_idx ==
+                                        (2 *
+                                         kIntermediateHidden) /
+                                                (DGRAD_BLOCK_K *
+                                                 kNumW13DgradSplits) -
+                                            1) {
+                                        cutlass::arch::
+                                            umma_arrive_multicast_2x1SM(
+                                                reinterpret_cast<
+                                                    uint64_t*>(
+                                                    tmem_full_barriers[
+                                                        accum_stage]),
+                                                kCTAMask);
+                                    }
+                                    __syncwarp();
                                 }
-                                __syncwarp();
                             }
                         });
                     if (current_iter > 0) {
@@ -2560,12 +2846,17 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                             current_iter %
                             kNumEpilogueStages;
                         const uint32_t accum_phase =
-                            (current_iter++ /
+                            (current_iter /
                              kNumEpilogueStages) &
                             1;
-                        tmem_full_barriers[
-                            accum_stage]
-                            ->wait(accum_phase);
+                        current_iter +=
+                            kNumW13DgradSplits;
+                        tmem_full_barriers[accum_stage]->wait(
+                            accum_phase);
+                        if constexpr (kBF16Mode)
+                            tmem_full_barriers[
+                                accum_stage ^ 1]
+                                ->wait(accum_phase);
                         ptx::tcgen05_after_thread_sync();
                         const uint32_t effective_m =
                             math::align(valid_m, 16u);
@@ -2591,31 +2882,56 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                          STORE_BLOCK_M /
                                              8;
                                      ++i) {
-                                    const uint32_t
-                                        tmem_addr =
-                                            accum_stage *
-                                                UMMA_N +
-                                            s *
-                                                STORE_BLOCK_M +
-                                            i * 8;
-                                    uint32_t values[8];
+                                    const uint32_t tmem_addr =
+                                        accum_stage * UMMA_N +
+                                        s * STORE_BLOCK_M +
+                                        i * 8;
+                                    uint32_t w1_values[8];
+                                    uint32_t w3_values[8];
                                     cute::
                                         SM100_TMEM_LOAD_16dp256b1x::
                                             copy(
                                                 tmem_addr,
-                                                values[0],
-                                                values[1],
-                                                values[2],
-                                                values[3]);
+                                                w1_values[0],
+                                                w1_values[1],
+                                                w1_values[2],
+                                                w1_values[3]);
                                     cute::
                                         SM100_TMEM_LOAD_16dp256b1x::
                                             copy(
                                                 tmem_addr |
                                                     0x00100000,
-                                                values[4],
-                                                values[5],
-                                                values[6],
-                                                values[7]);
+                                                w1_values[4],
+                                                w1_values[5],
+                                                w1_values[6],
+                                                w1_values[7]);
+                                    if constexpr (kBF16Mode) {
+                                        const uint32_t
+                                            w3_tmem_addr =
+                                                (accum_stage ^
+                                                 1) *
+                                                    UMMA_N +
+                                                s *
+                                                    STORE_BLOCK_M +
+                                                i * 8;
+                                        cute::
+                                            SM100_TMEM_LOAD_16dp256b1x::
+                                                copy(
+                                                    w3_tmem_addr,
+                                                    w3_values[0],
+                                                    w3_values[1],
+                                                    w3_values[2],
+                                                    w3_values[3]);
+                                        cute::
+                                            SM100_TMEM_LOAD_16dp256b1x::
+                                                copy(
+                                                    w3_tmem_addr |
+                                                        0x00100000,
+                                                    w3_values[4],
+                                                    w3_values[5],
+                                                    w3_values[6],
+                                                    w3_values[7]);
+                                    }
                                     cutlass::arch::
                                         fence_view_async_tmem_load();
 
@@ -2648,26 +2964,85 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                              8) +
                                         (col ^ row) *
                                             kBankBytes;
-                                    ptx::
-                                        SM90_U32x4_STSM_T<int>::
-                                            copy(
-                                                math::
-                                                    cast_into_bf16_and_pack(
-                                                        values[0],
-                                                        values[1]),
-                                                math::
-                                                    cast_into_bf16_and_pack(
-                                                        values[2],
-                                                        values[3]),
-                                                math::
-                                                    cast_into_bf16_and_pack(
-                                                        values[4],
-                                                        values[5]),
-                                                math::
-                                                    cast_into_bf16_and_pack(
-                                                        values[6],
-                                                        values[7]),
-                                                smem_ptr);
+                                    const auto add_bf16_pair =
+                                        [](uint32_t a,
+                                           uint32_t b,
+                                           uint32_t c,
+                                           uint32_t d) {
+                                            const uint32_t
+                                                w1_packed =
+                                                    math::
+                                                        cast_into_bf16_and_pack(
+                                                            a,
+                                                            b);
+                                            const uint32_t
+                                                w3_packed =
+                                                    math::
+                                                        cast_into_bf16_and_pack(
+                                                            c,
+                                                            d);
+                                            const auto w1 =
+                                                *reinterpret_cast<
+                                                    const nv_bfloat162*>(
+                                                    &w1_packed);
+                                            const auto w3 =
+                                                *reinterpret_cast<
+                                                    const nv_bfloat162*>(
+                                                    &w3_packed);
+                                            const auto sum =
+                                                __hadd2_rn(
+                                                    w1, w3);
+                                            return *reinterpret_cast<
+                                                const uint32_t*>(
+                                                &sum);
+                                        };
+                                    if constexpr (kBF16Mode) {
+                                        ptx::
+                                            SM90_U32x4_STSM_T<int>::
+                                                copy(
+                                                    add_bf16_pair(
+                                                        w1_values[0],
+                                                        w1_values[1],
+                                                        w3_values[0],
+                                                        w3_values[1]),
+                                                    add_bf16_pair(
+                                                        w1_values[2],
+                                                        w1_values[3],
+                                                        w3_values[2],
+                                                        w3_values[3]),
+                                                    add_bf16_pair(
+                                                        w1_values[4],
+                                                        w1_values[5],
+                                                        w3_values[4],
+                                                        w3_values[5]),
+                                                    add_bf16_pair(
+                                                        w1_values[6],
+                                                        w1_values[7],
+                                                        w3_values[6],
+                                                        w3_values[7]),
+                                                    smem_ptr);
+                                    } else {
+                                        ptx::
+                                            SM90_U32x4_STSM_T<int>::
+                                                copy(
+                                                    math::
+                                                        cast_into_bf16_and_pack(
+                                                            w1_values[0],
+                                                            w1_values[1]),
+                                                    math::
+                                                        cast_into_bf16_and_pack(
+                                                            w1_values[2],
+                                                            w1_values[3]),
+                                                    math::
+                                                        cast_into_bf16_and_pack(
+                                                            w1_values[4],
+                                                            w1_values[5]),
+                                                    math::
+                                                        cast_into_bf16_and_pack(
+                                                            w1_values[6],
+                                                            w1_values[7]),
+                                                    smem_ptr);
+                                    }
                                 }
                             }
                             cutlass::arch::
@@ -2768,10 +3143,33 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                             }
                         }
                         ptx::tcgen05_before_thread_sync();
-                        tmem_empty_barriers[
-                            accum_stage]
+                        tmem_empty_barriers[accum_stage]
                             ->arrive(0u);
+                        if constexpr (kBF16Mode)
+                            tmem_empty_barriers[
+                                accum_stage ^ 1]
+                                ->arrive(0u);
                     });
+            }
+        }
+
+        if constexpr (kNumRanks > 1) {
+            if (direct_remote_grad_x) {
+                // Publish every direct NVLink store before any destination
+                // rank returns from the kernel and consumes its source planes.
+                constexpr uint32_t
+                    kDirectGradXDoneGridSyncIndex = 1;
+                constexpr uint32_t
+                    kDirectGradXDoneBarrierTag = 9;
+                comm::nvlink_barrier<
+                    kNumRanks, kNumSMs, kNumThreads,
+                    kDirectGradXDoneGridSyncIndex,
+                    kDirectGradXDoneBarrierTag>(
+                    backward_workspace,
+                    backward_sym_buffer,
+                    blockIdx.x,
+                    threadIdx.x,
+                    []() { __syncthreads(); });
             }
         }
 

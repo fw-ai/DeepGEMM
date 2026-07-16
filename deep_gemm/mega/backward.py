@@ -62,7 +62,7 @@ def bf16_mega_moe_backward_dgrad(
     h_act_output: torch.Tensor,
     h_weighted_output: torch.Tensor,
     x_pool_output: torch.Tensor,
-    grad_x_pool_output: torch.Tensor,
+    grad_x_pool_output: Optional[torch.Tensor],
     grad_route_output: torch.Tensor,
     grad_ye: torch.Tensor,
     route_weights: torch.Tensor,
@@ -82,6 +82,7 @@ def bf16_mega_moe_backward_dgrad(
     route_weight_mode: RouteWeightMode = RouteWeightMode.PRE_DOWN,
     grad_y_unweighted_output: Optional[torch.Tensor] = None,
     down_unweighted_output: Optional[torch.Tensor] = None,
+    python_numerical_correction: bool = False,
 ) -> None:
     """Run BF16 reverse dispatch, dgrad, activation, and direct grad-x."""
     route_weight_mode = RouteWeightMode(route_weight_mode)
@@ -89,6 +90,15 @@ def bf16_mega_moe_backward_dgrad(
         raise ValueError(f"unsupported activation: {activation}")
     if not write_grad_x_pool and not direct_remote_grad_x:
         raise ValueError("grad-x requires a local or direct remote output")
+    if grad_x_pool_output is None:
+        if write_grad_x_pool:
+            raise ValueError(
+                "write_grad_x_pool requires grad_x_pool_output")
+        grad_x_pool_output = grad_ye.new_empty(
+            (0, grad_ye.size(1)))
+    if python_numerical_correction and not write_grad_x_pool:
+        raise ValueError(
+            "Python numerical correction requires grad_x_pool_output")
     if route_weight_mode is RouteWeightMode.POST_DOWN:
         if grad_y_unweighted_output is None:
             raise ValueError(
@@ -176,6 +186,8 @@ def bf16_mega_moe_backward_dgrad(
         sym_buffer.num_max_tokens_per_rank,
         sym_buffer.num_topk,
     )
+    if not python_numerical_correction:
+        return
     # FireTitan uses two native grouped GEMMs for W1/W3 dgrad and rounds each
     # result to BF16 before the in-place add. The fused W13 dgrad above uses
     # one FP32 accumulation across [gate | up], which is not bitwise

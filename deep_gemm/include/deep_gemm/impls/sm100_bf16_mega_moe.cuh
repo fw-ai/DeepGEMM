@@ -339,14 +339,85 @@ sm100_bf16_mega_moe_impl(void* y,
         }
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
-        // Write source indices (~2 us with 512 tokens)
-        read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
-            const auto dst_rank_idx = expert_idx / kNumExpertsPerRank;
-            const auto dst_slot_idx = atomicAdd_block(shared_storage.expert_token_count + expert_idx, 1);
-            const auto dst_ptr = workspace.get_src_token_topk_idx_ptr(
-                expert_idx % kNumExpertsPerRank, sym_buffer.rank_idx, dst_slot_idx);
-            *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;
-        });
+        if constexpr (kSaveL1Preact) {
+            // Training wgrads must traverse the same stable
+            // expert/source-rank/token/top-k order as native DeepEP. Assign
+            // one global warp to each expert and compact source routes in
+            // increasing token-top-k order without atomics.
+            const uint32_t global_warp_idx =
+                sm_idx * kNumDispatchWarps + warp_idx;
+            constexpr uint32_t kNumGlobalWarps =
+                kNumSMs * kNumDispatchWarps;
+            for (uint32_t target_expert = global_warp_idx;
+                 target_expert < kNumExperts;
+                 target_expert += kNumGlobalWarps) {
+                uint32_t dst_slot_base = 0;
+                for (uint32_t route_base = 0;
+                     route_base < num_tokens * kNumTopk;
+                     route_base += 32) {
+                    const uint32_t token_topk_idx =
+                        route_base + lane_idx;
+                    int expert_idx = -1;
+                    if (token_topk_idx <
+                        num_tokens * kNumTopk) {
+                        expert_idx = static_cast<int>(
+                            __ldg(
+                                input_topk_idx_buffer
+                                    .get_base_ptr<int64_t>() +
+                                token_topk_idx));
+                    }
+                    const uint32_t matches =
+                        __ballot_sync(
+                            0xffffffff,
+                            expert_idx ==
+                                static_cast<int>(
+                                    target_expert));
+                    if (expert_idx ==
+                        static_cast<int>(target_expert)) {
+                        const uint32_t lanes_before =
+                            (1u << lane_idx) - 1u;
+                        const uint32_t dst_slot_idx =
+                            dst_slot_base +
+                            __popc(matches & lanes_before);
+                        const uint32_t dst_rank_idx =
+                            target_expert /
+                            kNumExpertsPerRank;
+                        const auto dst_ptr =
+                            workspace
+                                .get_src_token_topk_idx_ptr(
+                                    target_expert %
+                                        kNumExpertsPerRank,
+                                    sym_buffer.rank_idx,
+                                    dst_slot_idx);
+                        *sym_buffer.map(
+                            dst_ptr, dst_rank_idx) =
+                            token_topk_idx;
+                    }
+                    dst_slot_base += __popc(matches);
+                }
+            }
+        } else {
+            // Inference keeps round-robin pull order for NVLink balance.
+            read_topk_idx([&](
+                              const uint32_t&
+                                  token_topk_idx,
+                              const int& expert_idx) {
+                const auto dst_rank_idx =
+                    expert_idx / kNumExpertsPerRank;
+                const auto dst_slot_idx =
+                    atomicAdd_block(
+                        shared_storage.expert_token_count +
+                        expert_idx,
+                        1);
+                const auto dst_ptr =
+                    workspace.get_src_token_topk_idx_ptr(
+                        expert_idx % kNumExpertsPerRank,
+                        sym_buffer.rank_idx,
+                        dst_slot_idx);
+                *sym_buffer.map(dst_ptr, dst_rank_idx) =
+                    token_topk_idx;
+            });
+        }
 
         // Grid sync
         comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(
@@ -430,54 +501,92 @@ sm100_bf16_mega_moe_impl(void* y,
                 }
             }
 
-            // Round-robin rank selection via iterative min-peeling
             uint32_t current_rank_in_expert_idx;
-            uint32_t remaining[kNumRanksPerLane];
-            #pragma unroll
-            for (uint32_t i = 0; i < kNumRanksPerLane; ++ i)
-                remaining[i] = stored_rank_count[i];
-            uint32_t offset = 0;
             uint32_t token_idx_in_expert = token_idx - expert_start_idx;
-            uint32_t slot_idx = token_idx_in_expert;
             uint32_t token_idx_in_rank;
-            while (true) {
-                // Compute active count and min across all ranks
-                // NOTES: reduce within each lane first, then warp-reduce once
-                uint32_t num_actives_in_lane = 0;
-                uint32_t min_in_lane = 0xffffffff;
+            if constexpr (kSaveL1Preact) {
+                // Match native DeepEP's rank-major stable route order.
+                uint32_t slot_idx = token_idx_in_expert;
+                current_rank_in_expert_idx = 0;
+                token_idx_in_rank = 0;
                 #pragma unroll
-                for (uint32_t i = 0; i < kNumRanksPerLane; ++ i) {
-                    num_actives_in_lane += remaining[i] > 0;
-                    if (remaining[i] > 0)
-                        min_in_lane = cute::min(min_in_lane, remaining[i]);
+                for (uint32_t rank_idx = 0;
+                     rank_idx < kNumRanks; ++rank_idx) {
+                    const uint32_t rank_count =
+                        __shfl_sync(
+                            0xffffffff,
+                            stored_rank_count[
+                                rank_idx / 32],
+                            rank_idx % 32);
+                    if (slot_idx < rank_count) {
+                        current_rank_in_expert_idx =
+                            rank_idx;
+                        token_idx_in_rank = slot_idx;
+                        break;
+                    }
+                    slot_idx -= rank_count;
                 }
-                const uint32_t num_active_ranks = __reduce_add_sync(0xffffffff, num_actives_in_lane);
-                const uint32_t length = __reduce_min_sync(0xffffffff, min_in_lane);
-
-                // Hit in the current round
-                const uint32_t num_round_tokens = length * num_active_ranks;
-                if (slot_idx < num_round_tokens) {
-                    const uint32_t slot_idx_in_round = slot_idx % num_active_ranks;
-                    uint32_t num_seen_ranks = 0;
-                    current_rank_in_expert_idx = 0;
+            } else {
+                // Round-robin rank selection via iterative min-peeling.
+                uint32_t remaining[kNumRanksPerLane];
+                #pragma unroll
+                for (uint32_t i = 0;
+                     i < kNumRanksPerLane; ++i)
+                    remaining[i] =
+                        stored_rank_count[i];
+                uint32_t offset = 0;
+                uint32_t slot_idx =
+                    token_idx_in_expert;
+                while (true) {
+                    uint32_t num_actives_in_lane = 0;
+                    uint32_t min_in_lane = 0xffffffff;
                     #pragma unroll
                     for (uint32_t i = 0; i < kNumRanksPerLane; ++ i) {
-                        const uint32_t mask = __ballot_sync(0xffffffff, remaining[i] > 0);
-                        const uint32_t num_active_lanes = __popc(mask);
-                        if (slot_idx_in_round >= num_seen_ranks and slot_idx_in_round < num_seen_ranks + num_active_lanes)
-                            current_rank_in_expert_idx = i * 32 + __fns(mask, 0, slot_idx_in_round - num_seen_ranks + 1);
-                        num_seen_ranks += num_active_lanes;
+                        num_actives_in_lane +=
+                            remaining[i] > 0;
+                        if (remaining[i] > 0)
+                            min_in_lane = cute::min(
+                                min_in_lane,
+                                remaining[i]);
                     }
-                    token_idx_in_rank = offset + (slot_idx / num_active_ranks);
-                    break;
+                    const uint32_t num_active_ranks =
+                        __reduce_add_sync(
+                            0xffffffff,
+                            num_actives_in_lane);
+                    const uint32_t length =
+                        __reduce_min_sync(
+                            0xffffffff, min_in_lane);
+                    const uint32_t num_round_tokens =
+                        length * num_active_ranks;
+                    if (slot_idx < num_round_tokens) {
+                        const uint32_t slot_idx_in_round =
+                            slot_idx % num_active_ranks;
+                        uint32_t num_seen_ranks = 0;
+                        current_rank_in_expert_idx = 0;
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kNumRanksPerLane; ++ i) {
+                            const uint32_t mask =
+                                __ballot_sync(
+                                    0xffffffff,
+                                    remaining[i] > 0);
+                            const uint32_t num_active_lanes =
+                                __popc(mask);
+                            if (slot_idx_in_round >= num_seen_ranks and slot_idx_in_round < num_seen_ranks + num_active_lanes)
+                                current_rank_in_expert_idx = i * 32 + __fns(mask, 0, slot_idx_in_round - num_seen_ranks + 1);
+                            num_seen_ranks += num_active_lanes;
+                        }
+                        token_idx_in_rank =
+                            offset +
+                            (slot_idx /
+                             num_active_ranks);
+                        break;
+                    }
+                    slot_idx -= num_round_tokens;
+                    offset += length;
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kNumRanksPerLane; ++ i)
+                        remaining[i] -= cute::min(remaining[i], length);
                 }
-
-                // Move into the next round
-                slot_idx -= num_round_tokens;
-                offset += length;
-                #pragma unroll
-                for (uint32_t i = 0; i < kNumRanksPerLane; ++ i)
-                    remaining[i] -= cute::min(remaining[i], length);
             }
 
             // Read source token-topk index (written by remote dispatch via NVLink)

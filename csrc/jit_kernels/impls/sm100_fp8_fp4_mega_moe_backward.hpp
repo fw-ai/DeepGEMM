@@ -753,7 +753,10 @@ static void sm100_bf16_mega_moe_backward_dgrad(
         x_pool_output.sizes() ==
         torch::IntArrayRef({num_pool_rows, hidden}));
     DG_HOST_ASSERT(
-        grad_x_pool_output.sizes() == x_pool_output.sizes());
+        write_grad_x_pool
+            ? grad_x_pool_output.sizes() == x_pool_output.sizes()
+            : grad_x_pool_output.sizes() ==
+                  torch::IntArrayRef({0, hidden}));
     DG_HOST_ASSERT(grad_ye.sizes() == x_pool_output.sizes());
     DG_HOST_ASSERT(
         grad_y_unweighted_output.sizes() ==

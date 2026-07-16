@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import random
 import sys
@@ -180,9 +181,11 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             saved_l1_preact = torch.full(
                 (buffer.token_src_metadata.size(0), 2 * intermediate_hidden),
                 float('nan'), dtype=torch.bfloat16, device='cuda')
-        if is_bf16xbf16 and (
+        if (args.save_forward_stages and
+                not args.benchmark_backward and
+                is_bf16xbf16 and (
             args.save_l1_preact or args.test_backward
-        ):
+        )):
             saved_h_unweighted = torch.full(
                 (buffer.token_src_metadata.size(0), intermediate_hidden),
                 float('nan'), dtype=torch.bfloat16, device='cuda')
@@ -190,6 +193,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 saved_h_unweighted, float('nan'))
         if (
             is_bf16xbf16 and
+            (args.save_forward_stages or
+             args.route_weight_mode == 'post_down') and
             (
                 args.save_l1_preact or args.test_backward
             )
@@ -609,17 +614,20 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             else 'w2_input')
         actual_stages = {
             'w13': saved_l1_preact[native_pool_indices],
-            'h': saved_h_unweighted[native_pool_indices],
-            activation_stage: (
+        }
+        if saved_h_unweighted is not None:
+            actual_stages['h'] = (
+                saved_h_unweighted[native_pool_indices])
+            actual_stages[activation_stage] = (
                 saved_h_weighted[native_pool_indices]
                 if args.route_weight_mode == 'pre_down'
-                else saved_h_unweighted[native_pool_indices]
-            ),
-            'down': saved_down_unweighted[native_pool_indices],
-        }
+                else saved_h_unweighted[native_pool_indices])
+        if saved_down_unweighted is not None:
+            actual_stages['down'] = (
+                saved_down_unweighted[native_pool_indices])
         first_difference = (
             'final' if final_mismatches else None)
-        for stage in ('w13', 'h', activation_stage, 'down'):
+        for stage in actual_stages:
             mismatch_count = report_bf16_parity(
                 f'Stage {stage}',
                 actual_stages[stage],
@@ -643,13 +651,13 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 explicit = (
                     gate / (1.0 + torch.exp(-z)) * up
                 ).to(torch.bfloat16)
-                dist_print(
-                    f' > First h mismatch inputs: '
+                print(
+                    f' > rank {rank_idx} first h mismatch inputs: '
                     f'row={route_row}, col={hidden_col}, '
                     f'gate={float(gate):.9g}, up={float(up):.9g}, '
                     f'z={float(z):.9g}, '
                     f'explicit={float(explicit.float()):.9g}',
-                    once_in_node=True)
+                    flush=True)
             if stage == 'h_weighted' and mismatch_count:
                 mismatch = (
                     actual_stages[stage] != reference_stages[stage])
@@ -676,8 +684,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 observed_weight = (
                     actual_weighted / actual_h
                     if actual_h else float('nan'))
-                dist_print(
-                    f' > First h_weighted mismatch inputs: '
+                print(
+                    f' > rank {rank_idx} first h_weighted mismatch inputs: '
                     f'native_row={route_row}, '
                     f'physical_row={physical_row}, col={hidden_col}, '
                     f'source={source}, h={actual_h:.9g}, '
@@ -685,7 +693,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                     f'observed_weight={observed_weight:.9g}, '
                     f'actual={actual_weighted:.9g}, '
                     f'expected={expected_weighted:.9g}',
-                    once_in_node=True)
+                    flush=True)
             if mismatch_count and first_difference is None:
                 first_difference = stage
         dist_print(
@@ -740,6 +748,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             assert valid_rows.sum().item() == valid_experts.numel()
 
     def run_bf16_backward_test():
+        backward_base_allocated = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
         config_num_tokens = torch.tensor(
             num_tokens, dtype=torch.int32, device='cuda')
         if num_ranks > 1:
@@ -788,17 +798,29 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         grad_ye = torch.zeros(
             (pool_rows, hidden),
             dtype=torch.bfloat16, device='cuda')
-        grad_y_unweighted = torch.zeros_like(grad_ye)
+        grad_y_unweighted = (
+            grad_ye
+            if args.route_weight_mode == 'pre_down'
+            else torch.zeros_like(grad_ye))
         grad_h = torch.zeros(
             (pool_rows, intermediate_hidden),
             dtype=torch.bfloat16, device='cuda')
         grad_gate_up = torch.zeros(
             (pool_rows, 2 * intermediate_hidden),
             dtype=torch.bfloat16, device='cuda')
-        h_act = torch.zeros_like(grad_h)
         h_weighted = torch.zeros_like(grad_h)
+        h_act = (
+            h_weighted
+            if args.route_weight_mode == 'post_down'
+            else torch.zeros_like(grad_h))
         x_pool = torch.zeros_like(grad_ye)
-        grad_x_pool = torch.zeros_like(grad_ye)
+        grad_x_pool = (
+            torch.zeros_like(grad_ye)
+            if args.write_grad_x_pool
+            else torch.empty(
+                (0, hidden),
+                dtype=torch.bfloat16,
+                device='cuda'))
         route_weights_pool = torch.zeros(
             pool_rows, dtype=torch.float, device='cuda')
         grad_route_pool = torch.zeros_like(route_weights_pool)
@@ -813,34 +835,104 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             num_grid_states, dtype=torch.int, device='cuda')
         metadata_before_backward = buffer.token_src_metadata.clone()
 
-        deep_gemm.bf16_mega_moe_backward_dgrad(
-            gate_up_output=saved_l1_preact,
-            grad_h_output=grad_h,
-            grad_gate_up_output=grad_gate_up,
-            h_act_output=h_act,
-            h_weighted_output=h_weighted,
-            x_pool_output=x_pool,
-            grad_x_pool_output=grad_x_pool,
-            grad_route_output=grad_route_pool,
-            grad_ye=grad_ye,
-            route_weights=route_weights_pool,
-            w2_weights=l2_weights_bf16,
-            w13_weights=l1_weights_bf16,
-            expert_counts=expert_counts,
-            grid_sync_counter=grid_sync_counter,
-            grad_y=grad_y,
-            sym_buffer=buffer,
-            activation_limit=float(args.activation_clamp),
-            block_m=block_m,
-            activation=args.activation,
-            fast_math=bool(args.fast_math),
-            route_weight_mode=deep_gemm.RouteWeightMode(
-                args.route_weight_mode),
-            grad_y_unweighted_output=grad_y_unweighted,
-            down_unweighted_output=saved_down_unweighted,
-            direct_remote_grad_x=num_ranks > 1,
-            write_grad_x_pool=True,
-            clear_wgrad_padding=True)
+        def run_backward_dgrad():
+            deep_gemm.bf16_mega_moe_backward_dgrad(
+                gate_up_output=saved_l1_preact,
+                grad_h_output=grad_h,
+                grad_gate_up_output=grad_gate_up,
+                h_act_output=h_act,
+                h_weighted_output=h_weighted,
+                x_pool_output=x_pool,
+                grad_x_pool_output=grad_x_pool,
+                grad_route_output=grad_route_pool,
+                grad_ye=grad_ye,
+                route_weights=route_weights_pool,
+                w2_weights=l2_weights_bf16,
+                w13_weights=l1_weights_bf16,
+                expert_counts=expert_counts,
+                grid_sync_counter=grid_sync_counter,
+                grad_y=grad_y,
+                sym_buffer=buffer,
+                activation_limit=float(args.activation_clamp),
+                block_m=block_m,
+                activation=args.activation,
+                fast_math=bool(args.fast_math),
+                route_weight_mode=deep_gemm.RouteWeightMode(
+                    args.route_weight_mode),
+                grad_y_unweighted_output=grad_y_unweighted,
+                down_unweighted_output=saved_down_unweighted,
+                direct_remote_grad_x=num_ranks > 1,
+                write_grad_x_pool=args.write_grad_x_pool,
+                clear_wgrad_padding=True,
+                python_numerical_correction=(
+                    args.python_numerical_correction))
+
+        if args.benchmark_backward:
+            for _ in range(args.backward_warmup):
+                run_backward_dgrad()
+            dist.barrier()
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(args.backward_iterations):
+                run_backward_dgrad()
+            end.record()
+            end.synchronize()
+            backward_ms = torch.tensor(
+                start.elapsed_time(end) /
+                args.backward_iterations,
+                dtype=torch.float64,
+                device='cuda')
+            dist.all_reduce(
+                backward_ms, op=dist.ReduceOp.MAX, group=group)
+            pool_tensors = {
+                'grad_ye': grad_ye,
+                'grad_y_unweighted': grad_y_unweighted,
+                'grad_h': grad_h,
+                'grad_gate_up': grad_gate_up,
+                'h_act': h_act,
+                'h_weighted': h_weighted,
+                'x_pool': x_pool,
+                'grad_x_pool': grad_x_pool,
+                'route_weights': route_weights_pool,
+                'grad_route': grad_route_pool,
+            }
+            seen_ptrs = set()
+            logical_bytes = {}
+            for name, tensor in pool_tensors.items():
+                is_alias = tensor.data_ptr() in seen_ptrs
+                logical_bytes[name] = (
+                    0 if is_alias else tensor.nbytes)
+                seen_ptrs.add(tensor.data_ptr())
+            benchmark_result = {
+                'backward_dgrad_ms': float(
+                    backward_ms.item()),
+                'write_grad_x_pool':
+                    args.write_grad_x_pool,
+                'python_numerical_correction':
+                    args.python_numerical_correction,
+                'pool_rows': pool_rows,
+                'pool_tensor_gib': {
+                    name: value / 2 ** 30
+                    for name, value in
+                    logical_bytes.items()
+                },
+                'pool_total_gib':
+                    sum(logical_bytes.values()) / 2 ** 30,
+                'backward_incremental_allocated_gib': (
+                    torch.cuda.memory_allocated() -
+                    backward_base_allocated) / 2 ** 30,
+                'backward_peak_incremental_gib': (
+                    torch.cuda.max_memory_allocated() -
+                    backward_base_allocated) / 2 ** 30,
+            }
+            dist_print(
+                json.dumps(
+                    benchmark_result, indent=2),
+                once_in_node=True)
+            return
+
+        run_backward_dgrad()
         actual_direct_grad_x_planes = None
         if num_ranks > 1:
             actual_direct_grad_x_planes = torch.as_strided(
@@ -873,7 +965,10 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         ref_h_act = torch.zeros_like(h_act)
         ref_h_weighted = torch.zeros_like(h_weighted)
         ref_x_pool = torch.zeros_like(x_pool)
-        ref_grad_x_pool = torch.zeros_like(grad_x_pool)
+        ref_grad_x_pool = torch.zeros(
+            (pool_rows, hidden),
+            dtype=torch.bfloat16,
+            device='cuda')
         ref_route_weights = torch.zeros_like(route_weights_pool)
         ref_grad_route = torch.zeros_like(grad_route_pool)
 
@@ -1041,20 +1136,104 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         assert_gradient_close(
             grad_gate_up, ref_grad_gate_up,
             'grad_gate_up')
+        if (
+            args.activation == 'geglu' and
+            not torch.equal(
+                grad_gate_up, ref_grad_gate_up)
+        ):
+            mismatch_rows = (
+                grad_gate_up != ref_grad_gate_up
+            ).nonzero()[:8]
+            mismatch_details = []
+            for pool_row, col in mismatch_rows.tolist():
+                mismatch_details.append({
+                    'pool_row': pool_row,
+                    'col': col,
+                    'actual': float(
+                        grad_gate_up[pool_row, col]),
+                    'expected': float(
+                        ref_grad_gate_up[pool_row, col]),
+                    'valid_row': bool(
+                        torch.isfinite(
+                            saved_l1_preact[
+                                pool_row, 0])),
+                })
+            print(
+                f' > rank {rank_idx} GeGLU full-pool mismatch details: '
+                f'{mismatch_details}; '
+                f'expert_counts={expert_counts.tolist()}',
+                flush=True)
         assert_gradient_close(h_act, ref_h_act, 'h_act')
         assert_gradient_close(
             h_weighted, ref_h_weighted,
             'h_weighted')
         assert_gradient_close(x_pool, ref_x_pool, 'x_pool')
-        assert_gradient_close(
-            grad_x_pool, ref_grad_x_pool,
-            'grad_x_pool')
+        if args.write_grad_x_pool:
+            assert_gradient_close(
+                grad_x_pool, ref_grad_x_pool,
+                'grad_x_pool')
         assert_gradient_close(
             route_weights_pool, ref_route_weights,
             'route_weights_pool')
         assert_gradient_close(
             grad_route_pool, ref_grad_route,
             'grad_route_pool')
+        if (
+            args.activation == 'geglu' and
+            not torch.equal(
+                grad_gate_up[
+                    actual_pool_indices,
+                    :intermediate_hidden],
+                grad_gate_bf16,
+            )
+        ):
+            manual_sig = 1.0 / (1.0 + torch.exp(-z))
+            manual_activation_grad = (
+                manual_sig +
+                gate_fp32 * manual_sig *
+                (1.0 - manual_sig) * dz)
+            manual_grad_gate = (
+                gh.float() * up_fp32 *
+                manual_activation_grad)
+            manual_grad_gate = torch.where(
+                gate.float() <= clamp,
+                manual_grad_gate,
+                torch.zeros_like(manual_grad_gate),
+            ).to(torch.bfloat16)
+            actual_grad_gate = grad_gate_up[
+                actual_pool_indices,
+                :intermediate_hidden]
+            mismatch = actual_grad_gate != grad_gate_bf16
+            mismatch_rows = mismatch.nonzero()[:8]
+            mismatch_details = []
+            for compact_row, col in mismatch_rows.tolist():
+                mismatch_details.append({
+                    'pool_row': int(
+                        actual_pool_indices[compact_row]),
+                    'compact_row': compact_row,
+                    'col': col,
+                    'actual': float(
+                        actual_grad_gate[compact_row, col]),
+                    'expected': float(
+                        grad_gate_bf16[compact_row, col]),
+                    'manual_sigmoid': float(
+                        manual_grad_gate[compact_row, col]),
+                    'gate': float(
+                        gate_fp32[compact_row, col]),
+                    'up': float(
+                        up_fp32[compact_row, col]),
+                    'grad_h': float(
+                        gh[compact_row, col]),
+                    'z': float(z[compact_row, col]),
+                    'sigmoid': float(sig[compact_row, col]),
+                    'manual_sig': float(
+                        manual_sig[compact_row, col]),
+                    'dz': float(dz[compact_row, col]),
+                })
+            print(
+                f' > rank {rank_idx} GeGLU grad-gate mismatch details: '
+                f'{mismatch_details}',
+                flush=True)
         repeated_grad_h = native_bf16_grouped_mm(
             grad_w2_input,
             l2_weights_bf16,
@@ -1227,10 +1406,10 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                     ]
                     for actual_slot in range(num_topk)
                 ]
-                dist_print(
-                    f' > grad_x source slot cross-mismatches: '
+                print(
+                    f' > rank {rank_idx} grad_x source slot cross-mismatches: '
                     f'{cross_slot_mismatches}',
-                    once_in_node=True)
+                    flush=True)
             assert_gradient_close(
                 actual_direct_grad_x_planes[
                     :, :num_tokens
@@ -1353,8 +1532,18 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     use_numerical_reference = is_bf16xbf16 or num_ranks == 1
     ran_correctness = False
 
+    if args.benchmark_backward:
+        if not is_bf16xbf16:
+            raise ValueError(
+                '--benchmark-backward requires bf16xbf16')
+        create_inputs()
+        run_fused()
+        run_bf16_backward_test()
+        ran_correctness = True
+
     # noinspection PyBroadException
-    if use_legacy_baseline and num_correctness_tests > 0:
+    if (not args.benchmark_backward and
+            use_legacy_baseline and num_correctness_tests > 0):
         dist_print('Running correctness tests (bitwise vs legacy baseline):', once_in_node=True)
         for i in range(num_correctness_tests):
             create_inputs()
@@ -1365,7 +1554,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         dist_print(once_in_node=True)
         ran_correctness = True
 
-    if use_numerical_reference and num_correctness_tests > 0:
+    if (not args.benchmark_backward and
+            use_numerical_reference and num_correctness_tests > 0):
         # FP8/FP4 quantization across two GEMMs bounds the achievable similarity
         max_diff = 0.05
         dist_print(f'Running correctness tests ({args.activation}, numerical reference):', once_in_node=True)
@@ -1479,7 +1669,31 @@ if __name__ == '__main__':
     parser.add_argument('--fast-math', type=int, default=1, help='Enable fast math (0 or 1, default: 1)')
     parser.add_argument('--mma-type', type=str, default='fp8xfp4', help='MMA type: fp8xfp4 or bf16xbf16')
     parser.add_argument('--save-l1-preact', action='store_true', help='Validate optional exact BF16 W13 output')
+    parser.add_argument(
+        '--no-save-forward-stages',
+        dest='save_forward_stages',
+        action='store_false',
+        help='Match production training: save preactivation only (and post-down output when needed)')
+    parser.set_defaults(save_forward_stages=True)
     parser.add_argument('--test-backward', action='store_true', help='Validate BF16 dgrad and grouped wgrad')
+    parser.add_argument(
+        '--python-numerical-correction',
+        action='store_true',
+        help='Debug only: replace raw BF16 CUDA backward outputs with native operations')
+    parser.add_argument(
+        '--no-write-grad-x-pool',
+        dest='write_grad_x_pool',
+        action='store_false',
+        help='Use direct source planes without allocating the local grad-x pool')
+    parser.set_defaults(write_grad_x_pool=True)
+    parser.add_argument(
+        '--benchmark-backward',
+        action='store_true',
+        help='Benchmark raw BF16 dgrad and skip backward reference construction')
+    parser.add_argument(
+        '--backward-warmup', type=int, default=3)
+    parser.add_argument(
+        '--backward-iterations', type=int, default=10)
 
     # Test settings
     parser.add_argument('--num-correctness-tests', type=int, default=None, help='Pressure test')

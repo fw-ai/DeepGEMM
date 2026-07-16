@@ -469,7 +469,9 @@ sm100_bf16_gemm_impl(int* grouped_layout,
                     kBeforeCombineReuseTag>(
                     combine_workspace, combine_sym_buffer,
                     blockIdx.x, combine_thread_idx,
-                    combine_sync);
+                    combine_sync,
+                    /* Kernel launch order publishes Kernel A locally. */ false,
+                    /* Kernel completion joins SM 0 after cross-rank sync. */ false);
             } else {
                 // Kernel A has already written every remote top-k plane.
                 // W13's combine warps reduce those planes while the
