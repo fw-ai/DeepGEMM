@@ -36,6 +36,8 @@ template <
     bool kFastMath,
     ActivationType kActivationType,
     bool kSaveL1Preact,
+    RouteWeightMode kRouteWeightMode,
+    bool kSaveDownUnweighted,
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
     uint32_t L2_SHAPE_N = kHidden,
@@ -59,7 +61,8 @@ sm100_bf16_mega_moe_impl(void* y,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_l1_weights,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_l1_output,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts,
-                         const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights) {
+                         const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights,
+                         const __grid_constant__ cute::TmaDescriptor tensor_map_down_unweighted) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::TMEM::Allocator2Sm;
@@ -84,6 +87,9 @@ sm100_bf16_mega_moe_impl(void* y,
         cute::prefetch_tma_descriptor(&tensor_map_l1_output);
         cute::prefetch_tma_descriptor(&tensor_map_l2_acts);
         cute::prefetch_tma_descriptor(&tensor_map_l2_weights);
+        if constexpr (kSaveDownUnweighted)
+            cute::prefetch_tma_descriptor(
+                &tensor_map_down_unweighted);
     }
 
     // Workspaces
@@ -1007,9 +1013,24 @@ sm100_bf16_mega_moe_impl(void* y,
                                     gate.x / denom.x,
                                     gate.y / denom.y};
                             }
-                            bf16x2_output[i * 2 + k] = __float22bfloat162_rn(
-                                __fmul2_rn(
-                                    __fmul2_rn(activated, up), weights));
+                            // The activation output is a BF16 boundary in both
+                            // route modes. Pre-down applies p only after that
+                            // rounding; post-down leaves h unweighted for W2.
+                            const auto h_bf16 =
+                                __float22bfloat162_rn(
+                                    __fmul2_rn(activated, up));
+                            if constexpr (
+                                kRouteWeightMode ==
+                                RouteWeightMode::PreDown) {
+                                bf16x2_output[i * 2 + k] =
+                                    __float22bfloat162_rn(
+                                        __fmul2_rn(
+                                            __bfloat1622float2(h_bf16),
+                                            weights));
+                            } else {
+                                bf16x2_output[i * 2 + k] =
+                                    h_bf16;
+                            }
                         }
                     }
 
@@ -1127,6 +1148,40 @@ sm100_bf16_mega_moe_impl(void* y,
                     // Wait shared memory ready
                     ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
 
+                    if constexpr (kSaveDownUnweighted) {
+                        if (warp_idx_in_wg == 0 &&
+                            cute::elect_one_sync()) {
+                            cute::tma_store_fence();
+                            #pragma unroll
+                            for (uint32_t atom = 0;
+                                 atom <
+                                     BLOCK_N * sizeof(d_dtype_t) /
+                                         kSwizzleCDMode;
+                                 ++atom) {
+                                cute::SM90_TMA_STORE_2D::copy(
+                                    &tensor_map_down_unweighted,
+                                    shared_storage.smem_d
+                                        .l2[epilogue_wg_idx] +
+                                        atom * STORE_BLOCK_M *
+                                            (kSwizzleCDMode /
+                                             sizeof(d_dtype_t)),
+                                    n_idx +
+                                        atom *
+                                            (kSwizzleCDMode /
+                                             sizeof(d_dtype_t)),
+                                    pool_m_idx +
+                                        epilogue_wg_idx *
+                                            WG_BLOCK_M +
+                                        s * STORE_BLOCK_M);
+                                cute::tma_store_arrive();
+                            }
+                        }
+                        if (warp_idx_in_wg == 0) {
+                            cute::tma_store_wait<0>();
+                        }
+                        __syncwarp();
+                    }
+
                     // Write into remote buffers
                     // Each warp writes 2 rows (lane_idx/16 splits the warp into two halves, one per row)
                     const uint32_t row_in_atom = (warp_idx_in_wg * 2 + lane_idx / 16) % ATOM_M;
@@ -1151,7 +1206,30 @@ sm100_bf16_mega_moe_impl(void* y,
                             (lane_idx % 16 / 8) * STORE_BLOCK_M * (kSwizzleCDMode / sizeof(d_dtype_t)) +
                             row_in_store * (kSwizzleCDMode / sizeof(d_dtype_t)) +
                             (bank_group_idx ^ row_in_atom) * (kNumBankGroupBytes / sizeof(d_dtype_t));
-                        const auto packed = ptx::ld_shared(reinterpret_cast<float4*>(smem_ptr));
+                        auto packed = ptx::ld_shared(
+                            reinterpret_cast<float4*>(smem_ptr));
+                        if constexpr (
+                            kRouteWeightMode ==
+                            RouteWeightMode::PostDown) {
+                            const float route_weight =
+                                *l1_topk_weights_buffer
+                                     .get_data_buffer(
+                                         ring_m_idx +
+                                         m_idx_in_block)
+                                     .template get_base_ptr<float>();
+                            auto* values =
+                                reinterpret_cast<nv_bfloat16*>(
+                                    &packed);
+                            #pragma unroll
+                            for (uint32_t value_idx = 0;
+                                 value_idx < 8; ++value_idx) {
+                                values[value_idx] =
+                                    __float2bfloat16_rn(
+                                        __bfloat162float(
+                                            values[value_idx]) *
+                                        route_weight);
+                            }
+                        }
 
                         // Write into remote
                         const auto dst_token = combine_token_buffer.get_rank_buffer(dst_topk_idx)

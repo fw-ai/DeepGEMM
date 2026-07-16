@@ -67,6 +67,7 @@ static void bf16_mega_moe_backward_dgrad(
     const torch::Tensor& grad_x_pool_output,
     const torch::Tensor& grad_route_output,
     const torch::Tensor& grad_ye,
+    const torch::Tensor& grad_y_unweighted_output,
     const torch::Tensor& route_weights,
     const torch::Tensor& w2_weights,
     const torch::Tensor& w13_weights,
@@ -75,6 +76,8 @@ static void bf16_mega_moe_backward_dgrad(
     const float& activation_limit,
     const std::string& activation,
     const bool& fast_math,
+    const std::string& route_weight_mode,
+    const torch::Tensor& down_unweighted_output,
     const int& block_m,
     const bool& direct_remote_grad_x,
     const bool& write_grad_x_pool,
@@ -91,9 +94,11 @@ static void bf16_mega_moe_backward_dgrad(
         gate_up_output, grad_h_output, grad_gate_up_output,
         h_act_output, h_weighted_output, x_pool_output,
         grad_x_pool_output, grad_route_output, grad_ye,
+        grad_y_unweighted_output,
         route_weights, w2_weights, w13_weights,
         expert_counts, grid_sync_counter, activation_limit,
-        activation, fast_math, block_m,
+        activation, fast_math, route_weight_mode,
+        down_unweighted_output, block_m,
         direct_remote_grad_x, write_grad_x_pool,
         clear_wgrad_padding, backward_grad_y, backward_x,
         backward_topk_weights, token_src_metadata,
@@ -105,7 +110,11 @@ static void bf16_mega_moe_backward_w2(
     const torch::Tensor& grad_w2_output,
     const torch::Tensor& grad_ye,
     const torch::Tensor& h_weighted,
-    const torch::Tensor& padded_expert_counts) {
+    const torch::Tensor& padded_expert_counts,
+    const std::string& route_weight_mode) {
+    DG_HOST_ASSERT(
+        route_weight_mode == "pre_down" ||
+        route_weight_mode == "post_down");
     deep_gemm::sm100_bf16_mega_moe_wgrad_1sm(
         grad_ye, h_weighted, grad_w2_output,
         padded_expert_counts);
@@ -176,7 +185,11 @@ static void bf16_mega_moe_backward_w2_combine(
     const std::vector<int64_t>& sym_buffer_ptrs,
     const int& rank,
     const int& num_max_tokens_per_rank,
-    const int& num_topk) {
+    const int& num_topk,
+    const std::string& route_weight_mode) {
+    DG_HOST_ASSERT(
+        route_weight_mode == "pre_down" ||
+        route_weight_mode == "post_down");
     const auto combine = make_backward_combine_args(
         grad_x_output, combine_buffer, sym_buffer_ptrs, rank,
         num_max_tokens_per_rank, num_topk,
@@ -246,6 +259,7 @@ static void register_apis(pybind11::module_& m) {
         py::arg("grad_x_pool_output"),
         py::arg("grad_route_output"),
         py::arg("grad_ye"),
+        py::arg("grad_y_unweighted_output"),
         py::arg("route_weights"),
         py::arg("w2_weights"),
         py::arg("w13_weights"),
@@ -254,6 +268,8 @@ static void register_apis(pybind11::module_& m) {
         py::arg("activation_limit"),
         py::arg("activation"),
         py::arg("fast_math"),
+        py::arg("route_weight_mode"),
+        py::arg("down_unweighted_output"),
         py::arg("block_m"),
         py::arg("direct_remote_grad_x"),
         py::arg("write_grad_x_pool"),
@@ -270,7 +286,8 @@ static void register_apis(pybind11::module_& m) {
           &bf16_mega_moe_backward_w2,
           py::arg("grad_w2_output"), py::arg("grad_ye"),
           py::arg("h_weighted"),
-          py::arg("padded_expert_counts"));
+          py::arg("padded_expert_counts"),
+          py::arg("route_weight_mode") = "pre_down");
     m.def("bf16_mega_moe_backward_w13",
           &bf16_mega_moe_backward_w13,
           py::arg("grad_w13_output"),
@@ -285,7 +302,8 @@ static void register_apis(pybind11::module_& m) {
           py::arg("combine_buffer"),
           py::arg("sym_buffer_ptrs"), py::arg("rank"),
           py::arg("num_max_tokens_per_rank"),
-          py::arg("num_topk"));
+          py::arg("num_topk"),
+          py::arg("route_weight_mode") = "pre_down");
     m.def("bf16_mega_moe_backward_w13_combine",
           &bf16_mega_moe_backward_w13_combine,
           py::arg("grad_w13_output"),

@@ -18,6 +18,15 @@
 
 namespace deep_gemm {
 
+static std::string get_backward_route_weight_mode_name(
+    const std::string& route_weight_mode) {
+    if (route_weight_mode == "pre_down")
+        return "RouteWeightMode::PreDown";
+    if (route_weight_mode == "post_down")
+        return "RouteWeightMode::PostDown";
+    DG_HOST_UNREACHABLE("Unsupported route weight mode");
+}
+
 class SM100FP8FP4MegaMoEBackwardWaveRuntime final
     : public LaunchRuntime<SM100FP8FP4MegaMoEBackwardWaveRuntime> {
 public:
@@ -38,6 +47,7 @@ public:
         bool bf16_mode = false;
         std::string activation = "swiglu";
         bool fast_math = false;
+        std::string route_weight_mode = "pre_down";
 
         const int* expert_counts;
         layout::SymBuffer<> backward_sym_buffer;
@@ -71,6 +81,7 @@ public:
         cutlass::bfloat16_t* w13_dequant_scratch;
         const cutlass::bfloat16_t* gate_up_output;
         cutlass::bfloat16_t* grad_ye_output;
+        cutlass::bfloat16_t* grad_y_unweighted_output;
         cutlass::bfloat16_t* route_weights;
         float* route_weights_fp32;
         cutlass::bfloat16_t* grad_h_output;
@@ -79,6 +90,7 @@ public:
         cutlass::bfloat16_t* h_weighted_output;
         cutlass::bfloat16_t* x_pool_output;
         cutlass::bfloat16_t* grad_x_pool_output;
+        const cutlass::bfloat16_t* down_unweighted_output;
         float* grad_route_output;
         uint32_t* grid_sync_counter;
         uint32_t launch_epoch;
@@ -109,6 +121,7 @@ static void __instantiate_kernel() {{
             {},
             {},
             {},
+            {},
             {}
         >);
 }};
@@ -125,7 +138,9 @@ static void __instantiate_kernel() {{
             args.activation == "geglu"
                 ? "ActivationType::GeGLU"
                 : "ActivationType::SwiGLU",
-            args.fast_math ? "true" : "false");
+            args.fast_math ? "true" : "false",
+            get_backward_route_weight_mode_name(
+                args.route_weight_mode));
     }
 
     static void launch_impl(
@@ -166,6 +181,7 @@ static void __instantiate_kernel() {{
             args.w13_dequant_scratch,
             args.gate_up_output,
             args.grad_ye_output,
+            args.grad_y_unweighted_output,
             args.route_weights,
             args.route_weights_fp32,
             args.grad_h_output,
@@ -174,6 +190,7 @@ static void __instantiate_kernel() {{
             args.h_weighted_output,
             args.x_pool_output,
             args.grad_x_pool_output,
+            args.down_unweighted_output,
             args.grad_route_output,
             args.grid_sync_counter,
             args.launch_epoch,
@@ -569,6 +586,9 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
         .grad_ye_output =
             reinterpret_cast<cutlass::bfloat16_t*>(
                 grad_ye.data_ptr<at::BFloat16>()),
+        .grad_y_unweighted_output =
+            reinterpret_cast<cutlass::bfloat16_t*>(
+                grad_ye.data_ptr<at::BFloat16>()),
         .route_weights =
             reinterpret_cast<cutlass::bfloat16_t*>(
                 route_weights.data_ptr<at::BFloat16>()),
@@ -591,6 +611,7 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
         .grad_x_pool_output =
             reinterpret_cast<cutlass::bfloat16_t*>(
                 grad_x_pool_output.data_ptr<at::BFloat16>()),
+        .down_unweighted_output = nullptr,
         .grad_route_output = nullptr,
         .grid_sync_counter =
             reinterpret_cast<uint32_t*>(
@@ -621,6 +642,7 @@ static void sm100_bf16_mega_moe_backward_dgrad(
     const torch::Tensor& grad_x_pool_output,
     const torch::Tensor& grad_route_output,
     const torch::Tensor& grad_ye,
+    const torch::Tensor& grad_y_unweighted_output,
     const torch::Tensor& route_weights,
     const torch::Tensor& w2_weights,
     const torch::Tensor& w13_weights,
@@ -629,6 +651,8 @@ static void sm100_bf16_mega_moe_backward_dgrad(
     const float& activation_limit,
     const std::string& activation,
     const bool& fast_math,
+    const std::string& route_weight_mode,
+    const torch::Tensor& down_unweighted_output,
     const int& block_m,
     const bool& direct_remote_grad_x,
     const bool& write_grad_x_pool,
@@ -664,6 +688,9 @@ static void sm100_bf16_mega_moe_backward_dgrad(
 
     DG_HOST_ASSERT(device_runtime->get_arch_major() == 10);
     DG_HOST_ASSERT(activation == "swiglu" || activation == "geglu");
+    DG_HOST_ASSERT(
+        route_weight_mode == "pre_down" ||
+        route_weight_mode == "post_down");
     DG_HOST_ASSERT(num_ranks >= 1);
     DG_HOST_ASSERT(
         backward_rank >= 0 && backward_rank < num_ranks);
@@ -689,6 +716,8 @@ static void sm100_bf16_mega_moe_backward_dgrad(
     check_bf16_contiguous(x_pool_output);
     check_bf16_contiguous(grad_x_pool_output);
     check_bf16_contiguous(grad_ye);
+    check_bf16_contiguous(grad_y_unweighted_output);
+    check_bf16_contiguous(down_unweighted_output);
     check_bf16_contiguous(w2_weights);
     check_bf16_contiguous(w13_weights);
     check_bf16_contiguous(backward_grad_y);
@@ -726,6 +755,12 @@ static void sm100_bf16_mega_moe_backward_dgrad(
     DG_HOST_ASSERT(
         grad_x_pool_output.sizes() == x_pool_output.sizes());
     DG_HOST_ASSERT(grad_ye.sizes() == x_pool_output.sizes());
+    DG_HOST_ASSERT(
+        grad_y_unweighted_output.sizes() ==
+        x_pool_output.sizes());
+    DG_HOST_ASSERT(
+        down_unweighted_output.sizes() ==
+        x_pool_output.sizes());
     DG_HOST_ASSERT(route_weights.numel() == num_pool_rows);
     DG_HOST_ASSERT(grad_route_output.numel() == num_pool_rows);
     DG_HOST_ASSERT(
@@ -858,6 +893,7 @@ static void sm100_bf16_mega_moe_backward_dgrad(
         .bf16_mode = true,
         .activation = activation,
         .fast_math = fast_math,
+        .route_weight_mode = route_weight_mode,
         .expert_counts = expert_counts.data_ptr<int>(),
         .backward_sym_buffer = backward_sym_buffer,
         .backward_workspace = backward_workspace,
@@ -907,6 +943,10 @@ static void sm100_bf16_mega_moe_backward_dgrad(
         .grad_ye_output =
             reinterpret_cast<cutlass::bfloat16_t*>(
                 grad_ye.data_ptr<at::BFloat16>()),
+        .grad_y_unweighted_output =
+            reinterpret_cast<cutlass::bfloat16_t*>(
+                grad_y_unweighted_output
+                    .data_ptr<at::BFloat16>()),
         .route_weights =
             nullptr,
         .route_weights_fp32 = route_weights.data_ptr<float>(),
@@ -928,6 +968,10 @@ static void sm100_bf16_mega_moe_backward_dgrad(
         .grad_x_pool_output =
             reinterpret_cast<cutlass::bfloat16_t*>(
                 grad_x_pool_output.data_ptr<at::BFloat16>()),
+        .down_unweighted_output =
+            reinterpret_cast<const cutlass::bfloat16_t*>(
+                down_unweighted_output
+                    .data_ptr<at::BFloat16>()),
         .grad_route_output =
             grad_route_output.data_ptr<float>(),
         .grid_sync_counter =

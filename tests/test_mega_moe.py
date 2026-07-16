@@ -117,7 +117,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     def create_inputs():
         global x, topk_idx, topk_weights, l1_weights, l2_weights, transformed_l1_weights, transformed_l2_weights
         global l1_weights_bf16, l2_weights_bf16
-        global saved_l1_preact
+        global saved_l1_preact, saved_down_unweighted
         global cumulative_local_expert_recv_stats_fused
         global cumulative_local_expert_recv_stats_baseline
         x = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
@@ -169,11 +169,20 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             deep_gemm.transform_weights_for_mega_moe(
                 l1_weights, l2_weights, activation=args.activation))
         saved_l1_preact = None
+        saved_down_unweighted = None
         if is_bf16xbf16 and (
             args.save_l1_preact or args.test_backward
         ):
             saved_l1_preact = torch.full(
                 (buffer.token_src_metadata.size(0), 2 * intermediate_hidden),
+                float('nan'), dtype=torch.bfloat16, device='cuda')
+        if (
+            is_bf16xbf16 and
+            args.route_weight_mode == 'post_down' and
+            args.test_backward
+        ):
+            saved_down_unweighted = torch.full(
+                (buffer.token_src_metadata.size(0), hidden),
                 float('nan'), dtype=torch.bfloat16, device='cuda')
 
     # Run fused mega MoE
@@ -196,6 +205,11 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             activation_clamp=args.activation_clamp,
             fast_math=bool(args.fast_math),
             saved_l1_preact=saved_l1_preact)
+        if is_bf16xbf16:
+            kernel_kwargs.update(
+                route_weight_mode=deep_gemm.RouteWeightMode(
+                    args.route_weight_mode),
+                saved_down_unweighted=saved_down_unweighted)
         (deep_gemm.bf16_mega_moe if is_bf16xbf16 else deep_gemm.fp8_fp4_mega_moe)(**kernel_kwargs)
         return y, cumulative_local_expert_recv_stats_fused
 
@@ -257,18 +271,33 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                     gate = torch.clamp(gate, max=clamp)
                     up = torch.clamp(up, min=-clamp, max=clamp)
 
-                # Gated activation with the per-token routing weight folded in
-                act = _apply_gate_activation(gate.float(), args.activation) * up.float()
-                act = act * weight[mask].unsqueeze(1)
+                # Unweighted gated activation.
+                act = (
+                    _apply_gate_activation(
+                        gate.float(), args.activation) *
+                    up.float())
 
                 if is_bf16xbf16:
-                    # Native BF16 contract: round the activation output before
-                    # W2, then round W2 before the FP32 top-k reduction.
-                    act_deq = act.to(torch.bfloat16)
-                    l2_out = act_deq @ l2_w[e].t()
+                    # Both modes materialize unweighted h in BF16. The route
+                    # multiplication then occurs at its mode-specific BF16
+                    # boundary.
+                    h = act.to(torch.bfloat16)
+                    if args.route_weight_mode == 'pre_down':
+                        w2_input = (
+                            h.float() *
+                            weight[mask].unsqueeze(1)
+                        ).to(torch.bfloat16)
+                        l2_out = w2_input @ l2_w[e].t()
+                    else:
+                        down = h @ l2_w[e].t()
+                        l2_out = (
+                            down.float() *
+                            weight[mask].unsqueeze(1)
+                        ).to(torch.bfloat16)
                 else:
                     # Requantize to FP8 (per-32 UE8M0), matching the
                     # quantized kernel's L1 output.
+                    act = act * weight[mask].unsqueeze(1)
                     act_fp8, act_sf = per_token_cast_to_fp8(
                         act, use_ue8m0=True, gran_k=32)
                     n_groups = intermediate_hidden // 32
@@ -392,6 +421,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         grad_ye = torch.zeros(
             (pool_rows, hidden),
             dtype=torch.bfloat16, device='cuda')
+        grad_y_unweighted = torch.zeros_like(grad_ye)
         grad_h = torch.zeros(
             (pool_rows, intermediate_hidden),
             dtype=torch.bfloat16, device='cuda')
@@ -436,6 +466,10 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             block_m=block_m,
             activation=args.activation,
             fast_math=bool(args.fast_math),
+            route_weight_mode=deep_gemm.RouteWeightMode(
+                args.route_weight_mode),
+            grad_y_unweighted_output=grad_y_unweighted,
+            down_unweighted_output=saved_down_unweighted,
             direct_remote_grad_x=num_ranks > 1,
             write_grad_x_pool=True,
             clear_wgrad_padding=True)
@@ -451,6 +485,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         local_experts = global_experts - local_expert_start
 
         ref_grad_ye = torch.zeros_like(grad_ye)
+        ref_grad_y_unweighted = torch.zeros_like(
+            grad_y_unweighted)
         ref_grad_h = torch.zeros_like(grad_h)
         ref_grad_gate_up = torch.zeros_like(grad_gate_up)
         ref_h_act = torch.zeros_like(h_act)
@@ -459,6 +495,20 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         ref_grad_x_pool = torch.zeros_like(grad_x_pool)
         ref_route_weights = torch.zeros_like(route_weights_pool)
         ref_grad_route = torch.zeros_like(grad_route_pool)
+
+        def ordered_fp32_dot(
+            lhs: torch.Tensor,
+            rhs: torch.Tensor,
+        ) -> torch.Tensor:
+            result = torch.zeros(
+                lhs.size(0), dtype=torch.float,
+                device=lhs.device)
+            for col in range(lhs.size(1)):
+                product = (
+                    lhs[:, col].float() *
+                    rhs[:, col].float())
+                result = result + product
+            return result
 
         for expert_idx in range(num_experts_per_rank):
             selected = local_experts == expert_idx
@@ -496,16 +546,35 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             activated_gate = gate_fp32 * sig
             h = (activated_gate * up_fp32).to(
                 torch.bfloat16)
-            hw = (
-                h.float() * route.float().unsqueeze(1)
-            ).to(torch.bfloat16)
-            gh_unweighted = (
-                gye @ l2_weights_bf16[expert_idx]
-            )
-            gh = (
-                gh_unweighted.float() *
-                route.float().unsqueeze(1)
-            ).to(torch.bfloat16)
+            if args.route_weight_mode == 'pre_down':
+                w2_input = (
+                    h.float() * route.float().unsqueeze(1)
+                ).to(torch.bfloat16)
+                grad_w2_input = gye
+                grad_h_w2 = (
+                    gye @ l2_weights_bf16[expert_idx])
+                gh = (
+                    grad_h_w2.float() *
+                    route.float().unsqueeze(1)
+                ).to(torch.bfloat16)
+                grad_route = ordered_fp32_dot(
+                    grad_h_w2, h)
+            else:
+                w2_input = h
+                grad_w2_input = (
+                    gye.float() *
+                    route.float().unsqueeze(1)
+                ).to(torch.bfloat16)
+                grad_h_w2 = (
+                    grad_w2_input @
+                    l2_weights_bf16[expert_idx])
+                gh = grad_h_w2
+                down = (
+                    h @ l2_weights_bf16[expert_idx].t())
+                grad_route = ordered_fp32_dot(gye, down)
+                torch.testing.assert_close(
+                    saved_down_unweighted[rows], down,
+                    rtol=0, atol=0)
             activation_grad = (
                 sig +
                 gate_fp32 * sig * (1 - sig) * dz)
@@ -530,17 +599,16 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 grad_gu @ l1_weights_bf16[expert_idx]
             )
 
-            ref_grad_ye[rows] = gye
-            ref_grad_h[rows] = gh_unweighted
+            ref_grad_ye[rows] = grad_w2_input
+            ref_grad_y_unweighted[rows] = gye
+            ref_grad_h[rows] = grad_h_w2
             ref_grad_gate_up[rows] = grad_gu
             ref_h_act[rows] = h
-            ref_h_weighted[rows] = hw
+            ref_h_weighted[rows] = w2_input
             ref_x_pool[rows] = xe
             ref_grad_x_pool[rows] = grad_xe
             ref_route_weights[rows] = route
-            ref_grad_route[rows] = (
-                gh_unweighted.float() * h.float()
-            ).sum(dim=1)
+            ref_grad_route[rows] = grad_route
 
         # Independently differentiate the native BF16 route computation. Keep
         # each rank's local experts but retain global source-token leaves so
@@ -574,10 +642,20 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             ).to(torch.bfloat16)
             route = autograd_routes[
                 source_rank, source_token, source_slot]
-            h_weighted_ref = (
-                h.float() * route.float().unsqueeze(1)
-            ).to(torch.bfloat16)
-            ye = h_weighted_ref @ autograd_w2[expert_idx].t()
+            if args.route_weight_mode == 'pre_down':
+                h_weighted_ref = (
+                    h.float() * route.float().unsqueeze(1)
+                ).to(torch.bfloat16)
+                ye = (
+                    h_weighted_ref @
+                    autograd_w2[expert_idx].t())
+            else:
+                down = (
+                    h @ autograd_w2[expert_idx].t())
+                ye = (
+                    down.float() *
+                    route.float().unsqueeze(1)
+                ).to(torch.bfloat16)
             loss = (
                 ye.float() *
                 all_grad_y[source_rank, source_token].float()
@@ -630,6 +708,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 msg=lambda msg: f'{name}: {msg}')
 
         assert_gradient_close(grad_ye, ref_grad_ye, 'grad_ye')
+        assert_gradient_close(
+            grad_y_unweighted, ref_grad_y_unweighted,
+            'grad_y_unweighted')
         assert_gradient_close(grad_h, ref_grad_h, 'grad_h')
         assert_gradient_close(
             grad_gate_up, ref_grad_gate_up,
@@ -659,7 +740,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             deep_gemm.bf16_mega_moe_backward_w2_combine(
                 grad_w2, grad_ye, h_weighted,
                 padded_expert_counts, grad_x_combined,
-                buffer)
+                buffer,
+                route_weight_mode=deep_gemm.RouteWeightMode(
+                    args.route_weight_mode))
             deep_gemm.bf16_mega_moe_backward_w13_combine(
                 grad_w13, grad_gate_up, x_pool,
                 padded_expert_counts, grad_x_combined,
@@ -667,7 +750,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         else:
             deep_gemm.bf16_mega_moe_backward_w2(
                 grad_w2, grad_ye, h_weighted,
-                padded_expert_counts)
+                padded_expert_counts,
+                route_weight_mode=deep_gemm.RouteWeightMode(
+                    args.route_weight_mode))
             deep_gemm.bf16_mega_moe_backward_w13(
                 grad_w13, grad_gate_up, x_pool,
                 padded_expert_counts)
@@ -944,6 +1029,7 @@ if __name__ == '__main__':
     parser.add_argument('--hidden', type=int, default=7168, help='Hidden size')
     parser.add_argument('--intermediate-hidden', type=int, default=3072, help='Intermediate hidden size')
     parser.add_argument('--activation', type=str, default='swiglu', choices=['swiglu', 'geglu'], help='Gated activation type')
+    parser.add_argument('--route-weight-mode', type=str, default='pre_down', choices=['pre_down', 'post_down'], help='Location of the BF16 route-weight boundary')
     parser.add_argument('--activation-clamp', type=float, default=10, help='Clamp value for activation')
     parser.add_argument('--num-experts', type=int, default=384, help='Number of experts')
     parser.add_argument('--num-topk', type=int, default=6, help='Number of expert selections')

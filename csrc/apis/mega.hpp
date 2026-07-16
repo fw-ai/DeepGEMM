@@ -292,11 +292,19 @@ static void bf16_mega_moe(
     const std::optional<float>& activation_clamp_opt,
     const bool& fast_math,
     const int& num_ring_tokens,
-    const std::optional<torch::Tensor>& saved_l1_preact
+    const std::optional<torch::Tensor>& saved_l1_preact,
+    const std::string& route_weight_mode,
+    const std::optional<torch::Tensor>& saved_down_unweighted
 ) {
     // Config checks
     const auto num_tokens = static_cast<int>(y.size(0));
     DG_HOST_ASSERT(activation == "swiglu" or activation == "geglu");
+    DG_HOST_ASSERT(
+        route_weight_mode == "pre_down" ||
+        route_weight_mode == "post_down");
+    DG_HOST_ASSERT(
+        not saved_down_unweighted.has_value() ||
+        route_weight_mode == "post_down");
 
     // Activation checks
     const auto activation_clamp =
@@ -355,7 +363,9 @@ static void bf16_mega_moe(
                             num_tokens, num_topk,
                             hidden, intermediate_hidden,
                             activation,
-                            activation_clamp, fast_math);
+                            activation_clamp, fast_math,
+                            route_weight_mode,
+                            saved_down_unweighted);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }

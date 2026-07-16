@@ -13,6 +13,14 @@ activation clamps, and shared-expert boundaries are semantic inputs. Fast
 approximations are excluded from parity runs. Empty experts and ranks with no
 tokens produce exact zero outputs and gradients.
 
+`RouteWeightMode` is an explicit API enum; DeepGEMM never infers it from a
+model name. `PreDown` materializes unweighted `h` in BF16, multiplies it by the
+FP32 route weight, materializes BF16 again, and feeds that value to W2.
+`PostDown` feeds BF16 `h` to W2, materializes unweighted W2 output in BF16,
+multiplies that output by the route weight, and materializes BF16 again before
+combine. These two rounding boundaries are intentionally not algebraically
+interchanged.
+
 ## Architecture
 
 ```mermaid
@@ -104,8 +112,10 @@ two 128-thread epilogue warpgroups selected by block shape:
 
 The scheduler assigns adjacent CTAs the same expert and M block with adjacent N
 blocks. W13's N dimension is `2*I`, so one scheduler pass computes gate and up
-together from interleaved BF16 weights. The route weight is applied at the
-existing model-defined point after activation and before W2.
+together from interleaved BF16 weights. `PreDown` applies the route weight in
+the activation epilogue; `PostDown` applies it to the BF16 W2 result during
+remote combine write-back. Training callers request an optional full-pool BF16
+save of the unweighted W2 result for the exact `PostDown` router gradient.
 
 ### TMA and UMMA layouts
 
@@ -158,6 +168,16 @@ dgrad with FP32 accumulation and BF16 materialization. It writes each selected
 route's grad-x directly to its source rank and emits the FP32 route-gradient
 term at the same route-weight boundary as forward.
 
+For `PreDown`, Kernel A computes BF16
+`g_h_unweighted = W2^T @ g_y`, uses
+`dot(g_h_unweighted, h)` for the router term, and materializes
+`g_h = BF16(p * g_h_unweighted)` for activation backward. Kernel B's W2
+operands are raw BF16 `g_y` and BF16 `p*h`. For `PostDown`, Kernel A first
+materializes BF16 `p*g_y`; both W2 dgrad and Kernel B W2 wgrad consume it while
+their forward operand is unweighted BF16 `h`. Its router term is
+`dot(g_y, y_unweighted)`, where `y_unweighted` is the exact BF16 value saved by
+forward.
+
 Kernel B consumes BLOCK_M-padded per-expert pools. It computes W2 and combined
 W13 grouped weight gradients and performs the protected top-k/direct-write
 reduction. BF16 grouped wgrad is a dedicated one-CTA specialization:
@@ -168,7 +188,8 @@ tiles do not inherently share the same grouped K interval, and the current
 single-CTA grouped-layout contract is what makes empty and padded expert rows
 harmless. Kernel A may use `.cta_group::2`; Kernel B remains `.cta_group::1`.
 
-Router gradients are reduced in FP32 in top-k-slot order. Invalid routes,
+Each router dot is reduced with explicit FP32 multiply and add in increasing
+hidden-index order, then written in the route tensor's dtype. Invalid routes,
 empty experts, padded rows, and zero-token ranks are explicitly zeroed rather
 than left as allocator state.
 
@@ -183,9 +204,10 @@ applicable row passes.
 | ranks | single rank first; EP8 when eight free GPUs are available |
 | tokens/rank | `0`, `1`, small decode, block boundary `BM-1/BM/BM+1`, prefill |
 | routing | balanced, Zipf/skewed, all routes to one expert, masked routes, empty experts |
+| route weight | explicit `PreDown` and `PostDown`, including their distinct BF16 boundaries |
 | top-k | `1`, `2`, model top-k, duplicate-free deterministic IDs |
 | activation | SwiGLU, clamped SwiGLU, GeGLU; finite and boundary clamp values |
-| outputs | final y and optional exact pre-clamp gate/up |
+| outputs | final y, optional exact pre-clamp gate/up, optional unweighted BF16 W2 output |
 | gradients | x, W13, W2, route weights; all-empty and partially empty experts |
 | integration | repeated forward/backward, activation checkpoint replay, FSDP-owned master weights |
 
@@ -205,6 +227,8 @@ Acceptance criteria:
    to make a test pass.
 6. IDs, source metadata, clamp masks, route-weight placement, and shared-expert
    boundaries are checked exactly.
+7. A single token, one expert, and top-k 1 is bitwise equal for forward,
+   grad-x, W13 wgrad, W2 wgrad, and router gradient in both route modes.
 
 ## Implementation increments and rollback
 

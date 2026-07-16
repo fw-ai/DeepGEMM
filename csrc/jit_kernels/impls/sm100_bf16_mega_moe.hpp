@@ -24,6 +24,15 @@ static std::string get_bf16_activation_type_name(
     DG_HOST_UNREACHABLE("Unsupported activation");
 }
 
+static std::string get_route_weight_mode_name(
+    const std::string& route_weight_mode) {
+    if (route_weight_mode == "pre_down")
+        return "RouteWeightMode::PreDown";
+    if (route_weight_mode == "post_down")
+        return "RouteWeightMode::PostDown";
+    DG_HOST_UNREACHABLE("Unsupported route weight mode");
+}
+
 class SM100BF16MegaMoERuntime final : public LaunchRuntime<SM100BF16MegaMoERuntime> {
 public:
     struct Args {
@@ -36,6 +45,8 @@ public:
         bool fast_math;
         std::string activation;
         bool save_l1_preact;
+        std::string route_weight_mode;
+        bool save_down_unweighted;
         MegaMoEConfig config;
 
         // Runtime arguments
@@ -51,6 +62,7 @@ public:
         CUtensorMap tensor_map_l1_output;
         CUtensorMap tensor_map_l2_acts;
         CUtensorMap tensor_map_l2_weights;
+        CUtensorMap tensor_map_down_unweighted;
 
         // Launch configs
         LaunchArgs launch_args;
@@ -78,6 +90,8 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
+        {},
         {}
     >);
 }};
@@ -95,7 +109,9 @@ static void __instantiate_kernel() {{
     to_string(args.activation_clamp),
     args.fast_math ? "true" : "false",
     get_bf16_activation_type_name(args.activation),
-    args.save_l1_preact ? "true" : "false");
+    args.save_l1_preact ? "true" : "false",
+    get_route_weight_mode_name(args.route_weight_mode),
+    args.save_down_unweighted ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -110,7 +126,8 @@ static void __instantiate_kernel() {{
             args.tensor_map_l1_weights,
             args.tensor_map_l1_output,
             args.tensor_map_l2_acts,
-            args.tensor_map_l2_weights
+            args.tensor_map_l2_weights,
+            args.tensor_map_down_unweighted
         ));
     }
 };
@@ -128,7 +145,9 @@ static void sm100_bf16_mega_moe(
     const int& hidden, const int& intermediate_hidden,
     const std::string& activation,
     const float& activation_clamp,
-    const bool& fast_math
+    const bool& fast_math,
+    const std::string& route_weight_mode,
+    const std::optional<torch::Tensor>& saved_down_unweighted
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -149,6 +168,23 @@ static void sm100_bf16_mega_moe(
             saved_l1_preact->sizes() ==
             torch::IntArrayRef(
                 {num_max_pool_tokens, 2 * intermediate_hidden}));
+    }
+    DG_HOST_ASSERT(
+        route_weight_mode == "pre_down" ||
+        route_weight_mode == "post_down");
+    DG_HOST_ASSERT(
+        not saved_down_unweighted.has_value() ||
+        route_weight_mode == "post_down");
+    if (saved_down_unweighted.has_value()) {
+        const auto num_max_pool_tokens = layout::get_num_max_pool_tokens(
+            num_ranks, num_max_tokens_per_rank, num_topk,
+            num_experts_per_rank);
+        DG_HOST_ASSERT(
+            saved_down_unweighted->scalar_type() == torch::kBFloat16);
+        DG_HOST_ASSERT(saved_down_unweighted->is_contiguous());
+        DG_HOST_ASSERT(
+            saved_down_unweighted->sizes() ==
+            torch::IntArrayRef({num_max_pool_tokens, hidden}));
     }
 
     // Make tensormap
@@ -177,6 +213,15 @@ static void sm100_bf16_mega_moe(
                                                         config.block_k, config.load_block_n,
                                                         static_cast<int>(l2_weights.stride(-2)),
                                                         config.swizzle_weights_mode);
+    const auto tensor_map_down_unweighted =
+        saved_down_unweighted.has_value()
+        ? make_tma_2d_desc(
+              *saved_down_unweighted,
+              hidden, saved_down_unweighted->size(0),
+              config.block_n, config.store_block_m,
+              static_cast<int>(saved_down_unweighted->stride(-2)),
+              config.swizzle_acts_mode)
+        : tensor_map_l2_acts;
 
     // Stats can be optional
     int* cumulative_local_expert_recv_stats_ptr = nullptr;
@@ -194,6 +239,9 @@ static void sm100_bf16_mega_moe(
         .fast_math = fast_math,
         .activation = activation,
         .save_l1_preact = saved_l1_preact.has_value(),
+        .route_weight_mode = route_weight_mode,
+        .save_down_unweighted =
+            saved_down_unweighted.has_value(),
         .config = config,
         .y = y.data_ptr(),
         .saved_l1_preact = saved_l1_preact.has_value()
@@ -207,6 +255,8 @@ static void sm100_bf16_mega_moe(
         .tensor_map_l1_output = tensor_map_l1_output,
         .tensor_map_l2_acts = tensor_map_l2_acts,
         .tensor_map_l2_weights = tensor_map_l2_weights,
+        .tensor_map_down_unweighted =
+            tensor_map_down_unweighted,
         .launch_args = LaunchArgs(num_sms,
                                   config.num_dispatch_threads + config.num_non_epilogue_threads + config.num_epilogue_threads,
                                   config.smem_size, 2)

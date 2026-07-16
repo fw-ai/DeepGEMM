@@ -3,6 +3,7 @@ from typing import Any, Optional, Tuple
 import torch
 
 from .. import _C
+from . import RouteWeightMode
 
 
 def bf16_mega_moe_backward_dgrad(
@@ -29,12 +30,28 @@ def bf16_mega_moe_backward_dgrad(
     direct_remote_grad_x: bool = True,
     write_grad_x_pool: bool = True,
     clear_wgrad_padding: bool = True,
+    route_weight_mode: RouteWeightMode = RouteWeightMode.PRE_DOWN,
+    grad_y_unweighted_output: Optional[torch.Tensor] = None,
+    down_unweighted_output: Optional[torch.Tensor] = None,
 ) -> None:
     """Run BF16 reverse dispatch, dgrad, activation, and direct grad-x."""
+    route_weight_mode = RouteWeightMode(route_weight_mode)
     if activation not in ("swiglu", "geglu"):
         raise ValueError(f"unsupported activation: {activation}")
     if not write_grad_x_pool and not direct_remote_grad_x:
         raise ValueError("grad-x requires a local or direct remote output")
+    if route_weight_mode is RouteWeightMode.POST_DOWN:
+        if grad_y_unweighted_output is None:
+            raise ValueError(
+                "post_down requires grad_y_unweighted_output")
+        if down_unweighted_output is None:
+            raise ValueError(
+                "post_down requires saved down_unweighted_output")
+    else:
+        if grad_y_unweighted_output is None:
+            grad_y_unweighted_output = grad_ye
+        if down_unweighted_output is None:
+            down_unweighted_output = grad_ye
     num_tokens = grad_y.shape[0]
     backward_grad_y = sym_buffer.backward_grad_y
     if direct_remote_grad_x:
@@ -73,6 +90,7 @@ def bf16_mega_moe_backward_dgrad(
         grad_x_pool_output,
         grad_route_output,
         grad_ye,
+        grad_y_unweighted_output,
         route_weights,
         w2_weights,
         w13_weights,
@@ -81,6 +99,8 @@ def bf16_mega_moe_backward_dgrad(
         activation_limit,
         activation,
         fast_math,
+        route_weight_mode.value,
+        down_unweighted_output,
         block_m,
         direct_remote_grad_x,
         write_grad_x_pool,
@@ -197,13 +217,16 @@ def bf16_mega_moe_backward_w2(
     grad_ye: torch.Tensor,
     h_weighted: torch.Tensor,
     padded_expert_counts: torch.Tensor,
+    route_weight_mode: RouteWeightMode = RouteWeightMode.PRE_DOWN,
 ) -> None:
     """Run standalone single-CTA BF16 W2 wgrad for local experts."""
+    route_weight_mode = RouteWeightMode(route_weight_mode)
     _C.bf16_mega_moe_backward_w2(
         grad_w2_output,
         grad_ye,
         h_weighted,
         padded_expert_counts,
+        route_weight_mode.value,
     )
 
 
@@ -229,8 +252,10 @@ def bf16_mega_moe_backward_w2_combine(
     padded_expert_counts: torch.Tensor,
     grad_x_output: torch.Tensor,
     sym_buffer: Any,
+    route_weight_mode: RouteWeightMode = RouteWeightMode.PRE_DOWN,
 ) -> None:
     """Run W2 wgrad while protecting the direct-write receive planes."""
+    route_weight_mode = RouteWeightMode(route_weight_mode)
     _C.bf16_mega_moe_backward_w2_combine(
         grad_w2_output,
         grad_ye,
@@ -242,6 +267,7 @@ def bf16_mega_moe_backward_w2_combine(
         sym_buffer.group.rank(),
         sym_buffer.num_max_tokens_per_rank,
         sym_buffer.num_topk,
+        route_weight_mode.value,
     )
 
 

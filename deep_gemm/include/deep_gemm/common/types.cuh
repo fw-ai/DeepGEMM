@@ -56,4 +56,13 @@ enum class ActivationType {
     GeGLU  = 1,
 };
 
+enum class RouteWeightMode {
+    // Round the activated expert input to BF16, then apply the route weight
+    // and round again before the down projection.
+    PreDown = 0,
+    // Round the unweighted down-projection output to BF16, then apply the
+    // route weight and round again before top-k combine.
+    PostDown = 1,
+};
+
 } // namespace deep_gemm

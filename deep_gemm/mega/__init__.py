@@ -1,6 +1,7 @@
 import torch
 import types
 import warnings
+from enum import Enum
 from typing import Tuple, Optional, Union
 from ..utils.math import align
 
@@ -15,6 +16,11 @@ except Exception as exception:
     )
 
 from .. import _C
+
+
+class RouteWeightMode(str, Enum):
+    PRE_DOWN = 'pre_down'
+    POST_DOWN = 'post_down'
 
 
 class SymmBuffer:
@@ -207,7 +213,21 @@ def bf16_mega_moe(y: torch.Tensor,
                   activation: str = 'swiglu',
                   activation_clamp: Optional[float] = None,
                   fast_math: bool = True,
-                  saved_l1_preact: Optional[torch.Tensor] = None):
+                  saved_l1_preact: Optional[torch.Tensor] = None,
+                  route_weight_mode: RouteWeightMode = RouteWeightMode.PRE_DOWN,
+                  saved_down_unweighted: Optional[torch.Tensor] = None):
+    """Run BF16 MegaMoE with an explicit route-weight boundary.
+
+    ``saved_down_unweighted`` is a post-down training save used to compute the
+    exact router gradient.
+    """
+    route_weight_mode = RouteWeightMode(route_weight_mode)
+    if (
+        saved_down_unweighted is not None and
+        route_weight_mode is not RouteWeightMode.POST_DOWN
+    ):
+        raise ValueError(
+            "saved_down_unweighted is only valid for post_down")
     _C.bf16_mega_moe(
         y,
         l1_weights,
@@ -222,5 +242,7 @@ def bf16_mega_moe(y: torch.Tensor,
         activation, activation_clamp,
         fast_math,
         sym_buffer.num_ring_tokens,
-        saved_l1_preact
+        saved_l1_preact,
+        route_weight_mode.value,
+        saved_down_unweighted,
     )

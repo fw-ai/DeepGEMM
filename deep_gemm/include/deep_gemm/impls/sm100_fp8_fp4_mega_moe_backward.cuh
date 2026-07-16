@@ -36,6 +36,7 @@ template <
     bool kBF16Mode = false,
     ActivationType kActivationType = ActivationType::SwiGLU,
     bool kFastMath = false,
+    RouteWeightMode kRouteWeightMode = RouteWeightMode::PreDown,
     uint32_t kNumNonEpilogueThreads = 128,
     uint32_t kNumEpilogueThreads = 128,
     uint32_t kNumThreads =
@@ -75,6 +76,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
     cutlass::bfloat16_t* w13_dequant_scratch,
     const cutlass::bfloat16_t* gate_up_output,
     cutlass::bfloat16_t* grad_ye_output,
+    cutlass::bfloat16_t* grad_y_unweighted_output,
     cutlass::bfloat16_t* route_weights,
     float* route_weights_fp32,
     cutlass::bfloat16_t* grad_h_output,
@@ -83,6 +85,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
     cutlass::bfloat16_t* h_weighted_output,
     cutlass::bfloat16_t* x_pool_output,
     cutlass::bfloat16_t* grad_x_pool_output,
+    const cutlass::bfloat16_t* down_unweighted_output,
     float* grad_route_output,
     uint32_t* weight_tile_states,
     const uint32_t launch_epoch,
@@ -1014,7 +1017,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                             pull_mbarrier,
                             pull_mbarrier_phase);
                         ptx::tma_store_1d(
-                            grad_ye_output +
+                            grad_y_unweighted_output +
                                 static_cast<uint64_t>(
                                     pool_row) *
                                     kHidden,
@@ -1091,7 +1094,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                     col,
                                 metadata.rank_idx);
                             if constexpr (kNumRanks == 1) {
-                                grad_ye_output[
+                                grad_y_unweighted_output[
                                     static_cast<uint64_t>(pool_row) *
                                         kHidden +
                                     col] =
@@ -1167,6 +1170,62 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
             constexpr uint32_t kLocalDispatchDoneGridSyncIndex = 1;
             comm::grid_sync<
                 kNumSMs, kLocalDispatchDoneGridSyncIndex>(
+                backward_workspace, blockIdx.x, threadIdx.x,
+                []() { __syncthreads(); });
+        }
+        if constexpr (kBF16Mode) {
+            uint32_t grad_pool_block_offset = 0;
+            #pragma unroll
+            for (uint32_t expert_idx = 0;
+                 expert_idx < kNumExperts; ++expert_idx) {
+                const uint32_t num_tokens =
+                    static_cast<uint32_t>(
+                        __ldg(expert_counts + expert_idx));
+                for (uint64_t linear =
+                         static_cast<uint64_t>(blockIdx.x) *
+                             kNumThreads +
+                         threadIdx.x;
+                     linear <
+                         static_cast<uint64_t>(num_tokens) *
+                             kHidden;
+                     linear +=
+                         static_cast<uint64_t>(kNumSMs) *
+                         kNumThreads) {
+                    const uint32_t token_idx =
+                        linear / kHidden;
+                    const uint32_t col =
+                        linear -
+                        static_cast<uint64_t>(token_idx) *
+                            kHidden;
+                    const uint32_t pool_row =
+                        grad_pool_block_offset * BLOCK_M +
+                        token_idx;
+                    grad_ye_output[
+                        static_cast<uint64_t>(pool_row) *
+                            kHidden +
+                        col] =
+                        kRouteWeightMode ==
+                                RouteWeightMode::PostDown
+                        ? cd_dtype_t(
+                              static_cast<float>(
+                                  grad_y_unweighted_output[
+                                      static_cast<uint64_t>(
+                                          pool_row) *
+                                          kHidden +
+                                      col]) *
+                              route_weights_fp32[pool_row])
+                        : grad_y_unweighted_output[
+                              static_cast<uint64_t>(
+                                  pool_row) *
+                                  kHidden +
+                              col];
+                }
+                grad_pool_block_offset +=
+                    math::ceil_div(num_tokens, BLOCK_M);
+            }
+            constexpr uint32_t kW2GradInputGridSyncIndex = 0;
+            comm::grid_sync<
+                kNumSMs, kW2GradInputGridSyncIndex>(
                 backward_workspace, blockIdx.x, threadIdx.x,
                 []() { __syncthreads(); });
         }
@@ -1753,14 +1812,13 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                     16 +
                                 (n_in_atom & 7) *
                                     sizeof(cd_dtype_t);
-                            const float grad_h_unweighted =
-                                static_cast<float>(
-                                    *reinterpret_cast<
-                                        cd_dtype_t*>(
-                                        reinterpret_cast<
-                                            uint8_t*>(
-                                            smem_cd[0]) +
-                                        smem_byte_offset));
+                            const cd_dtype_t grad_h_w2 =
+                                *reinterpret_cast<
+                                    cd_dtype_t*>(
+                                    reinterpret_cast<
+                                        uint8_t*>(
+                                        smem_cd[0]) +
+                                    smem_byte_offset);
                             const uint32_t pool_row =
                                 (pool_block_offset +
                                  m_block_idx) *
@@ -1774,24 +1832,25 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                 : static_cast<float>(
                                       route_weights[pool_row]);
                             const cd_dtype_t grad_h_bf16 =
-                                cd_dtype_t(
-                                grad_h_unweighted *
-                                route_weight);
-                            // Match fused_backward_core: torch grouped_mm and
-                            // route weighting materialize BF16 grad_h before
-                            // the activation derivative consumes it.
+                                kBF16Mode &&
+                                        kRouteWeightMode ==
+                                            RouteWeightMode::PostDown
+                                ? grad_h_w2
+                                : cd_dtype_t(
+                                      static_cast<float>(
+                                          grad_h_w2) *
+                                      route_weight);
                             const float grad_h =
                                 static_cast<float>(grad_h_bf16);
-                            // Expose the unweighted down-projection dgrad for
-                            // d(route_weight) = dot(grad_h_unweighted, h_act).
-                            // The weighted BF16 value above remains the exact
-                            // activation-dgrad input.
+                            // This is the W2 dgrad output before any pre-down
+                            // route multiplication. In post-down mode its GEMM
+                            // input was already weighted BF16 grad-y.
                             grad_h_output[
                                 static_cast<uint64_t>(
                                     pool_row) *
                                     kIntermediateHidden +
                                 hidden_col] =
-                                cd_dtype_t(grad_h_unweighted);
+                                grad_h_w2;
                             const uint32_t chunk =
                                 hidden_col / 8;
                             const uint32_t in_chunk =
@@ -1907,10 +1966,14 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                     pool_row) *
                                     kIntermediateHidden +
                                 hidden_col] =
-                                cd_dtype_t(
-                                    static_cast<float>(
-                                        h_act_bf16) *
-                                    route_weight);
+                                kBF16Mode &&
+                                        kRouteWeightMode ==
+                                            RouteWeightMode::PostDown
+                                ? h_act_bf16
+                                : cd_dtype_t(
+                                      static_cast<float>(
+                                          h_act_bf16) *
+                                      route_weight);
                             grad_gate_up_output[
                                 static_cast<uint64_t>(
                                     pool_row) *
@@ -1987,25 +2050,51 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                             route_pool_block_offset * BLOCK_M +
                             token_idx;
                         float grad_route = 0.0f;
-                        for (uint32_t col = 0;
-                             col < kIntermediateHidden; ++col) {
-                            const float grad_h =
-                                static_cast<float>(
-                                    grad_h_output[
-                                        static_cast<uint64_t>(
-                                            pool_row) *
-                                            kIntermediateHidden +
-                                        col]);
-                            const float h_act =
-                                static_cast<float>(
-                                    h_act_output[
-                                        static_cast<uint64_t>(
-                                            pool_row) *
-                                            kIntermediateHidden +
-                                        col]);
-                            grad_route = __fadd_rn(
-                                grad_route,
-                                __fmul_rn(grad_h, h_act));
+                        if constexpr (
+                            kRouteWeightMode ==
+                            RouteWeightMode::PostDown) {
+                            for (uint32_t col = 0;
+                                 col < kHidden; ++col) {
+                                const float grad_y =
+                                    static_cast<float>(
+                                        grad_y_unweighted_output[
+                                            static_cast<uint64_t>(
+                                                pool_row) *
+                                                kHidden +
+                                            col]);
+                                const float down =
+                                    static_cast<float>(
+                                        down_unweighted_output[
+                                            static_cast<uint64_t>(
+                                                pool_row) *
+                                                kHidden +
+                                            col]);
+                                grad_route = __fadd_rn(
+                                    grad_route,
+                                    __fmul_rn(grad_y, down));
+                            }
+                        } else {
+                            for (uint32_t col = 0;
+                                 col < kIntermediateHidden;
+                                 ++col) {
+                                const float grad_h =
+                                    static_cast<float>(
+                                        grad_h_output[
+                                            static_cast<uint64_t>(
+                                                pool_row) *
+                                                kIntermediateHidden +
+                                            col]);
+                                const float h_act =
+                                    static_cast<float>(
+                                        h_act_output[
+                                            static_cast<uint64_t>(
+                                                pool_row) *
+                                                kIntermediateHidden +
+                                            col]);
+                                grad_route = __fadd_rn(
+                                    grad_route,
+                                    __fmul_rn(grad_h, h_act));
+                            }
                         }
                         grad_route_output[pool_row] =
                             grad_route;
