@@ -1939,19 +1939,37 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                 gate * sig;
                             const float h_act =
                                 activated_gate * up;
+                            // Match the eager FireTitan FP32 expression one
+                            // operation at a time. Plain C++ arithmetic here
+                            // lets nvcc contract/reassociate the derivative,
+                            // which changes rare BF16 round-to-nearest ties.
+                            const float one_minus_sig =
+                                __fsub_rn(1.0f, sig);
+                            const float gate_sig =
+                                __fmul_rn(gate, sig);
+                            const float sigmoid_derivative =
+                                __fmul_rn(
+                                    gate_sig,
+                                    one_minus_sig);
                             const float activation_grad =
-                                sig +
-                                gate * sig *
-                                    (1.0f - sig) *
-                                    dz_dgate;
+                                __fadd_rn(
+                                    sig,
+                                    __fmul_rn(
+                                        sigmoid_derivative,
+                                        dz_dgate));
                             const float grad_gate =
                                 gate_in_range
-                                ? grad_h * up *
-                                      activation_grad
+                                ? __fmul_rn(
+                                      __fmul_rn(
+                                          grad_h,
+                                          up),
+                                      activation_grad)
                                 : 0.0f;
                             const float grad_up =
                                 up_in_range
-                                ? grad_h * activated_gate
+                                ? __fmul_rn(
+                                      grad_h,
+                                      activated_gate)
                                 : 0.0f;
                             const cd_dtype_t h_act_bf16 =
                                 cd_dtype_t(h_act);

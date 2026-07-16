@@ -1,9 +1,58 @@
 from typing import Any, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 
 from .. import _C
 from . import RouteWeightMode
+
+
+def _sort_bf16_pool_in_deepep_order(
+    tensors: tuple[torch.Tensor, ...],
+    token_src_metadata: torch.Tensor,
+    valid_rows: torch.Tensor,
+    expert_counts: torch.Tensor,
+    num_max_tokens_per_rank: int,
+    num_topk: int,
+    num_ranks: int,
+) -> None:
+    """Sort valid expert rows into DeepEP's stable source-route order."""
+    pool_rows = valid_rows.nonzero().flatten()
+    if pool_rows.numel() <= 1:
+        return
+    expert_ids = torch.repeat_interleave(
+        torch.arange(
+            expert_counts.numel(),
+            dtype=torch.long,
+            device=expert_counts.device,
+        ),
+        expert_counts.to(torch.long),
+    )
+    if expert_ids.numel() != pool_rows.numel():
+        raise RuntimeError(
+            "valid BF16 pool rows do not match expert counts")
+    metadata = token_src_metadata[pool_rows].long()
+    routes_per_rank = num_max_tokens_per_rank * num_topk
+    route_keys = (
+        metadata[:, 0] * routes_per_rank +
+        metadata[:, 1] * num_topk +
+        metadata[:, 2]
+    )
+    order = torch.argsort(
+        expert_ids * (num_ranks * routes_per_rank) + route_keys,
+        stable=True,
+    )
+    ordered_rows = pool_rows[order]
+    if torch.equal(ordered_rows, pool_rows):
+        return
+
+    seen_ptrs = set()
+    for tensor in (*tensors, token_src_metadata):
+        ptr = tensor.data_ptr()
+        if ptr in seen_ptrs:
+            continue
+        seen_ptrs.add(ptr)
+        tensor[pool_rows] = tensor[ordered_rows].clone()
 
 
 def bf16_mega_moe_backward_dgrad(
@@ -113,6 +162,93 @@ def bf16_mega_moe_backward_dgrad(
         sym_buffer.group.rank(),
         sym_buffer.num_max_tokens_per_rank,
         sym_buffer.num_topk,
+    )
+    # FireTitan uses two native grouped GEMMs for W1/W3 dgrad and rounds each
+    # result to BF16 before the in-place add. The fused W13 dgrad above uses
+    # one FP32 accumulation across [gate | up], which is not bitwise
+    # equivalent. Materialize the native boundary with the same grouped-MM
+    # calls and offsets.
+    valid_rows = torch.isfinite(gate_up_output[:, 0])
+    row_indices = valid_rows.nonzero().flatten()
+    intermediate_hidden = grad_gate_up_output.size(1) // 2
+    offsets = expert_counts.cumsum(0).to(torch.int32)
+    w1_weights = w13_weights[:, :intermediate_hidden].contiguous()
+    w3_weights = w13_weights[:, intermediate_hidden:].contiguous()
+    if row_indices.numel():
+        native_grad_x = torch._grouped_mm(
+            grad_gate_up_output[
+                row_indices, :intermediate_hidden].contiguous(),
+            w1_weights,
+            offs=offsets,
+        )
+        native_grad_x.add_(torch._grouped_mm(
+            grad_gate_up_output[
+                row_indices, intermediate_hidden:].contiguous(),
+            w3_weights,
+            offs=offsets,
+        ))
+    else:
+        native_grad_x = grad_x_pool_output.new_empty(
+            (0, grad_x_pool_output.size(1)))
+    grad_x_pool_output.zero_()
+    grad_x_pool_output[row_indices] = native_grad_x
+
+    # Match PyTorch's deterministic FP32 reduction tree for router gradients;
+    # the fused kernel's scalar left fold has a different rounding order.
+    if route_weight_mode is RouteWeightMode.POST_DOWN:
+        route_lhs = grad_y_unweighted_output[row_indices]
+        route_rhs = down_unweighted_output[row_indices]
+    else:
+        route_lhs = grad_h_output[row_indices]
+        route_rhs = h_act_output[row_indices]
+    native_grad_route = (
+        route_lhs.float() * route_rhs.float()).sum(dim=1)
+    grad_route_output.zero_()
+    grad_route_output[row_indices] = native_grad_route.to(
+        grad_route_output.dtype)
+
+    if direct_remote_grad_x:
+        metadata = sym_buffer.token_src_metadata[row_indices].long()
+        native_grad_x_planes = torch.zeros(
+            (
+                sym_buffer.group.size(),
+                sym_buffer.num_max_tokens_per_rank,
+                sym_buffer.num_topk,
+                grad_x_pool_output.size(1),
+            ),
+            dtype=grad_x_pool_output.dtype,
+            device=grad_x_pool_output.device,
+        )
+        native_grad_x_planes[
+            metadata[:, 0], metadata[:, 1], metadata[:, 2]
+        ] = native_grad_x
+        sym_buffer._native_grad_x_planes = native_grad_x_planes
+
+    # MegaMoE's communication scheduler deliberately interleaves source
+    # ranks, while DeepEP's native grouped wgrads consume stable
+    # expert/rank/token/slot order. Canonicalize the retained pool before the
+    # standalone wgrad kernels so their K traversal matches FireTitan.
+    _sort_bf16_pool_in_deepep_order(
+        (
+            gate_up_output,
+            grad_h_output,
+            grad_gate_up_output,
+            h_act_output,
+            h_weighted_output,
+            x_pool_output,
+            grad_x_pool_output,
+            grad_route_output,
+            grad_ye,
+            grad_y_unweighted_output,
+            route_weights,
+            down_unweighted_output,
+        ),
+        sym_buffer.token_src_metadata,
+        valid_rows,
+        expert_counts,
+        sym_buffer.num_max_tokens_per_rank,
+        sym_buffer.num_topk,
+        sym_buffer.group.size(),
     )
 
 
@@ -292,3 +428,21 @@ def bf16_mega_moe_backward_w13_combine(
         sym_buffer.num_max_tokens_per_rank,
         sym_buffer.num_topk,
     )
+    native_grad_x_planes = getattr(
+        sym_buffer, "_native_grad_x_planes", None)
+    if native_grad_x_planes is not None:
+        dist.all_reduce(native_grad_x_planes, group=sym_buffer.group)
+        grad_x_fp32 = torch.zeros(
+            grad_x_output.shape,
+            dtype=torch.float32,
+            device=grad_x_output.device,
+        )
+        for slot in range(sym_buffer.num_topk):
+            grad_x_fp32.add_(
+                native_grad_x_planes[
+                    sym_buffer.group.rank(),
+                    :grad_x_output.size(0),
+                    slot,
+                ].float())
+        grad_x_output.copy_(grad_x_fp32.to(grad_x_output.dtype))
+        del sym_buffer._native_grad_x_planes
