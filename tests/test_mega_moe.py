@@ -363,11 +363,19 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         clamp = float(args.activation_clamp)
         gate_clamped = torch.clamp(gate, max=clamp)
         up_clamped = torch.clamp(up, min=-clamp, max=clamp)
-        h = (
-            _apply_gate_activation(
-                gate_clamped.float(), args.activation) *
-            up_clamped.float()
-        ).to(torch.bfloat16)
+        if (
+            args.activation == 'swiglu' and
+            clamp == float('inf')
+        ):
+            # Standard FireTitan grouped experts materialize F.silu's BF16
+            # output before the separate BF16 multiply by W3(x).
+            h = torch.nn.functional.silu(gate_clamped) * up_clamped
+        else:
+            h = (
+                _apply_gate_activation(
+                    gate_clamped.float(), args.activation) *
+                up_clamped.float()
+            ).to(torch.bfloat16)
         h_weighted = (
             h.float() * route_weights.unsqueeze(1)
         ).to(torch.bfloat16)
@@ -890,6 +898,10 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             up, min=-clamp, max=clamp)
         gate_fp32 = gate_clamped.float()
         up_fp32 = up_clamped.float()
+        standard_bf16_swiglu = (
+            args.activation == 'swiglu' and
+            clamp == float('inf')
+        )
         if args.activation == 'geglu':
             alpha = 1.5957691216057308
             beta = 0.044715
@@ -904,7 +916,11 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             dz = torch.ones_like(gate_fp32)
         sig = torch.sigmoid(z)
         activated_gate = gate_fp32 * sig
-        h = (activated_gate * up_fp32).to(torch.bfloat16)
+        h = (
+            torch.nn.functional.silu(gate_clamped) * up_clamped
+            if standard_bf16_swiglu
+            else (activated_gate * up_fp32).to(torch.bfloat16)
+        )
         if args.route_weight_mode == 'pre_down':
             w2_input = (
                 h.float() * route.float().unsqueeze(1)
@@ -940,22 +956,29 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             ).sum(dim=1)
             assert torch.equal(
                 saved_down_unweighted[pool_indices], down)
-        activation_grad = (
-            sig + gate_fp32 * sig * (1 - sig) * dz)
-        grad_gate = (
-            gh.float() * up_fp32 * activation_grad)
-        grad_gate = torch.where(
-            gate.float() <= clamp,
-            grad_gate,
-            torch.zeros_like(grad_gate))
-        grad_up = gh.float() * activated_gate
-        grad_up = torch.where(
-            (up.float() >= -clamp) &
-            (up.float() <= clamp),
-            grad_up,
-            torch.zeros_like(grad_up))
-        grad_gate_bf16 = grad_gate.to(torch.bfloat16)
-        grad_up_bf16 = grad_up.to(torch.bfloat16)
+        if standard_bf16_swiglu:
+            silu_gate = torch.nn.functional.silu(gate_clamped)
+            grad_silu = gh * up_clamped
+            grad_gate_bf16 = torch.ops.aten.silu_backward(
+                grad_silu, gate_clamped)
+            grad_up_bf16 = gh * silu_gate
+        else:
+            activation_grad = (
+                sig + gate_fp32 * sig * (1 - sig) * dz)
+            grad_gate = (
+                gh.float() * up_fp32 * activation_grad)
+            grad_gate = torch.where(
+                gate.float() <= clamp,
+                grad_gate,
+                torch.zeros_like(grad_gate))
+            grad_up = gh.float() * activated_gate
+            grad_up = torch.where(
+                (up.float() >= -clamp) &
+                (up.float() <= clamp),
+                grad_up,
+                torch.zeros_like(grad_up))
+            grad_gate_bf16 = grad_gate.to(torch.bfloat16)
+            grad_up_bf16 = grad_up.to(torch.bfloat16)
         grad_gu = torch.cat(
             (grad_gate_bf16, grad_up_bf16), dim=1)
         w1_weights = l1_weights_bf16[

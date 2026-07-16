@@ -1919,12 +1919,21 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                 constexpr float kAlpha =
                                     1.5957691216057308f;
                                 constexpr float kBeta = 0.044715f;
-                                const float gate_sq = gate * gate;
-                                z = kAlpha * gate *
-                                    (1.0f + kBeta * gate_sq);
-                                dz_dgate = kAlpha *
-                                    (1.0f +
-                                     3.0f * kBeta * gate_sq);
+                                const float gate_sq =
+                                    __fmul_rn(gate, gate);
+                                z = __fmul_rn(
+                                    __fmul_rn(kAlpha, gate),
+                                    __fadd_rn(
+                                        1.0f,
+                                        __fmul_rn(
+                                            kBeta, gate_sq)));
+                                dz_dgate = __fmul_rn(
+                                    kAlpha,
+                                    __fadd_rn(
+                                        1.0f,
+                                        __fmul_rn(
+                                            3.0f * kBeta,
+                                            gate_sq)));
                             } else {
                                 z = gate;
                                 dz_dgate = 1.0f;
@@ -1936,9 +1945,9 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                             const float sig =
                                 1.0f / (1.0f + neg_exp);
                             const float activated_gate =
-                                gate * sig;
+                                __fmul_rn(gate, sig);
                             const float h_act =
-                                activated_gate * up;
+                                __fmul_rn(activated_gate, up);
                             // Match the eager FireTitan FP32 expression one
                             // operation at a time. Plain C++ arithmetic here
                             // lets nvcc contract/reassociate the derivative,

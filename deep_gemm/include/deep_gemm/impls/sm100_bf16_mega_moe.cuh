@@ -989,13 +989,12 @@ sm100_bf16_mega_moe_impl(void* y,
                                 constexpr float kBeta = 0.044715f;
                                 const auto gate_sq = __fmul2_rn(gate, gate);
                                 z = __fmul2_rn(
-                                    {kAlpha, kAlpha},
                                     __fmul2_rn(
-                                        gate,
-                                        __fadd2_rn(
-                                            {1.0f, 1.0f},
-                                            __fmul2_rn(
-                                                {kBeta, kBeta}, gate_sq))));
+                                        {kAlpha, kAlpha}, gate),
+                                    __fadd2_rn(
+                                        {1.0f, 1.0f},
+                                        __fmul2_rn(
+                                            {kBeta, kBeta}, gate_sq)));
                             } else {
                                 z = gate;
                             }
@@ -1012,16 +1011,42 @@ sm100_bf16_mega_moe_impl(void* y,
                                     {math::fast_rcp(denom.x),
                                      math::fast_rcp(denom.y)});
                             } else {
-                                activated = {
-                                    gate.x / denom.x,
-                                    gate.y / denom.y};
+                                if constexpr (
+                                    kActivationType ==
+                                        ActivationType::SwiGLU) {
+                                    // aten::silu evaluates x / (1 + exp(-x)).
+                                    activated = {
+                                        gate.x / denom.x,
+                                        gate.y / denom.y};
+                                } else {
+                                    // FireTitan's GeGLU expression materializes
+                                    // sigmoid(z) before multiplying by gate.
+                                    const float2 sig = {
+                                        1.0f / denom.x,
+                                        1.0f / denom.y};
+                                    activated =
+                                        __fmul2_rn(gate, sig);
+                                }
                             }
-                            // The activation output is a BF16 boundary in both
-                            // route modes. Pre-down applies p only after that
-                            // rounding; post-down leaves h unweighted for W2.
+                            // Standard FireTitan grouped experts materialize
+                            // F.silu(gate_bf16) before the separate BF16
+                            // multiply by up_bf16. DSV4's clamped SwiGLU and
+                            // GeGLU instead evaluate activation*up in FP32 and
+                            // round only the product.
+                            const auto activated_for_mul =
+                                kActivationType ==
+                                            ActivationType::SwiGLU &&
+                                        kActivationClamp ==
+                                            cute::numeric_limits<
+                                                float>::infinity()
+                                ? __bfloat1622float2(
+                                      __float22bfloat162_rn(
+                                          activated))
+                                : activated;
                             const auto h_bf16 =
                                 __float22bfloat162_rn(
-                                    __fmul2_rn(activated, up));
+                                    __fmul2_rn(
+                                        activated_for_mul, up));
                             const auto h_weighted_bf16 =
                                 __float22bfloat162_rn(
                                     __fmul2_rn(

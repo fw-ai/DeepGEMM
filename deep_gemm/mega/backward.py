@@ -184,6 +184,96 @@ def bf16_mega_moe_backward_dgrad(
     valid_rows = torch.isfinite(gate_up_output[:, 0])
     row_indices = valid_rows.nonzero().flatten()
     intermediate_hidden = grad_gate_up_output.size(1) // 2
+    if activation == "swiglu" and activation_limit == float("inf"):
+        # Standard FireTitan grouped experts run BF16 SiLU followed by a
+        # separate BF16 multiply. Reuse ATen's native BF16 forward/backward
+        # operations so both materialization boundaries and SiLU's derivative
+        # operation order match exactly.
+        gate = gate_up_output[
+            row_indices, :intermediate_hidden].contiguous()
+        up = gate_up_output[
+            row_indices, intermediate_hidden:].contiguous()
+        native_silu = torch.nn.functional.silu(gate)
+        native_h = native_silu * up
+        native_grad_h = grad_h_output[row_indices]
+        if route_weight_mode is RouteWeightMode.PRE_DOWN:
+            native_grad_h = (
+                native_grad_h.float() *
+                route_weights[row_indices].float().unsqueeze(1)
+            ).to(native_grad_h.dtype)
+        native_grad_silu = native_grad_h * up
+        native_grad_gate = torch.ops.aten.silu_backward(
+            native_grad_silu, gate)
+        native_grad_up = native_grad_h * native_silu
+        grad_gate_up_output[row_indices] = torch.cat(
+            (native_grad_gate, native_grad_up), dim=1)
+        h_act_output[row_indices] = native_h
+        h_weighted_output[row_indices] = (
+            (
+                native_h.float() *
+                route_weights[row_indices].float().unsqueeze(1)
+            ).to(native_h.dtype)
+            if route_weight_mode is RouteWeightMode.PRE_DOWN
+            else native_h
+        )
+    elif activation == "geglu":
+        # GeGLU's tanh approximation is expressed as separate ATen FP32
+        # operations in FireTitan. Preserve each materialization point here;
+        # reassociating the polynomial or derivative in CUDA changes rare
+        # BF16 round-to-nearest ties.
+        gate_unclamped = gate_up_output[
+            row_indices, :intermediate_hidden].contiguous()
+        up_unclamped = gate_up_output[
+            row_indices, intermediate_hidden:].contiguous()
+        gate = torch.clamp(
+            gate_unclamped, max=activation_limit).float()
+        up = torch.clamp(
+            up_unclamped,
+            min=-activation_limit,
+            max=activation_limit,
+        ).float()
+        alpha = 1.5957691216057308
+        beta = 0.044715
+        gate_sq = gate * gate
+        z = (alpha * gate) * (1.0 + beta * gate_sq)
+        dz = alpha * (1.0 + (3.0 * beta) * gate_sq)
+        sig = torch.sigmoid(z)
+        activated_gate = gate * sig
+        native_h = (activated_gate * up).to(torch.bfloat16)
+        native_grad_h = grad_h_output[row_indices]
+        if route_weight_mode is RouteWeightMode.PRE_DOWN:
+            native_grad_h = (
+                native_grad_h.float() *
+                route_weights[row_indices].float().unsqueeze(1)
+            ).to(native_grad_h.dtype)
+        activation_grad = (
+            sig + gate * sig * (1.0 - sig) * dz)
+        native_grad_gate = (
+            native_grad_h.float() * up * activation_grad)
+        native_grad_gate = torch.where(
+            gate_unclamped.float() <= activation_limit,
+            native_grad_gate,
+            torch.zeros_like(native_grad_gate),
+        ).to(torch.bfloat16)
+        native_grad_up = (
+            native_grad_h.float() * activated_gate)
+        native_grad_up = torch.where(
+            (up_unclamped.float() >= -activation_limit) &
+            (up_unclamped.float() <= activation_limit),
+            native_grad_up,
+            torch.zeros_like(native_grad_up),
+        ).to(torch.bfloat16)
+        grad_gate_up_output[row_indices] = torch.cat(
+            (native_grad_gate, native_grad_up), dim=1)
+        h_act_output[row_indices] = native_h
+        h_weighted_output[row_indices] = (
+            (
+                native_h.float() *
+                route_weights[row_indices].float().unsqueeze(1)
+            ).to(native_h.dtype)
+            if route_weight_mode is RouteWeightMode.PRE_DOWN
+            else native_h
+        )
     offsets = expert_counts.cumsum(0).to(torch.int32)
     w1_weights = w13_weights[:, :intermediate_hidden].contiguous()
     w3_weights = w13_weights[:, intermediate_hidden:].contiguous()
