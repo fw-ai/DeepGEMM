@@ -46,7 +46,8 @@ def _apply_gate_activation(gate: torch.Tensor, activation: str) -> torch.Tensor:
     elif activation == 'geglu':
         alpha = 1.5957691216057308  # 2 * sqrt(2 / pi)
         beta = 0.044715
-        z = alpha * (gate + beta * gate * gate * gate)
+        gate_sq = gate * gate
+        z = (alpha * gate) * (1.0 + beta * gate_sq)
     else:
         raise ValueError(f'Unsupported activation: {activation}')
     return gate * torch.sigmoid(z)
@@ -179,7 +180,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             saved_l1_preact = torch.full(
                 (buffer.token_src_metadata.size(0), 2 * intermediate_hidden),
                 float('nan'), dtype=torch.bfloat16, device='cuda')
-        if is_bf16xbf16 and args.save_l1_preact:
+        if is_bf16xbf16 and (
+            args.save_l1_preact or args.test_backward
+        ):
             saved_h_unweighted = torch.full(
                 (buffer.token_src_metadata.size(0), intermediate_hidden),
                 float('nan'), dtype=torch.bfloat16, device='cuda')
@@ -188,11 +191,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         if (
             is_bf16xbf16 and
             (
-                args.save_l1_preact or
-                (
-                    args.route_weight_mode == 'post_down' and
-                    args.test_backward
-                )
+                args.save_l1_preact or args.test_backward
             )
         ):
             saved_down_unweighted = torch.full(
@@ -231,13 +230,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     # Self-contained PyTorch reference. Distributed routing/combine is modeled
     # for BF16; the quantized reference remains single-rank.
-    def gather_expert_weights(local_weights: torch.Tensor) -> torch.Tensor:
-        if num_ranks == 1:
-            return local_weights
-        gathered = [torch.empty_like(local_weights) for _ in range(num_ranks)]
-        dist.all_gather(gathered, local_weights.contiguous(), group=group)
-        return torch.cat(gathered, dim=0)
-
     def gather_rank_padded(
         local_tensor: torch.Tensor, fill_value: float
     ) -> torch.Tensor:
@@ -254,34 +246,189 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         return torch.stack(gathered)
 
     reference_stages = {}
+    native_route_layout = {}
 
     def native_bf16_grouped_mm(
         lhs: torch.Tensor,
         rhs: torch.Tensor,
+        offsets: torch.Tensor,
+        *,
+        rhs_needs_transpose: bool = True,
+        lhs_needs_contiguous: bool = True,
     ) -> torch.Tensor:
-        offsets = torch.tensor(
-            [lhs.size(0)], dtype=torch.int32,
-            device=lhs.device)
-        return torch._grouped_mm(
-            lhs.contiguous(),
-            rhs.unsqueeze(0).transpose(-2, -1),
-            offs=offsets)
+        mat2 = rhs.transpose(-2, -1) if rhs_needs_transpose else rhs
+        mat1 = lhs.contiguous() if lhs_needs_contiguous else lhs
+        if not offsets.numel() or int(offsets[-1].item()) == 0:
+            if lhs_needs_contiguous:
+                output_columns = (
+                    rhs.size(-2)
+                    if rhs_needs_transpose
+                    else rhs.size(-1))
+                return lhs.new_zeros((0, output_columns))
+            return lhs.new_zeros(
+                (offsets.numel(), lhs.size(0), rhs.size(1)))
+        return torch._grouped_mm(mat1, mat2, offs=offsets)
+
+    def build_native_route_layout(
+        all_topk_idx: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        local_expert_start = rank_idx * num_experts_per_rank
+        flat_experts = all_topk_idx.reshape(-1)
+        valid = (
+            (flat_experts >= local_expert_start) &
+            (flat_experts < local_expert_start + num_experts_per_rank))
+        flat_positions = valid.nonzero().flatten()
+        local_experts = (
+            flat_experts[flat_positions] - local_expert_start)
+        # FireTitan DeepEP's permutation is expert-major and stable within an
+        # expert: source token order first, then top-k slot order.
+        order = torch.argsort(local_experts, stable=True)
+        flat_positions = flat_positions[order]
+        local_experts = local_experts[order]
+        routes_per_rank = all_topk_idx.size(1) * num_topk
+        source_ranks = flat_positions // routes_per_rank
+        rank_positions = flat_positions % routes_per_rank
+        source_tokens = rank_positions // num_topk
+        source_slots = rank_positions % num_topk
+        counts = torch.bincount(
+            local_experts, minlength=num_experts_per_rank).to(torch.int32)
+        return {
+            'local_experts': local_experts,
+            'source_ranks': source_ranks,
+            'source_tokens': source_tokens,
+            'source_slots': source_slots,
+            'counts': counts,
+            'offsets': counts.cumsum(0).to(torch.int32),
+        }
+
+    def native_to_pool_permutation(
+        metadata: torch.Tensor,
+        layout: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        routes_per_rank = (
+            buffer.num_max_tokens_per_rank * num_topk)
+        actual_keys = (
+            metadata[:, 0] * routes_per_rank +
+            metadata[:, 1] * num_topk +
+            metadata[:, 2])
+        native_keys = (
+            layout['source_ranks'] * routes_per_rank +
+            layout['source_tokens'] * num_topk +
+            layout['source_slots'])
+        positions_by_key = torch.full(
+            (num_ranks * routes_per_rank,),
+            -1, dtype=torch.long, device='cuda')
+        positions_by_key[actual_keys] = torch.arange(
+            actual_keys.numel(), dtype=torch.long, device='cuda')
+        permutation = positions_by_key[native_keys]
+        assert (permutation >= 0).all(), (
+            'MegaMoE pool is missing a native DeepEP route')
+        assert torch.unique(permutation).numel() == permutation.numel(), (
+            'MegaMoE pool contains duplicate route metadata')
+        return permutation
+
+    def run_native_bf16_reference() -> torch.Tensor:
+        all_topk_idx = gather_rank_padded(topk_idx, -1)
+        all_topk_weights = gather_rank_padded(topk_weights, 0)
+        all_x = gather_rank_padded(x, 0)
+        layout = build_native_route_layout(all_topk_idx)
+        native_route_layout.clear()
+        native_route_layout.update(layout)
+
+        source_ranks = layout['source_ranks']
+        source_tokens = layout['source_tokens']
+        source_slots = layout['source_slots']
+        counts = layout['counts']
+        offsets = layout['offsets']
+        if source_ranks.numel():
+            assert int(source_ranks.min().item()) >= 0
+            assert int(source_ranks.max().item()) < all_x.size(0), (
+                f'{source_ranks.max().item()=} {all_x.shape=}')
+            assert int(source_tokens.min().item()) >= 0
+            assert int(source_tokens.max().item()) < all_x.size(1), (
+                f'{source_tokens.max().item()=} {all_x.shape=}')
+        x_pool = all_x[source_ranks, source_tokens]
+        route_weights = all_topk_weights[
+            source_ranks, source_tokens, source_slots].float()
+
+        w1_weights = l1_weights_bf16[
+            :, :intermediate_hidden].contiguous()
+        w3_weights = l1_weights_bf16[
+            :, intermediate_hidden:].contiguous()
+        gate = native_bf16_grouped_mm(
+            x_pool, w1_weights, offsets)
+        up = native_bf16_grouped_mm(
+            x_pool, w3_weights, offsets)
+        w13 = torch.cat((gate, up), dim=1)
+        clamp = float(args.activation_clamp)
+        gate_clamped = torch.clamp(gate, max=clamp)
+        up_clamped = torch.clamp(up, min=-clamp, max=clamp)
+        h = (
+            _apply_gate_activation(
+                gate_clamped.float(), args.activation) *
+            up_clamped.float()
+        ).to(torch.bfloat16)
+        h_weighted = (
+            h.float() * route_weights.unsqueeze(1)
+        ).to(torch.bfloat16)
+        w2_input = (
+            h_weighted
+            if args.route_weight_mode == 'pre_down'
+            else h)
+        down = native_bf16_grouped_mm(
+            w2_input, l2_weights_bf16, offsets)
+        route_output = (
+            down
+            if args.route_weight_mode == 'pre_down'
+            else (
+                down.float() * route_weights.unsqueeze(1)
+            ).to(torch.bfloat16))
+
+        reference_stages.clear()
+        reference_stages.update({
+            'w13': w13,
+            'h': h,
+            'h_weighted': h_weighted,
+            'w2_input': w2_input,
+            'down': down,
+            'route_output': route_output,
+            'route_weights': route_weights,
+        })
+
+        # Match the native slot reducer: each top-k slot is accumulated in
+        # ascending slot order with FP32 accumulation, then rounded to BF16.
+        route_planes = torch.zeros(
+            (
+                num_ranks,
+                num_max_tokens_per_rank,
+                num_topk,
+                hidden,
+            ),
+            dtype=torch.float32,
+            device='cuda')
+        route_planes[
+            source_ranks, source_tokens, source_slots
+        ] = route_output.float()
+        if num_ranks > 1:
+            dist.all_reduce(route_planes, group=group)
+        combined = torch.zeros(
+            (num_tokens, hidden), dtype=torch.float32, device='cuda')
+        for slot in range(num_topk):
+            combined += route_planes[
+                rank_idx, :num_tokens, slot]
+        return combined.to(torch.bfloat16)
 
     def run_reference():
         assert is_bf16xbf16 or num_ranks == 1, (
             'Distributed numerical reference only supports BF16')
-        clamp = float(args.activation_clamp)
         if is_bf16xbf16:
-            x_deq = x[:num_tokens]
-            l1_w = gather_expert_weights(l1_weights_bf16)
-            l2_w = gather_expert_weights(l2_weights_bf16)
-            num_reference_experts = num_experts
-        else:
-            x_deq = _dequant_x_fp8(
-                x[0][:num_tokens], x[1][:num_tokens])
-            l1_w = _dequant_weight_fp4(l1_weights_bf16)
-            l2_w = _dequant_weight_fp4(l2_weights_bf16)
-            num_reference_experts = num_experts_per_rank
+            return run_native_bf16_reference()
+        clamp = float(args.activation_clamp)
+        x_deq = _dequant_x_fp8(
+            x[0][:num_tokens], x[1][:num_tokens])
+        l1_w = _dequant_weight_fp4(l1_weights_bf16)
+        l2_w = _dequant_weight_fp4(l2_weights_bf16)
+        num_reference_experts = num_experts_per_rank
 
         y = torch.zeros((num_tokens, hidden), dtype=torch.float32, device='cuda')
         for slot in range(num_topk):
@@ -294,10 +441,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 xt = x_deq[mask]
 
                 # L1 GEMM then split into gate/up (first/second half of the output)
-                acc1 = (
-                    native_bf16_grouped_mm(xt, l1_w[e])
-                    if is_bf16xbf16
-                    else xt @ l1_w[e].t())
+                acc1 = xt @ l1_w[e].t()
                 gate = acc1[:, :intermediate_hidden].to(torch.bfloat16)
                 up = acc1[:, intermediate_hidden:].to(torch.bfloat16)
                 if clamp != float('inf'):
@@ -310,210 +454,230 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                         gate.float(), args.activation) *
                     up.float())
 
-                if is_bf16xbf16:
-                    # Both modes materialize unweighted h in BF16. The route
-                    # multiplication then occurs at its mode-specific BF16
-                    # boundary.
-                    h = act.to(torch.bfloat16)
-                    h_weighted = (
-                        h.float() *
-                        weight[mask].unsqueeze(1)
-                    ).to(torch.bfloat16)
-                    if args.route_weight_mode == 'pre_down':
-                        w2_input = h_weighted
-                        l2_out = native_bf16_grouped_mm(
-                            w2_input, l2_w[e])
-                        down = l2_out
-                    else:
-                        down = native_bf16_grouped_mm(
-                            h, l2_w[e])
-                        l2_out = (
-                            down.float() *
-                            weight[mask].unsqueeze(1)
-                        ).to(torch.bfloat16)
-                    if (
-                        num_ranks == 1 and num_tokens == 1 and
-                        num_topk == 1 and num_experts == 1
-                    ):
-                        reference_stages.update({
-                            'w13': acc1.to(torch.bfloat16),
-                            'h': h,
-                            'h_weighted': h_weighted,
-                            'down': down,
-                            'final': l2_out,
-                        })
-                else:
-                    # Requantize to FP8 (per-32 UE8M0), matching the
-                    # quantized kernel's L1 output.
-                    act = act * weight[mask].unsqueeze(1)
-                    act_fp8, act_sf = per_token_cast_to_fp8(
-                        act, use_ue8m0=True, gran_k=32)
-                    n_groups = intermediate_hidden // 32
-                    act_deq = (
-                        act_fp8.float().view(-1, n_groups, 32) *
-                        act_sf[:, :n_groups].unsqueeze(2)
-                    ).view(-1, intermediate_hidden)
-                    l2_out = act_deq @ l2_w[e].t()
+                # Requantize to FP8 (per-32 UE8M0), matching the
+                # quantized kernel's L1 output.
+                act = act * weight[mask].unsqueeze(1)
+                act_fp8, act_sf = per_token_cast_to_fp8(
+                    act, use_ue8m0=True, gran_k=32)
+                n_groups = intermediate_hidden // 32
+                act_deq = (
+                    act_fp8.float().view(-1, n_groups, 32) *
+                    act_sf[:, :n_groups].unsqueeze(2)
+                ).view(-1, intermediate_hidden)
+                l2_out = act_deq @ l2_w[e].t()
 
                 # L2 GEMM, accumulate across the top-k experts
                 y[mask] += l2_out.float()
         return y.to(torch.bfloat16)
 
-    def report_single_token_stage_parity(
-        fused_y: torch.Tensor,
-    ):
-        if not (
-            is_bf16xbf16 and num_ranks == 1 and
-            num_tokens == num_topk == num_experts == 1 and
-            saved_l1_preact is not None
-        ):
-            return
+    def bf16_ulp_distance(
+        lhs: torch.Tensor,
+        rhs: torch.Tensor,
+    ) -> torch.Tensor:
+        def ordered_bits(tensor: torch.Tensor) -> torch.Tensor:
+            bits = tensor.view(torch.int16).to(torch.int32) & 0xffff
+            magnitude = bits & 0x7fff
+            return torch.where(
+                (bits & 0x8000) != 0,
+                0x8000 - magnitude,
+                0x8000 + magnitude)
 
-        valid_rows = torch.isfinite(
-            saved_l1_preact.float()).all(dim=1)
-        pool_row = int(valid_rows.nonzero()[0].item())
-        actual_stages = {
-            'w13': saved_l1_preact[pool_row].unsqueeze(0),
-            'h': saved_h_unweighted[pool_row].unsqueeze(0),
-            'h_weighted': (
-                saved_h_weighted[pool_row].unsqueeze(0)),
-            'final': fused_y,
-            'down': (
-                saved_down_unweighted[pool_row].unsqueeze(0)),
-        }
+        return (
+            ordered_bits(lhs) - ordered_bits(rhs)
+        ).abs()
 
-        first_difference = None
-        for stage in ('w13', 'h', 'h_weighted', 'down', 'final'):
-            if stage not in actual_stages:
-                continue
-            actual = actual_stages[stage]
-            expected = reference_stages[stage]
-            mismatch = actual != expected
-            mismatch_count = int(mismatch.sum().item())
+    def report_bf16_parity(
+        name: str,
+        actual: torch.Tensor,
+        expected: torch.Tensor,
+    ) -> int:
+        assert actual.shape == expected.shape, (
+            f'{name}: {actual.shape=} != {expected.shape=}')
+        mismatch_count = int((actual != expected).sum().item())
+        if actual.numel():
             abs_error = (actual.float() - expected.float()).abs()
             max_abs = float(abs_error.max().item())
             denominator = expected.float().abs().clamp_min(
                 torch.finfo(torch.float32).tiny)
             max_relative = float(
                 (abs_error / denominator).max().item())
-            actual_bits = (
-                actual.view(torch.int16).to(torch.int32) &
-                0xffff)
-            expected_bits = (
-                expected.view(torch.int16).to(torch.int32) &
-                0xffff)
             max_ulp = int(
-                (actual_bits - expected_bits).abs().max().item())
-            max_scale = float(expected.float().abs().max().item())
+                bf16_ulp_distance(actual, expected).max().item())
+        else:
+            max_abs = max_relative = 0.0
+            max_ulp = 0
+        mismatch_detail = ''
+        if mismatch_count:
+            mismatch = actual != expected
+            mismatch_ulps = bf16_ulp_distance(
+                actual[mismatch], expected[mismatch])
+            ulps, ulp_counts = torch.unique(
+                mismatch_ulps, return_counts=True)
+            top_count = min(12, ulp_counts.numel())
+            top_indices = torch.topk(
+                ulp_counts, top_count).indices
+            ulp_histogram = ','.join(
+                f'{int(ulp)}:{int(count)}'
+                for ulp, count in zip(
+                    ulps[top_indices].cpu().tolist(),
+                    ulp_counts[top_indices].cpu().tolist()))
+            first_flat = int(
+                mismatch.flatten().nonzero()[0].item())
+            first_actual = float(actual.flatten()[first_flat].float())
+            first_expected = float(
+                expected.flatten()[first_flat].float())
+            mismatch_detail = (
+                f', top_ulp_hist={{{ulp_histogram}}}, '
+                f'unique_ulps={ulps.numel()}, '
+                f'first_flat={first_flat}, '
+                f'first_actual={first_actual:.9g}, '
+                f'first_expected={first_expected:.9g}')
+        dist_print(
+            f' > {name}: mismatches={mismatch_count}/'
+            f'{actual.numel()}, max_abs={max_abs:.9g}, '
+            f'max_rel={max_relative:.9g}, max_ulp={max_ulp}'
+            f'{mismatch_detail}',
+            once_in_node=True)
+        return mismatch_count
+
+    def report_forward_stage_parity(
+        fused_y: torch.Tensor,
+        ref_y: torch.Tensor,
+    ) -> None:
+        final_mismatches = report_bf16_parity(
+            'Stage final', fused_y, ref_y)
+        if saved_l1_preact is None:
+            assert final_mismatches == 0, (
+                'native grouped-MM final output must be bitwise equal')
+            return
+
+        valid_rows = torch.isfinite(
+            saved_l1_preact.float()).all(dim=1)
+        pool_indices = valid_rows.nonzero().flatten()
+        metadata = buffer.token_src_metadata[pool_indices].long()
+        native_to_pool = native_to_pool_permutation(
+            metadata, native_route_layout)
+        native_pool_indices = pool_indices[native_to_pool]
+        pool_order_mismatches = int(
+            (native_to_pool != torch.arange(
+                native_to_pool.numel(),
+                dtype=torch.long,
+                device=native_to_pool.device)).sum().item())
+        dist_print(
+            f' > Pool-vs-DeepEP order mismatches='
+            f'{pool_order_mismatches}/{native_to_pool.numel()}',
+            once_in_node=True)
+        activation_stage = (
+            'h_weighted'
+            if args.route_weight_mode == 'pre_down'
+            else 'w2_input')
+        actual_stages = {
+            'w13': saved_l1_preact[native_pool_indices],
+            'h': saved_h_unweighted[native_pool_indices],
+            activation_stage: saved_h_weighted[native_pool_indices],
+            'down': saved_down_unweighted[native_pool_indices],
+        }
+        first_difference = (
+            'final' if final_mismatches else None)
+        for stage in ('w13', 'h', activation_stage, 'down'):
+            mismatch_count = report_bf16_parity(
+                f'Stage {stage}',
+                actual_stages[stage],
+                reference_stages[stage])
+            if stage == 'h' and mismatch_count:
+                mismatch = (
+                    actual_stages[stage] != reference_stages[stage])
+                first_flat = int(
+                    mismatch.flatten().nonzero()[0].item())
+                route_row = first_flat // intermediate_hidden
+                hidden_col = first_flat % intermediate_hidden
+                gate = reference_stages['w13'][
+                    route_row, hidden_col].float()
+                up = reference_stages['w13'][
+                    route_row,
+                    intermediate_hidden + hidden_col].float()
+                alpha = 1.5957691216057308
+                beta = 0.044715
+                gate_sq = gate * gate
+                z = (alpha * gate) * (1.0 + beta * gate_sq)
+                explicit = (
+                    gate / (1.0 + torch.exp(-z)) * up
+                ).to(torch.bfloat16)
+                dist_print(
+                    f' > First h mismatch inputs: '
+                    f'row={route_row}, col={hidden_col}, '
+                    f'gate={float(gate):.9g}, up={float(up):.9g}, '
+                    f'z={float(z):.9g}, '
+                    f'explicit={float(explicit.float()):.9g}',
+                    once_in_node=True)
+            if stage == 'h_weighted' and mismatch_count:
+                mismatch = (
+                    actual_stages[stage] != reference_stages[stage])
+                first_flat = int(
+                    mismatch.flatten().nonzero()[0].item())
+                route_row = first_flat // intermediate_hidden
+                hidden_col = first_flat % intermediate_hidden
+                physical_row = int(
+                    native_pool_indices[route_row].item())
+                source = buffer.token_src_metadata[
+                    physical_row].tolist()
+                actual_h = float(
+                    actual_stages['h'][
+                        route_row, hidden_col].float())
+                actual_weighted = float(
+                    actual_stages['h_weighted'][
+                        route_row, hidden_col].float())
+                expected_weighted = float(
+                    reference_stages['h_weighted'][
+                        route_row, hidden_col].float())
+                expected_weight = float(
+                    reference_stages['route_weights'][
+                        route_row].float())
+                observed_weight = (
+                    actual_weighted / actual_h
+                    if actual_h else float('nan'))
+                dist_print(
+                    f' > First h_weighted mismatch inputs: '
+                    f'native_row={route_row}, '
+                    f'physical_row={physical_row}, col={hidden_col}, '
+                    f'source={source}, h={actual_h:.9g}, '
+                    f'expected_weight={expected_weight:.9g}, '
+                    f'observed_weight={observed_weight:.9g}, '
+                    f'actual={actual_weighted:.9g}, '
+                    f'expected={expected_weighted:.9g}',
+                    once_in_node=True)
             if mismatch_count and first_difference is None:
                 first_difference = stage
-            dist_print(
-                f' > Stage {stage}: mismatches={mismatch_count}/'
-                f'{actual.numel()}, max_abs={max_abs:.9g}, '
-                f'max_rel={max_relative:.9g}, max_ulp={max_ulp}, '
-                f'reference_max_abs={max_scale:.9g}',
-                once_in_node=True)
         dist_print(
             f' > First differing stage: {first_difference}',
             once_in_node=True)
-
-        # Control comparison: plain torch.matmul may choose a different
-        # tensor-core reduction tree than FireTitan's production
-        # torch._grouped_mm path. Report it to make accumulation-order
-        # differences explicit instead of attributing them to MegaMoE.
-        matmul_w13 = (
-            x[:1] @ l1_weights_bf16[0].t())
-        gate = matmul_w13[:, :intermediate_hidden]
-        up = matmul_w13[:, intermediate_hidden:]
-        clamp = float(args.activation_clamp)
-        gate = torch.clamp(gate, max=clamp)
-        up = torch.clamp(up, min=-clamp, max=clamp)
-        matmul_h = (
-            _apply_gate_activation(
-                gate.float(), args.activation) *
-            up.float()).to(torch.bfloat16)
-        route = topk_weights[0, 0].float()
-        matmul_h_weighted = (
-            matmul_h.float() * route
-        ).to(torch.bfloat16)
-        matmul_down = (
-            (
-                matmul_h_weighted
-                if args.route_weight_mode == 'pre_down'
-                else matmul_h
-            ) @ l2_weights_bf16[0].t())
-        matmul_final = (
-            matmul_down
-            if args.route_weight_mode == 'pre_down'
-            else (
-                matmul_down.float() * route
-            ).to(torch.bfloat16))
-        matmul_stages = {
-            'w13': matmul_w13,
-            'h': matmul_h,
-            'h_weighted': matmul_h_weighted,
-            'down': matmul_down,
-            'final': matmul_final,
-        }
-        control_first_difference = None
-        for stage in ('w13', 'h', 'h_weighted', 'down', 'final'):
-            control = matmul_stages[stage]
-            native = reference_stages[stage]
-            mismatch_count = int((control != native).sum().item())
-            abs_error = (control.float() - native.float()).abs()
-            max_abs = float(abs_error.max().item())
-            max_relative = float(
-                (
-                    abs_error /
-                    native.float().abs().clamp_min(
-                        torch.finfo(torch.float32).tiny)
-                ).max().item())
-            control_bits = (
-                control.view(torch.int16).to(torch.int32) &
-                0xffff)
-            native_bits = (
-                native.view(torch.int16).to(torch.int32) &
-                0xffff)
-            max_ulp = int(
-                (control_bits - native_bits).abs().max().item())
-            native_scale = float(
-                native.float().abs().max().item())
-            normalized_max_abs = (
-                max_abs / native_scale
-                if native_scale else 0.0)
-            if (
-                mismatch_count and
-                control_first_difference is None
-            ):
-                control_first_difference = stage
-            dist_print(
-                f' > Matmul control {stage}: '
-                f'mismatches={mismatch_count}/{control.numel()}, '
-                f'max_abs={max_abs:.9g}, '
-                f'normalized_max_abs={normalized_max_abs:.9g}, '
-                f'max_rel={max_relative:.9g}, '
-                f'max_ulp={max_ulp}',
-                once_in_node=True)
-        dist_print(
-            ' > Matmul control first differing stage: '
-            f'{control_first_difference}',
-            once_in_node=True)
+        assert first_difference is None, (
+            f'first native grouped-MM difference: {first_difference}')
 
     def check_bf16_parity(fused_y: torch.Tensor, ref_y: torch.Tensor):
-        report_single_token_stage_parity(fused_y)
+        report_forward_stage_parity(fused_y, ref_y)
         assert torch.isfinite(fused_y.float()).all()
         assert torch.isfinite(ref_y.float()).all()
-        if fused_y.numel() > 0 and torch.count_nonzero(ref_y):
-            cosine = torch.nn.functional.cosine_similarity(
-                fused_y.float().flatten(),
-                ref_y.float().flatten(),
-                dim=0).item()
-            assert cosine >= 0.999999, f'BF16 cosine too small: {cosine}'
-        torch.testing.assert_close(
-            fused_y, ref_y, rtol=2 ** -7, atol=2 ** -7)
-        if num_ranks == 1 and num_tokens == num_topk == num_experts == 1:
-            assert torch.equal(
-                fused_y, ref_y), 'deterministic 1x1 route must be bitwise equal'
+
+    def check_native_forward_repeatability(
+        ref_y: torch.Tensor,
+    ) -> None:
+        first_stages = dict(reference_stages)
+        repeated_y = run_native_bf16_reference()
+        mismatch_count = report_bf16_parity(
+            'Native repeat final', repeated_y, ref_y)
+        assert mismatch_count == 0, (
+            'native final output varied across identical runs')
+        for stage in (
+            'w13', 'h', 'h_weighted', 'w2_input',
+            'down', 'route_output'
+        ):
+            mismatch_count = report_bf16_parity(
+                f'Native repeat {stage}',
+                reference_stages[stage],
+                first_stages[stage])
+            assert mismatch_count == 0, (
+                f'native {stage} varied across identical runs')
 
         expected_stats = cumulative_local_expert_recv_stats_baseline.clone()
         all_topk_idx = gather_rank_padded(topk_idx, -1)
@@ -528,46 +692,12 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         assert torch.equal(
             cumulative_local_expert_recv_stats_fused, expected_stats)
 
-        if saved_l1_preact is None:
-            return
-
-        finite = torch.isfinite(saved_l1_preact.float())
-        valid_rows = finite.all(dim=1)
-        assert torch.equal(valid_rows, finite.any(dim=1)), (
-            'saved pre-clamp rows must be either complete or untouched')
-        assert valid_rows.sum().item() == valid_experts.numel()
-        metadata = buffer.token_src_metadata[valid_rows].long()
-        all_x = gather_rank_padded(x, 0)
-        global_l1_weights = gather_expert_weights(l1_weights_bf16)
-        if metadata.numel() == 0:
-            return
-        assert (
-            (metadata[:, 0] >= 0) &
-            (metadata[:, 0] < num_ranks)
-        ).all()
-        source_ranks = metadata[:, 0]
-        token_ids, topk_slots = metadata[:, 1], metadata[:, 2]
-        expert_ids = all_topk_idx[source_ranks, token_ids, topk_slots]
-        expected_preact = torch.empty(
-            (metadata.size(0), 2 * intermediate_hidden),
-            dtype=torch.bfloat16, device='cuda')
-        for expert_idx in range(num_experts):
-            mask = expert_ids == expert_idx
-            if bool(mask.any()):
-                expected_preact[mask] = (
-                    all_x[source_ranks[mask], token_ids[mask]] @
-                    global_l1_weights[expert_idx].t())
-        actual_preact = saved_l1_preact[valid_rows]
-        assert torch.isfinite(actual_preact.float()).all()
-        preact_cosine = torch.nn.functional.cosine_similarity(
-            actual_preact.float().flatten(),
-            expected_preact.float().flatten(),
-            dim=0).item()
-        assert preact_cosine >= 0.999999, (
-            f'pre-clamp cosine too small: {preact_cosine}')
-        torch.testing.assert_close(
-            actual_preact, expected_preact,
-            rtol=2 ** -7, atol=2 ** -7)
+        if saved_l1_preact is not None:
+            finite = torch.isfinite(saved_l1_preact.float())
+            valid_rows = finite.all(dim=1)
+            assert torch.equal(valid_rows, finite.any(dim=1)), (
+                'saved pre-clamp rows must be either complete or untouched')
+            assert valid_rows.sum().item() == valid_experts.numel()
 
     def run_bf16_backward_test():
         expected_tokens_per_expert = (
@@ -665,13 +795,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         valid_rows = torch.isfinite(
             saved_l1_preact.float()).all(dim=1)
         metadata = buffer.token_src_metadata[valid_rows].long()
-        pool_indices = valid_rows.nonzero().flatten()
-        source_ranks = metadata[:, 0]
-        source_tokens = metadata[:, 1]
-        source_slots = metadata[:, 2]
-        global_experts = all_topk_idx[
-            source_ranks, source_tokens, source_slots]
-        local_experts = global_experts - local_expert_start
+        actual_pool_indices = valid_rows.nonzero().flatten()
 
         ref_grad_ye = torch.zeros_like(grad_ye)
         ref_grad_y_unweighted = torch.zeros_like(
@@ -685,189 +809,122 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         ref_route_weights = torch.zeros_like(route_weights_pool)
         ref_grad_route = torch.zeros_like(grad_route_pool)
 
-        def ordered_fp32_dot(
-            lhs: torch.Tensor,
-            rhs: torch.Tensor,
-        ) -> torch.Tensor:
-            result = torch.zeros(
-                lhs.size(0), dtype=torch.float,
-                device=lhs.device)
-            for col in range(lhs.size(1)):
-                product = (
-                    lhs[:, col].float() *
-                    rhs[:, col].float())
-                result = result + product
-            return result
-
-        for expert_idx in range(num_experts_per_rank):
-            selected = local_experts == expert_idx
-            if not bool(selected.any()):
-                continue
-            rows = pool_indices[selected]
-            source_rank = source_ranks[selected]
-            source_token = source_tokens[selected]
-            source_slot = source_slots[selected]
-            xe = all_x[source_rank, source_token]
-            gye = all_grad_y[source_rank, source_token]
-            route = all_topk_weights[
-                source_rank, source_token, source_slot]
-            preact = saved_l1_preact[rows]
-            gate = preact[:, :intermediate_hidden]
-            up = preact[:, intermediate_hidden:]
-            clamp = float(args.activation_clamp)
-            gate_clamped = torch.clamp(gate, max=clamp)
-            up_clamped = torch.clamp(
-                up, min=-clamp, max=clamp)
-            gate_fp32 = gate_clamped.float()
-            up_fp32 = up_clamped.float()
-            if args.activation == 'geglu':
-                alpha = 1.5957691216057308
-                beta = 0.044715
-                z = alpha * (
-                    gate_fp32 +
-                    beta * gate_fp32 ** 3)
-                dz = alpha * (
-                    1 + 3 * beta * gate_fp32 ** 2)
-            else:
-                z = gate_fp32
-                dz = torch.ones_like(gate_fp32)
-            sig = torch.sigmoid(z)
-            activated_gate = gate_fp32 * sig
-            h = (activated_gate * up_fp32).to(
-                torch.bfloat16)
-            if args.route_weight_mode == 'pre_down':
-                w2_input = (
-                    h.float() * route.float().unsqueeze(1)
-                ).to(torch.bfloat16)
-                grad_w2_input = gye
-                grad_h_w2 = native_bf16_grouped_mm(
-                    gye,
-                    l2_weights_bf16[expert_idx].t())
-                gh = (
-                    grad_h_w2.float() *
-                    route.float().unsqueeze(1)
-                ).to(torch.bfloat16)
-                grad_route = ordered_fp32_dot(
-                    grad_h_w2, h)
-            else:
-                w2_input = h
-                grad_w2_input = (
-                    gye.float() *
-                    route.float().unsqueeze(1)
-                ).to(torch.bfloat16)
-                grad_h_w2 = native_bf16_grouped_mm(
-                    grad_w2_input,
-                    l2_weights_bf16[expert_idx].t())
-                gh = grad_h_w2
-                down = native_bf16_grouped_mm(
-                    h, l2_weights_bf16[expert_idx])
-                grad_route = ordered_fp32_dot(gye, down)
-                torch.testing.assert_close(
-                    saved_down_unweighted[rows], down,
-                    rtol=0, atol=0)
-            activation_grad = (
-                sig +
-                gate_fp32 * sig * (1 - sig) * dz)
-            grad_gate = (
-                gh.float() * up_fp32 *
-                activation_grad)
-            grad_gate = torch.where(
-                gate.float() <= clamp,
-                grad_gate,
-                torch.zeros_like(grad_gate))
-            grad_up = (
-                gh.float() * activated_gate)
-            grad_up = torch.where(
-                (up.float() >= -clamp) &
-                (up.float() <= clamp),
-                grad_up,
-                torch.zeros_like(grad_up))
-            grad_gu = torch.cat(
-                [grad_gate, grad_up], dim=1
+        layout = native_route_layout
+        assert torch.equal(layout['counts'], expert_counts)
+        native_to_pool = native_to_pool_permutation(metadata, layout)
+        pool_indices = actual_pool_indices[native_to_pool]
+        source_ranks = layout['source_ranks']
+        source_tokens = layout['source_tokens']
+        source_slots = layout['source_slots']
+        offsets = layout['offsets']
+        xe = all_x[source_ranks, source_tokens]
+        gye = all_grad_y[source_ranks, source_tokens]
+        route = all_topk_weights[
+            source_ranks, source_tokens, source_slots]
+        preact = saved_l1_preact[pool_indices]
+        gate = preact[:, :intermediate_hidden]
+        up = preact[:, intermediate_hidden:]
+        clamp = float(args.activation_clamp)
+        gate_clamped = torch.clamp(gate, max=clamp)
+        up_clamped = torch.clamp(
+            up, min=-clamp, max=clamp)
+        gate_fp32 = gate_clamped.float()
+        up_fp32 = up_clamped.float()
+        if args.activation == 'geglu':
+            alpha = 1.5957691216057308
+            beta = 0.044715
+            gate_sq = gate_fp32 * gate_fp32
+            z = (
+                alpha * gate_fp32 *
+                (1.0 + beta * gate_sq))
+            dz = alpha * (
+                1.0 + (3.0 * beta) * gate_sq)
+        else:
+            z = gate_fp32
+            dz = torch.ones_like(gate_fp32)
+        sig = torch.sigmoid(z)
+        activated_gate = gate_fp32 * sig
+        h = (activated_gate * up_fp32).to(torch.bfloat16)
+        if args.route_weight_mode == 'pre_down':
+            w2_input = (
+                h.float() * route.float().unsqueeze(1)
             ).to(torch.bfloat16)
-            grad_xe = native_bf16_grouped_mm(
-                grad_gu,
-                l1_weights_bf16[expert_idx].t())
-
-            ref_grad_ye[rows] = grad_w2_input
-            ref_grad_y_unweighted[rows] = gye
-            ref_grad_h[rows] = grad_h_w2
-            ref_grad_gate_up[rows] = grad_gu
-            ref_h_act[rows] = h
-            ref_h_weighted[rows] = w2_input
-            ref_x_pool[rows] = xe
-            ref_grad_x_pool[rows] = grad_xe
-            ref_route_weights[rows] = route
-            ref_grad_route[rows] = grad_route
-
-        # Independently differentiate the native BF16 route computation. Keep
-        # each rank's local experts but retain global source-token leaves so
-        # distributed input and router gradients can be reduced below.
-        autograd_x = all_x.detach().clone().requires_grad_(True)
-        autograd_routes = (
-            all_topk_weights.detach().clone().requires_grad_(True))
-        autograd_w13 = (
-            l1_weights_bf16.detach().clone().requires_grad_(True))
-        autograd_w2 = (
-            l2_weights_bf16.detach().clone().requires_grad_(True))
-        autograd_loss = None
-        for expert_idx in range(num_experts_per_rank):
-            selected = local_experts == expert_idx
-            if not bool(selected.any()):
-                continue
-            source_rank = source_ranks[selected]
-            source_token = source_tokens[selected]
-            source_slot = source_slots[selected]
-            xe = autograd_x[source_rank, source_token]
-            preact = native_bf16_grouped_mm(
-                xe, autograd_w13[expert_idx])
-            gate = preact[:, :intermediate_hidden]
-            up = preact[:, intermediate_hidden:]
-            clamp = float(args.activation_clamp)
-            gate = torch.clamp(gate, max=clamp)
-            up = torch.clamp(up, min=-clamp, max=clamp)
-            h = (
-                _apply_gate_activation(
-                    gate.float(), args.activation) *
-                up.float()
+            grad_w2_input = gye
+            grad_h_w2 = native_bf16_grouped_mm(
+                gye,
+                l2_weights_bf16,
+                offsets,
+                rhs_needs_transpose=False)
+            gh = (
+                grad_h_w2.float() *
+                route.float().unsqueeze(1)
             ).to(torch.bfloat16)
-            route = autograd_routes[
-                source_rank, source_token, source_slot]
-            if args.route_weight_mode == 'pre_down':
-                h_weighted_ref = (
-                    h.float() * route.float().unsqueeze(1)
-                ).to(torch.bfloat16)
-                ye = (
-                    native_bf16_grouped_mm(
-                        h_weighted_ref,
-                        autograd_w2[expert_idx]))
-            else:
-                down = native_bf16_grouped_mm(
-                    h, autograd_w2[expert_idx])
-                ye = (
-                    down.float() *
-                    route.float().unsqueeze(1)
-                ).to(torch.bfloat16)
-            loss = (
-                ye.float() *
-                all_grad_y[source_rank, source_token].float()
-            ).sum()
-            autograd_loss = (
-                loss if autograd_loss is None
-                else autograd_loss + loss)
-        if autograd_loss is not None:
-            autograd_loss.backward()
+            grad_route = (
+                grad_h_w2.float() * h.float()
+            ).sum(dim=1)
+        else:
+            w2_input = h
+            grad_w2_input = (
+                gye.float() * route.float().unsqueeze(1)
+            ).to(torch.bfloat16)
+            grad_h_w2 = native_bf16_grouped_mm(
+                grad_w2_input,
+                l2_weights_bf16,
+                offsets,
+                rhs_needs_transpose=False)
+            gh = grad_h_w2
+            down = native_bf16_grouped_mm(
+                h, l2_weights_bf16, offsets)
+            grad_route = (
+                gye.float() * down.float()
+            ).sum(dim=1)
+            assert torch.equal(
+                saved_down_unweighted[pool_indices], down)
+        activation_grad = (
+            sig + gate_fp32 * sig * (1 - sig) * dz)
+        grad_gate = (
+            gh.float() * up_fp32 * activation_grad)
+        grad_gate = torch.where(
+            gate.float() <= clamp,
+            grad_gate,
+            torch.zeros_like(grad_gate))
+        grad_up = gh.float() * activated_gate
+        grad_up = torch.where(
+            (up.float() >= -clamp) &
+            (up.float() <= clamp),
+            grad_up,
+            torch.zeros_like(grad_up))
+        grad_gate_bf16 = grad_gate.to(torch.bfloat16)
+        grad_up_bf16 = grad_up.to(torch.bfloat16)
+        grad_gu = torch.cat(
+            (grad_gate_bf16, grad_up_bf16), dim=1)
+        w1_weights = l1_weights_bf16[
+            :, :intermediate_hidden].contiguous()
+        w3_weights = l1_weights_bf16[
+            :, intermediate_hidden:].contiguous()
+        grad_xe = native_bf16_grouped_mm(
+            grad_gate_bf16,
+            w1_weights,
+            offsets,
+            rhs_needs_transpose=False)
+        grad_xe.add_(native_bf16_grouped_mm(
+            grad_up_bf16,
+            w3_weights,
+            offsets,
+            rhs_needs_transpose=False))
 
-        def grad_or_zeros(tensor: torch.Tensor) -> torch.Tensor:
-            return (
-                tensor.grad.detach()
-                if tensor.grad is not None
-                else torch.zeros_like(tensor))
+        ref_grad_ye[pool_indices] = grad_w2_input
+        ref_grad_y_unweighted[pool_indices] = gye
+        ref_grad_h[pool_indices] = grad_h_w2
+        ref_grad_gate_up[pool_indices] = grad_gu
+        ref_h_act[pool_indices] = h
+        ref_h_weighted[pool_indices] = w2_input
+        ref_x_pool[pool_indices] = xe
+        ref_grad_x_pool[pool_indices] = grad_xe
+        ref_route_weights[pool_indices] = route
+        ref_grad_route[pool_indices] = grad_route
 
-        autograd_grad_x = grad_or_zeros(autograd_x)
-        autograd_grad_routes = grad_or_zeros(autograd_routes)
-        autograd_grad_w13 = grad_or_zeros(autograd_w13)
-        autograd_grad_w2 = grad_or_zeros(autograd_w2)
+        gradient_mismatches = {}
 
         def assert_gradient_close(
             actual: torch.Tensor,
@@ -875,29 +932,23 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             name: str,
         ):
             assert torch.isfinite(actual.float()).all(), name
-            if (
-                num_ranks == 1 and
-                num_tokens == 1 and
-                num_experts == 1 and
-                num_topk == 1
-            ):
-                assert torch.equal(actual, expected), (
-                    f'{name} must be bitwise equal in the '
-                    'single-token/single-expert case')
-                return
-            if torch.count_nonzero(expected):
-                cosine = torch.nn.functional.cosine_similarity(
-                    actual.float().flatten(),
-                    expected.float().flatten(),
-                    dim=0).item()
-                assert cosine >= 0.999999, (
-                    f'{name} cosine too small: {cosine}')
-            # Allow two BF16 ULPs for valid FP32 tensor-core reduction-order
-            # differences before the required BF16 output rounding.
-            torch.testing.assert_close(
-                actual, expected,
-                rtol=2 ** -6, atol=2 ** -6,
-                msg=lambda msg: f'{name}: {msg}')
+            if actual.dtype == torch.bfloat16:
+                mismatch_count = report_bf16_parity(
+                    name, actual, expected)
+            else:
+                mismatch_count = int(
+                    (actual != expected).sum().item())
+                max_abs = (
+                    float(
+                        (actual.float() - expected.float())
+                        .abs().max().item())
+                    if actual.numel() else 0.0)
+                dist_print(
+                    f' > {name}: mismatches={mismatch_count}/'
+                    f'{actual.numel()}, max_abs={max_abs:.9g}',
+                    once_in_node=True)
+            if mismatch_count:
+                gradient_mismatches[name] = mismatch_count
 
         assert_gradient_close(grad_ye, ref_grad_ye, 'grad_ye')
         assert_gradient_close(
@@ -921,6 +972,40 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         assert_gradient_close(
             grad_route_pool, ref_grad_route,
             'grad_route_pool')
+        repeated_grad_h = native_bf16_grouped_mm(
+            grad_w2_input,
+            l2_weights_bf16,
+            offsets,
+            rhs_needs_transpose=False)
+        repeated_grad_x = native_bf16_grouped_mm(
+            grad_gate_bf16,
+            w1_weights,
+            offsets,
+            rhs_needs_transpose=False)
+        repeated_grad_x.add_(native_bf16_grouped_mm(
+            grad_up_bf16,
+            w3_weights,
+            offsets,
+            rhs_needs_transpose=False))
+        if args.route_weight_mode == 'pre_down':
+            repeated_grad_route = (
+                repeated_grad_h.float() * h.float()
+            ).sum(dim=1)
+        else:
+            repeated_down = native_bf16_grouped_mm(
+                h, l2_weights_bf16, offsets)
+            repeated_grad_route = (
+                gye.float() * repeated_down.float()
+            ).sum(dim=1)
+        assert_gradient_close(
+            repeated_grad_h, grad_h_w2,
+            'native_repeat_grad_h')
+        assert_gradient_close(
+            repeated_grad_x, grad_xe,
+            'native_repeat_grad_x')
+        assert_gradient_close(
+            repeated_grad_route, grad_route,
+            'native_repeat_grad_route')
 
         grad_w2 = torch.zeros_like(l2_weights_bf16)
         grad_w13 = torch.zeros_like(l1_weights_bf16)
@@ -948,31 +1033,74 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             deep_gemm.bf16_mega_moe_backward_w13(
                 grad_w13, grad_gate_up, x_pool,
                 padded_expert_counts)
-        ref_grad_w2 = torch.zeros_like(grad_w2)
-        ref_grad_w13 = torch.zeros_like(grad_w13)
-        pool_offset = 0
-        for expert_idx in range(num_experts_per_rank):
-            count = int(expert_counts[expert_idx].item())
-            rows = slice(pool_offset, pool_offset + count)
-            if count:
-                ref_grad_w2[expert_idx] = (
-                    ref_grad_ye[rows].t() @
-                    ref_h_weighted[rows])
-                ref_grad_w13[expert_idx] = (
-                    ref_grad_gate_up[rows].t() @
-                    ref_x_pool[rows])
-            pool_offset += int(
-                padded_expert_counts[expert_idx].item())
+        compact_grad_ye = ref_grad_ye[pool_indices]
+        compact_h_weighted = ref_h_weighted[pool_indices]
+        compact_grad_gate = ref_grad_gate_up[
+            pool_indices, :intermediate_hidden]
+        compact_grad_up = ref_grad_gate_up[
+            pool_indices, intermediate_hidden:]
+        compact_x = ref_x_pool[pool_indices]
+        # These are the exact native FireTitan transposed-LHS grouped-MM
+        # calls. They preserve the native K-group boundaries and BF16 output
+        # rounding; no per-expert Python matmul participates in parity.
+        ref_grad_w2 = native_bf16_grouped_mm(
+            compact_grad_ye.t(),
+            compact_h_weighted,
+            offsets,
+            rhs_needs_transpose=False,
+            lhs_needs_contiguous=False)
+        ref_grad_w1 = native_bf16_grouped_mm(
+            compact_grad_gate.t(),
+            compact_x,
+            offsets,
+            rhs_needs_transpose=False,
+            lhs_needs_contiguous=False)
+        ref_grad_w3 = native_bf16_grouped_mm(
+            compact_grad_up.t(),
+            compact_x,
+            offsets,
+            rhs_needs_transpose=False,
+            lhs_needs_contiguous=False)
+        inactive = (expert_counts == 0).view(-1, 1, 1)
+        ref_grad_w2.masked_fill_(inactive, 0)
+        ref_grad_w1.masked_fill_(inactive, 0)
+        ref_grad_w3.masked_fill_(inactive, 0)
+        ref_grad_w13 = torch.cat(
+            (ref_grad_w1, ref_grad_w3), dim=1)
+        repeated_grad_w2 = native_bf16_grouped_mm(
+            compact_grad_ye.t(),
+            compact_h_weighted,
+            offsets,
+            rhs_needs_transpose=False,
+            lhs_needs_contiguous=False)
+        repeated_grad_w1 = native_bf16_grouped_mm(
+            compact_grad_gate.t(),
+            compact_x,
+            offsets,
+            rhs_needs_transpose=False,
+            lhs_needs_contiguous=False)
+        repeated_grad_w3 = native_bf16_grouped_mm(
+            compact_grad_up.t(),
+            compact_x,
+            offsets,
+            rhs_needs_transpose=False,
+            lhs_needs_contiguous=False)
+        repeated_grad_w2.masked_fill_(inactive, 0)
+        repeated_grad_w1.masked_fill_(inactive, 0)
+        repeated_grad_w3.masked_fill_(inactive, 0)
+        assert_gradient_close(
+            repeated_grad_w2, ref_grad_w2,
+            'native_repeat_grad_w2')
+        assert_gradient_close(
+            repeated_grad_w1, ref_grad_w1,
+            'native_repeat_grad_w1')
+        assert_gradient_close(
+            repeated_grad_w3, ref_grad_w3,
+            'native_repeat_grad_w3')
         assert_gradient_close(
             grad_w2, ref_grad_w2, 'grad_w2')
         assert_gradient_close(
             grad_w13, ref_grad_w13, 'grad_w13')
-        assert_gradient_close(
-            grad_w2, autograd_grad_w2,
-            'grad_w2_autograd')
-        assert_gradient_close(
-            grad_w13, autograd_grad_w13,
-            'grad_w13_autograd')
 
         if num_ranks > 1:
             ref_grad_x_planes = torch.zeros(
@@ -989,19 +1117,22 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 source_ranks, source_tokens, source_slots
             ] = ref_grad_x_pool[pool_indices]
             actual_route_planes[
-                source_ranks, source_tokens, source_slots
-            ] = grad_route_pool[pool_indices]
+                metadata[:, 0], metadata[:, 1], metadata[:, 2]
+            ] = grad_route_pool[actual_pool_indices]
             ref_route_planes[
                 source_ranks, source_tokens, source_slots
             ] = ref_grad_route[pool_indices]
             dist.all_reduce(ref_grad_x_planes, group=group)
             dist.all_reduce(actual_route_planes, group=group)
             dist.all_reduce(ref_route_planes, group=group)
-            dist.all_reduce(autograd_grad_x, group=group)
-            dist.all_reduce(autograd_grad_routes, group=group)
-            ref_grad_x = ref_grad_x_planes[
-                rank_idx, :num_tokens
-            ].float().sum(dim=1).to(torch.bfloat16)
+            ref_grad_x_fp32 = torch.zeros(
+                (num_tokens, hidden),
+                dtype=torch.float32,
+                device='cuda')
+            for slot in range(num_topk):
+                ref_grad_x_fp32 += ref_grad_x_planes[
+                    rank_idx, :num_tokens, slot].float()
+            ref_grad_x = ref_grad_x_fp32.to(torch.bfloat16)
             assert_gradient_close(
                 grad_x_combined, ref_grad_x,
                 'grad_x_combined')
@@ -1009,14 +1140,10 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 actual_route_planes[rank_idx, :num_tokens],
                 ref_route_planes[rank_idx, :num_tokens],
                 'grad_route_source')
-            assert_gradient_close(
-                grad_x_combined,
-                autograd_grad_x[rank_idx, :num_tokens],
-                'grad_x_autograd')
-            assert_gradient_close(
-                actual_route_planes[rank_idx, :num_tokens],
-                autograd_grad_routes[rank_idx, :num_tokens],
-                'grad_route_autograd')
+
+        assert not gradient_mismatches, (
+            'native FireTitan gradient mismatches: '
+            f'{gradient_mismatches}')
 
     dist_print('Config:', once_in_node=True)
     dist_print(f' > MMA: {args.mma_type}', once_in_node=True)
@@ -1133,6 +1260,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             fused_y, _ = run_fused()
             ref_y = run_reference()
             if is_bf16xbf16:
+                check_native_forward_repeatability(ref_y)
                 check_bf16_parity(fused_y, ref_y)
                 if args.test_backward:
                     run_bf16_backward_test()
@@ -1147,6 +1275,13 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     if not ran_correctness:
         create_inputs()
+
+    if args.correctness_only:
+        dist.barrier()
+        buffer.destroy()
+        ep_buffer.destroy() if ep_buffer else None
+        dist.destroy_process_group()
+        return
 
     # Count local received tokens
     gathered_topk_idx = uneven_all_gather(topk_idx, group=group)
@@ -1234,6 +1369,7 @@ if __name__ == '__main__':
 
     # Test settings
     parser.add_argument('--num-correctness-tests', type=int, default=None, help='Pressure test')
+    parser.add_argument('--correctness-only', action='store_true', help='Exit after correctness validation')
     parser.add_argument('--dump-profile-traces', type=str, default='', help='Dump profiling trace JSONs')
     parser.add_argument('--local-rank-idx', type=int, default=None, help='Run as single process with this local rank (e.g. for NCU prof)')
     args = parser.parse_args()
