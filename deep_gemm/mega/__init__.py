@@ -224,12 +224,22 @@ def bf16_mega_moe(y: torch.Tensor,
                   saved_h_weighted: Optional[torch.Tensor] = None,
                   saved_down_unweighted: Optional[torch.Tensor] = None,
                   combine_order_mode: CombineOrderMode =
-                  CombineOrderMode.FIXED_TOPK):
+                  CombineOrderMode.FIXED_TOPK,
+                  precomputed_route_counts: Optional[torch.Tensor] = None,
+                  active_pool_rows: Optional[int] = None,
+                  route_count_mismatch: Optional[torch.Tensor] = None,
+                  num_config_tokens: Optional[int] = None):
     """Run BF16 MegaMoE with an explicit route-weight boundary.
 
     The optional stage saves expose unweighted/weighted activation and W2
     output boundaries for strict parity checks. ``saved_down_unweighted`` is
     also used by post-down backward for the exact router gradient.
+
+    Training callers may provide an exact local source-route histogram,
+    rank-uniform ``active_pool_rows``, and a scalar mismatch flag to size saved
+    pools from actual receive counts. The kernel publishes the precomputed
+    counts, verifies them against its internal dispatch count, and sets the
+    flag before any caller can accept a truncated result.
     """
     route_weight_mode = RouteWeightMode(route_weight_mode)
     combine_order_mode = CombineOrderMode(combine_order_mode)
@@ -239,8 +249,22 @@ def bf16_mega_moe(y: torch.Tensor,
     ):
         raise ValueError(
             "both activation stage outputs must be provided together")
-    num_config_tokens = y.size(0)
-    if sym_buffer.group.size() > 1:
+    active_plan = (
+        precomputed_route_counts is not None,
+        active_pool_rows is not None,
+        route_count_mismatch is not None,
+    )
+    if any(active_plan) and not all(active_plan):
+        raise ValueError(
+            "precomputed_route_counts, active_pool_rows, and "
+            "route_count_mismatch must be provided together")
+    has_precomputed_config_tokens = num_config_tokens is not None
+    if num_config_tokens is None:
+        num_config_tokens = y.size(0)
+    if (
+        not has_precomputed_config_tokens
+        and sym_buffer.group.size() > 1
+    ):
         # The config selects BLOCK_M, which defines the persistent launch and
         # pool packing. Empty source ranks can still receive expert rows, so
         # every rank must select the config from the same source-token extent.
@@ -272,4 +296,7 @@ def bf16_mega_moe(y: torch.Tensor,
         saved_down_unweighted,
         num_config_tokens,
         combine_order_mode.value,
+        precomputed_route_counts,
+        active_pool_rows,
+        route_count_mismatch,
     )

@@ -66,6 +66,8 @@ public:
         void* saved_h_unweighted;
         void* saved_h_weighted;
         int* cumulative_local_expert_recv_stats;
+        const int* precomputed_route_counts;
+        int* route_count_mismatch;
         int num_tokens;
         layout::SymBuffer<> sym_buffer_ptrs;
 
@@ -139,6 +141,8 @@ static void __instantiate_kernel() {{
             args.saved_h_unweighted,
             args.saved_h_weighted,
             args.cumulative_local_expert_recv_stats,
+            args.precomputed_route_counts,
+            args.route_count_mismatch,
             args.num_tokens,
             args.sym_buffer_ptrs,
             args.tensor_map_l1_acts,
@@ -170,7 +174,10 @@ static void sm100_bf16_mega_moe(
     const std::optional<torch::Tensor>& saved_h_unweighted,
     const std::optional<torch::Tensor>& saved_h_weighted,
     const std::optional<torch::Tensor>& saved_down_unweighted,
-    const std::string& combine_order_mode
+    const std::string& combine_order_mode,
+    const std::optional<torch::Tensor>& precomputed_route_counts,
+    const std::optional<int>& active_pool_rows,
+    const std::optional<torch::Tensor>& route_count_mismatch
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -182,16 +189,22 @@ static void sm100_bf16_mega_moe(
         num_max_tokens_per_rank, num_config_tokens, num_topk,
         hidden, intermediate_hidden,
         num_ring_tokens, 0, MmaKind::BF16);
-    if (saved_l1_preact.has_value()) {
-        const auto num_max_pool_tokens = layout::get_num_max_pool_tokens(
+    const auto num_max_pool_tokens =
+        layout::get_num_max_pool_tokens(
             num_ranks, num_max_tokens_per_rank, num_topk,
             num_experts_per_rank);
+    const auto num_saved_pool_tokens =
+        active_pool_rows.value_or(num_max_pool_tokens);
+    DG_HOST_ASSERT(
+        num_saved_pool_tokens > 0 &&
+        num_saved_pool_tokens <= num_max_pool_tokens);
+    if (saved_l1_preact.has_value()) {
         DG_HOST_ASSERT(saved_l1_preact->scalar_type() == torch::kBFloat16);
         DG_HOST_ASSERT(saved_l1_preact->is_contiguous());
         DG_HOST_ASSERT(
             saved_l1_preact->sizes() ==
             torch::IntArrayRef(
-                {num_max_pool_tokens, 2 * intermediate_hidden}));
+                {num_saved_pool_tokens, 2 * intermediate_hidden}));
     }
     DG_HOST_ASSERT(
         route_weight_mode == "pre_down" ||
@@ -203,10 +216,6 @@ static void sm100_bf16_mega_moe(
         saved_h_unweighted.has_value() ==
         saved_h_weighted.has_value());
     if (saved_h_unweighted.has_value()) {
-        const auto num_max_pool_tokens =
-            layout::get_num_max_pool_tokens(
-                num_ranks, num_max_tokens_per_rank, num_topk,
-                num_experts_per_rank);
         for (const auto* saved :
              {&*saved_h_unweighted, &*saved_h_weighted}) {
             DG_HOST_ASSERT(
@@ -214,19 +223,16 @@ static void sm100_bf16_mega_moe(
             DG_HOST_ASSERT(saved->is_contiguous());
             DG_HOST_ASSERT(
                 saved->sizes() == torch::IntArrayRef(
-                    {num_max_pool_tokens, intermediate_hidden}));
+                    {num_saved_pool_tokens, intermediate_hidden}));
         }
     }
     if (saved_down_unweighted.has_value()) {
-        const auto num_max_pool_tokens = layout::get_num_max_pool_tokens(
-            num_ranks, num_max_tokens_per_rank, num_topk,
-            num_experts_per_rank);
         DG_HOST_ASSERT(
             saved_down_unweighted->scalar_type() == torch::kBFloat16);
         DG_HOST_ASSERT(saved_down_unweighted->is_contiguous());
         DG_HOST_ASSERT(
             saved_down_unweighted->sizes() ==
-            torch::IntArrayRef({num_max_pool_tokens, hidden}));
+            torch::IntArrayRef({num_saved_pool_tokens, hidden}));
     }
 
     // Make tensormap
@@ -301,6 +307,14 @@ static void sm100_bf16_mega_moe(
             ? saved_h_weighted->data_ptr()
             : nullptr,
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,
+        .precomputed_route_counts =
+            precomputed_route_counts.has_value()
+            ? precomputed_route_counts->data_ptr<int>()
+            : nullptr,
+        .route_count_mismatch =
+            route_count_mismatch.has_value()
+            ? route_count_mismatch->data_ptr<int>()
+            : nullptr,
         .num_tokens = num_tokens,
         .sym_buffer_ptrs = layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
         .tensor_map_l1_acts = tensor_map_l1_acts,

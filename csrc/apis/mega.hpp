@@ -298,7 +298,10 @@ static void bf16_mega_moe(
     const std::optional<torch::Tensor>& saved_h_weighted,
     const std::optional<torch::Tensor>& saved_down_unweighted,
     const int& num_config_tokens,
-    const std::string& combine_order_mode
+    const std::string& combine_order_mode,
+    const std::optional<torch::Tensor>& precomputed_route_counts,
+    const std::optional<int>& active_pool_rows,
+    const std::optional<torch::Tensor>& route_count_mismatch
 ) {
     // Config checks
     const auto num_tokens = static_cast<int>(y.size(0));
@@ -340,6 +343,25 @@ static void bf16_mega_moe(
         DG_HOST_ASSERT(cumulative_local_expert_recv_stats->numel() == num_experts_per_rank);
         DG_HOST_ASSERT(cumulative_local_expert_recv_stats->is_contiguous());
     }
+    DG_HOST_ASSERT(
+        precomputed_route_counts.has_value() ==
+        active_pool_rows.has_value());
+    DG_HOST_ASSERT(
+        precomputed_route_counts.has_value() ==
+        route_count_mismatch.has_value());
+    if (precomputed_route_counts.has_value()) {
+        DG_HOST_ASSERT(
+            precomputed_route_counts->scalar_type() ==
+            torch::kInt);
+        DG_HOST_ASSERT(
+            precomputed_route_counts->numel() == num_experts);
+        DG_HOST_ASSERT(precomputed_route_counts->is_contiguous());
+        DG_HOST_ASSERT(
+            route_count_mismatch->scalar_type() == torch::kInt);
+        DG_HOST_ASSERT(route_count_mismatch->numel() == 1);
+        DG_HOST_ASSERT(route_count_mismatch->is_contiguous());
+        DG_HOST_ASSERT(*active_pool_rows > 0);
+    }
 
     // Check buffer bytes
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
@@ -374,7 +396,10 @@ static void bf16_mega_moe(
                             saved_h_unweighted,
                             saved_h_weighted,
                             saved_down_unweighted,
-                            combine_order_mode);
+                            combine_order_mode,
+                            precomputed_route_counts,
+                            active_pool_rows,
+                            route_count_mismatch);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }

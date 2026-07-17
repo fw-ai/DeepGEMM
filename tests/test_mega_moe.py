@@ -123,6 +123,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         global saved_h_weighted, saved_down_unweighted
         global cumulative_local_expert_recv_stats_fused
         global cumulative_local_expert_recv_stats_baseline
+        global precomputed_route_counts, active_pool_rows
+        global route_count_mismatch, num_config_tokens
         x = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
         l1_weights = torch.randn(
             (num_experts_per_rank, intermediate_hidden * 2, hidden), dtype=torch.bfloat16, device='cuda')
@@ -161,6 +163,53 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             topk_idx.masked_fill_(rand_mask < args.masked_ratio, -1)
             topk_weights.masked_fill_(topk_idx < 0, 0)
 
+        precomputed_route_counts = None
+        active_pool_rows = None
+        route_count_mismatch = None
+        num_config_tokens = None
+        if args.active_saved_pool:
+            assert is_bf16xbf16
+            valid_routes = topk_idx[
+                (topk_idx >= 0) & (topk_idx < num_experts)]
+            precomputed_route_counts = torch.bincount(
+                valid_routes,
+                minlength=num_experts).to(torch.int32)
+            global_route_counts = precomputed_route_counts.clone()
+            if num_ranks > 1:
+                dist.all_reduce(global_route_counts, group=group)
+            num_config_tokens_tensor = torch.tensor(
+                num_tokens, dtype=torch.int32, device='cuda')
+            if num_ranks > 1:
+                dist.all_reduce(
+                    num_config_tokens_tensor,
+                    op=dist.ReduceOp.MAX,
+                    group=group)
+            num_config_tokens = int(num_config_tokens_tensor.item())
+            expected_tokens_per_expert = (
+                num_config_tokens * num_ranks * num_topk /
+                num_experts)
+            if expected_tokens_per_expert <= 8.5:
+                active_block_m = 16
+            elif expected_tokens_per_expert <= 16.5:
+                active_block_m = 32
+            elif expected_tokens_per_expert <= 32.5:
+                active_block_m = 64
+            elif expected_tokens_per_expert <= 64.5:
+                active_block_m = 96
+            elif expected_tokens_per_expert <= 96.5:
+                active_block_m = 128
+            else:
+                active_block_m = 192
+            destination_counts = global_route_counts.view(
+                num_ranks, num_experts_per_rank)
+            padded_destination_counts = (
+                (destination_counts + active_block_m - 1) //
+                active_block_m * active_block_m)
+            active_pool_rows = int(
+                padded_destination_counts.sum(dim=1).max().item())
+            route_count_mismatch = torch.zeros(
+                1, dtype=torch.int32, device='cuda')
+
         if not is_bf16xbf16:
             # FP8 path: cast inputs to FP8/FP4 with per-32 UE8M0 SF
             assert hidden % 128 == 0 and intermediate_hidden % 128 == 0
@@ -179,7 +228,10 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             args.save_l1_preact or args.test_backward
         ):
             saved_l1_preact = torch.full(
-                (buffer.token_src_metadata.size(0), 2 * intermediate_hidden),
+                (
+                    active_pool_rows or
+                    buffer.token_src_metadata.size(0),
+                    2 * intermediate_hidden),
                 float('nan'), dtype=torch.bfloat16, device='cuda')
         if (args.save_forward_stages and
                 not args.benchmark_backward and
@@ -187,7 +239,10 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             args.save_l1_preact or args.test_backward
         )):
             saved_h_unweighted = torch.full(
-                (buffer.token_src_metadata.size(0), intermediate_hidden),
+                (
+                    active_pool_rows or
+                    buffer.token_src_metadata.size(0),
+                    intermediate_hidden),
                 float('nan'), dtype=torch.bfloat16, device='cuda')
             saved_h_weighted = torch.full_like(
                 saved_h_unweighted, float('nan'))
@@ -200,7 +255,10 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             )
         ):
             saved_down_unweighted = torch.full(
-                (buffer.token_src_metadata.size(0), hidden),
+                (
+                    active_pool_rows or
+                    buffer.token_src_metadata.size(0),
+                    hidden),
                 float('nan'), dtype=torch.bfloat16, device='cuda')
 
     # Run fused mega MoE
@@ -231,8 +289,19 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                     args.combine_order_mode),
                 saved_h_unweighted=saved_h_unweighted,
                 saved_h_weighted=saved_h_weighted,
-                saved_down_unweighted=saved_down_unweighted)
+                saved_down_unweighted=saved_down_unweighted,
+                precomputed_route_counts=precomputed_route_counts,
+                active_pool_rows=active_pool_rows,
+                route_count_mismatch=route_count_mismatch,
+                num_config_tokens=num_config_tokens)
         (deep_gemm.bf16_mega_moe if is_bf16xbf16 else deep_gemm.fp8_fp4_mega_moe)(**kernel_kwargs)
+        if route_count_mismatch is not None:
+            if num_ranks > 1:
+                dist.all_reduce(
+                    route_count_mismatch,
+                    op=dist.ReduceOp.MAX,
+                    group=group)
+            assert route_count_mismatch.item() == 0
         return y, cumulative_local_expert_recv_stats_fused
 
     # Self-contained PyTorch reference. Distributed routing/combine is modeled
@@ -1087,7 +1156,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 'backward must preserve forward source-route metadata')
         valid_rows = torch.isfinite(
             reference_gate_up.float()).all(dim=1)
-        metadata = buffer.token_src_metadata[valid_rows].long()
+        metadata = buffer.token_src_metadata[:pool_rows][valid_rows].long()
         actual_pool_indices = valid_rows.nonzero().flatten()
 
         ref_grad_ye = torch.zeros_like(grad_ye)
@@ -1829,6 +1898,10 @@ if __name__ == '__main__':
     parser.add_argument('--fast-math', type=int, default=1, help='Enable fast math (0 or 1, default: 1)')
     parser.add_argument('--mma-type', type=str, default='fp8xfp4', help='MMA type: fp8xfp4 or bf16xbf16')
     parser.add_argument('--save-l1-preact', action='store_true', help='Validate optional exact BF16 W13 output')
+    parser.add_argument(
+        '--active-saved-pool',
+        action='store_true',
+        help='Size BF16 saved pools from an exact route-count exchange')
     parser.add_argument(
         '--no-save-forward-stages',
         dest='save_forward_stages',

@@ -59,6 +59,8 @@ sm100_bf16_mega_moe_impl(void* y,
                          nv_bfloat16* saved_h_unweighted,
                          nv_bfloat16* saved_h_weighted,
                          int* cumulative_local_expert_recv_stats,
+                         const int* precomputed_route_counts,
+                         int* route_count_mismatch,
                          const uint32_t num_tokens,
                          const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts,
@@ -433,12 +435,37 @@ sm100_bf16_mega_moe_impl(void* y,
                 const auto dst_rank_idx = i / kNumExpertsPerRank;
                 const auto dst_local_expert_idx = i % kNumExpertsPerRank;
                 const auto expert_status = *workspace.get_expert_send_count_ptr(i);
+                const uint32_t actual_count =
+                    static_cast<uint32_t>(
+                        expert_status & 0xffffffff);
+                uint32_t published_count = actual_count;
+                if (precomputed_route_counts != nullptr) {
+                    const int expected_count =
+                        precomputed_route_counts[i];
+                    if (
+                        expected_count < 0 ||
+                        static_cast<uint32_t>(
+                            expected_count) != actual_count
+                    ) {
+                        atomicExch(
+                            route_count_mismatch, 1);
+                    }
+                    published_count =
+                        expected_count >= 0
+                        ? static_cast<uint32_t>(
+                              expected_count)
+                        : actual_count;
+                }
+                const uint64_t published_status =
+                    (expert_status &
+                     0xffffffff00000000ull) |
+                    published_count;
                 *sym_buffer.map(
                     workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
-                    dst_rank_idx) = expert_status & 0xffffffff;
+                    dst_rank_idx) = published_count;
                 ptx::atomic_add_sys(
                     sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx), dst_rank_idx),
-                    expert_status);
+                    published_status);
             }
         }
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
