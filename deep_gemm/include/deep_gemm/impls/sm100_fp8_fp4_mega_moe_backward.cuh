@@ -479,7 +479,7 @@ sm100_bf16_mega_moe_backward_post_down_prelude(
     }();
     constexpr uint32_t kTritonRouteNumWarps = [] {
         uint32_t value = kTritonRouteBlockH / 256;
-        value = value < 8 ? 8 : value;
+        value = value < 4 ? 4 : value;
         return value > 32 ? 32 : value;
     }();
     constexpr uint32_t kTritonRouteThreads =
