@@ -1,7 +1,10 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <cstdint>
+#include <functional>
 
 #include <torch/python.h>
 
@@ -35,6 +38,80 @@ static std::string get_backward_combine_order_mode_name(
         return "CombineOrderMode::DeepEP";
     DG_HOST_UNREACHABLE("Unsupported combine order mode");
 }
+
+class SM100BF16MegaMoEBackwardPostDownPreludeRuntime final
+    : public LaunchRuntime<
+          SM100BF16MegaMoEBackwardPostDownPreludeRuntime> {
+public:
+    struct Args {
+        int hidden;
+        int num_experts;
+        int block_m;
+        int num_sms;
+        int num_ranks;
+        std::string combine_order_mode = "fixed_topk";
+        bool do_reverse_dispatch = true;
+        bool prepare_route_and_weighted = true;
+        const int* expert_counts;
+        layout::SymBuffer<> backward_sym_buffer;
+        const cutlass::bfloat16_t* backward_grad_y;
+        const cutlass::bfloat16_t* backward_x;
+        const float* backward_topk_weights;
+        const layout::TokenSrcMetadata* token_src_metadata;
+        uint32_t num_topk;
+        uint32_t num_pool_rows;
+        cutlass::bfloat16_t* grad_y_unweighted_output;
+        cutlass::bfloat16_t* grad_y_weighted_output;
+        cutlass::bfloat16_t* x_pool_output;
+        float* route_weights_output;
+        const cutlass::bfloat16_t* down_unweighted;
+        float* grad_route_output;
+        LaunchArgs launch_args;
+    };
+
+    static std::string generate_impl(const Args& args) {
+        return fmt::format(R"(
+#include <deep_gemm/impls/sm100_fp8_fp4_mega_moe_backward.cuh>
+
+using namespace deep_gemm;
+
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(
+        &sm100_bf16_mega_moe_backward_post_down_prelude<
+            {}, {}, {}, {}, {}, {}, {}, {}
+        >);
+}};
+)",
+            args.hidden, args.num_experts, args.block_m,
+            args.num_sms, args.num_ranks,
+            get_backward_combine_order_mode_name(
+                args.combine_order_mode),
+            args.do_reverse_dispatch ? "true" : "false",
+            args.prepare_route_and_weighted ? "true" : "false");
+    }
+
+    static void launch_impl(
+        const KernelHandle& kernel,
+        const LaunchConfigHandle& config,
+        Args args) {
+        DG_CUDA_UNIFIED_CHECK(launch_kernel(
+            kernel, config,
+            args.expert_counts,
+            args.backward_sym_buffer,
+            args.backward_grad_y,
+            args.backward_x,
+            args.backward_topk_weights,
+            args.token_src_metadata,
+            args.num_topk,
+            args.num_pool_rows,
+            args.grad_y_unweighted_output,
+            args.grad_y_weighted_output,
+            args.x_pool_output,
+            args.route_weights_output,
+            args.down_unweighted,
+            args.grad_route_output));
+    }
+};
 
 class SM100FP8FP4MegaMoEBackwardWaveRuntime final
     : public LaunchRuntime<SM100FP8FP4MegaMoEBackwardWaveRuntime> {
@@ -109,6 +186,7 @@ public:
         bool direct_remote_grad_x;
         bool write_grad_x_pool;
         bool clear_wgrad_padding;
+        bool inputs_prepared = false;
         LaunchArgs launch_args;
     };
 
@@ -125,6 +203,7 @@ static void __instantiate_kernel() {{
             {},
             {}, {}, {},
             {}, {},
+            {},
             {},
             {},
             {},
@@ -153,7 +232,8 @@ static void __instantiate_kernel() {{
             get_backward_route_weight_mode_name(
                 args.route_weight_mode),
             get_backward_combine_order_mode_name(
-                args.combine_order_mode));
+                args.combine_order_mode),
+            args.inputs_prepared ? "true" : "false");
     }
 
     static void launch_impl(
@@ -170,6 +250,7 @@ static void __instantiate_kernel() {{
             args.backward_topk_weights,
             args.token_src_metadata,
             args.num_topk,
+            args.num_pool_rows,
             args.acts_sf_stride,
             args.tensor_map_acts,
             args.tensor_map_acts_sf,
@@ -645,6 +726,209 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
     SM100FP8FP4MegaMoEBackwardWaveRuntime::launch(runtime, args);
 }
 
+static void sm100_bf16_mega_moe_backward_post_down_prelude(
+    const torch::Tensor& grad_y_unweighted_output,
+    const torch::Tensor& grad_y_weighted_output,
+    const torch::Tensor& x_pool_output,
+    const torch::Tensor& route_weights_output,
+    const torch::Tensor& grad_route_output,
+    const torch::Tensor& down_unweighted_output,
+    const torch::Tensor& expert_counts,
+    const torch::Tensor& backward_grad_y,
+    const torch::Tensor& backward_x,
+    const torch::Tensor& backward_topk_weights,
+    const torch::Tensor& token_src_metadata,
+    const std::vector<int64_t>& backward_sym_buffer_ptrs,
+    const int& backward_rank,
+    const int& num_topk,
+    const int& block_m,
+    const std::string& combine_order_mode) {
+    const auto [num_pool_rows, hidden] =
+        get_shape<2>(grad_y_unweighted_output);
+    const int num_experts =
+        static_cast<int>(expert_counts.numel());
+    const int num_ranks =
+        static_cast<int>(backward_sym_buffer_ptrs.size());
+    DG_HOST_ASSERT(device_runtime->get_arch_major() == 10);
+    DG_HOST_ASSERT(
+        combine_order_mode == "fixed_topk" ||
+        combine_order_mode == "deepep");
+    DG_HOST_ASSERT(num_ranks >= 1);
+    DG_HOST_ASSERT(
+        backward_rank >= 0 && backward_rank < num_ranks);
+    DG_HOST_ASSERT(hidden % 256 == 0);
+    DG_HOST_ASSERT(block_m % 16 == 0);
+    DG_HOST_ASSERT(num_topk > 0);
+    const auto check_bf16_pool = [=](
+        const torch::Tensor& tensor) {
+        DG_HOST_ASSERT(
+            tensor.scalar_type() == torch::kBFloat16);
+        DG_HOST_ASSERT(tensor.is_contiguous());
+        DG_HOST_ASSERT(
+            tensor.sizes() ==
+            torch::IntArrayRef({num_pool_rows, hidden}));
+    };
+    check_bf16_pool(grad_y_unweighted_output);
+    check_bf16_pool(grad_y_weighted_output);
+    check_bf16_pool(x_pool_output);
+    check_bf16_pool(down_unweighted_output);
+    DG_HOST_ASSERT(
+        backward_grad_y.scalar_type() ==
+            torch::kBFloat16 &&
+        backward_grad_y.is_contiguous() &&
+        backward_grad_y.size(1) == hidden);
+    DG_HOST_ASSERT(
+        backward_x.scalar_type() == torch::kBFloat16 &&
+        backward_x.is_contiguous() &&
+        backward_x.size(1) == hidden);
+    DG_HOST_ASSERT(
+        backward_topk_weights.scalar_type() ==
+            torch::kFloat &&
+        backward_topk_weights.is_contiguous() &&
+        backward_topk_weights.size(1) == num_topk);
+    DG_HOST_ASSERT(
+        expert_counts.scalar_type() == torch::kInt &&
+        expert_counts.is_contiguous());
+    DG_HOST_ASSERT(
+        token_src_metadata.scalar_type() == torch::kInt &&
+        token_src_metadata.is_contiguous() &&
+        token_src_metadata.size(0) >= num_pool_rows &&
+        token_src_metadata.size(1) == 3);
+    DG_HOST_ASSERT(
+        route_weights_output.scalar_type() ==
+            torch::kFloat &&
+        route_weights_output.is_contiguous() &&
+        route_weights_output.numel() == num_pool_rows);
+    DG_HOST_ASSERT(
+        grad_route_output.scalar_type() ==
+            torch::kFloat &&
+        grad_route_output.is_contiguous() &&
+        grad_route_output.numel() == num_pool_rows);
+
+    const auto exact_alias = [](
+        const torch::Tensor& lhs,
+        const torch::Tensor& rhs) {
+        return lhs.data_ptr() == rhs.data_ptr() &&
+               lhs.numel() == rhs.numel();
+    };
+    const auto overlaps = [](
+        const torch::Tensor& lhs,
+        const torch::Tensor& rhs) {
+        const auto lhs_begin =
+            reinterpret_cast<uintptr_t>(lhs.data_ptr());
+        const auto rhs_begin =
+            reinterpret_cast<uintptr_t>(rhs.data_ptr());
+        const auto lhs_end =
+            lhs_begin + lhs.numel() * lhs.element_size();
+        const auto rhs_end =
+            rhs_begin + rhs.numel() * rhs.element_size();
+        return std::max(lhs_begin, rhs_begin) <
+               std::min(lhs_end, rhs_end);
+    };
+    // The weighted destination may replace the retained down pool only
+    // because every row is read and overwritten by the same route group.
+    DG_HOST_ASSERT(
+        exact_alias(
+            grad_y_weighted_output,
+            down_unweighted_output) ||
+        !overlaps(
+            grad_y_weighted_output,
+            down_unweighted_output));
+    DG_HOST_ASSERT(!overlaps(
+        grad_y_unweighted_output,
+        down_unweighted_output));
+    DG_HOST_ASSERT(!overlaps(
+        x_pool_output, down_unweighted_output));
+    DG_HOST_ASSERT(!overlaps(
+        grad_y_unweighted_output,
+        grad_y_weighted_output));
+    DG_HOST_ASSERT(!overlaps(
+        x_pool_output, grad_y_weighted_output));
+    DG_HOST_ASSERT(!overlaps(
+        x_pool_output, grad_y_unweighted_output));
+
+    const int num_sms = device_runtime->get_num_sms();
+    const auto backward_sym_buffer = layout::SymBuffer<>(
+        backward_sym_buffer_ptrs, backward_rank);
+    SM100BF16MegaMoEBackwardPostDownPreludeRuntime::Args
+        args = {
+            .hidden = hidden,
+            .num_experts = num_experts,
+            .block_m = block_m,
+            .num_sms = num_sms,
+            .num_ranks = num_ranks,
+            .combine_order_mode = combine_order_mode,
+            .do_reverse_dispatch = true,
+            .prepare_route_and_weighted = false,
+            .expert_counts = expert_counts.data_ptr<int>(),
+            .backward_sym_buffer = backward_sym_buffer,
+            .backward_grad_y =
+                reinterpret_cast<
+                    const cutlass::bfloat16_t*>(
+                    backward_grad_y
+                        .data_ptr<at::BFloat16>()),
+            .backward_x =
+                reinterpret_cast<
+                    const cutlass::bfloat16_t*>(
+                    backward_x.data_ptr<at::BFloat16>()),
+            .backward_topk_weights =
+                backward_topk_weights.data_ptr<float>(),
+            .token_src_metadata =
+                reinterpret_cast<
+                    const layout::TokenSrcMetadata*>(
+                    token_src_metadata.data_ptr<int>()),
+            .num_topk =
+                static_cast<uint32_t>(num_topk),
+            .num_pool_rows =
+                static_cast<uint32_t>(num_pool_rows),
+            .grad_y_unweighted_output =
+                reinterpret_cast<cutlass::bfloat16_t*>(
+                    grad_y_unweighted_output
+                        .data_ptr<at::BFloat16>()),
+            .grad_y_weighted_output =
+                reinterpret_cast<cutlass::bfloat16_t*>(
+                    grad_y_weighted_output
+                        .data_ptr<at::BFloat16>()),
+            .x_pool_output =
+                reinterpret_cast<cutlass::bfloat16_t*>(
+                    x_pool_output
+                        .data_ptr<at::BFloat16>()),
+            .route_weights_output =
+                route_weights_output.data_ptr<float>(),
+            .down_unweighted =
+                reinterpret_cast<
+                    const cutlass::bfloat16_t*>(
+                    down_unweighted_output
+                        .data_ptr<at::BFloat16>()),
+            .grad_route_output =
+                grad_route_output.data_ptr<float>(),
+            .launch_args =
+                LaunchArgs(num_sms, 1024, 4096),
+        };
+    const auto code =
+        SM100BF16MegaMoEBackwardPostDownPreludeRuntime::
+            generate(args);
+    const auto runtime = compiler->build(
+        "sm100_bf16_mega_moe_backward_post_down_dispatch",
+        code);
+    SM100BF16MegaMoEBackwardPostDownPreludeRuntime::launch(
+        runtime, args);
+    // A launch boundary makes the dispatched BF16 pool globally visible.
+    // The second kernel owns each row from its exact FP32 dot through the
+    // destructive weighted-grad write, so no grid barrier is required.
+    args.combine_order_mode = "fixed_topk";
+    args.do_reverse_dispatch = false;
+    args.prepare_route_and_weighted = true;
+    const auto route_code =
+        SM100BF16MegaMoEBackwardPostDownPreludeRuntime::
+            generate(args);
+    const auto route_runtime = compiler->build(
+        "sm100_bf16_mega_moe_backward_post_down_route",
+        route_code);
+    SM100BF16MegaMoEBackwardPostDownPreludeRuntime::launch(
+        route_runtime, args);
+}
+
 static void sm100_bf16_mega_moe_backward_dgrad(
     const torch::Tensor& gate_up_output,
     const torch::Tensor& grad_h_output,
@@ -678,7 +962,8 @@ static void sm100_bf16_mega_moe_backward_dgrad(
     const std::vector<int64_t>& backward_sym_buffer_ptrs,
     const int& backward_rank,
     const int& num_max_tokens_per_rank,
-    const int& num_topk) {
+    const int& num_topk,
+    const std::string& memory_mode) {
     constexpr int block_n = 128;
     constexpr int block_k = 128;
     constexpr int dgrad_block_k = 64;
@@ -705,6 +990,9 @@ static void sm100_bf16_mega_moe_backward_dgrad(
     DG_HOST_ASSERT(
         route_weight_mode == "pre_down" ||
         route_weight_mode == "post_down");
+    DG_HOST_ASSERT(
+        memory_mode == "legacy" ||
+        memory_mode == "phase_ordered");
     DG_HOST_ASSERT(num_ranks >= 1);
     DG_HOST_ASSERT(
         backward_rank >= 0 && backward_rank < num_ranks);
@@ -794,6 +1082,123 @@ static void sm100_bf16_mega_moe_backward_dgrad(
         token_src_metadata.size(0) >= num_pool_rows &&
         token_src_metadata.size(1) == 3);
     DG_HOST_ASSERT(write_grad_x_pool || direct_remote_grad_x);
+
+    const auto exact_alias = [](
+        const torch::Tensor& lhs,
+        const torch::Tensor& rhs) {
+        return lhs.data_ptr() == rhs.data_ptr() &&
+               lhs.numel() == rhs.numel();
+    };
+    const auto overlaps = [](
+        const torch::Tensor& lhs,
+        const torch::Tensor& rhs) {
+        if (lhs.numel() == 0 || rhs.numel() == 0)
+            return false;
+        const auto lhs_begin = reinterpret_cast<uintptr_t>(
+            lhs.data_ptr());
+        const auto rhs_begin = reinterpret_cast<uintptr_t>(
+            rhs.data_ptr());
+        const auto lhs_end =
+            lhs_begin + lhs.numel() * lhs.element_size();
+        const auto rhs_end =
+            rhs_begin + rhs.numel() * rhs.element_size();
+        return std::max(lhs_begin, rhs_begin) <
+               std::min(lhs_end, rhs_end);
+    };
+    const std::array<std::reference_wrapper<const torch::Tensor>, 10>
+        alias_tensors = {
+            gate_up_output, grad_gate_up_output,
+            grad_h_output, h_act_output, h_weighted_output,
+            x_pool_output, grad_x_pool_output, grad_ye,
+            grad_y_unweighted_output, down_unweighted_output};
+    const auto allowed_overlap = [&](const int lhs, const int rhs) {
+        const auto pair_is = [=](
+            const int first, const int second) {
+            return (lhs == first && rhs == second) ||
+                   (lhs == second && rhs == first);
+        };
+        if (route_weight_mode == "pre_down" &&
+            pair_is(7, 8))
+            return exact_alias(
+                grad_ye, grad_y_unweighted_output);
+        if (route_weight_mode == "pre_down" &&
+            pair_is(7, 9))
+            return exact_alias(
+                grad_ye, down_unweighted_output);
+        if (route_weight_mode == "pre_down" &&
+            pair_is(8, 9))
+            return exact_alias(
+                grad_y_unweighted_output,
+                down_unweighted_output);
+        if (route_weight_mode == "post_down" &&
+            pair_is(3, 4))
+            return exact_alias(
+                h_act_output, h_weighted_output);
+        if (memory_mode != "phase_ordered")
+            return false;
+        if (pair_is(0, 1))
+            return exact_alias(
+                gate_up_output, grad_gate_up_output);
+        if (route_weight_mode == "post_down") {
+            if (pair_is(7, 9))
+                return exact_alias(
+                    grad_ye, down_unweighted_output);
+            if (pair_is(2, 8))
+                return
+                    grad_h_output.data_ptr() ==
+                        grad_y_unweighted_output.data_ptr() &&
+                    grad_h_output.numel() <=
+                        grad_y_unweighted_output.numel();
+            if (pair_is(2, 3) || pair_is(2, 4))
+                return exact_alias(
+                    grad_h_output,
+                    pair_is(2, 3)
+                        ? h_act_output
+                        : h_weighted_output);
+            if (pair_is(3, 8) || pair_is(4, 8))
+                return
+                    grad_y_unweighted_output.data_ptr() ==
+                    (pair_is(3, 8)
+                         ? h_act_output.data_ptr()
+                         : h_weighted_output.data_ptr());
+        } else if (pair_is(3, 4)) {
+            return exact_alias(
+                h_act_output, h_weighted_output);
+        }
+        return false;
+    };
+    for (int lhs = 0; lhs < alias_tensors.size(); ++lhs) {
+        for (int rhs = lhs + 1;
+             rhs < alias_tensors.size(); ++rhs) {
+            DG_HOST_ASSERT(
+                !overlaps(
+                    alias_tensors[lhs].get(),
+                    alias_tensors[rhs].get()) ||
+                allowed_overlap(lhs, rhs));
+        }
+    }
+    if (memory_mode == "phase_ordered") {
+        DG_HOST_ASSERT(exact_alias(
+            gate_up_output, grad_gate_up_output));
+        if (route_weight_mode == "post_down") {
+            DG_HOST_ASSERT(exact_alias(
+                grad_ye, down_unweighted_output));
+            DG_HOST_ASSERT(
+                grad_h_output.data_ptr() ==
+                    grad_y_unweighted_output.data_ptr() &&
+                grad_h_output.numel() <=
+                    grad_y_unweighted_output.numel());
+            DG_HOST_ASSERT(exact_alias(
+                grad_h_output, h_act_output));
+            DG_HOST_ASSERT(exact_alias(
+                grad_h_output, h_weighted_output));
+        } else {
+            DG_HOST_ASSERT(exact_alias(
+                grad_ye, grad_y_unweighted_output));
+            DG_HOST_ASSERT(exact_alias(
+                h_act_output, h_weighted_output));
+        }
+    }
 
     const int num_w2_states =
         num_experts * (hidden / dgrad_block_k) *
@@ -1001,6 +1406,9 @@ static void sm100_bf16_mega_moe_backward_dgrad(
         .direct_remote_grad_x = direct_remote_grad_x,
         .write_grad_x_pool = write_grad_x_pool,
         .clear_wgrad_padding = clear_wgrad_padding,
+        .inputs_prepared =
+            memory_mode == "phase_ordered" &&
+            route_weight_mode == "post_down",
         .launch_args =
             LaunchArgs(num_sms, 1024, smem_size, 2),
     };

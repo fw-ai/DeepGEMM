@@ -7,6 +7,124 @@ from .. import _C
 from . import CombineOrderMode, RouteWeightMode
 
 
+def _storage_byte_range(tensor: torch.Tensor) -> tuple[int, int]:
+    start = tensor.data_ptr()
+    return start, start + tensor.numel() * tensor.element_size()
+
+
+def _exact_alias(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
+    return (
+        lhs.data_ptr() == rhs.data_ptr() and
+        lhs.numel() == rhs.numel()
+    )
+
+
+def _validate_bf16_backward_alias_contract(
+    *,
+    memory_mode: str,
+    route_weight_mode: RouteWeightMode,
+    gate_up_output: torch.Tensor,
+    grad_gate_up_output: torch.Tensor,
+    grad_h_output: torch.Tensor,
+    h_act_output: torch.Tensor,
+    h_weighted_output: torch.Tensor,
+    x_pool_output: torch.Tensor,
+    grad_x_pool_output: torch.Tensor,
+    grad_ye: torch.Tensor,
+    grad_y_unweighted_output: torch.Tensor,
+    down_unweighted_output: torch.Tensor,
+) -> None:
+    """Validate every overlapping BF16 pool against the phase contract."""
+    if memory_mode not in ("legacy", "phase_ordered"):
+        raise ValueError(
+            "memory_mode must be 'legacy' or 'phase_ordered', got "
+            f"{memory_mode!r}")
+
+    tensors = {
+        "gate_up": gate_up_output,
+        "grad_gate_up": grad_gate_up_output,
+        "grad_h": grad_h_output,
+        "h_act": h_act_output,
+        "h_weighted": h_weighted_output,
+        "x_pool": x_pool_output,
+        "grad_x_pool": grad_x_pool_output,
+        "grad_ye": grad_ye,
+        "grad_y_unweighted": grad_y_unweighted_output,
+        "down_unweighted": down_unweighted_output,
+    }
+    # Empty debug outputs have data_ptr()==0 and do not overlap anything.
+    ranges = {
+        name: _storage_byte_range(tensor)
+        for name, tensor in tensors.items()
+        if tensor.numel()
+    }
+    overlaps = set()
+    names = list(ranges)
+    for idx, lhs_name in enumerate(names):
+        lhs_start, lhs_end = ranges[lhs_name]
+        for rhs_name in names[idx + 1:]:
+            rhs_start, rhs_end = ranges[rhs_name]
+            if max(lhs_start, rhs_start) < min(lhs_end, rhs_end):
+                overlaps.add(frozenset((lhs_name, rhs_name)))
+
+    # These aliases predate phase-ordered reuse and are safe in legacy mode.
+    allowed = set()
+    if route_weight_mode is RouteWeightMode.PRE_DOWN:
+        allowed.add(frozenset(("grad_ye", "grad_y_unweighted")))
+        allowed.add(frozenset(("grad_ye", "down_unweighted")))
+        allowed.add(
+            frozenset(("grad_y_unweighted", "down_unweighted")))
+    else:
+        allowed.add(frozenset(("h_act", "h_weighted")))
+
+    if memory_mode == "phase_ordered":
+        if route_weight_mode is RouteWeightMode.POST_DOWN:
+            required_exact = (
+                ("grad_ye", grad_ye,
+                 "down_unweighted", down_unweighted_output),
+                ("h_act", h_act_output, "grad_h", grad_h_output),
+                ("h_weighted", h_weighted_output,
+                 "grad_h", grad_h_output),
+                ("grad_gate_up", grad_gate_up_output,
+                 "gate_up", gate_up_output),
+            )
+            if (
+                grad_h_output.data_ptr() !=
+                grad_y_unweighted_output.data_ptr() or
+                grad_h_output.numel() >
+                grad_y_unweighted_output.numel()
+            ):
+                raise ValueError(
+                    "phase_ordered post_down requires grad_h to be a "
+                    "contiguous prefix view of grad_y_unweighted")
+            allowed.add(frozenset(("grad_h", "grad_y_unweighted")))
+            allowed.add(frozenset(("h_act", "grad_y_unweighted")))
+            allowed.add(
+                frozenset(("h_weighted", "grad_y_unweighted")))
+        else:
+            required_exact = (
+                ("grad_ye", grad_ye,
+                 "grad_y_unweighted", grad_y_unweighted_output),
+                ("h_act", h_act_output,
+                 "h_weighted", h_weighted_output),
+                ("grad_gate_up", grad_gate_up_output,
+                 "gate_up", gate_up_output),
+            )
+        for lhs_name, lhs, rhs_name, rhs in required_exact:
+            if not _exact_alias(lhs, rhs):
+                raise ValueError(
+                    f"phase_ordered {route_weight_mode.value} requires "
+                    f"{lhs_name} to exactly alias {rhs_name}")
+            allowed.add(frozenset((lhs_name, rhs_name)))
+
+    unexpected = overlaps - allowed
+    if unexpected:
+        pairs = sorted("/".join(sorted(pair)) for pair in unexpected)
+        raise ValueError(
+            f"unsafe BF16 backward storage overlap for {memory_mode}: "
+            + ", ".join(pairs))
+
+
 def _sort_bf16_pool_in_deepep_order(
     tensors: tuple[torch.Tensor, ...],
     token_src_metadata: torch.Tensor,
@@ -84,8 +202,19 @@ def bf16_mega_moe_backward_dgrad(
     down_unweighted_output: Optional[torch.Tensor] = None,
     python_numerical_correction: bool = False,
     combine_order_mode: CombineOrderMode = CombineOrderMode.FIXED_TOPK,
+    memory_mode: str = "legacy",
 ) -> None:
-    """Run BF16 reverse dispatch, dgrad, activation, and direct grad-x."""
+    """Run BF16 reverse dispatch, dgrad, activation, and direct grad-x.
+
+    ``memory_mode="phase_ordered"`` enables destructive pool reuse. POST_DOWN
+    requires ``grad_ye == down_unweighted``, a ``grad_h`` prefix view of
+    ``grad_y_unweighted``, ``h_act == h_weighted == grad_h``, and
+    ``grad_gate_up == gate_up``. PRE_DOWN requires
+    ``grad_y_unweighted == grad_ye``, ``h_act == h_weighted``, and
+    ``grad_gate_up == gate_up``. Logical tensors whose storage is reused are
+    no longer observable after this call. ``"legacy"`` keeps independent
+    storage, apart from the historical semantic aliases validated above.
+    """
     route_weight_mode = RouteWeightMode(route_weight_mode)
     combine_order_mode = CombineOrderMode(combine_order_mode)
     if activation not in ("swiglu", "geglu"):
@@ -101,6 +230,10 @@ def bf16_mega_moe_backward_dgrad(
     if python_numerical_correction and not write_grad_x_pool:
         raise ValueError(
             "Python numerical correction requires grad_x_pool_output")
+    if python_numerical_correction and memory_mode != "legacy":
+        raise ValueError(
+            "Python numerical correction does not support destructive "
+            "phase-ordered aliases")
     if route_weight_mode is RouteWeightMode.POST_DOWN:
         if grad_y_unweighted_output is None:
             raise ValueError(
@@ -113,6 +246,20 @@ def bf16_mega_moe_backward_dgrad(
             grad_y_unweighted_output = grad_ye
         if down_unweighted_output is None:
             down_unweighted_output = grad_ye
+    _validate_bf16_backward_alias_contract(
+        memory_mode=memory_mode,
+        route_weight_mode=route_weight_mode,
+        gate_up_output=gate_up_output,
+        grad_gate_up_output=grad_gate_up_output,
+        grad_h_output=grad_h_output,
+        h_act_output=h_act_output,
+        h_weighted_output=h_weighted_output,
+        x_pool_output=x_pool_output,
+        grad_x_pool_output=grad_x_pool_output,
+        grad_ye=grad_ye,
+        grad_y_unweighted_output=grad_y_unweighted_output,
+        down_unweighted_output=down_unweighted_output,
+    )
     if sym_buffer.group.size() > 1:
         # BLOCK_M determines the persistent grid shape and therefore every
         # grid/NVLink barrier's participant count. A rank with no source
@@ -154,6 +301,34 @@ def bf16_mega_moe_backward_dgrad(
             grad_y.to(torch.bfloat16).contiguous()
         )
     grad_route_output.zero_()
+    if (
+        memory_mode == "phase_ordered"
+        and route_weight_mode is RouteWeightMode.POST_DOWN
+    ):
+        if sym_buffer.group.size() > 1:
+            # Publish each rank's local grad-y before the prelude performs
+            # direct symmetric-buffer loads. Kernel A's existing NVLink
+            # barrier remains responsible for protecting later combine-plane
+            # reuse; the prelude itself has no inter-CTA or inter-rank barrier.
+            dist.barrier(group=sym_buffer.group)
+        _C.bf16_mega_moe_backward_post_down_prelude(
+            grad_y_unweighted_output,
+            grad_ye,
+            x_pool_output,
+            route_weights,
+            grad_route_output,
+            down_unweighted_output,
+            expert_counts,
+            sym_buffer.backward_grad_y,
+            sym_buffer.x,
+            sym_buffer.topk_weights,
+            sym_buffer.token_src_metadata,
+            sym_buffer.handle.buffer_ptrs,
+            sym_buffer.group.rank(),
+            sym_buffer.num_topk,
+            block_m,
+            combine_order_mode.value,
+        )
     _C.bf16_mega_moe_backward_dgrad(
         gate_up_output,
         grad_h_output,
@@ -188,6 +363,7 @@ def bf16_mega_moe_backward_dgrad(
         sym_buffer.num_max_tokens_per_rank,
         sym_buffer.num_topk,
         combine_order_mode.value,
+        memory_mode,
     )
     if not python_numerical_correction:
         return

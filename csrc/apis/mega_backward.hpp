@@ -90,7 +90,8 @@ static void bf16_mega_moe_backward_dgrad(
     const int& backward_rank,
     const int& num_max_tokens_per_rank,
     const int& num_topk,
-    const std::string& combine_order_mode) {
+    const std::string& combine_order_mode,
+    const std::string& memory_mode) {
     deep_gemm::sm100_bf16_mega_moe_backward_dgrad(
         gate_up_output, grad_h_output, grad_gate_up_output,
         h_act_output, h_weighted_output, x_pool_output,
@@ -105,7 +106,36 @@ static void bf16_mega_moe_backward_dgrad(
         clear_wgrad_padding, backward_grad_y, backward_x,
         backward_topk_weights, token_src_metadata,
         backward_sym_buffer_ptrs, backward_rank,
-        num_max_tokens_per_rank, num_topk);
+        num_max_tokens_per_rank, num_topk, memory_mode);
+}
+
+static void bf16_mega_moe_backward_post_down_prelude(
+    const torch::Tensor& grad_y_unweighted_output,
+    const torch::Tensor& grad_y_weighted_output,
+    const torch::Tensor& x_pool_output,
+    const torch::Tensor& route_weights_output,
+    const torch::Tensor& grad_route_output,
+    const torch::Tensor& down_unweighted_output,
+    const torch::Tensor& expert_counts,
+    const torch::Tensor& backward_grad_y,
+    const torch::Tensor& backward_x,
+    const torch::Tensor& backward_topk_weights,
+    const torch::Tensor& token_src_metadata,
+    const std::vector<int64_t>& backward_sym_buffer_ptrs,
+    const int& backward_rank,
+    const int& num_topk,
+    const int& block_m,
+    const std::string& combine_order_mode) {
+    deep_gemm::
+        sm100_bf16_mega_moe_backward_post_down_prelude(
+            grad_y_unweighted_output,
+            grad_y_weighted_output, x_pool_output,
+            route_weights_output, grad_route_output,
+            down_unweighted_output, expert_counts,
+            backward_grad_y, backward_x,
+            backward_topk_weights, token_src_metadata,
+            backward_sym_buffer_ptrs, backward_rank,
+            num_topk, block_m, combine_order_mode);
 }
 
 static void bf16_mega_moe_backward_w2(
@@ -313,6 +343,26 @@ static void register_apis(pybind11::module_& m) {
         py::arg("backward_rank"),
         py::arg("num_max_tokens_per_rank"),
         py::arg("num_topk"),
+        py::arg("combine_order_mode") = "fixed_topk",
+        py::arg("memory_mode") = "legacy");
+    m.def(
+        "bf16_mega_moe_backward_post_down_prelude",
+        &bf16_mega_moe_backward_post_down_prelude,
+        py::arg("grad_y_unweighted_output"),
+        py::arg("grad_y_weighted_output"),
+        py::arg("x_pool_output"),
+        py::arg("route_weights_output"),
+        py::arg("grad_route_output"),
+        py::arg("down_unweighted_output"),
+        py::arg("expert_counts"),
+        py::arg("backward_grad_y"),
+        py::arg("backward_x"),
+        py::arg("backward_topk_weights"),
+        py::arg("token_src_metadata"),
+        py::arg("backward_sym_buffer_ptrs"),
+        py::arg("backward_rank"),
+        py::arg("num_topk"),
+        py::arg("block_m"),
         py::arg("combine_order_mode") = "fixed_topk");
     m.def("bf16_mega_moe_backward_w2",
           &bf16_mega_moe_backward_w2,

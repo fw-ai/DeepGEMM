@@ -866,30 +866,68 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             (expert_counts + block_m - 1) // block_m * block_m)
 
         pool_rows = saved_l1_preact.size(0)
+        phase_ordered_memory = (
+            args.backward_memory_mode == 'phase_ordered')
+        reference_gate_up = (
+            saved_l1_preact.clone()
+            if phase_ordered_memory
+            else saved_l1_preact)
+        reference_down_unweighted = (
+            saved_down_unweighted.clone()
+            if phase_ordered_memory and
+            args.route_weight_mode == 'post_down' and
+            saved_down_unweighted is not None
+            else saved_down_unweighted)
         grad_y = torch.randn(
             (num_tokens, hidden),
             dtype=torch.bfloat16, device='cuda')
         all_grad_y = gather_rank_padded(grad_y, 0)
         all_x = gather_rank_padded(x, 0)
 
-        grad_ye = torch.zeros(
-            (pool_rows, hidden),
-            dtype=torch.bfloat16, device='cuda')
+        grad_ye = (
+            saved_down_unweighted
+            if phase_ordered_memory and
+            args.route_weight_mode == 'post_down'
+            else torch.zeros(
+                (pool_rows, hidden),
+                dtype=torch.bfloat16, device='cuda'))
         grad_y_unweighted = (
             grad_ye
             if args.route_weight_mode == 'pre_down'
             else torch.zeros_like(grad_ye))
-        grad_h = torch.zeros(
-            (pool_rows, intermediate_hidden),
-            dtype=torch.bfloat16, device='cuda')
-        grad_gate_up = torch.zeros(
-            (pool_rows, 2 * intermediate_hidden),
-            dtype=torch.bfloat16, device='cuda')
-        h_weighted = torch.zeros_like(grad_h)
-        h_act = (
-            h_weighted
-            if args.route_weight_mode == 'post_down'
-            else torch.zeros_like(grad_h))
+        if (
+            phase_ordered_memory and
+            args.route_weight_mode == 'post_down'
+        ):
+            if intermediate_hidden > hidden:
+                raise ValueError(
+                    'phase_ordered post_down requires '
+                    'intermediate_hidden <= hidden')
+            grad_h = grad_y_unweighted.view(-1)[
+                :pool_rows * intermediate_hidden
+            ].view(pool_rows, intermediate_hidden)
+            h_act = grad_h
+            h_weighted = grad_h
+        else:
+            grad_h = torch.zeros(
+                (pool_rows, intermediate_hidden),
+                dtype=torch.bfloat16, device='cuda')
+            h_act = torch.zeros_like(grad_h)
+            h_weighted = (
+                h_act
+                if phase_ordered_memory
+                else torch.zeros_like(grad_h))
+            if (
+                not phase_ordered_memory and
+                args.route_weight_mode == 'post_down'
+            ):
+                h_act = h_weighted
+        grad_gate_up = (
+            saved_l1_preact
+            if phase_ordered_memory
+            else torch.zeros(
+                (pool_rows, 2 * intermediate_hidden),
+                dtype=torch.bfloat16, device='cuda'))
         x_pool = torch.zeros_like(grad_ye)
         grad_x_pool = (
             torch.zeros_like(grad_ye)
@@ -943,27 +981,41 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 clear_wgrad_padding=True,
                 python_numerical_correction=(
                     args.python_numerical_correction),
-                combine_order_mode=args.combine_order_mode)
+                combine_order_mode=args.combine_order_mode,
+                memory_mode=args.backward_memory_mode)
 
         if args.benchmark_backward:
             for _ in range(args.backward_warmup):
+                if phase_ordered_memory:
+                    saved_l1_preact.copy_(reference_gate_up)
+                    if args.route_weight_mode == 'post_down':
+                        saved_down_unweighted.copy_(
+                            reference_down_unweighted)
                 run_backward_dgrad()
             dist.barrier()
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
+            elapsed_ms = 0.0
             for _ in range(args.backward_iterations):
+                if phase_ordered_memory:
+                    saved_l1_preact.copy_(reference_gate_up)
+                    if args.route_weight_mode == 'post_down':
+                        saved_down_unweighted.copy_(
+                            reference_down_unweighted)
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
                 run_backward_dgrad()
-            end.record()
-            end.synchronize()
+                end.record()
+                end.synchronize()
+                elapsed_ms += start.elapsed_time(end)
             backward_ms = torch.tensor(
-                start.elapsed_time(end) /
-                args.backward_iterations,
+                elapsed_ms / args.backward_iterations,
                 dtype=torch.float64,
                 device='cuda')
             dist.all_reduce(
                 backward_ms, op=dist.ReduceOp.MAX, group=group)
             pool_tensors = {
+                'saved_gate_up': saved_l1_preact,
+                'saved_down_unweighted': saved_down_unweighted,
                 'grad_ye': grad_ye,
                 'grad_y_unweighted': grad_y_unweighted,
                 'grad_h': grad_h,
@@ -978,6 +1030,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             seen_ptrs = set()
             logical_bytes = {}
             for name, tensor in pool_tensors.items():
+                if tensor is None:
+                    logical_bytes[name] = 0
+                    continue
                 is_alias = tensor.data_ptr() in seen_ptrs
                 logical_bytes[name] = (
                     0 if is_alias else tensor.nbytes)
@@ -1031,7 +1086,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             metadata_before_backward), (
                 'backward must preserve forward source-route metadata')
         valid_rows = torch.isfinite(
-            saved_l1_preact.float()).all(dim=1)
+            reference_gate_up.float()).all(dim=1)
         metadata = buffer.token_src_metadata[valid_rows].long()
         actual_pool_indices = valid_rows.nonzero().flatten()
 
@@ -1062,7 +1117,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         gye = all_grad_y[source_ranks, source_tokens]
         route = all_topk_weights[
             source_ranks, source_tokens, source_slots]
-        preact = saved_l1_preact[pool_indices]
+        preact = reference_gate_up[pool_indices]
         gate = preact[:, :intermediate_hidden]
         up = preact[:, intermediate_hidden:]
         clamp = float(args.activation_clamp)
@@ -1128,7 +1183,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 gye.float() * down.float()
             ).sum(dim=1)
             assert torch.equal(
-                saved_down_unweighted[pool_indices], down)
+                reference_down_unweighted[pool_indices], down)
         if standard_bf16_swiglu:
             silu_gate = torch.nn.functional.silu(gate_clamped)
             grad_silu = gh * up_clamped
@@ -1187,7 +1242,14 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             expected: torch.Tensor,
             name: str,
         ):
-            assert torch.isfinite(actual.float()).all(), name
+            finite = torch.isfinite(actual.float())
+            if not finite.all():
+                nonfinite = (~finite).nonzero()
+                dist_print(
+                    f' > {name}: nonfinite={nonfinite.size(0)}, '
+                    f'first={nonfinite[0].tolist()}',
+                    once_in_node=True)
+            assert finite.all(), name
             if actual.dtype == torch.bfloat16:
                 mismatch_count = report_bf16_parity(
                     name, actual, expected)
@@ -1203,14 +1265,26 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                     f' > {name}: mismatches={mismatch_count}/'
                     f'{actual.numel()}, max_abs={max_abs:.9g}',
                     once_in_node=True)
+                if mismatch_count:
+                    first = (actual != expected).nonzero()[0]
+                    index = tuple(first.tolist())
+                    dist_print(
+                        f' > {name}: first={index}, '
+                        f'actual={float(actual[index]):.9g}, '
+                        f'expected={float(expected[index]):.9g}',
+                        once_in_node=True)
             if mismatch_count:
                 gradient_mismatches[name] = mismatch_count
 
         assert_gradient_close(grad_ye, ref_grad_ye, 'grad_ye')
-        assert_gradient_close(
-            grad_y_unweighted, ref_grad_y_unweighted,
-            'grad_y_unweighted')
-        assert_gradient_close(grad_h, ref_grad_h, 'grad_h')
+        if not (
+            phase_ordered_memory and
+            args.route_weight_mode == 'post_down'
+        ):
+            assert_gradient_close(
+                grad_y_unweighted, ref_grad_y_unweighted,
+                'grad_y_unweighted')
+            assert_gradient_close(grad_h, ref_grad_h, 'grad_h')
         assert_gradient_close(
             grad_gate_up, ref_grad_gate_up,
             'grad_gate_up')
@@ -1233,7 +1307,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                         ref_grad_gate_up[pool_row, col]),
                     'valid_row': bool(
                         torch.isfinite(
-                            saved_l1_preact[
+                            reference_gate_up[
                                 pool_row, 0])),
                 })
             print(
@@ -1241,7 +1315,11 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 f'{mismatch_details}; '
                 f'expert_counts={expert_counts.tolist()}',
                 flush=True)
-        assert_gradient_close(h_act, ref_h_act, 'h_act')
+        if not (
+            phase_ordered_memory and
+            args.route_weight_mode == 'pre_down'
+        ):
+            assert_gradient_close(h_act, ref_h_act, 'h_act')
         assert_gradient_close(
             h_weighted, ref_h_weighted,
             'h_weighted')
@@ -1738,6 +1816,11 @@ if __name__ == '__main__':
     parser.add_argument('--activation', type=str, default='swiglu', choices=['swiglu', 'geglu'], help='Gated activation type')
     parser.add_argument('--route-weight-mode', type=str, default='pre_down', choices=['pre_down', 'post_down'], help='Location of the BF16 route-weight boundary')
     parser.add_argument('--combine-order-mode', type=str, default='fixed_topk', choices=['fixed_topk', 'deepep'], help='Top-k combine reduction and BF16 materialization order')
+    parser.add_argument(
+        '--backward-memory-mode',
+        choices=['legacy', 'phase_ordered'],
+        default='legacy',
+        help='Use validated destructive BF16 backward pool aliases')
     parser.add_argument('--activation-clamp', type=float, default=10, help='Clamp value for activation')
     parser.add_argument('--num-experts', type=int, default=384, help='Number of experts')
     parser.add_argument('--num-topk', type=int, default=6, help='Number of expert selections')
