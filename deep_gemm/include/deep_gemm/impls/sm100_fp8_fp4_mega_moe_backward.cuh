@@ -37,6 +37,7 @@ template <
     ActivationType kActivationType = ActivationType::SwiGLU,
     bool kFastMath = false,
     RouteWeightMode kRouteWeightMode = RouteWeightMode::PreDown,
+    CombineOrderMode kCombineOrderMode = CombineOrderMode::FixedTopK,
     uint32_t kNumNonEpilogueThreads = 128,
     uint32_t kNumEpilogueThreads = 128,
     uint32_t kNumThreads =
@@ -1985,21 +1986,24 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                             __fsub_rn(
                                                 1.0f, sig);
                                     const float
-                                        silu_grad =
-                                            __fmul_rn(
-                                                sig,
-                                                __fadd_rn(
-                                                    1.0f,
-                                                    __fmul_rn(
-                                                        gate,
-                                                        one_minus_sig)));
-                                    grad_gate_bf16 =
-                                        cd_dtype_t(
+                                        silu_inner =
+                                            __fadd_rn(
+                                                1.0f,
+                                                __fmul_rn(
+                                                    gate,
+                                                    one_minus_sig));
+                                    const float
+                                        grad_silu_sig =
                                             __fmul_rn(
                                                 static_cast<
                                                     float>(
                                                     grad_silu_bf16),
-                                                silu_grad));
+                                                sig);
+                                    grad_gate_bf16 =
+                                        cd_dtype_t(
+                                            __fmul_rn(
+                                                grad_silu_sig,
+                                                silu_inner));
                                     grad_up_bf16 =
                                         cd_dtype_t(
                                             __fmul_rn(
@@ -2164,16 +2168,41 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                 // The activation epilogue spans multiple N-tile CTAs. Reduce
                 // each route term only after all tiles are visible so the
                 // router gradient has a fixed FP32 summation order instead of
-                // depending on cross-CTA atomic arrival order. PyTorch's
-                // contiguous FP32 sum chooses a power-of-two block width from
-                // both the reduction width and the number of output rows. It
-                // then uses four independent accumulators per lane, shared
-                // reductions down to 32 lanes, and a warp shuffle tree.
+                // depending on cross-CTA atomic arrival order.
                 constexpr uint32_t kRouteColumns =
                     kRouteWeightMode ==
                             RouteWeightMode::PostDown
                         ? kHidden
                         : kIntermediateHidden;
+                // FireTitan's POST_DOWN path uses Triton's tl.sum with a
+                // power-of-two BLOCK_H and BLOCK_H / 256 warps (clamped to
+                // [4, 32]). For the production hidden sizes this gives 2, 4,
+                // or 8 elements per thread. Preserve that exact logical
+                // layout; changing the columns assigned to a lane changes the
+                // FP32 reduction result.
+                constexpr uint32_t kTritonRouteBlockH = [] {
+                    uint32_t value = 1;
+                    while (value < kRouteColumns && value < 8192)
+                        value <<= 1;
+                    return value;
+                }();
+                constexpr uint32_t kTritonRouteNumWarps = [] {
+                    uint32_t value =
+                        kTritonRouteBlockH / 256;
+                    value = value < 4 ? 4 : value;
+                    return value > 32 ? 32 : value;
+                }();
+                constexpr uint32_t kTritonRouteThreads =
+                    kTritonRouteNumWarps * 32;
+                constexpr uint32_t
+                    kTritonRouteValuesPerThread =
+                        kTritonRouteBlockH /
+                        kTritonRouteThreads;
+                DG_STATIC_ASSERT(
+                    kTritonRouteValuesPerThread == 2 ||
+                        kTritonRouteValuesPerThread == 4 ||
+                        kTritonRouteValuesPerThread == 8,
+                    "Unsupported Triton route reduction width");
                 constexpr uint32_t kRouteInputPow2 = [] {
                     uint32_t value = 1;
                     const uint32_t vectorized_columns =
@@ -2221,9 +2250,14 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                         512u /
                             kInitialRouteGroupThreads);
                 const uint32_t route_group_threads =
-                    cute::min(
-                        kRouteInputPow2,
-                        512u / route_block_height);
+                    kRouteWeightMode ==
+                                RouteWeightMode::PostDown &&
+                            kCombineOrderMode ==
+                                CombineOrderMode::DeepEP
+                        ? kTritonRouteThreads
+                        : cute::min(
+                              kRouteInputPow2,
+                              512u / route_block_height);
                 const uint32_t num_route_groups_per_cta =
                     kNumThreads / route_group_threads;
                 const uint32_t route_group_idx =
@@ -2251,122 +2285,281 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                         const uint32_t pool_row =
                             route_pool_block_offset * BLOCK_M +
                             token_idx;
-                        float lane_sums[4] = {
-                            0.0f, 0.0f, 0.0f, 0.0f};
+                        float grad_route = 0.0f;
                         if constexpr (
                             kRouteWeightMode ==
-                            RouteWeightMode::PostDown) {
-                            for (uint32_t col_base =
-                                     route_group_lane_idx * 4;
-                                 col_base < kHidden;
-                                 col_base +=
-                                     route_group_threads * 4) {
-                                #pragma unroll
-                                for (uint32_t i = 0; i < 4; ++i) {
-                                    const uint32_t col =
-                                        col_base + i;
-                                    const float grad_y =
-                                        static_cast<float>(
-                                            grad_y_unweighted_output[
-                                                static_cast<uint64_t>(
-                                                    pool_row) *
-                                                    kHidden +
-                                                col]);
-                                    const float down =
-                                        static_cast<float>(
-                                            down_unweighted_output[
-                                                static_cast<uint64_t>(
-                                                    pool_row) *
-                                                    kHidden +
-                                                col]);
-                                    lane_sums[i] =
-                                        __fadd_rn(
-                                            lane_sums[i],
-                                            __fmul_rn(
-                                                grad_y,
-                                                down));
-                                }
+                                    RouteWeightMode::PostDown &&
+                            kCombineOrderMode ==
+                                    CombineOrderMode::DeepEP) {
+                            float grad_y[
+                                kTritonRouteValuesPerThread];
+                            float down[
+                                kTritonRouteValuesPerThread];
+                            #pragma unroll
+                            for (uint32_t i = 0;
+                                 i <
+                                     kTritonRouteValuesPerThread;
+                                 ++i) {
+                                const uint32_t col =
+                                    route_group_lane_idx +
+                                    i * kTritonRouteThreads;
+                                grad_y[i] =
+                                    col < kHidden
+                                    ? static_cast<float>(
+                                          grad_y_unweighted_output[
+                                              static_cast<uint64_t>(
+                                                  pool_row) *
+                                                  kHidden +
+                                              col])
+                                    : 0.0f;
+                                down[i] =
+                                    col < kHidden
+                                    ? static_cast<float>(
+                                          down_unweighted_output[
+                                              static_cast<uint64_t>(
+                                                  pool_row) *
+                                                  kHidden +
+                                              col])
+                                    : 0.0f;
                             }
-                        } else {
-                            for (uint32_t col_base =
-                                     route_group_lane_idx * 4;
-                                 col_base <
-                                     kIntermediateHidden;
-                                 col_base +=
-                                     route_group_threads * 4) {
-                                #pragma unroll
-                                for (uint32_t i = 0; i < 4; ++i) {
-                                    const uint32_t col =
-                                        col_base + i;
-                                    const float grad_h =
-                                        static_cast<float>(
-                                            grad_h_output[
-                                                static_cast<uint64_t>(
-                                                    pool_row) *
-                                                    kIntermediateHidden +
-                                                col]);
-                                    const float h_act =
-                                        static_cast<float>(
-                                            h_act_output[
-                                                static_cast<uint64_t>(
-                                                    pool_row) *
-                                                    kIntermediateHidden +
-                                                col]);
-                                    lane_sums[i] =
-                                        __fadd_rn(
-                                            lane_sums[i],
-                                            __fmul_rn(
-                                                grad_h,
-                                                h_act));
-                                }
+
+                            if constexpr (
+                                kTritonRouteValuesPerThread ==
+                                2) {
+                                grad_route = __fmaf_rn(
+                                    grad_y[0], down[0],
+                                    __fmul_rn(
+                                        grad_y[1], down[1]));
+                            } else if constexpr (
+                                kTritonRouteValuesPerThread ==
+                                4) {
+                                const float even =
+                                    __fmaf_rn(
+                                        grad_y[0], down[0],
+                                        __fmul_rn(
+                                            grad_y[2],
+                                            down[2]));
+                                const float odd =
+                                    __fmaf_rn(
+                                        grad_y[1], down[1],
+                                        __fmul_rn(
+                                            grad_y[3],
+                                            down[3]));
+                                grad_route =
+                                    __fadd_rn(even, odd);
+                            } else {
+                                const float pair_02 =
+                                    __fmaf_rn(
+                                        grad_y[0], down[0],
+                                        __fmul_rn(
+                                            grad_y[2],
+                                            down[2]));
+                                const float pair_13 =
+                                    __fmaf_rn(
+                                        grad_y[1], down[1],
+                                        __fmul_rn(
+                                            grad_y[3],
+                                            down[3]));
+                                const float pair_46 =
+                                    __fmaf_rn(
+                                        grad_y[4], down[4],
+                                        __fmul_rn(
+                                            grad_y[6],
+                                            down[6]));
+                                const float pair_57 =
+                                    __fmaf_rn(
+                                        grad_y[5], down[5],
+                                        __fmul_rn(
+                                            grad_y[7],
+                                            down[7]));
+                                grad_route = __fadd_rn(
+                                    __fadd_rn(
+                                        pair_02, pair_46),
+                                    __fadd_rn(
+                                        pair_13, pair_57));
                             }
-                        }
-                        float grad_route =
-                            __fadd_rn(
-                                __fadd_rn(
-                                    lane_sums[0],
-                                    lane_sums[1]),
-                                lane_sums[2]);
-                        grad_route =
-                            __fadd_rn(
-                                grad_route, lane_sums[3]);
-                        route_lane_sums[threadIdx.x] =
-                            grad_route;
-                        if (route_group_threads > 32) {
-                            for (uint32_t offset =
-                                     route_group_threads /
-                                     2;
-                                 offset >= 32;
-                                 offset >>= 1) {
-                                ptx::sync_aligned(
-                                    route_group_threads,
-                                    route_group_idx);
-                                if (route_group_lane_idx <
-                                    offset) {
-                                    grad_route =
-                                        __fadd_rn(
-                                            grad_route,
-                                            route_lane_sums[
-                                                threadIdx.x +
-                                                offset]);
-                                    route_lane_sums[
-                                        threadIdx.x] =
-                                        grad_route;
-                                }
-                            }
-                        }
-                        if (route_group_lane_idx < 32) {
+
+                            // Triton first performs a butterfly reduction
+                            // within each physical warp.
                             #pragma unroll
                             for (uint32_t offset = 16;
                                  offset > 0;
                                  offset >>= 1) {
-                                grad_route =
-                                    __fadd_rn(
+                                grad_route = __fadd_rn(
+                                    grad_route,
+                                    __shfl_xor_sync(
+                                        0xffffffff,
                                         grad_route,
-                                        __shfl_down_sync(
+                                        offset));
+                            }
+
+                            const uint32_t warp_in_group =
+                                route_group_lane_idx / 32;
+                            const uint32_t lane_in_warp =
+                                route_group_lane_idx & 31;
+                            if (lane_in_warp == 0) {
+                                route_lane_sums[
+                                    route_group_idx *
+                                        kTritonRouteNumWarps +
+                                    warp_in_group] =
+                                    grad_route;
+                            }
+                            ptx::sync_aligned(
+                                kTritonRouteThreads,
+                                route_group_idx);
+
+                            // Triton loads the power-of-two set of warp
+                            // partials into the first warp and reduces it with
+                            // the same butterfly tree.
+                            if (warp_in_group == 0) {
+                                grad_route =
+                                    route_lane_sums[
+                                        route_group_idx *
+                                            kTritonRouteNumWarps +
+                                        (lane_in_warp &
+                                         (kTritonRouteNumWarps -
+                                          1))];
+                                #pragma unroll
+                                for (uint32_t offset =
+                                         kTritonRouteNumWarps /
+                                         2;
+                                     offset > 0;
+                                     offset >>= 1) {
+                                    grad_route = __fadd_rn(
+                                        grad_route,
+                                        __shfl_xor_sync(
                                             0xffffffff,
                                             grad_route,
                                             offset));
+                                }
+                            }
+                        } else {
+                            float lane_sums[4] = {
+                                0.0f, 0.0f, 0.0f, 0.0f};
+                            if constexpr (
+                                kRouteWeightMode ==
+                                RouteWeightMode::PostDown) {
+                                for (uint32_t col_base =
+                                         route_group_lane_idx *
+                                         4;
+                                     col_base < kHidden;
+                                     col_base +=
+                                         route_group_threads *
+                                         4) {
+                                    #pragma unroll
+                                    for (uint32_t i = 0; i < 4;
+                                         ++i) {
+                                        const uint32_t col =
+                                            col_base + i;
+                                        const float grad_y =
+                                            static_cast<float>(
+                                                grad_y_unweighted_output[
+                                                    static_cast<
+                                                        uint64_t>(
+                                                        pool_row) *
+                                                        kHidden +
+                                                    col]);
+                                        const float down =
+                                            static_cast<float>(
+                                                down_unweighted_output[
+                                                    static_cast<
+                                                        uint64_t>(
+                                                        pool_row) *
+                                                        kHidden +
+                                                    col]);
+                                        lane_sums[i] =
+                                            __fadd_rn(
+                                                lane_sums[i],
+                                                __fmul_rn(
+                                                    grad_y,
+                                                    down));
+                                    }
+                                }
+                            } else {
+                                for (uint32_t col_base =
+                                         route_group_lane_idx *
+                                         4;
+                                     col_base <
+                                         kIntermediateHidden;
+                                     col_base +=
+                                         route_group_threads *
+                                         4) {
+                                    #pragma unroll
+                                    for (uint32_t i = 0; i < 4;
+                                         ++i) {
+                                        const uint32_t col =
+                                            col_base + i;
+                                        const float grad_h =
+                                            static_cast<float>(
+                                                grad_h_output[
+                                                    static_cast<
+                                                        uint64_t>(
+                                                        pool_row) *
+                                                        kIntermediateHidden +
+                                                    col]);
+                                        const float h_act =
+                                            static_cast<float>(
+                                                h_act_output[
+                                                    static_cast<
+                                                        uint64_t>(
+                                                        pool_row) *
+                                                        kIntermediateHidden +
+                                                    col]);
+                                        lane_sums[i] =
+                                            __fadd_rn(
+                                                lane_sums[i],
+                                                __fmul_rn(
+                                                    grad_h,
+                                                    h_act));
+                                    }
+                                }
+                            }
+                            grad_route = __fadd_rn(
+                                __fadd_rn(
+                                    lane_sums[0],
+                                    lane_sums[1]),
+                                lane_sums[2]);
+                            grad_route = __fadd_rn(
+                                grad_route, lane_sums[3]);
+
+                            route_lane_sums[threadIdx.x] =
+                                grad_route;
+                            if (route_group_threads > 32) {
+                                for (uint32_t offset =
+                                         route_group_threads /
+                                         2;
+                                     offset >= 32;
+                                     offset >>= 1) {
+                                    ptx::sync_aligned(
+                                        route_group_threads,
+                                        route_group_idx);
+                                    if (route_group_lane_idx <
+                                        offset) {
+                                        grad_route =
+                                            __fadd_rn(
+                                                grad_route,
+                                                route_lane_sums[
+                                                    threadIdx.x +
+                                                    offset]);
+                                        route_lane_sums[
+                                            threadIdx.x] =
+                                            grad_route;
+                                    }
+                                }
+                            }
+                            if (route_group_lane_idx < 32) {
+                                #pragma unroll
+                                for (uint32_t offset = 16;
+                                     offset > 0;
+                                     offset >>= 1) {
+                                    grad_route =
+                                        __fadd_rn(
+                                            grad_route,
+                                            __shfl_down_sync(
+                                                0xffffffff,
+                                                grad_route,
+                                                offset));
+                                }
                             }
                         }
                         if (route_group_lane_idx == 0)

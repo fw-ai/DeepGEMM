@@ -27,6 +27,15 @@ static std::string get_backward_route_weight_mode_name(
     DG_HOST_UNREACHABLE("Unsupported route weight mode");
 }
 
+static std::string get_backward_combine_order_mode_name(
+    const std::string& combine_order_mode) {
+    if (combine_order_mode == "fixed_topk")
+        return "CombineOrderMode::FixedTopK";
+    if (combine_order_mode == "deepep")
+        return "CombineOrderMode::DeepEP";
+    DG_HOST_UNREACHABLE("Unsupported combine order mode");
+}
+
 class SM100FP8FP4MegaMoEBackwardWaveRuntime final
     : public LaunchRuntime<SM100FP8FP4MegaMoEBackwardWaveRuntime> {
 public:
@@ -48,6 +57,7 @@ public:
         std::string activation = "swiglu";
         bool fast_math = false;
         std::string route_weight_mode = "pre_down";
+        std::string combine_order_mode = "fixed_topk";
 
         const int* expert_counts;
         layout::SymBuffer<> backward_sym_buffer;
@@ -122,6 +132,7 @@ static void __instantiate_kernel() {{
             {},
             {},
             {},
+            {},
             {}
         >);
 }};
@@ -140,7 +151,9 @@ static void __instantiate_kernel() {{
                 : "ActivationType::SwiGLU",
             args.fast_math ? "true" : "false",
             get_backward_route_weight_mode_name(
-                args.route_weight_mode));
+                args.route_weight_mode),
+            get_backward_combine_order_mode_name(
+                args.combine_order_mode));
     }
 
     static void launch_impl(
@@ -652,6 +665,7 @@ static void sm100_bf16_mega_moe_backward_dgrad(
     const std::string& activation,
     const bool& fast_math,
     const std::string& route_weight_mode,
+    const std::string& combine_order_mode,
     const torch::Tensor& down_unweighted_output,
     const int& block_m,
     const bool& direct_remote_grad_x,
@@ -897,6 +911,7 @@ static void sm100_bf16_mega_moe_backward_dgrad(
         .activation = activation,
         .fast_math = fast_math,
         .route_weight_mode = route_weight_mode,
+        .combine_order_mode = combine_order_mode,
         .expert_counts = expert_counts.data_ptr<int>(),
         .backward_sym_buffer = backward_sym_buffer,
         .backward_workspace = backward_workspace,

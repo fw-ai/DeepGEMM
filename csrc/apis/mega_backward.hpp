@@ -89,7 +89,8 @@ static void bf16_mega_moe_backward_dgrad(
     const std::vector<int64_t>& backward_sym_buffer_ptrs,
     const int& backward_rank,
     const int& num_max_tokens_per_rank,
-    const int& num_topk) {
+    const int& num_topk,
+    const std::string& combine_order_mode) {
     deep_gemm::sm100_bf16_mega_moe_backward_dgrad(
         gate_up_output, grad_h_output, grad_gate_up_output,
         h_act_output, h_weighted_output, x_pool_output,
@@ -98,6 +99,7 @@ static void bf16_mega_moe_backward_dgrad(
         route_weights, w2_weights, w13_weights,
         expert_counts, grid_sync_counter, activation_limit,
         activation, fast_math, route_weight_mode,
+        combine_order_mode,
         down_unweighted_output, block_m,
         direct_remote_grad_x, write_grad_x_pool,
         clear_wgrad_padding, backward_grad_y, backward_x,
@@ -310,7 +312,8 @@ static void register_apis(pybind11::module_& m) {
         py::arg("backward_sym_buffer_ptrs"),
         py::arg("backward_rank"),
         py::arg("num_max_tokens_per_rank"),
-        py::arg("num_topk"));
+        py::arg("num_topk"),
+        py::arg("combine_order_mode") = "fixed_topk");
     m.def("bf16_mega_moe_backward_w2",
           &bf16_mega_moe_backward_w2,
           py::arg("grad_w2_output"), py::arg("grad_ye"),

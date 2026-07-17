@@ -83,9 +83,11 @@ def bf16_mega_moe_backward_dgrad(
     grad_y_unweighted_output: Optional[torch.Tensor] = None,
     down_unweighted_output: Optional[torch.Tensor] = None,
     python_numerical_correction: bool = False,
+    combine_order_mode: CombineOrderMode = CombineOrderMode.FIXED_TOPK,
 ) -> None:
     """Run BF16 reverse dispatch, dgrad, activation, and direct grad-x."""
     route_weight_mode = RouteWeightMode(route_weight_mode)
+    combine_order_mode = CombineOrderMode(combine_order_mode)
     if activation not in ("swiglu", "geglu"):
         raise ValueError(f"unsupported activation: {activation}")
     if not write_grad_x_pool and not direct_remote_grad_x:
@@ -185,6 +187,7 @@ def bf16_mega_moe_backward_dgrad(
         sym_buffer.group.rank(),
         sym_buffer.num_max_tokens_per_rank,
         sym_buffer.num_topk,
+        combine_order_mode.value,
     )
     if not python_numerical_correction:
         return

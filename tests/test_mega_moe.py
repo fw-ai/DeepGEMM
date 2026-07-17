@@ -942,7 +942,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 write_grad_x_pool=args.write_grad_x_pool,
                 clear_wgrad_padding=True,
                 python_numerical_correction=(
-                    args.python_numerical_correction))
+                    args.python_numerical_correction),
+                combine_order_mode=args.combine_order_mode)
 
         if args.benchmark_backward:
             for _ in range(args.backward_warmup):
