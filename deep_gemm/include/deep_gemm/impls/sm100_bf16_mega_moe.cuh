@@ -38,6 +38,7 @@ template <
     bool kSaveL1Preact,
     bool kSaveStageActivations,
     RouteWeightMode kRouteWeightMode,
+    CombineOrderMode kCombineOrderMode,
     bool kSaveDownUnweighted,
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -1415,7 +1416,9 @@ sm100_bf16_mega_moe_impl(void* y,
                             reinterpret_cast<float4*>(smem_ptr));
                         if constexpr (
                             kRouteWeightMode ==
-                            RouteWeightMode::PostDown) {
+                                RouteWeightMode::PostDown &&
+                            kCombineOrderMode ==
+                                CombineOrderMode::FixedTopK) {
                             const float route_weight =
                                 *l1_topk_weights_buffer
                                      .get_data_buffer(
@@ -1521,50 +1524,252 @@ sm100_bf16_mega_moe_impl(void* y,
             for (uint32_t chunk = 0; chunk < kNumChunks; ++ chunk) {
                 const uint32_t chunk_byte_offset = chunk * kNumChunkBytes;
 
-                // Move mask and load
-                uint32_t mask = total_mask;
-                const auto move_mask_and_load = [&](const uint32_t& i) {
-                    if (mask) {
-                        // Move
-                        const uint32_t slot_idx = __ffs(mask) - 1;
-                        mask ^= 1 << slot_idx;
-
-                        // Load
-                        if (cute::elect_one_sync()) {
-                            const auto src_ptr = math::advance_ptr<uint8_t>(
-                                combine_token_buffer.get_rank_buffer(slot_idx)
-                                                    .get_data_buffer(token_idx).get_base_ptr(),
-                                chunk_byte_offset);
-                            ptx::tma_load_1d(combine_load_buffer[i], src_ptr, combine_load_barriers[i], kNumChunkBytes);
-                            ptx::mbarrier_arrive_and_set_tx(combine_load_barriers[i], kNumChunkBytes);
-                        }
-                        __syncwarp();
-                        return true;
-                    }
-                    return false;
-                };
-
-                // Load the first selection
-                bool do_reduce = move_mask_and_load(load_stage_idx);
-
                 // Accumulate all top-k contributions for this chunk in float registers
                 float2 reduced[kNumUint4PerLane * kNumElemsPerUint4] = {};
-                while (do_reduce) {
-                    // Prefetch next top-k into the buffer while current is being accumulated
-                    do_reduce = move_mask_and_load(load_stage_idx ^ 1);
+                if constexpr (
+                    kCombineOrderMode ==
+                    CombineOrderMode::FixedTopK) {
+                    // Move mask and load
+                    uint32_t mask = total_mask;
+                    const auto move_mask_and_load =
+                        [&](const uint32_t& i) {
+                            if (mask) {
+                                // Move
+                                const uint32_t slot_idx =
+                                    __ffs(mask) - 1;
+                                mask ^= 1 << slot_idx;
 
-                    // Accumulate
-                    combine_load_barriers[load_stage_idx]->wait(combine_phase);
-                    #pragma unroll
-                    for (uint32_t j = 0; j < kNumUint4PerLane; ++ j) {
-                        const auto uint4_values = combine_load_buffer[load_stage_idx][j * 32 + lane_idx];
-                        const auto bf16_values = reinterpret_cast<const nv_bfloat162*>(&uint4_values);
+                                // Load
+                                if (cute::elect_one_sync()) {
+                                    const auto src_ptr =
+                                        math::advance_ptr<uint8_t>(
+                                            combine_token_buffer
+                                                .get_rank_buffer(
+                                                    slot_idx)
+                                                .get_data_buffer(
+                                                    token_idx)
+                                                .get_base_ptr(),
+                                            chunk_byte_offset);
+                                    ptx::tma_load_1d(
+                                        combine_load_buffer[i],
+                                        src_ptr,
+                                        combine_load_barriers[i],
+                                        kNumChunkBytes);
+                                    ptx::mbarrier_arrive_and_set_tx(
+                                        combine_load_barriers[i],
+                                        kNumChunkBytes);
+                                }
+                                __syncwarp();
+                                return true;
+                            }
+                            return false;
+                        };
+
+                    // Load the first selection
+                    bool do_reduce =
+                        move_mask_and_load(load_stage_idx);
+                    while (do_reduce) {
+                        // Prefetch next top-k while accumulating current.
+                        do_reduce = move_mask_and_load(
+                            load_stage_idx ^ 1);
+
+                        combine_load_barriers[load_stage_idx]->wait(
+                            combine_phase);
                         #pragma unroll
-                        for (uint32_t l = 0; l < kNumElemsPerUint4; ++ l)
-                            ptx::accumulate(reduced[j * kNumElemsPerUint4 + l], bf16_values[l]);
+                        for (uint32_t j = 0;
+                             j < kNumUint4PerLane; ++j) {
+                            const auto uint4_values =
+                                combine_load_buffer[
+                                    load_stage_idx][
+                                    j * 32 + lane_idx];
+                            const auto bf16_values =
+                                reinterpret_cast<
+                                    const nv_bfloat162*>(
+                                    &uint4_values);
+                            #pragma unroll
+                            for (uint32_t l = 0;
+                                 l < kNumElemsPerUint4; ++l) {
+                                ptx::accumulate(
+                                    reduced[
+                                        j *
+                                            kNumElemsPerUint4 +
+                                        l],
+                                    bf16_values[l]);
+                            }
+                        }
+                        combine_phase ^= load_stage_idx;
+                        load_stage_idx ^= 1;
                     }
-                    combine_phase ^= load_stage_idx;
-                    load_stage_idx ^= 1;
+                } else {
+                    // FireTitan's DeepEP V2 path first atomically unpermutes
+                    // expert-major rows into one FP32 partial per destination
+                    // rank and stores that partial as BF16. Canonicalize the
+                    // nondeterministic atomic order as expert-major here.
+                    // DeepEP's final epilogue then accumulates the BF16 rank
+                    // partials in the order of each rank's last top-k
+                    // occurrence.
+                    constexpr uint32_t kNumExpertsPerRank =
+                        kNumExperts / kNumRanks;
+                    const int dst_rank =
+                        stored_topk_slot_idx >= 0
+                        ? stored_topk_slot_idx /
+                              static_cast<int>(
+                                  kNumExpertsPerRank)
+                        : -1;
+                    const uint32_t same_rank_mask =
+                        __match_any_sync(
+                            0xffffffff, dst_rank);
+                    uint32_t rank_master_mask =
+                        __ballot_sync(
+                            0xffffffff,
+                            stored_topk_slot_idx >= 0 &&
+                                lane_idx ==
+                                    31 -
+                                        __clz(
+                                            same_rank_mask));
+                    while (rank_master_mask) {
+                        const uint32_t rank_master_slot =
+                            __ffs(rank_master_mask) - 1;
+                        rank_master_mask &=
+                            rank_master_mask - 1;
+                        const int current_rank =
+                            ptx::exchange(
+                                dst_rank,
+                                rank_master_slot);
+                        uint32_t rank_mask = __ballot_sync(
+                            0xffffffff,
+                            dst_rank == current_rank);
+
+                        float2 rank_reduced[
+                            kNumUint4PerLane *
+                            kNumElemsPerUint4] = {};
+                        while (rank_mask) {
+                            // Select the lowest expert id still present in
+                            // this rank. Expert ids are unique within a
+                            // token's top-k, so no slot tie-break is needed.
+                            uint32_t slot_idx =
+                                __ffs(rank_mask) - 1;
+                            int selected_expert =
+                                ptx::exchange(
+                                    stored_topk_slot_idx,
+                                    slot_idx);
+                            uint32_t candidates =
+                                rank_mask &
+                                ~(1u << slot_idx);
+                            while (candidates) {
+                                const uint32_t candidate_slot =
+                                    __ffs(candidates) - 1;
+                                candidates &=
+                                    candidates - 1;
+                                const int candidate_expert =
+                                    ptx::exchange(
+                                        stored_topk_slot_idx,
+                                        candidate_slot);
+                                if (candidate_expert <
+                                    selected_expert) {
+                                    selected_expert =
+                                        candidate_expert;
+                                    slot_idx =
+                                        candidate_slot;
+                                }
+                            }
+                            rank_mask &= ~(1u << slot_idx);
+                            if (cute::elect_one_sync()) {
+                                const auto src_ptr =
+                                    math::advance_ptr<uint8_t>(
+                                        combine_token_buffer
+                                            .get_rank_buffer(
+                                                slot_idx)
+                                            .get_data_buffer(
+                                                token_idx)
+                                            .get_base_ptr(),
+                                        chunk_byte_offset);
+                                ptx::tma_load_1d(
+                                    combine_load_buffer[0],
+                                    src_ptr,
+                                    combine_load_barriers[0],
+                                    kNumChunkBytes);
+                                ptx::mbarrier_arrive_and_set_tx(
+                                    combine_load_barriers[0],
+                                    kNumChunkBytes);
+                            }
+                            __syncwarp();
+                            combine_load_barriers[0]->wait(
+                                combine_phase);
+                            #pragma unroll
+                            for (uint32_t j = 0;
+                                 j < kNumUint4PerLane; ++j) {
+                                const auto uint4_values =
+                                    combine_load_buffer[0][
+                                        j * 32 + lane_idx];
+                                const auto bf16_values =
+                                    reinterpret_cast<
+                                        const nv_bfloat162*>(
+                                        &uint4_values);
+                                const float route_weight =
+                                    kRouteWeightMode ==
+                                            RouteWeightMode::
+                                                PostDown
+                                    ? input_topk_weights_buffer
+                                          .get_data_buffer(
+                                              token_idx)
+                                          .template
+                                              get_base_ptr<
+                                                  float>()[slot_idx]
+                                    : 1.0f;
+                                #pragma unroll
+                                for (uint32_t l = 0;
+                                     l < kNumElemsPerUint4;
+                                     ++l) {
+                                    if constexpr (
+                                        kRouteWeightMode ==
+                                        RouteWeightMode::
+                                            PostDown) {
+                                        const float2 source =
+                                            __bfloat1622float2(
+                                                bf16_values[l]);
+                                        auto& value =
+                                            rank_reduced[
+                                                j *
+                                                    kNumElemsPerUint4 +
+                                                l];
+                                        value.x = __fadd_rn(
+                                            value.x,
+                                            __fmul_rn(
+                                                source.x,
+                                                route_weight));
+                                        value.y = __fadd_rn(
+                                            value.y,
+                                            __fmul_rn(
+                                                source.y,
+                                                route_weight));
+                                    } else {
+                                        ptx::accumulate(
+                                            rank_reduced[
+                                                j *
+                                                    kNumElemsPerUint4 +
+                                                l],
+                                            bf16_values[l]);
+                                    }
+                                }
+                            }
+                            combine_phase ^= 1;
+                        }
+
+                        #pragma unroll
+                        for (uint32_t value_idx = 0;
+                             value_idx <
+                                 kNumUint4PerLane *
+                                     kNumElemsPerUint4;
+                             ++value_idx) {
+                            const nv_bfloat162 rank_partial =
+                                __float22bfloat162_rn(
+                                    rank_reduced[value_idx]);
+                            ptx::accumulate(
+                                reduced[value_idx],
+                                rank_partial);
+                        }
+                    }
                 }
 
                 // Cast

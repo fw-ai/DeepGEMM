@@ -11,11 +11,13 @@ struct MegaMoEBackwardCombineArgs {
     layout::Workspace workspace{nullptr, 1, 1, 1, 1, 1};
     cutlass::bfloat16_t* grad_x_output = nullptr;
     cutlass::bfloat16_t* combine_buffer = nullptr;
+    const int64_t* topk_ids = nullptr;
     uint32_t num_tokens = 0;
     uint32_t num_max_tokens = 0;
     uint32_t num_topk = 0;
     uint32_t hidden = 0;
     bool reduce = false;
+    std::string order_mode = "fixed_topk";
 };
 
 // Dedicated single-CTA specialization for MegaMoE local expert wgrad.
@@ -148,11 +150,13 @@ static void sm100_bf16_mega_moe_wgrad_1sm(
         .combine_workspace = combine.workspace,
         .grad_x_output = combine.grad_x_output,
         .combine_buffer = combine.combine_buffer,
+        .combine_topk_ids = combine.topk_ids,
         .combine_num_tokens = combine.num_tokens,
         .combine_num_max_tokens = combine.num_max_tokens,
         .combine_num_topk = combine.num_topk,
         .combine_hidden = combine.hidden,
         .combine_reduce = combine.reduce,
+        .combine_order_mode = combine.order_mode,
         .combine_num_extra_threads =
             static_cast<uint32_t>(num_extra_combine_threads),
     };

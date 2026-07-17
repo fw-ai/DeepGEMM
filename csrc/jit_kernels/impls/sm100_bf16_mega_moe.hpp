@@ -33,6 +33,15 @@ static std::string get_route_weight_mode_name(
     DG_HOST_UNREACHABLE("Unsupported route weight mode");
 }
 
+static std::string get_combine_order_mode_name(
+    const std::string& combine_order_mode) {
+    if (combine_order_mode == "fixed_topk")
+        return "CombineOrderMode::FixedTopK";
+    if (combine_order_mode == "deepep")
+        return "CombineOrderMode::DeepEP";
+    DG_HOST_UNREACHABLE("Unsupported combine order mode");
+}
+
 class SM100BF16MegaMoERuntime final : public LaunchRuntime<SM100BF16MegaMoERuntime> {
 public:
     struct Args {
@@ -47,6 +56,7 @@ public:
         bool save_l1_preact;
         bool save_stage_activations;
         std::string route_weight_mode;
+        std::string combine_order_mode;
         bool save_down_unweighted;
         MegaMoEConfig config;
 
@@ -96,6 +106,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
         {}
     >);
 }};
@@ -116,6 +127,7 @@ static void __instantiate_kernel() {{
     args.save_l1_preact ? "true" : "false",
     args.save_stage_activations ? "true" : "false",
     get_route_weight_mode_name(args.route_weight_mode),
+    get_combine_order_mode_name(args.combine_order_mode),
     args.save_down_unweighted ? "true" : "false");
     }
 
@@ -157,7 +169,8 @@ static void sm100_bf16_mega_moe(
     const std::string& route_weight_mode,
     const std::optional<torch::Tensor>& saved_h_unweighted,
     const std::optional<torch::Tensor>& saved_h_weighted,
-    const std::optional<torch::Tensor>& saved_down_unweighted
+    const std::optional<torch::Tensor>& saved_down_unweighted,
+    const std::string& combine_order_mode
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -183,6 +196,9 @@ static void sm100_bf16_mega_moe(
     DG_HOST_ASSERT(
         route_weight_mode == "pre_down" ||
         route_weight_mode == "post_down");
+    DG_HOST_ASSERT(
+        combine_order_mode == "fixed_topk" ||
+        combine_order_mode == "deepep");
     DG_HOST_ASSERT(
         saved_h_unweighted.has_value() ==
         saved_h_weighted.has_value());
@@ -268,6 +284,7 @@ static void sm100_bf16_mega_moe(
         .save_stage_activations =
             saved_h_unweighted.has_value(),
         .route_weight_mode = route_weight_mode,
+        .combine_order_mode = combine_order_mode,
         .save_down_unweighted =
             saved_down_unweighted.has_value(),
         .config = config,

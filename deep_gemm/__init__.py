@@ -91,6 +91,7 @@ except ImportError:
 
 # Mega kernels
 from .mega import (
+    CombineOrderMode,
     RouteWeightMode,
     SymmBuffer,
     get_symm_buffer_for_mega_moe,

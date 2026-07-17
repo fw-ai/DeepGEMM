@@ -23,6 +23,11 @@ class RouteWeightMode(str, Enum):
     POST_DOWN = 'post_down'
 
 
+class CombineOrderMode(str, Enum):
+    FIXED_TOPK = 'fixed_topk'
+    DEEPEP = 'deepep'
+
+
 class SymmBuffer:
     def __init__(self, group: dist.ProcessGroup,
                  num_experts: int,
@@ -217,7 +222,9 @@ def bf16_mega_moe(y: torch.Tensor,
                   route_weight_mode: RouteWeightMode = RouteWeightMode.PRE_DOWN,
                   saved_h_unweighted: Optional[torch.Tensor] = None,
                   saved_h_weighted: Optional[torch.Tensor] = None,
-                  saved_down_unweighted: Optional[torch.Tensor] = None):
+                  saved_down_unweighted: Optional[torch.Tensor] = None,
+                  combine_order_mode: CombineOrderMode =
+                  CombineOrderMode.FIXED_TOPK):
     """Run BF16 MegaMoE with an explicit route-weight boundary.
 
     The optional stage saves expose unweighted/weighted activation and W2
@@ -225,6 +232,7 @@ def bf16_mega_moe(y: torch.Tensor,
     also used by post-down backward for the exact router gradient.
     """
     route_weight_mode = RouteWeightMode(route_weight_mode)
+    combine_order_mode = CombineOrderMode(combine_order_mode)
     if (
         (saved_h_unweighted is None) !=
         (saved_h_weighted is None)
@@ -263,4 +271,5 @@ def bf16_mega_moe(y: torch.Tensor,
         saved_h_weighted,
         saved_down_unweighted,
         num_config_tokens,
+        combine_order_mode.value,
     )

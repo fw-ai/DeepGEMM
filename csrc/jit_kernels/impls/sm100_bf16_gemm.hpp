@@ -15,6 +15,15 @@
 
 namespace deep_gemm {
 
+static std::string get_bf16_gemm_combine_order_mode_name(
+    const std::string& combine_order_mode) {
+    if (combine_order_mode == "fixed_topk")
+        return "CombineOrderMode::FixedTopK";
+    if (combine_order_mode == "deepep")
+        return "CombineOrderMode::DeepEP";
+    DG_HOST_UNREACHABLE("Unsupported combine order mode");
+}
+
 class SM100BF16GemmRuntime final: public LaunchRuntime<SM100BF16GemmRuntime> {
 public:
     struct Args {
@@ -33,11 +42,13 @@ public:
             nullptr, 1, 1, 1, 1, 1};
         cutlass::bfloat16_t* grad_x_output = nullptr;
         cutlass::bfloat16_t* combine_buffer = nullptr;
+        const int64_t* combine_topk_ids = nullptr;
         uint32_t combine_num_tokens = 0;
         uint32_t combine_num_max_tokens = 0;
         uint32_t combine_num_topk = 0;
         uint32_t combine_hidden = 0;
         bool combine_reduce = false;
+        std::string combine_order_mode = "fixed_topk";
         uint32_t combine_num_extra_threads = 0;
     };
 
@@ -63,7 +74,7 @@ static void __instantiate_kernel() {{
         {},
         {}, {}, {},
         {},
-        {}, {}, {}
+        {}, {}, {}, {}
     >);
 }};
 )",
@@ -83,6 +94,8 @@ static void __instantiate_kernel() {{
         to_string(args.gemm_desc.gemm_type), args.gemm_desc.with_accumulation, to_string(args.gemm_desc.cd_dtype),
         args.gemm_desc.tc_util,
         args.combine_num_ranks, args.fuse_combine,
+        get_bf16_gemm_combine_order_mode_name(
+            args.combine_order_mode),
         args.combine_num_extra_threads);
     }
 
@@ -94,7 +107,8 @@ static void __instantiate_kernel() {{
             args.tensor_map_cd,
             args.combine_sym_buffer, args.combine_workspace,
             args.grad_x_output,
-            args.combine_buffer, args.combine_num_tokens,
+            args.combine_buffer, args.combine_topk_ids,
+            args.combine_num_tokens,
             args.combine_num_max_tokens, args.combine_num_topk,
             args.combine_hidden, args.combine_reduce));
     }

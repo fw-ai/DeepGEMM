@@ -65,4 +65,12 @@ enum class RouteWeightMode {
     PostDown = 1,
 };
 
+enum class CombineOrderMode {
+    // Accumulate valid routes in their original top-k slot order.
+    FixedTopK = 0,
+    // Match DeepEP V2's per-rank BF16 materialization boundary and reduce the
+    // rank partials in the order of each rank's last top-k occurrence.
+    DeepEP = 1,
+};
+
 } // namespace deep_gemm

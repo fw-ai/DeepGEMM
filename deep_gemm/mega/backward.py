@@ -4,7 +4,7 @@ import torch
 import torch.distributed as dist
 
 from .. import _C
-from . import RouteWeightMode
+from . import CombineOrderMode, RouteWeightMode
 
 
 def _sort_bf16_pool_in_deepep_order(
@@ -530,8 +530,11 @@ def bf16_mega_moe_backward_w13_combine(
     padded_expert_counts: torch.Tensor,
     grad_x_output: torch.Tensor,
     sym_buffer: Any,
+    combine_order_mode: CombineOrderMode =
+    CombineOrderMode.FIXED_TOPK,
 ) -> None:
     """Run W13 wgrad while reducing direct-write grad-x planes."""
+    combine_order_mode = CombineOrderMode(combine_order_mode)
     _C.bf16_mega_moe_backward_w13_combine(
         grad_w13_output,
         grad_gate_up,
@@ -543,4 +546,6 @@ def bf16_mega_moe_backward_w13_combine(
         sym_buffer.group.rank(),
         sym_buffer.num_max_tokens_per_rank,
         sym_buffer.num_topk,
+        sym_buffer.topk_idx,
+        combine_order_mode.value,
     )

@@ -297,7 +297,8 @@ static void bf16_mega_moe(
     const std::optional<torch::Tensor>& saved_h_unweighted,
     const std::optional<torch::Tensor>& saved_h_weighted,
     const std::optional<torch::Tensor>& saved_down_unweighted,
-    const int& num_config_tokens
+    const int& num_config_tokens,
+    const std::string& combine_order_mode
 ) {
     // Config checks
     const auto num_tokens = static_cast<int>(y.size(0));
@@ -305,6 +306,9 @@ static void bf16_mega_moe(
     DG_HOST_ASSERT(
         route_weight_mode == "pre_down" ||
         route_weight_mode == "post_down");
+    DG_HOST_ASSERT(
+        combine_order_mode == "fixed_topk" ||
+        combine_order_mode == "deepep");
 
     // Activation checks
     const auto activation_clamp =
@@ -369,7 +373,8 @@ static void bf16_mega_moe(
                             route_weight_mode,
                             saved_h_unweighted,
                             saved_h_weighted,
-                            saved_down_unweighted);
+                            saved_down_unweighted,
+                            combine_order_mode);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }

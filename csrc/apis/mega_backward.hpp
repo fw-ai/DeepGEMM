@@ -138,7 +138,11 @@ static MegaMoEBackwardCombineArgs make_backward_combine_args(
     const int& num_max_tokens_per_rank,
     const int& num_topk,
     const int num_local_experts,
-    const bool reduce) {
+    const bool reduce,
+    const std::optional<torch::Tensor>& topk_ids =
+        std::nullopt,
+    const std::string& combine_order_mode =
+        "fixed_topk") {
     const int num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     DG_HOST_ASSERT(num_ranks > 1);
     DG_HOST_ASSERT(rank >= 0 and rank < num_ranks);
@@ -148,6 +152,23 @@ static MegaMoEBackwardCombineArgs make_backward_combine_args(
     DG_HOST_ASSERT(combine_buffer.is_contiguous());
     DG_HOST_ASSERT(grad_x_output.dim() == 2);
     DG_HOST_ASSERT(num_max_tokens_per_rank >= grad_x_output.size(0));
+    DG_HOST_ASSERT(
+        combine_order_mode == "fixed_topk" ||
+        combine_order_mode == "deepep");
+    if (combine_order_mode == "deepep") {
+        DG_HOST_ASSERT(topk_ids.has_value());
+        DG_HOST_ASSERT(topk_ids->is_cuda());
+        DG_HOST_ASSERT(
+            topk_ids->scalar_type() == torch::kInt64);
+        DG_HOST_ASSERT(topk_ids->is_contiguous());
+        DG_HOST_ASSERT(topk_ids->dim() == 2);
+        DG_HOST_ASSERT(
+            topk_ids->size(0) >=
+            grad_x_output.size(0));
+        DG_HOST_ASSERT(
+            topk_ids->size(1) == num_topk);
+        DG_HOST_ASSERT(num_topk <= 32);
+    }
 
     MegaMoEBackwardCombineArgs combine;
     combine.enabled = true;
@@ -165,6 +186,10 @@ static MegaMoEBackwardCombineArgs make_backward_combine_args(
     combine.combine_buffer =
         reinterpret_cast<cutlass::bfloat16_t*>(
             combine_buffer.data_ptr<at::BFloat16>());
+    combine.topk_ids =
+        topk_ids.has_value()
+        ? topk_ids->data_ptr<int64_t>()
+        : nullptr;
     combine.num_tokens =
         static_cast<uint32_t>(grad_x_output.size(0));
     combine.num_max_tokens =
@@ -172,6 +197,7 @@ static MegaMoEBackwardCombineArgs make_backward_combine_args(
     combine.num_topk = static_cast<uint32_t>(num_topk);
     combine.hidden = static_cast<uint32_t>(grad_x_output.size(1));
     combine.reduce = reduce;
+    combine.order_mode = combine_order_mode;
     return combine;
 }
 
@@ -209,11 +235,14 @@ static void bf16_mega_moe_backward_w13_combine(
     const std::vector<int64_t>& sym_buffer_ptrs,
     const int& rank,
     const int& num_max_tokens_per_rank,
-    const int& num_topk) {
+    const int& num_topk,
+    const std::optional<torch::Tensor>& topk_ids,
+    const std::string& combine_order_mode) {
     const auto combine = make_backward_combine_args(
         grad_x_output, combine_buffer, sym_buffer_ptrs, rank,
         num_max_tokens_per_rank, num_topk,
-        static_cast<int>(padded_expert_counts.numel()), true);
+        static_cast<int>(padded_expert_counts.numel()), true,
+        topk_ids, combine_order_mode);
     deep_gemm::sm100_bf16_mega_moe_wgrad_1sm(
         grad_gate_up, x_pool, grad_w13_output,
         padded_expert_counts, combine);
@@ -313,7 +342,9 @@ static void register_apis(pybind11::module_& m) {
           py::arg("combine_buffer"),
           py::arg("sym_buffer_ptrs"), py::arg("rank"),
           py::arg("num_max_tokens_per_rank"),
-          py::arg("num_topk"));
+          py::arg("num_topk"),
+          py::arg("topk_ids") = py::none(),
+          py::arg("combine_order_mode") = "fixed_topk");
 #endif
 }
 
