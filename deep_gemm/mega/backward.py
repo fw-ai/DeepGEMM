@@ -203,6 +203,7 @@ def bf16_mega_moe_backward_dgrad(
     python_numerical_correction: bool = False,
     combine_order_mode: CombineOrderMode = CombineOrderMode.FIXED_TOPK,
     memory_mode: str = "legacy",
+    rank_uniform_block_m: bool = False,
 ) -> None:
     """Run BF16 reverse dispatch, dgrad, activation, and direct grad-x.
 
@@ -260,7 +261,7 @@ def bf16_mega_moe_backward_dgrad(
         grad_y_unweighted_output=grad_y_unweighted_output,
         down_unweighted_output=down_unweighted_output,
     )
-    if sym_buffer.group.size() > 1:
+    if sym_buffer.group.size() > 1 and not rank_uniform_block_m:
         # BLOCK_M determines the persistent grid shape and therefore every
         # grid/NVLink barrier's participant count. A rank with no source
         # tokens may choose a smaller local bucket than its peers; launching

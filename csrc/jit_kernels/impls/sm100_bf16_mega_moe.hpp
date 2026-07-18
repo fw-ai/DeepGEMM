@@ -71,6 +71,7 @@ public:
         const int* precomputed_route_counts;
         int* route_count_mismatch;
         int num_tokens;
+        int num_saved_pool_tokens;
         layout::SymBuffer<> sym_buffer_ptrs;
 
         // Tensormap
@@ -146,6 +147,7 @@ static void __instantiate_kernel() {{
             args.precomputed_route_counts,
             args.route_count_mismatch,
             args.num_tokens,
+            args.num_saved_pool_tokens,
             args.sym_buffer_ptrs,
             args.tensor_map_l1_acts,
             args.tensor_map_l1_weights,
@@ -319,6 +321,7 @@ static void sm100_bf16_mega_moe(
             ? route_count_mismatch->data_ptr<int>()
             : nullptr,
         .num_tokens = num_tokens,
+        .num_saved_pool_tokens = num_saved_pool_tokens,
         .sym_buffer_ptrs = layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
         .tensor_map_l1_acts = tensor_map_l1_acts,
         .tensor_map_l1_weights = tensor_map_l1_weights,

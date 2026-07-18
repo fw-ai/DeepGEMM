@@ -62,6 +62,7 @@ sm100_bf16_mega_moe_impl(void* y,
                          const int* precomputed_route_counts,
                          int* route_count_mismatch,
                          const uint32_t num_tokens,
+                         const uint32_t num_saved_pool_tokens,
                          const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_l1_weights,
@@ -1095,7 +1096,10 @@ sm100_bf16_mega_moe_impl(void* y,
                                 #pragma unroll
                                 for (uint32_t r = 0; r < 2; ++ r) {
                                     const uint32_t m_out = row_base + r;
-                                    if (m_out < pool_m_idx + valid_m) {
+                                    if (
+                                        m_out < pool_m_idx + valid_m &&
+                                        m_out < num_saved_pool_tokens
+                                    ) {
                                         auto* dst = reinterpret_cast<uint16_t*>(
                                             saved_l1_preact +
                                             static_cast<uint64_t>(m_out) *
@@ -1257,8 +1261,10 @@ sm100_bf16_mega_moe_impl(void* y,
                                      r < 2; ++r) {
                                     const uint32_t m_out =
                                         row_base + r;
-                                    if (m_out <
-                                        pool_m_idx + valid_m) {
+                                    if (
+                                        m_out < pool_m_idx + valid_m &&
+                                        m_out < num_saved_pool_tokens
+                                    ) {
                                         const uint64_t output_idx =
                                             static_cast<uint64_t>(
                                                 m_out) *
@@ -1399,7 +1405,12 @@ sm100_bf16_mega_moe_impl(void* y,
                     ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
 
                     if constexpr (kSaveDownUnweighted) {
-                        if (warp_idx_in_wg == 0 &&
+                        const uint32_t saved_store_row =
+                            pool_m_idx +
+                            epilogue_wg_idx * WG_BLOCK_M +
+                            s * STORE_BLOCK_M;
+                        if (saved_store_row < num_saved_pool_tokens &&
+                            warp_idx_in_wg == 0 &&
                             cute::elect_one_sync()) {
                             cute::tma_store_fence();
                             #pragma unroll
