@@ -982,6 +982,9 @@ template <
     RouteWeightMode kRouteWeightMode = RouteWeightMode::PreDown,
     CombineOrderMode kCombineOrderMode = CombineOrderMode::FixedTopK,
     bool kInputsPrepared = false,
+    bool kDirectRemoteGradX = false,
+    bool kWriteGradXPool = true,
+    bool kClearWgradPadding = false,
     uint32_t kNumNonEpilogueThreads = 128,
     uint32_t kNumEpilogueThreads = 128,
     uint32_t kNumThreads =
@@ -1035,11 +1038,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
     float* grad_route_output,
     uint32_t* weight_tile_states,
     const uint32_t launch_epoch,
-    const float activation_limit,
-    const bool compute_w13_dgrad,
-    const bool direct_remote_grad_x,
-    const bool write_grad_x_pool,
-    const bool clear_wgrad_padding) {
+    const float activation_limit) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)) || defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::TMEM::Allocator2Sm;
@@ -1132,19 +1131,21 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
     const uint32_t lane_idx = ptx::get_lane_idx();
 
     if (warp_idx == 0) {
-        cute::prefetch_tma_descriptor(&tensor_map_acts);
-        cute::prefetch_tma_descriptor(&tensor_map_acts_sf);
-        cute::prefetch_tma_descriptor(&tensor_map_weights);
-        cute::prefetch_tma_descriptor(&tensor_map_weights_sf);
-        cute::prefetch_tma_descriptor(&tensor_map_output);
         cute::prefetch_tma_descriptor(&tensor_map_grad_ye);
         cute::prefetch_tma_descriptor(&tensor_map_w2_dequant);
-        cute::prefetch_tma_descriptor(&tensor_map_w2_weights);
-        cute::prefetch_tma_descriptor(&tensor_map_w2_scales);
         cute::prefetch_tma_descriptor(&tensor_map_w13_dequant);
-        cute::prefetch_tma_descriptor(&tensor_map_w13_weights);
-        cute::prefetch_tma_descriptor(&tensor_map_w13_scales);
         cute::prefetch_tma_descriptor(&tensor_map_grad_gate_up);
+        if constexpr (!kBF16Mode) {
+            cute::prefetch_tma_descriptor(&tensor_map_acts);
+            cute::prefetch_tma_descriptor(&tensor_map_acts_sf);
+            cute::prefetch_tma_descriptor(&tensor_map_weights);
+            cute::prefetch_tma_descriptor(&tensor_map_weights_sf);
+            cute::prefetch_tma_descriptor(&tensor_map_output);
+            cute::prefetch_tma_descriptor(&tensor_map_w2_weights);
+            cute::prefetch_tma_descriptor(&tensor_map_w2_scales);
+            cute::prefetch_tma_descriptor(&tensor_map_w13_weights);
+            cute::prefetch_tma_descriptor(&tensor_map_w13_scales);
+        }
     }
 
     constexpr uint32_t SMEM_CD_SIZE_PER_STAGE =
@@ -1901,7 +1902,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
         // The 1024-thread dgrad launch already reserves extra warps. Reuse one
         // warpgroup as the third role instead of increasing the launch size.
         constexpr uint32_t kNumDispatchRegisters =
-            kBF16Mode ? 40 : 48;
+            kBF16Mode ? 56 : 48;
         cutlass::arch::warpgroup_reg_dealloc<kNumDispatchRegisters>();
         if constexpr (
             kNumRanks > 1 &&
@@ -2029,7 +2030,10 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
         // otherwise-idle warps.  Padding rows are explicitly zeroed so the
         // k-grouped wgrad mainloop can round K up to 64 without reading the
         // following expert.
-        cutlass::arch::warpgroup_reg_dealloc<40>();
+        constexpr uint32_t kNumXPoolRegisters =
+            kBF16Mode ? 56 : 40;
+        cutlass::arch::warpgroup_reg_dealloc<
+            kNumXPoolRegisters>();
         constexpr uint32_t kFirstXPoolWarp = 12;
         constexpr uint32_t kNumXPoolThreads =
             kNumThreads - kFirstXPoolWarp * 32;
@@ -2137,7 +2141,10 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
           }
         }
     } else {
-        cutlass::arch::warpgroup_reg_dealloc<24>();
+        constexpr uint32_t kNumIdleRegisters =
+            kBF16Mode ? 56 : 24;
+        cutlass::arch::warpgroup_reg_dealloc<
+            kNumIdleRegisters>();
     }
 
     {
@@ -2218,7 +2225,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                 []() { __syncthreads(); });
         }
         if constexpr (kNumRanks > 1) {
-            if (direct_remote_grad_x) {
+            if constexpr (kDirectRemoteGradX) {
                 // backward_grad_y aliases combine plane zero. All ranks must
                 // finish remotely pulling it before any W13 dgrad epilogue
                 // reuses the combine planes for direct grad-x writes.
@@ -2266,16 +2273,18 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                     []() { __syncthreads(); });
             }
         }
-        if (warp_idx >= kDispatchWarpStart &&
-            warp_idx <
-                kDispatchWarpStart +
-                    kNumDispatchWarps) {
-            // Dispatch used 48 registers; transition down to the common
-            // dgrad epilogue budget with dealloc, not reg_alloc (allocating a
-            // lower count is an illegal instruction on SM100).
-            cutlass::arch::warpgroup_reg_dealloc<40>();
-        } else if (warp_idx >= kDispatchWarpStart) {
-            cutlass::arch::warpgroup_reg_alloc<40>();
+        if constexpr (!kBF16Mode) {
+            if (warp_idx >= kDispatchWarpStart &&
+                warp_idx <
+                    kDispatchWarpStart +
+                        kNumDispatchWarps) {
+                // Dispatch used 48 registers; transition down to the common
+                // dgrad epilogue budget with dealloc, not reg_alloc
+                // (allocating a lower count is illegal on SM100).
+                cutlass::arch::warpgroup_reg_dealloc<40>();
+            } else if (warp_idx >= kDispatchWarpStart) {
+                cutlass::arch::warpgroup_reg_alloc<40>();
+            }
         }
         const auto for_each_dgrad_block = [&](const auto& func) {
             uint32_t next_assigned_block = blockIdx.x;
@@ -4462,14 +4471,14 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                             uint8_t*>(
                                             smem_cd[0]) +
                                         smem_byte_offset);
-                                if (write_grad_x_pool) {
+                                if constexpr (kWriteGradXPool) {
                                     grad_x_pool_output[
                                         static_cast<uint64_t>(
                                             pool_row) *
                                             kHidden +
                                         out_col] = value;
                                 }
-                                if (direct_remote_grad_x) {
+                                if constexpr (kDirectRemoteGradX) {
                                     const auto metadata =
                                         token_src_metadata[
                                             pool_row];
@@ -4507,7 +4516,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
         }
 
         if constexpr (kNumRanks > 1) {
-            if (direct_remote_grad_x) {
+            if constexpr (kDirectRemoteGradX) {
                 // Publish every direct NVLink store before any destination
                 // rank returns from the kernel and consumes its source planes.
                 constexpr uint32_t
@@ -4600,10 +4609,8 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
         // Standalone Kernel B consumes only these three padded operands. Valid
         // rows are fully overwritten above; clear only the final partial block
         // of each expert instead of memset'ing every active scratch prefix.
-        if (clear_wgrad_padding)
+        if constexpr (kClearWgradPadding)
             clear_wgrad_padding_rows();
-
-
 
         __syncthreads();
         comm::cluster_sync_with_relaxed_arrive();

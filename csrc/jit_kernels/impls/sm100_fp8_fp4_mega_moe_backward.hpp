@@ -214,6 +214,9 @@ static void __instantiate_kernel() {{
             {},
             {},
             {},
+            {},
+            {},
+            {},
             {}
         >);
 }};
@@ -235,7 +238,10 @@ static void __instantiate_kernel() {{
                 args.route_weight_mode),
             get_backward_combine_order_mode_name(
                 args.combine_order_mode),
-            args.inputs_prepared ? "true" : "false");
+            args.inputs_prepared ? "true" : "false",
+            args.direct_remote_grad_x ? "true" : "false",
+            args.write_grad_x_pool ? "true" : "false",
+            args.clear_wgrad_padding ? "true" : "false");
     }
 
     static void launch_impl(
@@ -290,11 +296,7 @@ static void __instantiate_kernel() {{
             args.grad_route_output,
             args.grid_sync_counter,
             args.launch_epoch,
-            args.activation_limit,
-            args.compute_w13_dgrad,
-            args.direct_remote_grad_x,
-            args.write_grad_x_pool,
-            args.clear_wgrad_padding));
+            args.activation_limit));
     }
 };
 
