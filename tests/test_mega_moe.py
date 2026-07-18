@@ -327,8 +327,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     def combine_source_planes(
         source_planes: torch.Tensor,
         source_weights: torch.Tensor | None = None,
-        *,
-        expert_major_within_rank: bool = False,
     ) -> torch.Tensor:
         """Reduce local [token, slot, hidden] planes in the selected order."""
         if args.combine_order_mode == 'fixed_topk':
@@ -350,6 +348,24 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             (num_tokens, source_planes.size(-1)),
             dtype=torch.float32,
             device=source_planes.device)
+        if args.combine_order_mode == 'deepep_v1':
+            for master_rank in range(num_ranks):
+                rank_partial = torch.zeros_like(combined)
+                for slot in range(num_topk):
+                    in_rank = (
+                        valid[:, slot] &
+                        (route_ranks[:, slot] == master_rank)
+                    )
+                    slot_values = source_planes[:, slot].float()
+                    if source_weights is not None:
+                        slot_values = slot_values * source_weights[
+                            :, slot].float().unsqueeze(1)
+                    rank_partial += torch.where(
+                        in_rank.unsqueeze(1),
+                        slot_values,
+                        0.0)
+                combined += rank_partial.to(torch.bfloat16).float()
+            return combined.to(torch.bfloat16)
         for master_slot in range(num_topk):
             master_rank = route_ranks[:, master_slot]
             is_last_for_rank = valid[:, master_slot].clone()
@@ -360,30 +376,19 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                     (route_ranks[:, later_slot] ==
                      master_rank))
             rank_partial = torch.zeros_like(combined)
-            expert_order = (
-                range(num_experts_per_rank)
-                if expert_major_within_rank
-                else (None,)
-            )
-            for local_expert in expert_order:
-                for slot in range(num_topk):
-                    in_rank = (
-                        is_last_for_rank &
-                        valid[:, slot] &
-                        (route_ranks[:, slot] == master_rank))
-                    if local_expert is not None:
-                        in_rank &= (
-                            topk_idx[:num_tokens, slot] %
-                            num_experts_per_rank ==
-                            local_expert)
-                    slot_values = source_planes[:, slot].float()
-                    if source_weights is not None:
-                        slot_values = slot_values * source_weights[
-                            :, slot].float().unsqueeze(1)
-                    rank_partial += torch.where(
-                        in_rank.unsqueeze(1),
-                        slot_values,
-                        0.0)
+            for slot in range(num_topk):
+                in_rank = (
+                    is_last_for_rank &
+                    valid[:, slot] &
+                    (route_ranks[:, slot] == master_rank))
+                slot_values = source_planes[:, slot].float()
+                if source_weights is not None:
+                    slot_values = slot_values * source_weights[
+                        :, slot].float().unsqueeze(1)
+                rank_partial += torch.where(
+                    in_rank.unsqueeze(1),
+                    slot_values,
+                    0.0)
             combined += rank_partial.to(torch.bfloat16).float()
         return combined.to(torch.bfloat16)
 
@@ -509,14 +514,15 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             # Standard FireTitan grouped experts materialize F.silu's BF16
             # output before the separate BF16 multiply by W3(x).
             h = torch.nn.functional.silu(gate_clamped) * up_clamped
+            h_for_weight = h.float()
         else:
-            h = (
+            h_for_weight = (
                 _apply_gate_activation(
                     gate_clamped.float(), args.activation) *
-                up_clamped.float()
-            ).to(torch.bfloat16)
+                up_clamped.float())
+            h = h_for_weight.to(torch.bfloat16)
         h_weighted = (
-            h.float() * route_weights.unsqueeze(1)
+            h_for_weight * route_weights.unsqueeze(1)
         ).to(torch.bfloat16)
         w2_input = (
             h_weighted
@@ -556,7 +562,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         combine_route_output = (
             down
             if (
-                args.combine_order_mode == 'deepep' and
+                args.combine_order_mode != 'fixed_topk' and
                 args.route_weight_mode == 'post_down')
             else route_output)
         route_planes[
@@ -570,12 +576,10 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 all_topk_weights[
                     rank_idx, :num_tokens]
                 if (
-                    args.combine_order_mode == 'deepep' and
+                    args.combine_order_mode != 'fixed_topk' and
                     args.route_weight_mode == 'post_down')
                 else None
-            ),
-            expert_major_within_rank=(
-                args.combine_order_mode == 'deepep'))
+            ))
 
         # The non-EP DSV4 bridge accumulates already expert-sorted output in
         # increasing expert-id order. This is intentionally only local: EP
@@ -1503,25 +1507,25 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 dtype=torch.bfloat16, device='cuda')
             deep_gemm.bf16_mega_moe_backward_w2_combine(
                 grad_w2, grad_ye, h_weighted,
-                padded_expert_counts, grad_x_combined,
+                padded_expert_counts, block_m, grad_x_combined,
                 buffer,
                 route_weight_mode=deep_gemm.RouteWeightMode(
                     args.route_weight_mode))
             deep_gemm.bf16_mega_moe_backward_w13_combine(
                 grad_w13, grad_gate_up, x_pool,
-                padded_expert_counts, grad_x_combined,
+                padded_expert_counts, block_m, grad_x_combined,
                 buffer,
                 combine_order_mode=deep_gemm.CombineOrderMode(
                     args.combine_order_mode))
         else:
             deep_gemm.bf16_mega_moe_backward_w2(
                 grad_w2, grad_ye, h_weighted,
-                padded_expert_counts,
+                padded_expert_counts, block_m,
                 route_weight_mode=deep_gemm.RouteWeightMode(
                     args.route_weight_mode))
             deep_gemm.bf16_mega_moe_backward_w13(
                 grad_w13, grad_gate_up, x_pool,
-                padded_expert_counts)
+                padded_expert_counts, block_m)
         compact_grad_ye = ref_grad_ye[actual_pool_indices]
         compact_h_weighted = ref_h_weighted[actual_pool_indices]
         compact_grad_gate = ref_grad_gate_up[
@@ -1646,9 +1650,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 ],
                 'grad_x_source_planes')
             ref_grad_x = combine_source_planes(
-                ref_grad_x_planes[rank_idx, :num_tokens],
-                expert_major_within_rank=(
-                    args.combine_order_mode == 'deepep'))
+                ref_grad_x_planes[rank_idx, :num_tokens])
             assert_gradient_close(
                 grad_x_combined, ref_grad_x,
                 'grad_x_combined')
@@ -1884,7 +1886,7 @@ if __name__ == '__main__':
     parser.add_argument('--intermediate-hidden', type=int, default=3072, help='Intermediate hidden size')
     parser.add_argument('--activation', type=str, default='swiglu', choices=['swiglu', 'geglu'], help='Gated activation type')
     parser.add_argument('--route-weight-mode', type=str, default='pre_down', choices=['pre_down', 'post_down'], help='Location of the BF16 route-weight boundary')
-    parser.add_argument('--combine-order-mode', type=str, default='fixed_topk', choices=['fixed_topk', 'deepep'], help='Top-k combine reduction and BF16 materialization order')
+    parser.add_argument('--combine-order-mode', type=str, default='fixed_topk', choices=['fixed_topk', 'deepep', 'deepep_v1'], help='Top-k combine reduction and BF16 materialization order')
     parser.add_argument(
         '--backward-memory-mode',
         choices=['legacy', 'phase_ordered'],

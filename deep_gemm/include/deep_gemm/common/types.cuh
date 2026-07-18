@@ -71,6 +71,9 @@ enum class CombineOrderMode {
     // Match DeepEP V2's per-rank BF16 materialization boundary and reduce the
     // rank partials in the order of each rank's last top-k occurrence.
     DeepEP = 1,
+    // Match deterministic legacy DeepEP: reduce source top-k slots into one
+    // BF16 partial per destination rank, then add rank partials by rank.
+    DeepEPV1 = 2,
 };
 
 } // namespace deep_gemm

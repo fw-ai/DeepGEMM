@@ -311,7 +311,8 @@ static void bf16_mega_moe(
         route_weight_mode == "post_down");
     DG_HOST_ASSERT(
         combine_order_mode == "fixed_topk" ||
-        combine_order_mode == "deepep");
+        combine_order_mode == "deepep" ||
+        combine_order_mode == "deepep_v1");
 
     // Activation checks
     const auto activation_clamp =

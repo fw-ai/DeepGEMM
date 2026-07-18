@@ -26,6 +26,7 @@ class RouteWeightMode(str, Enum):
 class CombineOrderMode(str, Enum):
     FIXED_TOPK = 'fixed_topk'
     DEEPEP = 'deepep'
+    DEEPEP_V1 = 'deepep_v1'
 
 
 class SymmBuffer:

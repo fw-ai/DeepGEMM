@@ -21,6 +21,8 @@ static std::string get_bf16_gemm_combine_order_mode_name(
         return "CombineOrderMode::FixedTopK";
     if (combine_order_mode == "deepep")
         return "CombineOrderMode::DeepEP";
+    if (combine_order_mode == "deepep_v1")
+        return "CombineOrderMode::DeepEPV1";
     DG_HOST_UNREACHABLE("Unsupported combine order mode");
 }
 

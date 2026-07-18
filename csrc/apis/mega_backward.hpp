@@ -143,23 +143,25 @@ static void bf16_mega_moe_backward_w2(
     const torch::Tensor& grad_ye,
     const torch::Tensor& h_weighted,
     const torch::Tensor& padded_expert_counts,
+    const int& pool_block_m,
     const std::string& route_weight_mode) {
     DG_HOST_ASSERT(
         route_weight_mode == "pre_down" ||
         route_weight_mode == "post_down");
     deep_gemm::sm100_bf16_mega_moe_wgrad_1sm(
         grad_ye, h_weighted, grad_w2_output,
-        padded_expert_counts);
+        padded_expert_counts, pool_block_m);
 }
 
 static void bf16_mega_moe_backward_w13(
     const torch::Tensor& grad_w13_output,
     const torch::Tensor& grad_gate_up,
     const torch::Tensor& x_pool,
-    const torch::Tensor& padded_expert_counts) {
+    const torch::Tensor& padded_expert_counts,
+    const int& pool_block_m) {
     deep_gemm::sm100_bf16_mega_moe_wgrad_1sm(
         grad_gate_up, x_pool, grad_w13_output,
-        padded_expert_counts);
+        padded_expert_counts, pool_block_m);
 }
 
 static MegaMoEBackwardCombineArgs make_backward_combine_args(
@@ -186,8 +188,9 @@ static MegaMoEBackwardCombineArgs make_backward_combine_args(
     DG_HOST_ASSERT(num_max_tokens_per_rank >= grad_x_output.size(0));
     DG_HOST_ASSERT(
         combine_order_mode == "fixed_topk" ||
-        combine_order_mode == "deepep");
-    if (combine_order_mode == "deepep") {
+        combine_order_mode == "deepep" ||
+        combine_order_mode == "deepep_v1");
+    if (combine_order_mode != "fixed_topk") {
         DG_HOST_ASSERT(topk_ids.has_value());
         DG_HOST_ASSERT(topk_ids->is_cuda());
         DG_HOST_ASSERT(
@@ -238,6 +241,7 @@ static void bf16_mega_moe_backward_w2_combine(
     const torch::Tensor& grad_ye,
     const torch::Tensor& h_weighted,
     const torch::Tensor& padded_expert_counts,
+    const int& pool_block_m,
     const torch::Tensor& grad_x_output,
     const torch::Tensor& combine_buffer,
     const std::vector<int64_t>& sym_buffer_ptrs,
@@ -254,7 +258,7 @@ static void bf16_mega_moe_backward_w2_combine(
         static_cast<int>(padded_expert_counts.numel()), false);
     deep_gemm::sm100_bf16_mega_moe_wgrad_1sm(
         grad_ye, h_weighted, grad_w2_output,
-        padded_expert_counts, combine);
+        padded_expert_counts, pool_block_m, combine);
 }
 
 static void bf16_mega_moe_backward_w13_combine(
@@ -262,6 +266,7 @@ static void bf16_mega_moe_backward_w13_combine(
     const torch::Tensor& grad_gate_up,
     const torch::Tensor& x_pool,
     const torch::Tensor& padded_expert_counts,
+    const int& pool_block_m,
     const torch::Tensor& grad_x_output,
     const torch::Tensor& combine_buffer,
     const std::vector<int64_t>& sym_buffer_ptrs,
@@ -277,7 +282,7 @@ static void bf16_mega_moe_backward_w13_combine(
         topk_ids, combine_order_mode);
     deep_gemm::sm100_bf16_mega_moe_wgrad_1sm(
         grad_gate_up, x_pool, grad_w13_output,
-        padded_expert_counts, combine);
+        padded_expert_counts, pool_block_m, combine);
 }
 
 static void register_apis(pybind11::module_& m) {
@@ -369,17 +374,20 @@ static void register_apis(pybind11::module_& m) {
           py::arg("grad_w2_output"), py::arg("grad_ye"),
           py::arg("h_weighted"),
           py::arg("padded_expert_counts"),
+          py::arg("pool_block_m"),
           py::arg("route_weight_mode") = "pre_down");
     m.def("bf16_mega_moe_backward_w13",
           &bf16_mega_moe_backward_w13,
           py::arg("grad_w13_output"),
           py::arg("grad_gate_up"), py::arg("x_pool"),
-          py::arg("padded_expert_counts"));
+          py::arg("padded_expert_counts"),
+          py::arg("pool_block_m"));
     m.def("bf16_mega_moe_backward_w2_combine",
           &bf16_mega_moe_backward_w2_combine,
           py::arg("grad_w2_output"),
           py::arg("grad_ye"), py::arg("h_weighted"),
           py::arg("padded_expert_counts"),
+          py::arg("pool_block_m"),
           py::arg("grad_x_output"),
           py::arg("combine_buffer"),
           py::arg("sym_buffer_ptrs"), py::arg("rank"),
@@ -391,6 +399,7 @@ static void register_apis(pybind11::module_& m) {
           py::arg("grad_w13_output"),
           py::arg("grad_gate_up"), py::arg("x_pool"),
           py::arg("padded_expert_counts"),
+          py::arg("pool_block_m"),
           py::arg("grad_x_output"),
           py::arg("combine_buffer"),
           py::arg("sym_buffer_ptrs"), py::arg("rank"),

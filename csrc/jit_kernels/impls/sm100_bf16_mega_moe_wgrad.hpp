@@ -28,6 +28,7 @@ static void sm100_bf16_mega_moe_wgrad_1sm(
     const torch::Tensor& b,
     const torch::Tensor& d,
     const torch::Tensor& padded_expert_counts,
+    const int pool_block_m,
     const MegaMoEBackwardCombineArgs& combine = {}) {
     const auto [num_groups, m, n] = get_shape<3>(d);
     const auto [pool_rows_a, m_] = get_shape<2>(a);
@@ -43,14 +44,26 @@ static void sm100_bf16_mega_moe_wgrad_1sm(
         d.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(a.is_contiguous() and b.is_contiguous() and d.is_contiguous());
 
+    DG_HOST_ASSERT(
+        pool_block_m == 16 || pool_block_m == 32 ||
+        pool_block_m == 64 || pool_block_m == 96 ||
+        pool_block_m == 128 || pool_block_m == 192);
     constexpr int kBlockM = 128;
     // Amortize each A tile and scheduler assignment across twice as much
     // tensor-core work whenever the output width permits a full 256-column
     // tile. Keep the 128-column fallback for non-divisible model dimensions.
     const int kBlockN = n % 256 == 0 ? 256 : 128;
-    constexpr int kBlockK = 64;
+    // The K-grouped scheduler addresses each expert in the shared physical
+    // pool. Its K tile must divide the forward pool alignment; otherwise the
+    // final tile of one expert reads rows from the next expert. In particular,
+    // BLOCK_M=96 previously contaminated Qwen top-8 wgrads while BLOCK_M=128
+    // happened to pass.
+    const int kBlockK =
+        pool_block_m % 64 == 0 ? 64 :
+        pool_block_m % 32 == 0 ? 32 : 16;
     constexpr int kNumStages = 4;
-    constexpr int kSwizzle = 128;
+    const int kSwizzle =
+        kBlockK * static_cast<int>(sizeof(cutlass::bfloat16_t));
     constexpr int kStoreBlockN = 64;
     constexpr int kNumNonEpilogueThreads = 128;
     constexpr int kNumEpilogueThreads = 128;

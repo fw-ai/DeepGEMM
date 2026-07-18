@@ -1151,7 +1151,11 @@ sm100_bf16_mega_moe_impl(void* y,
                                 if constexpr (
                                     kActivationType ==
                                         ActivationType::SwiGLU) {
-                                    // aten::silu evaluates x / (1 + exp(-x)).
+                                    // CUDA aten::silu evaluates x / (1 +
+                                    // exp(-x)) directly. Multiplying x by a
+                                    // separately rounded reciprocal differs
+                                    // at BF16 product ties (for example
+                                    // x=0.78515625).
                                     activated = {
                                         gate.x / denom.x,
                                         gate.y / denom.y};
@@ -1180,14 +1184,27 @@ sm100_bf16_mega_moe_impl(void* y,
                                       __float22bfloat162_rn(
                                           activated))
                                 : activated;
+                            const auto h_fp32 =
+                                __fmul2_rn(
+                                    activated_for_mul, up);
                             const auto h_bf16 =
-                                __float22bfloat162_rn(
-                                    __fmul2_rn(
-                                        activated_for_mul, up));
+                                __float22bfloat162_rn(h_fp32);
+                            // DSV4 applies its pre-down route score while the
+                            // clamped activation is still FP32, then rounds the
+                            // weighted W2 input once. Other model families
+                            // materialize the activation as BF16 first.
+                            const auto h_for_weight =
+                                kRouteWeightMode ==
+                                            RouteWeightMode::PreDown &&
+                                        kActivationClamp !=
+                                            cute::numeric_limits<
+                                                float>::infinity()
+                                ? h_fp32
+                                : __bfloat1622float2(h_bf16);
                             const auto h_weighted_bf16 =
                                 __float22bfloat162_rn(
                                     __fmul2_rn(
-                                        __bfloat1622float2(h_bf16),
+                                        h_for_weight,
                                         weights));
                             if constexpr (
                                 kRouteWeightMode ==
@@ -1628,13 +1645,10 @@ sm100_bf16_mega_moe_impl(void* y,
                         load_stage_idx ^= 1;
                     }
                 } else {
-                    // FireTitan's DeepEP V2 path first atomically unpermutes
-                    // expert-major rows into one FP32 partial per destination
-                    // rank and stores that partial as BF16. Canonicalize the
-                    // nondeterministic atomic order as expert-major here.
-                    // DeepEP's final epilogue then accumulates the BF16 rank
-                    // partials in the order of each rank's last top-k
-                    // occurrence.
+                    // FireTitan's deterministic DeepEP V1 and V2 paths both
+                    // reduce each destination-rank partial in source top-k
+                    // slot order. V1 then uses rank order while V2 uses
+                    // last-slot rank order.
                     constexpr uint32_t kNumExpertsPerRank =
                         kNumExperts / kNumRanks;
                     const int dst_rank =
@@ -1651,14 +1665,51 @@ sm100_bf16_mega_moe_impl(void* y,
                             0xffffffff,
                             stored_topk_slot_idx >= 0 &&
                                 lane_idx ==
-                                    31 -
-                                        __clz(
-                                            same_rank_mask));
+                                    (kCombineOrderMode ==
+                                             CombineOrderMode::
+                                                 DeepEPV1
+                                         ? __ffs(
+                                               same_rank_mask) -
+                                               1
+                                         : 31 -
+                                               __clz(
+                                                   same_rank_mask)));
                     while (rank_master_mask) {
-                        const uint32_t rank_master_slot =
+                        uint32_t rank_master_slot =
                             __ffs(rank_master_mask) - 1;
+                        if constexpr (
+                            kCombineOrderMode ==
+                            CombineOrderMode::DeepEPV1) {
+                            int selected_rank =
+                                ptx::exchange(
+                                    dst_rank,
+                                    rank_master_slot);
+                            uint32_t candidates =
+                                rank_master_mask &
+                                ~(1u <<
+                                  rank_master_slot);
+                            while (candidates) {
+                                const uint32_t
+                                    candidate_slot =
+                                        __ffs(candidates) -
+                                        1;
+                                candidates &=
+                                    candidates - 1;
+                                const int candidate_rank =
+                                    ptx::exchange(
+                                        dst_rank,
+                                        candidate_slot);
+                                if (candidate_rank <
+                                    selected_rank) {
+                                    selected_rank =
+                                        candidate_rank;
+                                    rank_master_slot =
+                                        candidate_slot;
+                                }
+                            }
+                        }
                         rank_master_mask &=
-                            rank_master_mask - 1;
+                            ~(1u << rank_master_slot);
                         const int current_rank =
                             ptx::exchange(
                                 dst_rank,
@@ -1671,35 +1722,8 @@ sm100_bf16_mega_moe_impl(void* y,
                             kNumUint4PerLane *
                             kNumElemsPerUint4] = {};
                         while (rank_mask) {
-                            // Select the lowest expert id still present in
-                            // this rank. Expert ids are unique within a
-                            // token's top-k, so no slot tie-break is needed.
                             uint32_t slot_idx =
                                 __ffs(rank_mask) - 1;
-                            int selected_expert =
-                                ptx::exchange(
-                                    stored_topk_slot_idx,
-                                    slot_idx);
-                            uint32_t candidates =
-                                rank_mask &
-                                ~(1u << slot_idx);
-                            while (candidates) {
-                                const uint32_t candidate_slot =
-                                    __ffs(candidates) - 1;
-                                candidates &=
-                                    candidates - 1;
-                                const int candidate_expert =
-                                    ptx::exchange(
-                                        stored_topk_slot_idx,
-                                        candidate_slot);
-                                if (candidate_expert <
-                                    selected_expert) {
-                                    selected_expert =
-                                        candidate_expert;
-                                    slot_idx =
-                                        candidate_slot;
-                                }
-                            }
                             rank_mask &= ~(1u << slot_idx);
                             if (cute::elect_one_sync()) {
                                 const auto src_ptr =
@@ -1760,16 +1784,14 @@ sm100_bf16_mega_moe_impl(void* y,
                                                 j *
                                                     kNumElemsPerUint4 +
                                                 l];
-                                        value.x = __fadd_rn(
-                                            value.x,
-                                            __fmul_rn(
-                                                source.x,
-                                                route_weight));
-                                        value.y = __fadd_rn(
-                                            value.y,
-                                            __fmul_rn(
-                                                source.y,
-                                                route_weight));
+                                        value.x = __fmaf_rn(
+                                            source.x,
+                                            route_weight,
+                                            value.x);
+                                        value.y = __fmaf_rn(
+                                            source.y,
+                                            route_weight,
+                                            value.y);
                                     } else {
                                         ptx::accumulate(
                                             rank_reduced[

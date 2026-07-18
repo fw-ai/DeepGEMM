@@ -648,6 +648,7 @@ def bf16_mega_moe_backward_w2(
     grad_ye: torch.Tensor,
     h_weighted: torch.Tensor,
     padded_expert_counts: torch.Tensor,
+    pool_block_m: int,
     route_weight_mode: RouteWeightMode = RouteWeightMode.PRE_DOWN,
 ) -> None:
     """Run standalone single-CTA BF16 W2 wgrad for local experts."""
@@ -657,6 +658,7 @@ def bf16_mega_moe_backward_w2(
         grad_ye,
         h_weighted,
         padded_expert_counts,
+        pool_block_m,
         route_weight_mode.value,
     )
 
@@ -666,6 +668,7 @@ def bf16_mega_moe_backward_w13(
     grad_gate_up: torch.Tensor,
     x_pool: torch.Tensor,
     padded_expert_counts: torch.Tensor,
+    pool_block_m: int,
 ) -> None:
     """Run standalone single-CTA BF16 combined W1/W3 wgrad."""
     _C.bf16_mega_moe_backward_w13(
@@ -673,6 +676,7 @@ def bf16_mega_moe_backward_w13(
         grad_gate_up,
         x_pool,
         padded_expert_counts,
+        pool_block_m,
     )
 
 
@@ -681,6 +685,7 @@ def bf16_mega_moe_backward_w2_combine(
     grad_ye: torch.Tensor,
     h_weighted: torch.Tensor,
     padded_expert_counts: torch.Tensor,
+    pool_block_m: int,
     grad_x_output: torch.Tensor,
     sym_buffer: Any,
     route_weight_mode: RouteWeightMode = RouteWeightMode.PRE_DOWN,
@@ -692,6 +697,7 @@ def bf16_mega_moe_backward_w2_combine(
         grad_ye,
         h_weighted,
         padded_expert_counts,
+        pool_block_m,
         grad_x_output,
         sym_buffer.backward_grad_y,
         sym_buffer.handle.buffer_ptrs,
@@ -707,6 +713,7 @@ def bf16_mega_moe_backward_w13_combine(
     grad_gate_up: torch.Tensor,
     x_pool: torch.Tensor,
     padded_expert_counts: torch.Tensor,
+    pool_block_m: int,
     grad_x_output: torch.Tensor,
     sym_buffer: Any,
     combine_order_mode: CombineOrderMode =
@@ -719,6 +726,7 @@ def bf16_mega_moe_backward_w13_combine(
         grad_gate_up,
         x_pool,
         padded_expert_counts,
+        pool_block_m,
         grad_x_output,
         sym_buffer.backward_grad_y,
         sym_buffer.handle.buffer_ptrs,

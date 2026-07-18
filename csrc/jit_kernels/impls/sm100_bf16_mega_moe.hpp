@@ -39,6 +39,8 @@ static std::string get_combine_order_mode_name(
         return "CombineOrderMode::FixedTopK";
     if (combine_order_mode == "deepep")
         return "CombineOrderMode::DeepEP";
+    if (combine_order_mode == "deepep_v1")
+        return "CombineOrderMode::DeepEPV1";
     DG_HOST_UNREACHABLE("Unsupported combine order mode");
 }
 
@@ -211,7 +213,8 @@ static void sm100_bf16_mega_moe(
         route_weight_mode == "post_down");
     DG_HOST_ASSERT(
         combine_order_mode == "fixed_topk" ||
-        combine_order_mode == "deepep");
+        combine_order_mode == "deepep" ||
+        combine_order_mode == "deepep_v1");
     DG_HOST_ASSERT(
         saved_h_unweighted.has_value() ==
         saved_h_weighted.has_value());

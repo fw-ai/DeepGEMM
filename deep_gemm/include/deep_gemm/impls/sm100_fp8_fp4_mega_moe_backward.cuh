@@ -64,7 +64,7 @@ bf16_mega_moe_reduce_post_down_route(
     auto* route_lane_sums = reinterpret_cast<float*>(scratch);
     auto* route_control = reinterpret_cast<uint32_t*>(scratch);
     if constexpr (
-        kCombineOrderMode == CombineOrderMode::DeepEP) {
+        kCombineOrderMode != CombineOrderMode::FixedTopK) {
         // A sub-CTA named barrier is not safe while the persistent kernel's
         // earlier role-specific register/barrier phases are still live.
         // Assign one route to the CTA instead. The first Triton-sized thread
@@ -247,7 +247,7 @@ bf16_mega_moe_reduce_post_down_route(
             route_output_pow2,
             512u / kInitialRouteGroupThreads);
     const uint32_t route_group_threads =
-        kCombineOrderMode == CombineOrderMode::DeepEP
+        kCombineOrderMode != CombineOrderMode::FixedTopK
         ? kTritonRouteThreads
         : cute::min(
               kRouteInputPow2,
@@ -277,7 +277,7 @@ bf16_mega_moe_reduce_post_down_route(
                 route_pool_block_offset * BLOCK_M + token_idx;
             float grad_route = 0.0f;
             if constexpr (
-                kCombineOrderMode == CombineOrderMode::DeepEP) {
+                kCombineOrderMode != CombineOrderMode::FixedTopK) {
                 float grad_y[kTritonRouteValuesPerThread];
                 float down[kTritonRouteValuesPerThread];
                 #pragma unroll
@@ -529,7 +529,7 @@ sm100_bf16_mega_moe_backward_post_down_prelude(
             route_output_pow2,
             512u / kInitialRouteGroupThreads);
     const uint32_t route_group_threads =
-        kCombineOrderMode == CombineOrderMode::DeepEP
+        kCombineOrderMode != CombineOrderMode::FixedTopK
         ? kTritonRouteThreads
         : cute::min(
               kRouteInputPow2,
@@ -617,8 +617,8 @@ sm100_bf16_mega_moe_backward_post_down_prelude(
                         remote_x[col];
                 }
             } else if constexpr (
-                kCombineOrderMode ==
-                CombineOrderMode::DeepEP) {
+                kCombineOrderMode !=
+                CombineOrderMode::FixedTopK) {
                 float grad_y[
                     kTritonRouteValuesPerThread];
                 float down[

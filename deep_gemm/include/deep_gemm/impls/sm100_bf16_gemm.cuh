@@ -81,7 +81,9 @@ sm100_bf16_gemm_impl(int* grouped_layout,
     constexpr uint32_t UMMA_K = 16;
     constexpr uint32_t LOAD_BLOCK_M = BLOCK_M / (kIsMulticastOnA ? kNumMulticast: 1);
     constexpr uint32_t LOAD_BLOCK_N = BLOCK_N / (kIsMulticastOnA ? 1 : kNumMulticast);
-    DG_STATIC_ASSERT(BLOCK_K_ == 64, "Invalid block K");
+    DG_STATIC_ASSERT(
+        BLOCK_K_ == 16 || BLOCK_K_ == 32 || BLOCK_K_ == 64,
+        "Invalid block K");
     DG_STATIC_ASSERT(BLOCK_K % UMMA_K == 0, "Block K must be divisible by UMMA K");
     DG_STATIC_ASSERT(kKAlignment % UMMA_K == 0, "K alignment must be divisible by UMMA K");
     DG_STATIC_ASSERT(kNumMulticast == 1 or kNumMulticast == 2, "Only support 1/2 multicast");
@@ -553,45 +555,88 @@ sm100_bf16_gemm_impl(int* grouped_layout,
                             combine_topk_ids != nullptr);
                         DG_DEVICE_ASSERT(
                             combine_num_topk <= 32);
-                        for (uint32_t rank_master_slot = 0;
-                             rank_master_slot <
-                                 combine_num_topk;
-                             ++rank_master_slot) {
-                            const int64_t expert_idx =
-                                combine_topk_ids[
-                                    static_cast<uint64_t>(
-                                        token_idx) *
-                                        combine_num_topk +
-                                    rank_master_slot];
-                            if (expert_idx < 0)
-                                continue;
-                            const int dst_rank =
-                                static_cast<int>(
-                                    expert_idx /
-                                    kNumGroups);
-                            bool appears_later = false;
-                            for (uint32_t i =
-                                     rank_master_slot + 1;
-                                 i <
-                                     combine_num_topk;
-                                 ++i) {
+                        const uint32_t
+                            num_rank_iterations =
+                                kCombineOrderMode ==
+                                        CombineOrderMode::
+                                            DeepEPV1
+                                ? kCombineNumRanks
+                                : combine_num_topk;
+                        for (uint32_t rank_iteration = 0;
+                             rank_iteration <
+                                 num_rank_iterations;
+                             ++rank_iteration) {
+                            int dst_rank;
+                            if constexpr (
+                                kCombineOrderMode ==
+                                CombineOrderMode::
+                                    DeepEPV1) {
+                                dst_rank =
+                                    static_cast<int>(
+                                        rank_iteration);
+                                bool rank_is_present =
+                                    false;
+                                for (uint32_t i = 0;
+                                     i <
+                                         combine_num_topk;
+                                     ++i) {
+                                    const int64_t
+                                        expert_idx =
+                                            combine_topk_ids[
+                                                static_cast<
+                                                    uint64_t>(
+                                                    token_idx) *
+                                                    combine_num_topk +
+                                                i];
+                                    rank_is_present |=
+                                        expert_idx >= 0 &&
+                                        expert_idx /
+                                                kNumGroups ==
+                                            dst_rank;
+                                }
+                                if (!rank_is_present)
+                                    continue;
+                            } else {
                                 const int64_t
-                                    later_expert_idx =
+                                    expert_idx =
                                         combine_topk_ids[
                                             static_cast<
                                                 uint64_t>(
                                                 token_idx) *
                                                 combine_num_topk +
-                                            i];
-                                appears_later |=
-                                    later_expert_idx >=
-                                        0 &&
-                                    later_expert_idx /
-                                            kNumGroups ==
-                                        dst_rank;
+                                            rank_iteration];
+                                if (expert_idx < 0)
+                                    continue;
+                                dst_rank =
+                                    static_cast<int>(
+                                        expert_idx /
+                                        kNumGroups);
+                                bool appears_later =
+                                    false;
+                                for (uint32_t i =
+                                         rank_iteration +
+                                         1;
+                                     i <
+                                         combine_num_topk;
+                                     ++i) {
+                                    const int64_t
+                                        later_expert_idx =
+                                            combine_topk_ids[
+                                                static_cast<
+                                                    uint64_t>(
+                                                    token_idx) *
+                                                    combine_num_topk +
+                                                i];
+                                    appears_later |=
+                                        later_expert_idx >=
+                                            0 &&
+                                        later_expert_idx /
+                                                kNumGroups ==
+                                            dst_rank;
+                                }
+                                if (appears_later)
+                                    continue;
                             }
-                            if (appears_later)
-                                continue;
 
                             float rank_values[
                                 kReduceValuesPerVec] = {
@@ -617,48 +662,13 @@ sm100_bf16_gemm_impl(int* grouped_layout,
                                         1u << topk_idx;
                                 }
                             }
-                            // DeepEP's backward permutation is expert-major,
-                            // then source-token/top-k stable within an expert.
-                            // Its FP32 scatter uses atomics, so canonicalize
-                            // that nondeterministic local order as
-                            // expert-major before materializing the same BF16
-                            // rank partial.
+                            // TorchTitan's deterministic DeepEP V1 and V2
+                            // paths both reduce each rank partial in source
+                            // top-k slot order. Their cross-rank orders remain
+                            // distinct.
                             while (rank_mask) {
                                 uint32_t selected_slot =
                                     __ffs(rank_mask) - 1;
-                                int64_t selected_expert =
-                                    combine_topk_ids[
-                                        static_cast<uint64_t>(
-                                            token_idx) *
-                                            combine_num_topk +
-                                        selected_slot];
-                                uint32_t candidates =
-                                    rank_mask &
-                                    ~(1u << selected_slot);
-                                while (candidates) {
-                                    const uint32_t
-                                        candidate_slot =
-                                            __ffs(
-                                                candidates) -
-                                            1;
-                                    candidates &=
-                                        candidates - 1;
-                                    const int64_t
-                                        candidate_expert =
-                                            combine_topk_ids[
-                                                static_cast<
-                                                    uint64_t>(
-                                                    token_idx) *
-                                                    combine_num_topk +
-                                                candidate_slot];
-                                    if (candidate_expert <
-                                        selected_expert) {
-                                        selected_expert =
-                                            candidate_expert;
-                                        selected_slot =
-                                            candidate_slot;
-                                    }
-                                }
                                 rank_mask &=
                                     ~(1u << selected_slot);
                                 accumulate_slot(
