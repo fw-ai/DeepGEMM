@@ -558,8 +558,13 @@ sm100_bf16_mega_moe_backward_post_down_prelude(
         cute::min(
             route_output_pow2,
             512u / kInitialRouteGroupThreads);
+    // The dispatch-only launch copies vectorized BF16 payloads and does not
+    // need Triton's exact reduction lane map. Use more route groups per CTA
+    // so remote reads have enough independent rows to cover NVLink latency.
     const uint32_t route_group_threads =
-        kCombineOrderMode != CombineOrderMode::FixedTopK
+        !kComputeRouteDot && !kWriteWeighted
+        ? cute::min(kRouteInputPow2, 128u)
+        : kCombineOrderMode != CombineOrderMode::FixedTopK
         ? kTritonRouteThreads
         : cute::min(
               kRouteInputPow2,
@@ -1065,6 +1070,7 @@ template <
     RouteWeightMode kRouteWeightMode = RouteWeightMode::PreDown,
     CombineOrderMode kCombineOrderMode = CombineOrderMode::FixedTopK,
     bool kInputsPrepared = false,
+    bool kDispatchInputsPrepared = false,
     bool kDirectRemoteGradX = false,
     bool kWriteGradXPool = true,
     bool kClearWgradPadding = false,
@@ -1989,7 +1995,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
         cutlass::arch::warpgroup_reg_dealloc<kNumDispatchRegisters>();
         if constexpr (
             kNumRanks > 1 &&
-            !(kBF16Mode && kInputsPrepared)) {
+            !(kBF16Mode && kDispatchInputsPrepared)) {
             const uint32_t dispatch_warp_idx =
                 warp_idx - kDispatchWarpStart;
             const uint32_t dispatch_thread_idx =
@@ -2122,7 +2128,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
             kNumThreads - kFirstXPoolWarp * 32;
         const uint32_t x_thread_idx =
             (warp_idx - kFirstXPoolWarp) * 32 + lane_idx;
-        if constexpr (!(kBF16Mode && kInputsPrepared)) {
+        if constexpr (!(kBF16Mode && kDispatchInputsPrepared)) {
           uint32_t pool_block_offset = 0;
           uint32_t global_pool_block = 0;
           #pragma unroll
@@ -2234,7 +2240,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
         __syncthreads();
         if constexpr (
             kBF16Mode && kNumRanks == 1 &&
-            !kInputsPrepared) {
+            !kDispatchInputsPrepared) {
             // In single-rank BF16 mode the x-pool warps also stage grad-y.
             // Their pool-block assignment is independent of the dgrad tile
             // assignment, so a cluster barrier is insufficient before W2
@@ -2245,7 +2251,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                 backward_workspace, blockIdx.x, threadIdx.x,
                 []() { __syncthreads(); });
         }
-        if constexpr (kBF16Mode && !kInputsPrepared) {
+        if constexpr (kBF16Mode && !kDispatchInputsPrepared) {
             uint32_t grad_pool_block_offset = 0;
             #pragma unroll
             for (uint32_t expert_idx = 0;
@@ -2313,7 +2319,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                 // finish remotely pulling it before any W13 dgrad epilogue
                 // reuses the combine planes for direct grad-x writes.
                 if constexpr (
-                    !(kBF16Mode && kInputsPrepared)) {
+                    !(kBF16Mode && kDispatchInputsPrepared)) {
                     constexpr uint32_t
                         kBeforeDirectGradXGridSyncIndex = 2;
                     constexpr uint32_t

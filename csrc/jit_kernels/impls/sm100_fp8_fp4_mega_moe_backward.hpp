@@ -200,6 +200,7 @@ public:
         bool write_grad_x_pool;
         bool clear_wgrad_padding;
         bool inputs_prepared = false;
+        bool dispatch_inputs_prepared = false;
         LaunchArgs launch_args;
     };
 
@@ -216,6 +217,7 @@ static void __instantiate_kernel() {{
             {},
             {}, {}, {},
             {}, {},
+            {},
             {},
             {},
             {},
@@ -250,6 +252,7 @@ static void __instantiate_kernel() {{
             get_backward_combine_order_mode_name(
                 args.combine_order_mode),
             args.inputs_prepared ? "true" : "false",
+            args.dispatch_inputs_prepared ? "true" : "false",
             args.direct_remote_grad_x ? "true" : "false",
             args.write_grad_x_pool ? "true" : "false",
             args.clear_wgrad_padding ? "true" : "false");
@@ -1447,6 +1450,8 @@ static void sm100_bf16_mega_moe_backward_dgrad(
         .inputs_prepared =
             memory_mode == "phase_ordered" &&
             route_weight_mode == "post_down",
+        .dispatch_inputs_prepared =
+            memory_mode == "phase_ordered",
         .launch_args =
             LaunchArgs(num_sms, 1024, smem_size, 2),
     };

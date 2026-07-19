@@ -320,11 +320,8 @@ def bf16_mega_moe_backward_dgrad(
                 grad_y.to(torch.bfloat16).contiguous()
             ),
         )
-    inputs_prepared = (
-        memory_mode == "phase_ordered"
-        and route_weight_mode is RouteWeightMode.POST_DOWN
-    )
-    if inputs_prepared:
+    dispatch_inputs_prepared = memory_mode == "phase_ordered"
+    if dispatch_inputs_prepared:
         # The prelude starts with a device-side NVLink barrier. It publishes
         # local grad-y before pulling grad-y, x, and route weights with the
         # full persistent grid. POST_DOWN also performs its exact route dot
@@ -419,10 +416,44 @@ def bf16_mega_moe_backward_dgrad(
                 ),
             )
 
+        def launch_decomposed_input_prelude() -> None:
+            _timed_cuda_phase(
+                "rank_arrival_barrier",
+                lambda: launch_prelude(
+                    do_reverse_dispatch=False,
+                    compute_route_dot=False,
+                    write_weighted=False,
+                    synchronize_ranks=True,
+                    synchronize_after_dispatch=False,
+                    barrier_only=True,
+                ),
+            )
+            _timed_cuda_phase(
+                "reverse_dispatch_nvlink_pull",
+                lambda: launch_prelude(
+                    do_reverse_dispatch=True,
+                    compute_route_dot=False,
+                    write_weighted=False,
+                    synchronize_ranks=False,
+                    synchronize_after_dispatch=False,
+                ),
+            )
+            _timed_cuda_phase(
+                "final_rank_synchronization",
+                lambda: launch_prelude(
+                    do_reverse_dispatch=False,
+                    compute_route_dot=False,
+                    write_weighted=False,
+                    synchronize_ranks=False,
+                    synchronize_after_dispatch=True,
+                    barrier_only=True,
+                ),
+            )
+
         def launch_chunked_route_prelude() -> None:
             # Pull the two remote BF16 planes with the dispatch-only vector
             # path, then preserve the exact Triton route reduction tree while
-            # consuming the local grad-y plane.  Splitting here avoids coupling
+            # consuming the local grad-y plane. Splitting here avoids coupling
             # NVLink load coalescing to Triton's strided reduction lane map.
             _timed_cuda_phase(
                 "reverse_dispatch_nvlink_pull",
@@ -457,12 +488,16 @@ def bf16_mega_moe_backward_dgrad(
                 else (
                     launch_chunked_route_prelude
                     if prepare_route_and_weighted
-                    else lambda: launch_prelude(
-                        do_reverse_dispatch=True,
-                        compute_route_dot=False,
-                        write_weighted=False,
-                        synchronize_ranks=True,
-                        synchronize_after_dispatch=True,
+                    else (
+                        launch_decomposed_input_prelude
+                        if _BF16_BACKWARD_DECOMPOSE_PRELUDE
+                        else lambda: launch_prelude(
+                            do_reverse_dispatch=True,
+                            compute_route_dot=False,
+                            write_weighted=False,
+                            synchronize_ranks=True,
+                            synchronize_after_dispatch=True,
+                        )
                     )
                 )
             ),
