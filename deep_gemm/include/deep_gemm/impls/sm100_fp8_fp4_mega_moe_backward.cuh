@@ -1096,6 +1096,7 @@ template <
     CombineOrderMode kCombineOrderMode = CombineOrderMode::FixedTopK,
     bool kInputsPrepared = false,
     bool kDispatchInputsPrepared = false,
+    bool kOverlapPostDownRoute = false,
     bool kDirectRemoteGradX = false,
     bool kWriteGradXPool = true,
     bool kClearWgradPadding = false,
@@ -1175,6 +1176,12 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
         (kNumNonEpilogueThreads + kNumEpilogueThreads) / 32;
     constexpr uint32_t kNumDgradEpilogueThreads =
         kNumThreads - kNumNonEpilogueThreads;
+    constexpr uint32_t kNumPostDownRouteThreads =
+        kOverlapPostDownRoute ? 256 : 0;
+    constexpr uint32_t kPostDownRouteWarpStart =
+        kNumThreads / 32 - kNumPostDownRouteThreads / 32;
+    constexpr uint32_t kNumW2DgradEpilogueThreads =
+        kNumDgradEpilogueThreads - kNumPostDownRouteThreads;
     constexpr uint32_t kGranK = 32;
     constexpr uint32_t kNumUTCCPAlignedElems = 128;
     constexpr uint32_t kNumBlockNs = (2 * kIntermediateHidden) / BLOCK_N;
@@ -1215,6 +1222,17 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
     DG_STATIC_ASSERT(SF_BLOCK_N == BLOCK_N, "Invalid SFB block");
     DG_STATIC_ASSERT(kHidden % BLOCK_K == 0, "Invalid hidden size");
     DG_STATIC_ASSERT(kNumSMs % 2 == 0, "2-CTA clusters require an even SM count");
+    DG_STATIC_ASSERT(
+        !kOverlapPostDownRoute ||
+            (kBF16Mode && kHidden == 2048 && kNumRanks > 1 &&
+             kRouteWeightMode == RouteWeightMode::PostDown &&
+             kCombineOrderMode != CombineOrderMode::FixedTopK &&
+             kInputsPrepared && kDispatchInputsPrepared),
+        "POST_DOWN route overlap is only valid for prepared multi-rank H=2048 BF16");
+    DG_STATIC_ASSERT(
+        !kOverlapPostDownRoute ||
+            kNumW2DgradEpilogueThreads >= kNumEpilogueThreads,
+        "POST_DOWN route workers leave too few W2 epilogue threads");
 
     constexpr uint32_t kNumW13WeightTileStates =
         kNumExperts *
@@ -1224,6 +1242,10 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
         weight_tile_states + kNumW2WeightTileStates +
         kNumW13WeightTileStates;
     auto* phase_sense = phase_count + 1;
+    // BF16 uses canonical BF16 weights and never consumes the W2 dequant
+    // readiness range. The overlap specialization reuses that range as
+    // per-pool-block epochs, avoiding a separate workspace allocation.
+    auto* post_down_route_block_states = weight_tile_states;
     constexpr uint32_t kTraceSiteCount = 22;
     constexpr uint32_t kTraceValueCount = 5;
     constexpr uint32_t kTraceBeginCycle = 0;
@@ -2549,7 +2571,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
             for (uint32_t i = 0; i < kNumEpilogueStages; ++i) {
                 tmem_full_barriers[i]->init(1);
                 tmem_empty_barriers[i]->init(
-                    2 * kNumDgradEpilogueThreads);
+                    2 * kNumW2DgradEpilogueThreads);
             }
             cutlass::arch::fence_barrier_init();
         }
@@ -2569,6 +2591,12 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                     const uint32_t& valid_m) {
                     const uint32_t pool_block_idx =
                         pool_block_offset + m_block_idx;
+                    if constexpr (kOverlapPostDownRoute) {
+                        while (ptx::ld_acq(
+                                   post_down_route_block_states +
+                                   pool_block_idx) != launch_epoch) {
+                        }
+                    }
                     #pragma unroll 1
                     for (uint32_t k_block_idx = 0;
                          k_block_idx < kHidden / DGRAD_BLOCK_K;
@@ -2906,7 +2934,10 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                             (last / kNumEpilogueStages) & 1);
                 }
             }
-        } else if (warp_idx >= 4) {
+        } else if (
+            warp_idx >= 4 &&
+            warp_idx <
+                4 + kNumW2DgradEpilogueThreads / 32) {
             const uint32_t epilogue_warp_idx = warp_idx - 4;
             const uint32_t epilogue_thread_idx =
                 epilogue_warp_idx * 32 + lane_idx;
@@ -2932,7 +2963,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                     for (uint32_t s = 0;
                          s < effective_m / STORE_BLOCK_M; ++s) {
                         cutlass::arch::NamedBarrier::sync(
-                            kNumDgradEpilogueThreads, 0);
+                            kNumW2DgradEpilogueThreads, 0);
                         if (epilogue_warp_idx <
                             kNumEpilogueThreads / 32) {
                             #pragma unroll
@@ -2984,7 +3015,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                             }
                         }
                         cutlass::arch::NamedBarrier::sync(
-                            kNumDgradEpilogueThreads, 0);
+                            kNumW2DgradEpilogueThreads, 0);
 
                         #pragma unroll
                         for (uint32_t linear =
@@ -2992,7 +3023,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                              linear <
                                  STORE_BLOCK_M * BLOCK_N;
                              linear +=
-                                 kNumDgradEpilogueThreads) {
+                                 kNumW2DgradEpilogueThreads) {
                             const uint32_t row =
                                 linear / BLOCK_N;
                             const uint32_t n =
@@ -3341,7 +3372,243 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                     ptx::tcgen05_before_thread_sync();
                     tmem_empty_barriers[accum_stage]->arrive(0u);
                 });
+        } else if constexpr (kOverlapPostDownRoute) {
+            if (warp_idx >= kPostDownRouteWarpStart) {
+                constexpr uint32_t kRouteThreads = 256;
+                constexpr uint32_t kRouteWarps =
+                    kRouteThreads / 32;
+                constexpr uint32_t kRouteValuesPerThread =
+                    kHidden / kRouteThreads;
+                constexpr uint32_t kRouteNamedBarrierIdx = 14;
+                DG_STATIC_ASSERT(
+                    kRouteValuesPerThread == 8,
+                    "H=2048 route overlap must match Triton's eight values per thread");
+                DG_STATIC_ASSERT(
+                    kRouteWarps * sizeof(float) <=
+                        SMEM_DISPATCH_SIZE,
+                    "Route overlap scratch must fit the inactive dispatch plane");
+                auto* route_warp_sums =
+                    reinterpret_cast<float*>(smem_buffer);
+                const uint32_t route_thread_idx =
+                    (warp_idx - kPostDownRouteWarpStart) *
+                        32 +
+                    lane_idx;
+                const uint32_t route_warp_idx =
+                    route_thread_idx / 32;
+                const uint32_t route_lane_idx =
+                    route_thread_idx & 31;
+                uint32_t route_pool_block_offset = 0;
+                uint32_t global_pool_block = 0;
 
+                #pragma unroll
+                for (uint32_t expert_idx = 0;
+                     expert_idx < kNumExperts; ++expert_idx) {
+                    const uint32_t num_tokens =
+                        static_cast<uint32_t>(
+                            __ldg(expert_counts + expert_idx));
+                    const uint32_t num_blocks =
+                        math::ceil_div(num_tokens, BLOCK_M);
+                    for (uint32_t m_block_idx = 0;
+                         m_block_idx < num_blocks;
+                         ++m_block_idx, ++global_pool_block) {
+                        if (global_pool_block % kNumSMs !=
+                            blockIdx.x) {
+                            continue;
+                        }
+                        const uint32_t valid_m = cute::min(
+                            num_tokens -
+                                m_block_idx * BLOCK_M,
+                            BLOCK_M);
+                        const uint32_t pool_block_idx =
+                            route_pool_block_offset +
+                            m_block_idx;
+
+                        for (uint32_t row = 0;
+                             row < BLOCK_M; ++row) {
+                            const uint32_t pool_row =
+                                pool_block_idx * BLOCK_M +
+                                row;
+                            float grad_y[
+                                kRouteValuesPerThread];
+                            float down[
+                                kRouteValuesPerThread];
+                            #pragma unroll
+                            for (uint32_t i = 0;
+                                 i <
+                                     kRouteValuesPerThread;
+                                 ++i) {
+                                const uint32_t col =
+                                    route_thread_idx +
+                                    i * kRouteThreads;
+                                grad_y[i] =
+                                    row < valid_m
+                                    ? static_cast<float>(
+                                          grad_y_unweighted_output[
+                                              static_cast<
+                                                  uint64_t>(
+                                                  pool_row) *
+                                                  kHidden +
+                                              col])
+                                    : 0.0f;
+                                down[i] =
+                                    row < valid_m
+                                    ? static_cast<float>(
+                                          down_unweighted_output[
+                                              static_cast<
+                                                  uint64_t>(
+                                                  pool_row) *
+                                                  kHidden +
+                                              col])
+                                    : 0.0f;
+                            }
+
+                            const float pair_02 =
+                                __fmaf_rn(
+                                    grad_y[0], down[0],
+                                    __fmul_rn(
+                                        grad_y[2],
+                                        down[2]));
+                            const float pair_13 =
+                                __fmaf_rn(
+                                    grad_y[1], down[1],
+                                    __fmul_rn(
+                                        grad_y[3],
+                                        down[3]));
+                            const float pair_46 =
+                                __fmaf_rn(
+                                    grad_y[4], down[4],
+                                    __fmul_rn(
+                                        grad_y[6],
+                                        down[6]));
+                            const float pair_57 =
+                                __fmaf_rn(
+                                    grad_y[5], down[5],
+                                    __fmul_rn(
+                                        grad_y[7],
+                                        down[7]));
+                            float grad_route =
+                                __fadd_rn(
+                                    __fadd_rn(
+                                        pair_02, pair_46),
+                                    __fadd_rn(
+                                        pair_13, pair_57));
+                            #pragma unroll
+                            for (uint32_t offset = 16;
+                                 offset > 0;
+                                 offset >>= 1) {
+                                grad_route =
+                                    __fadd_rn(
+                                        grad_route,
+                                        __shfl_xor_sync(
+                                            0xffffffff,
+                                            grad_route,
+                                            offset));
+                            }
+                            if (route_lane_idx == 0) {
+                                route_warp_sums[
+                                    route_warp_idx] =
+                                    grad_route;
+                            }
+                            ptx::sync_aligned(
+                                kRouteThreads,
+                                kRouteNamedBarrierIdx);
+                            if (route_warp_idx == 0) {
+                                grad_route =
+                                    route_warp_sums[
+                                        route_lane_idx &
+                                        (kRouteWarps - 1)];
+                                #pragma unroll
+                                for (uint32_t offset =
+                                         kRouteWarps / 2;
+                                     offset > 0;
+                                     offset >>= 1) {
+                                    grad_route =
+                                        __fadd_rn(
+                                            grad_route,
+                                            __shfl_xor_sync(
+                                                0xffffffff,
+                                                grad_route,
+                                                offset));
+                                }
+                            }
+
+                            if (route_thread_idx == 0) {
+                                grad_route_output[pool_row] =
+                                    row < valid_m
+                                    ? grad_route
+                                    : 0.0f;
+                                if (row < valid_m) {
+                                    const auto metadata =
+                                        token_src_metadata[
+                                            pool_row];
+                                    auto* remote_grad_route =
+                                        backward_sym_buffer.map(
+                                            const_cast<float*>(
+                                                backward_topk_weights) +
+                                                static_cast<
+                                                    uint64_t>(
+                                                    metadata
+                                                        .token_idx) *
+                                                    num_topk +
+                                                metadata
+                                                    .topk_idx,
+                                            metadata.rank_idx);
+                                    *remote_grad_route =
+                                        grad_route;
+                                }
+                            }
+
+                            const float route_weight =
+                                row < valid_m
+                                ? route_weights_fp32[
+                                      pool_row]
+                                : 0.0f;
+                            #pragma unroll
+                            for (uint32_t i = 0;
+                                 i <
+                                     kRouteValuesPerThread;
+                                 ++i) {
+                                const uint32_t col =
+                                    route_thread_idx +
+                                    i * kRouteThreads;
+                                grad_ye_output[
+                                    static_cast<uint64_t>(
+                                        pool_row) *
+                                        kHidden +
+                                    col] =
+                                    cd_dtype_t(
+                                        __fmul_rn(
+                                            grad_y[i],
+                                            route_weight));
+                            }
+                            ptx::sync_aligned(
+                                kRouteThreads,
+                                kRouteNamedBarrierIdx);
+                        }
+
+                        // All 256 route threads contribute weighted columns.
+                        // Flush each writer, then release-publish the block
+                        // epoch so any CTA's W2 TMA producer may consume it.
+                        __threadfence();
+                        ptx::sync_aligned(
+                            kRouteThreads,
+                            kRouteNamedBarrierIdx);
+                        if (route_thread_idx == 0) {
+                            asm volatile(
+                                "st.release.gpu.global.u32 [%0], %1;"
+                                :: "l"(
+                                       post_down_route_block_states +
+                                       pool_block_idx),
+                                   "r"(launch_epoch)
+                                : "memory");
+                        }
+                        ptx::sync_aligned(
+                            kRouteThreads,
+                            kRouteNamedBarrierIdx);
+                    }
+                    route_pool_block_offset += num_blocks;
+                }
+            }
         }
 
         __syncthreads();
@@ -4967,9 +5234,12 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
 
         trace_end(21);
         if constexpr (kNumRanks > 1) {
-            if constexpr (kDirectRemoteGradX) {
-                // Publish every direct NVLink store before any destination
-                // rank returns from the kernel and consumes its source planes.
+            if constexpr (
+                kDirectRemoteGradX ||
+                kOverlapPostDownRoute) {
+                // Publish every direct grad-x and route-gradient NVLink store
+                // before any destination rank returns and consumes its source
+                // planes. One barrier covers both optional producers.
                 constexpr uint32_t
                     kDirectGradXDoneGridSyncIndex = 1;
                 constexpr uint32_t

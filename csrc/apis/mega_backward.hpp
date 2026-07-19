@@ -92,6 +92,7 @@ static void bf16_mega_moe_backward_dgrad(
     const int& num_topk,
     const std::string& combine_order_mode,
     const std::string& memory_mode,
+    const bool& overlap_post_down_route,
     const std::optional<torch::Tensor>& kernel_trace =
         std::nullopt) {
     deep_gemm::sm100_bf16_mega_moe_backward_dgrad(
@@ -109,6 +110,7 @@ static void bf16_mega_moe_backward_dgrad(
         backward_topk_weights, token_src_metadata,
         backward_sym_buffer_ptrs, backward_rank,
         num_max_tokens_per_rank, num_topk, memory_mode,
+        overlap_post_down_route,
         kernel_trace);
 }
 
@@ -364,6 +366,7 @@ static void register_apis(pybind11::module_& m) {
         py::arg("num_topk"),
         py::arg("combine_order_mode") = "fixed_topk",
         py::arg("memory_mode") = "legacy",
+        py::arg("overlap_post_down_route") = false,
         py::arg("kernel_trace") = py::none());
     m.def(
         "bf16_mega_moe_backward_post_down_prelude",

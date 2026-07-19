@@ -207,6 +207,7 @@ public:
         uint64_t* kernel_trace = nullptr;
         bool inputs_prepared = false;
         bool dispatch_inputs_prepared = false;
+        bool overlap_post_down_route = false;
         LaunchArgs launch_args;
     };
 
@@ -223,6 +224,7 @@ static void __instantiate_kernel() {{
             {},
             {}, {}, {},
             {}, {},
+            {},
             {},
             {},
             {},
@@ -262,6 +264,7 @@ static void __instantiate_kernel() {{
                 args.combine_order_mode),
             args.inputs_prepared ? "true" : "false",
             args.dispatch_inputs_prepared ? "true" : "false",
+            args.overlap_post_down_route ? "true" : "false",
             args.direct_remote_grad_x ? "true" : "false",
             args.write_grad_x_pool ? "true" : "false",
             args.clear_wgrad_padding ? "true" : "false",
@@ -1021,6 +1024,7 @@ static void sm100_bf16_mega_moe_backward_dgrad(
     const int& num_max_tokens_per_rank,
     const int& num_topk,
     const std::string& memory_mode,
+    const bool& overlap_post_down_route,
     const std::optional<torch::Tensor>& kernel_trace =
         std::nullopt) {
     constexpr int block_n = 128;
@@ -1052,6 +1056,13 @@ static void sm100_bf16_mega_moe_backward_dgrad(
     DG_HOST_ASSERT(
         memory_mode == "legacy" ||
         memory_mode == "phase_ordered");
+    if (overlap_post_down_route) {
+        DG_HOST_ASSERT(hidden == 2048);
+        DG_HOST_ASSERT(num_ranks > 1);
+        DG_HOST_ASSERT(route_weight_mode == "post_down");
+        DG_HOST_ASSERT(combine_order_mode != "fixed_topk");
+        DG_HOST_ASSERT(memory_mode == "phase_ordered");
+    }
     DG_HOST_ASSERT(num_ranks >= 1);
     DG_HOST_ASSERT(
         backward_rank >= 0 && backward_rank < num_ranks);
@@ -1276,6 +1287,14 @@ static void sm100_bf16_mega_moe_backward_dgrad(
     DG_HOST_ASSERT(
         grid_sync_counter.numel() >=
         num_w2_states + num_w13_states + 2);
+    if (overlap_post_down_route) {
+        // BF16 consumes canonical BF16 weights directly, so the W2 tile
+        // readiness range is otherwise unused. Reuse its prefix for
+        // route-block epochs instead of allocating another workspace.
+        DG_HOST_ASSERT(
+            (num_pool_rows + block_m - 1) / block_m <=
+            num_w2_states);
+    }
 
     const int smem_cd =
         store_block_m * block_n *
@@ -1498,6 +1517,8 @@ static void sm100_bf16_mega_moe_backward_dgrad(
             route_weight_mode == "post_down",
         .dispatch_inputs_prepared =
             memory_mode == "phase_ordered",
+        .overlap_post_down_route =
+            overlap_post_down_route,
         .launch_args =
             LaunchArgs(num_sms, 1024, smem_size, 2),
     };
@@ -1505,10 +1526,11 @@ static void sm100_bf16_mega_moe_backward_dgrad(
         SM100FP8FP4MegaMoEBackwardWaveRuntime::generate(args);
     const auto runtime = compiler->build(
         fmt::format(
-            "sm100_bf16_mega_moe_backward_dgrad_trace{}_vec{}_wide{}",
+            "sm100_bf16_mega_moe_backward_dgrad_trace{}_vec{}_wide{}_route_overlap{}",
             kernel_trace.has_value(),
             args.vectorized_grad_x_store,
-            args.wide_grad_x_store),
+            args.wide_grad_x_store,
+            args.overlap_post_down_route),
         code);
     SM100FP8FP4MegaMoEBackwardWaveRuntime::launch(
         runtime, args);
