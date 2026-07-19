@@ -378,12 +378,12 @@ def bf16_mega_moe_backward_dgrad(
             overlap_post_down_route_threads = int(_BF16_POST_DOWN_ROUTE_THREADS)
         except ValueError as exc:
             raise ValueError(
-                "DG_BF16_POST_DOWN_ROUTE_THREADS must be 64, 128, or 256, got "
+                "DG_BF16_POST_DOWN_ROUTE_THREADS must be 32, 64, 128, or 256, got "
                 f"{_BF16_POST_DOWN_ROUTE_THREADS!r}"
             ) from exc
-        if overlap_post_down_route_threads not in (64, 128, 256):
+        if overlap_post_down_route_threads not in (32, 64, 128, 256):
             raise ValueError(
-                "DG_BF16_POST_DOWN_ROUTE_THREADS must be 64, 128, or 256, got "
+                "DG_BF16_POST_DOWN_ROUTE_THREADS must be 32, 64, 128, or 256, got "
                 f"{overlap_post_down_route_threads}"
             )
     if dispatch_inputs_prepared:

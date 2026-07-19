@@ -1224,10 +1224,11 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
     DG_STATIC_ASSERT(kNumSMs % 2 == 0, "2-CTA clusters require an even SM count");
     DG_STATIC_ASSERT(
         kNumPostDownRouteThreads == 0 ||
+            kNumPostDownRouteThreads == 32 ||
             kNumPostDownRouteThreads == 64 ||
             kNumPostDownRouteThreads == 128 ||
             kNumPostDownRouteThreads == 256,
-        "POST_DOWN route overlap requires 64, 128, or 256 physical threads");
+        "POST_DOWN route overlap requires 32, 64, 128, or 256 physical threads");
     DG_STATIC_ASSERT(
         !kOverlapPostDownRoute ||
             (kBF16Mode && kHidden == 2048 && kNumRanks > 1 &&

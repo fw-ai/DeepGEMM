@@ -1058,6 +1058,7 @@ static void sm100_bf16_mega_moe_backward_dgrad(
         memory_mode == "phase_ordered");
     if (overlap_post_down_route_threads != 0) {
         DG_HOST_ASSERT(
+            overlap_post_down_route_threads == 32 ||
             overlap_post_down_route_threads == 64 ||
             overlap_post_down_route_threads == 128 ||
             overlap_post_down_route_threads == 256);
