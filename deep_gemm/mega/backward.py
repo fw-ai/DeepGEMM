@@ -50,6 +50,7 @@ _BF16_BACKWARD_SPLIT_BARRIER_FUSED_ROUTE = (
     os.getenv("DG_BF16_SPLIT_BARRIER_FUSED_ROUTE", "1") == "1"
 )
 _BF16_POST_DOWN_ROUTE_OVERLAP = os.getenv("DG_BF16_POST_DOWN_ROUTE_OVERLAP", "0") == "1"
+_BF16_POST_DOWN_ROUTE_THREADS = os.getenv("DG_BF16_POST_DOWN_ROUTE_THREADS", "128")
 
 
 def _timed_cuda_phase(name: str, operation: Callable[[], Any]) -> Any:
@@ -371,6 +372,20 @@ def bf16_mega_moe_backward_dgrad(
         and grad_y.shape[1] == 2048
         and sym_buffer.group.size() > 1
     )
+    overlap_post_down_route_threads = 0
+    if overlap_post_down_route:
+        try:
+            overlap_post_down_route_threads = int(_BF16_POST_DOWN_ROUTE_THREADS)
+        except ValueError as exc:
+            raise ValueError(
+                "DG_BF16_POST_DOWN_ROUTE_THREADS must be 64, 128, or 256, got "
+                f"{_BF16_POST_DOWN_ROUTE_THREADS!r}"
+            ) from exc
+        if overlap_post_down_route_threads not in (64, 128, 256):
+            raise ValueError(
+                "DG_BF16_POST_DOWN_ROUTE_THREADS must be 64, 128, or 256, got "
+                f"{overlap_post_down_route_threads}"
+            )
     if dispatch_inputs_prepared:
         # The prelude starts with a device-side NVLink barrier. It publishes
         # local grad-y before pulling grad-y, x, and route weights with the
@@ -653,7 +668,7 @@ def bf16_mega_moe_backward_dgrad(
             sym_buffer.num_topk,
             combine_order_mode.value,
             memory_mode,
-            overlap_post_down_route,
+            overlap_post_down_route_threads,
             kernel_trace,
         ),
     )

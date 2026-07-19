@@ -1096,7 +1096,7 @@ template <
     CombineOrderMode kCombineOrderMode = CombineOrderMode::FixedTopK,
     bool kInputsPrepared = false,
     bool kDispatchInputsPrepared = false,
-    bool kOverlapPostDownRoute = false,
+    uint32_t kNumPostDownRouteThreads = 0,
     bool kDirectRemoteGradX = false,
     bool kWriteGradXPool = true,
     bool kClearWgradPadding = false,
@@ -1176,8 +1176,8 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
         (kNumNonEpilogueThreads + kNumEpilogueThreads) / 32;
     constexpr uint32_t kNumDgradEpilogueThreads =
         kNumThreads - kNumNonEpilogueThreads;
-    constexpr uint32_t kNumPostDownRouteThreads =
-        kOverlapPostDownRoute ? 256 : 0;
+    constexpr bool kOverlapPostDownRoute =
+        kNumPostDownRouteThreads != 0;
     constexpr uint32_t kPostDownRouteWarpStart =
         kNumThreads / 32 - kNumPostDownRouteThreads / 32;
     constexpr uint32_t kNumW2DgradEpilogueThreads =
@@ -1222,6 +1222,12 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
     DG_STATIC_ASSERT(SF_BLOCK_N == BLOCK_N, "Invalid SFB block");
     DG_STATIC_ASSERT(kHidden % BLOCK_K == 0, "Invalid hidden size");
     DG_STATIC_ASSERT(kNumSMs % 2 == 0, "2-CTA clusters require an even SM count");
+    DG_STATIC_ASSERT(
+        kNumPostDownRouteThreads == 0 ||
+            kNumPostDownRouteThreads == 64 ||
+            kNumPostDownRouteThreads == 128 ||
+            kNumPostDownRouteThreads == 256,
+        "POST_DOWN route overlap requires 64, 128, or 256 physical threads");
     DG_STATIC_ASSERT(
         !kOverlapPostDownRoute ||
             (kBF16Mode && kHidden == 2048 && kNumRanks > 1 &&
@@ -3374,29 +3380,42 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                 });
         } else if constexpr (kOverlapPostDownRoute) {
             if (warp_idx >= kPostDownRouteWarpStart) {
-                constexpr uint32_t kRouteThreads = 256;
-                constexpr uint32_t kRouteWarps =
-                    kRouteThreads / 32;
-                constexpr uint32_t kRouteValuesPerThread =
-                    kHidden / kRouteThreads;
+                constexpr uint32_t kLogicalRouteThreads = 256;
+                constexpr uint32_t kLogicalRouteWarps =
+                    kLogicalRouteThreads / 32;
+                constexpr uint32_t kPhysicalRouteThreads =
+                    kNumPostDownRouteThreads;
+                constexpr uint32_t kPhysicalRouteWarps =
+                    kPhysicalRouteThreads / 32;
+                constexpr uint32_t kVirtualLanesPerThread =
+                    kLogicalRouteThreads /
+                    kPhysicalRouteThreads;
+                constexpr uint32_t
+                    kRouteValuesPerLogicalLane =
+                        kHidden / kLogicalRouteThreads;
                 constexpr uint32_t kRouteNamedBarrierIdx = 14;
                 DG_STATIC_ASSERT(
-                    kRouteValuesPerThread == 8,
-                    "H=2048 route overlap must match Triton's eight values per thread");
+                    kRouteValuesPerLogicalLane == 8,
+                    "H=2048 route overlap must match Triton's eight values per logical lane");
                 DG_STATIC_ASSERT(
-                    kRouteWarps * sizeof(float) <=
+                    kLogicalRouteThreads %
+                            kPhysicalRouteThreads ==
+                        0,
+                    "Physical route threads must evenly cover Triton's logical lanes");
+                DG_STATIC_ASSERT(
+                    kLogicalRouteWarps * sizeof(float) <=
                         SMEM_DISPATCH_SIZE,
                     "Route overlap scratch must fit the inactive dispatch plane");
                 auto* route_warp_sums =
                     reinterpret_cast<float*>(smem_buffer);
-                const uint32_t route_thread_idx =
+                const uint32_t physical_route_thread_idx =
                     (warp_idx - kPostDownRouteWarpStart) *
                         32 +
                     lane_idx;
-                const uint32_t route_warp_idx =
-                    route_thread_idx / 32;
-                const uint32_t route_lane_idx =
-                    route_thread_idx & 31;
+                const uint32_t physical_route_warp_idx =
+                    physical_route_thread_idx / 32;
+                const uint32_t physical_route_lane_idx =
+                    physical_route_thread_idx & 31;
                 uint32_t route_pool_block_offset = 0;
                 uint32_t global_pool_block = 0;
 
@@ -3428,98 +3447,147 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                             const uint32_t pool_row =
                                 pool_block_idx * BLOCK_M +
                                 row;
-                            float grad_y[
-                                kRouteValuesPerThread];
-                            float down[
-                                kRouteValuesPerThread];
-                            #pragma unroll
-                            for (uint32_t i = 0;
-                                 i <
-                                     kRouteValuesPerThread;
-                                 ++i) {
-                                const uint32_t col =
-                                    route_thread_idx +
-                                    i * kRouteThreads;
-                                grad_y[i] =
-                                    row < valid_m
-                                    ? static_cast<float>(
-                                          grad_y_unweighted_output[
-                                              static_cast<
-                                                  uint64_t>(
-                                                  pool_row) *
-                                                  kHidden +
-                                              col])
-                                    : 0.0f;
-                                down[i] =
-                                    row < valid_m
-                                    ? static_cast<float>(
-                                          down_unweighted_output[
-                                              static_cast<
-                                                  uint64_t>(
-                                                  pool_row) *
-                                                  kHidden +
-                                              col])
-                                    : 0.0f;
+                            const float route_weight =
+                                row < valid_m
+                                ? route_weights_fp32[
+                                      pool_row]
+                                : 0.0f;
+                            #pragma unroll 1
+                            for (uint32_t virtual_lane = 0;
+                                 virtual_lane <
+                                     kVirtualLanesPerThread;
+                                 ++virtual_lane) {
+                                const uint32_t
+                                    logical_route_thread_idx =
+                                        physical_route_thread_idx +
+                                        virtual_lane *
+                                            kPhysicalRouteThreads;
+                                const uint32_t
+                                    logical_route_warp_idx =
+                                        physical_route_warp_idx +
+                                        virtual_lane *
+                                            kPhysicalRouteWarps;
+                                float grad_y[
+                                    kRouteValuesPerLogicalLane];
+                                float down[
+                                    kRouteValuesPerLogicalLane];
+                                #pragma unroll
+                                for (uint32_t i = 0;
+                                     i <
+                                         kRouteValuesPerLogicalLane;
+                                     ++i) {
+                                    const uint32_t col =
+                                        logical_route_thread_idx +
+                                        i *
+                                            kLogicalRouteThreads;
+                                    grad_y[i] =
+                                        row < valid_m
+                                        ? static_cast<float>(
+                                              grad_y_unweighted_output[
+                                                  static_cast<
+                                                      uint64_t>(
+                                                      pool_row) *
+                                                      kHidden +
+                                                  col])
+                                        : 0.0f;
+                                    down[i] =
+                                        row < valid_m
+                                        ? static_cast<float>(
+                                              down_unweighted_output[
+                                                  static_cast<
+                                                      uint64_t>(
+                                                      pool_row) *
+                                                      kHidden +
+                                                  col])
+                                        : 0.0f;
+                                }
+
+                                const float pair_02 =
+                                    __fmaf_rn(
+                                        grad_y[0], down[0],
+                                        __fmul_rn(
+                                            grad_y[2],
+                                            down[2]));
+                                const float pair_13 =
+                                    __fmaf_rn(
+                                        grad_y[1], down[1],
+                                        __fmul_rn(
+                                            grad_y[3],
+                                            down[3]));
+                                const float pair_46 =
+                                    __fmaf_rn(
+                                        grad_y[4], down[4],
+                                        __fmul_rn(
+                                            grad_y[6],
+                                            down[6]));
+                                const float pair_57 =
+                                    __fmaf_rn(
+                                        grad_y[5], down[5],
+                                        __fmul_rn(
+                                            grad_y[7],
+                                            down[7]));
+                                float logical_lane_sum =
+                                    __fadd_rn(
+                                        __fadd_rn(
+                                            pair_02,
+                                            pair_46),
+                                        __fadd_rn(
+                                            pair_13,
+                                            pair_57));
+                                #pragma unroll
+                                for (uint32_t offset = 16;
+                                     offset > 0;
+                                     offset >>= 1) {
+                                    logical_lane_sum =
+                                        __fadd_rn(
+                                            logical_lane_sum,
+                                            __shfl_xor_sync(
+                                                0xffffffff,
+                                                logical_lane_sum,
+                                                offset));
+                                }
+                                if (physical_route_lane_idx ==
+                                    0) {
+                                    route_warp_sums[
+                                        logical_route_warp_idx] =
+                                        logical_lane_sum;
+                                }
+
+                                #pragma unroll
+                                for (uint32_t i = 0;
+                                     i <
+                                         kRouteValuesPerLogicalLane;
+                                     ++i) {
+                                    const uint32_t col =
+                                        logical_route_thread_idx +
+                                        i *
+                                            kLogicalRouteThreads;
+                                    grad_ye_output[
+                                        static_cast<uint64_t>(
+                                            pool_row) *
+                                            kHidden +
+                                        col] =
+                                        cd_dtype_t(
+                                            __fmul_rn(
+                                                grad_y[i],
+                                                route_weight));
+                                }
                             }
 
-                            const float pair_02 =
-                                __fmaf_rn(
-                                    grad_y[0], down[0],
-                                    __fmul_rn(
-                                        grad_y[2],
-                                        down[2]));
-                            const float pair_13 =
-                                __fmaf_rn(
-                                    grad_y[1], down[1],
-                                    __fmul_rn(
-                                        grad_y[3],
-                                        down[3]));
-                            const float pair_46 =
-                                __fmaf_rn(
-                                    grad_y[4], down[4],
-                                    __fmul_rn(
-                                        grad_y[6],
-                                        down[6]));
-                            const float pair_57 =
-                                __fmaf_rn(
-                                    grad_y[5], down[5],
-                                    __fmul_rn(
-                                        grad_y[7],
-                                        down[7]));
-                            float grad_route =
-                                __fadd_rn(
-                                    __fadd_rn(
-                                        pair_02, pair_46),
-                                    __fadd_rn(
-                                        pair_13, pair_57));
-                            #pragma unroll
-                            for (uint32_t offset = 16;
-                                 offset > 0;
-                                 offset >>= 1) {
-                                grad_route =
-                                    __fadd_rn(
-                                        grad_route,
-                                        __shfl_xor_sync(
-                                            0xffffffff,
-                                            grad_route,
-                                            offset));
-                            }
-                            if (route_lane_idx == 0) {
-                                route_warp_sums[
-                                    route_warp_idx] =
-                                    grad_route;
-                            }
+                            // All virtual logical warps have emitted their
+                            // partials in logical-warp order [0, 8).
                             ptx::sync_aligned(
-                                kRouteThreads,
+                                kPhysicalRouteThreads,
                                 kRouteNamedBarrierIdx);
-                            if (route_warp_idx == 0) {
+                            float grad_route = 0.0f;
+                            if (physical_route_warp_idx == 0) {
                                 grad_route =
                                     route_warp_sums[
-                                        route_lane_idx &
-                                        (kRouteWarps - 1)];
+                                        physical_route_lane_idx &
+                                        (kLogicalRouteWarps - 1)];
                                 #pragma unroll
                                 for (uint32_t offset =
-                                         kRouteWarps / 2;
+                                         kLogicalRouteWarps / 2;
                                      offset > 0;
                                      offset >>= 1) {
                                     grad_route =
@@ -3532,7 +3600,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                 }
                             }
 
-                            if (route_thread_idx == 0) {
+                            if (physical_route_thread_idx == 0) {
                                 grad_route_output[pool_row] =
                                     row < valid_m
                                     ? grad_route
@@ -3557,43 +3625,20 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                         grad_route;
                                 }
                             }
-
-                            const float route_weight =
-                                row < valid_m
-                                ? route_weights_fp32[
-                                      pool_row]
-                                : 0.0f;
-                            #pragma unroll
-                            for (uint32_t i = 0;
-                                 i <
-                                     kRouteValuesPerThread;
-                                 ++i) {
-                                const uint32_t col =
-                                    route_thread_idx +
-                                    i * kRouteThreads;
-                                grad_ye_output[
-                                    static_cast<uint64_t>(
-                                        pool_row) *
-                                        kHidden +
-                                    col] =
-                                    cd_dtype_t(
-                                        __fmul_rn(
-                                            grad_y[i],
-                                            route_weight));
-                            }
                             ptx::sync_aligned(
-                                kRouteThreads,
+                                kPhysicalRouteThreads,
                                 kRouteNamedBarrierIdx);
                         }
 
-                        // All 256 route threads contribute weighted columns.
-                        // Flush each writer, then release-publish the block
-                        // epoch so any CTA's W2 TMA producer may consume it.
+                        // Every physical thread contributes one or more
+                        // virtual lanes. Flush each writer, then
+                        // release-publish the block epoch so any CTA's W2 TMA
+                        // producer may consume it.
                         __threadfence();
                         ptx::sync_aligned(
-                            kRouteThreads,
+                            kPhysicalRouteThreads,
                             kRouteNamedBarrierIdx);
-                        if (route_thread_idx == 0) {
+                        if (physical_route_thread_idx == 0) {
                             asm volatile(
                                 "st.release.gpu.global.u32 [%0], %1;"
                                 :: "l"(
@@ -3603,7 +3648,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                 : "memory");
                         }
                         ptx::sync_aligned(
-                            kRouteThreads,
+                            kPhysicalRouteThreads,
                             kRouteNamedBarrierIdx);
                     }
                     route_pool_block_offset += num_blocks;
