@@ -38,20 +38,131 @@ def import_baseline():
 
 
 def _apply_gate_activation(gate: torch.Tensor, activation: str) -> torch.Tensor:
-    # Both variants reduce to `gate * sigmoid(z)`:
-    #  - SwiGLU: SiLU(gate)        => z = gate
-    #  - GeGLU:  tanh-approx GELU  => z = alpha * (gate + beta * gate ** 3),
-    #    since 0.5 * (1 + tanh(t)) == sigmoid(2 * t)
     if activation == 'swiglu':
-        z = gate
-    elif activation == 'geglu':
+        # Match FireTitan's F.silu CUDA boundary. Evaluating this as
+        # gate * sigmoid(gate) rounds the reciprocal separately and can move a
+        # later BF16 route-weight product across a tie.
+        return torch.nn.functional.silu(gate)
+    if activation == 'geglu':
         alpha = 1.5957691216057308  # 2 * sqrt(2 / pi)
         beta = 0.044715
         gate_sq = gate * gate
         z = (alpha * gate) * (1.0 + beta * gate_sq)
+        # 0.5 * (1 + tanh(t)) == sigmoid(2 * t).
+        return gate * torch.sigmoid(z)
+    raise ValueError(f'Unsupported activation: {activation}')
+
+
+def _triton_route_dot(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+    """Match DeepEP's FMA and butterfly order for one route per row."""
+    assert lhs.shape == rhs.shape and lhs.ndim == 2
+    if lhs.size(0) == 0:
+        return torch.empty(
+            (0,), dtype=torch.float32, device=lhs.device)
+    hidden = lhs.size(1)
+    block_h = 1
+    while block_h < hidden and block_h < 8192:
+        block_h <<= 1
+    num_warps = min(32, max(4, block_h // 256))
+    num_threads = num_warps * 32
+    values_per_thread = block_h // num_threads
+    assert values_per_thread in (2, 4, 8)
+
+    if hidden < block_h:
+        lhs = torch.nn.functional.pad(lhs, (0, block_h - hidden))
+        rhs = torch.nn.functional.pad(rhs, (0, block_h - hidden))
+    lhs_lanes = lhs.float().view(-1, values_per_thread, num_threads).transpose(1, 2)
+    rhs_lanes = rhs.float().view(-1, values_per_thread, num_threads).transpose(1, 2)
+
+    def fma(first: int, second: int) -> torch.Tensor:
+        product = lhs_lanes[:, :, second] * rhs_lanes[:, :, second]
+        return torch.addcmul(
+            product,
+            lhs_lanes[:, :, first],
+            rhs_lanes[:, :, first])
+
+    if values_per_thread == 2:
+        lane_sums = fma(0, 1)
+    elif values_per_thread == 4:
+        lane_sums = fma(0, 2) + fma(1, 3)
     else:
-        raise ValueError(f'Unsupported activation: {activation}')
-    return gate * torch.sigmoid(z)
+        lane_sums = (
+            fma(0, 2) + fma(4, 6) +
+            (fma(1, 3) + fma(5, 7)))
+
+    warp_lanes = lane_sums.view(-1, num_warps, 32)
+    lane_indices = torch.arange(32, device=lhs.device)
+    for offset in (16, 8, 4, 2, 1):
+        warp_lanes = (
+            warp_lanes +
+            warp_lanes[:, :, lane_indices ^ offset])
+    warp_sums = warp_lanes[:, :, 0]
+
+    warp_indices = torch.arange(num_warps, device=lhs.device)
+    offset = num_warps // 2
+    while offset:
+        warp_sums = warp_sums + warp_sums[:, warp_indices ^ offset]
+        offset >>= 1
+    return warp_sums[:, 0]
+
+
+def _native_route_dot(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+    """Match the fused backward kernel's four-column route reduction."""
+    assert lhs.shape == rhs.shape and lhs.ndim == 2
+    num_rows, hidden = lhs.shape
+    assert hidden % 4 == 0
+    if num_rows == 0:
+        return torch.empty(
+            (0,), dtype=torch.float32, device=lhs.device)
+
+    input_pow2 = 1
+    vectorized_columns = hidden // 4
+    while input_pow2 < 512 and input_pow2 * 2 <= vectorized_columns:
+        input_pow2 *= 2
+    initial_group_threads = min(input_pow2, 32)
+    output_pow2 = 1 << (max(num_rows, 1).bit_length() - 1)
+    block_height = min(output_pow2, 512 // initial_group_threads)
+    group_threads = min(input_pow2, 512 // block_height)
+    assert group_threads >= 32 and group_threads & (group_threads - 1) == 0
+
+    # CUDA assigns four adjacent columns to each lane, then advances by one
+    # whole route group. Keep the four accumulators separate until every
+    # column has been consumed.
+    products = (lhs.float() * rhs.float()).view(
+        num_rows, -1, group_threads, 4)
+    lane_sums = torch.zeros(
+        (num_rows, group_threads, 4),
+        dtype=torch.float32,
+        device=lhs.device)
+    for chunk in products.unbind(dim=1):
+        lane_sums = lane_sums + chunk
+    thread_sums = (
+        (lane_sums[:, :, 0] + lane_sums[:, :, 1]) +
+        lane_sums[:, :, 2]
+    ) + lane_sums[:, :, 3]
+
+    # Groups wider than one warp first fold through shared memory. The first
+    # warp then finishes with CUDA's shfl_down tree.
+    offset = group_threads // 2
+    while offset >= 32:
+        thread_sums = torch.cat(
+            (
+                thread_sums[:, :offset] +
+                thread_sums[:, offset:offset * 2],
+                thread_sums[:, offset * 2:],
+            ),
+            dim=1)
+        offset //= 2
+    warp_sums = thread_sums[:, :32]
+    for offset in (16, 8, 4, 2, 1):
+        warp_sums = torch.cat(
+            (
+                warp_sums[:, :offset] +
+                warp_sums[:, offset:offset * 2],
+                warp_sums[:, offset * 2:],
+            ),
+            dim=1)
+    return warp_sums[:, 0]
 
 
 def _dequant_x_fp8(x_fp8: torch.Tensor, sf_packed: torch.Tensor, gran_k: int = 32) -> torch.Tensor:
@@ -357,13 +468,19 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                         (route_ranks[:, slot] == master_rank)
                     )
                     slot_values = source_planes[:, slot].float()
-                    if source_weights is not None:
-                        slot_values = slot_values * source_weights[
-                            :, slot].float().unsqueeze(1)
-                    rank_partial += torch.where(
+                    selected_values = torch.where(
                         in_rank.unsqueeze(1),
                         slot_values,
                         0.0)
+                    if source_weights is None:
+                        rank_partial += selected_values
+                    else:
+                        # Match the fused post-down reducer's single FP32 FMA.
+                        rank_partial = torch.addcmul(
+                            rank_partial,
+                            selected_values,
+                            source_weights[
+                                :, slot].float().unsqueeze(1))
                 combined += rank_partial.to(torch.bfloat16).float()
             return combined.to(torch.bfloat16)
         for master_slot in range(num_topk):
@@ -382,13 +499,18 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                     valid[:, slot] &
                     (route_ranks[:, slot] == master_rank))
                 slot_values = source_planes[:, slot].float()
-                if source_weights is not None:
-                    slot_values = slot_values * source_weights[
-                        :, slot].float().unsqueeze(1)
-                rank_partial += torch.where(
+                selected_values = torch.where(
                     in_rank.unsqueeze(1),
                     slot_values,
                     0.0)
+                if source_weights is None:
+                    rank_partial += selected_values
+                else:
+                    rank_partial = torch.addcmul(
+                        rank_partial,
+                        selected_values,
+                        source_weights[
+                            :, slot].float().unsqueeze(1))
             combined += rank_partial.to(torch.bfloat16).float()
         return combined.to(torch.bfloat16)
 
@@ -695,6 +817,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         mismatch_detail = ''
         if mismatch_count:
             mismatch = actual != expected
+            flat_mismatch_indices = (
+                mismatch.flatten().nonzero().flatten())
             mismatch_ulps = bf16_ulp_distance(
                 actual[mismatch], expected[mismatch])
             ulps, ulp_counts = torch.unique(
@@ -707,23 +831,40 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 for ulp, count in zip(
                     ulps[top_indices].cpu().tolist(),
                     ulp_counts[top_indices].cpu().tolist()))
-            first_flat = int(
-                mismatch.flatten().nonzero()[0].item())
+            first_flat = int(flat_mismatch_indices[0].item())
             first_actual = float(actual.flatten()[first_flat].float())
             first_expected = float(
                 expected.flatten()[first_flat].float())
+            coordinate_detail = ''
+            if actual.ndim == 2:
+                columns = actual.size(1)
+                coordinate_detail = ', first_coords=' + ','.join(
+                    f'({int(flat_idx) // columns},'
+                    f'{int(flat_idx) % columns})'
+                    for flat_idx in
+                    flat_mismatch_indices[:12].cpu().tolist())
+                row_mismatches = mismatch.sum(dim=1)
+                mismatch_rows = row_mismatches.nonzero().flatten()
+                coordinate_detail += ', row_counts={' + ','.join(
+                    f'{int(row)}:{int(row_mismatches[row])}'
+                    for row in mismatch_rows[:12].cpu().tolist()
+                ) + '}'
             mismatch_detail = (
                 f', top_ulp_hist={{{ulp_histogram}}}, '
                 f'unique_ulps={ulps.numel()}, '
                 f'first_flat={first_flat}, '
                 f'first_actual={first_actual:.9g}, '
-                f'first_expected={first_expected:.9g}')
+                f'first_expected={first_expected:.9g}'
+                f'{coordinate_detail}')
+        # Keep passing output rank-0-only, but never hide a mismatch from a
+        # nonzero rank. Rank-local failures otherwise surface only as a generic
+        # spawn assertion without the tensor location or ULP histogram.
         dist_print(
-            f' > {name}: mismatches={mismatch_count}/'
+            f' > rank {rank_idx} {name}: mismatches={mismatch_count}/'
             f'{actual.numel()}, max_abs={max_abs:.9g}, '
             f'max_rel={max_relative:.9g}, max_ulp={max_ulp}'
             f'{mismatch_detail}',
-            once_in_node=True)
+            once_in_node=mismatch_count == 0)
         return mismatch_count
 
     def report_forward_stage_parity(
@@ -937,6 +1078,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             minlength=num_experts_per_rank).to(torch.int)
         padded_expert_counts = (
             (expert_counts + block_m - 1) // block_m * block_m)
+        wgrad_pool_rows = int(padded_expert_counts.sum().item())
 
         pool_rows = saved_l1_preact.size(0)
         phase_ordered_memory = (
@@ -1236,9 +1378,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 grad_h_w2.float() *
                 route.float().unsqueeze(1)
             ).to(torch.bfloat16)
-            grad_route = (
-                grad_h_w2.float() * h.float()
-            ).sum(dim=1)
+            grad_route = _native_route_dot(grad_h_w2, h)
         else:
             w2_input = h
             grad_w2_input = (
@@ -1252,9 +1392,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             gh = grad_h_w2
             down = native_bf16_grouped_mm(
                 h, l2_weights_bf16, offsets)
-            grad_route = (
-                gye.float() * down.float()
-            ).sum(dim=1)
+            grad_route = _triton_route_dot(gye, down)
             assert torch.equal(
                 reference_down_unweighted[pool_indices], down)
         if standard_bf16_swiglu:
@@ -1319,9 +1457,10 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             if not finite.all():
                 nonfinite = (~finite).nonzero()
                 dist_print(
-                    f' > {name}: nonfinite={nonfinite.size(0)}, '
-                    f'first={nonfinite[0].tolist()}',
-                    once_in_node=True)
+                    f' > rank {rank_idx} {name}: '
+                    f'nonfinite={nonfinite.size(0)}, '
+                    f'first={nonfinite[:12].tolist()}',
+                    once_in_node=False)
             assert finite.all(), name
             if actual.dtype == torch.bfloat16:
                 mismatch_count = report_bf16_parity(
@@ -1349,7 +1488,20 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             if mismatch_count:
                 gradient_mismatches[name] = mismatch_count
 
-        assert_gradient_close(grad_ye, ref_grad_ye, 'grad_ye')
+        def wgrad_observable(tensor: torch.Tensor) -> torch.Tensor:
+            # Phase-ordered outputs alias forward scratch. Kernel B consumes
+            # only expert-count-rounded rows; the bucket tail is intentionally
+            # left untouched and is no longer a logical tensor after reuse.
+            return (
+                tensor[:wgrad_pool_rows]
+                if phase_ordered_memory
+                else tensor
+            )
+
+        assert_gradient_close(
+            wgrad_observable(grad_ye),
+            wgrad_observable(ref_grad_ye),
+            'grad_ye')
         if not (
             phase_ordered_memory and
             args.route_weight_mode == 'post_down'
@@ -1359,15 +1511,18 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 'grad_y_unweighted')
             assert_gradient_close(grad_h, ref_grad_h, 'grad_h')
         assert_gradient_close(
-            grad_gate_up, ref_grad_gate_up,
+            wgrad_observable(grad_gate_up),
+            wgrad_observable(ref_grad_gate_up),
             'grad_gate_up')
         if (
             args.activation == 'geglu' and
             not torch.equal(
-                grad_gate_up, ref_grad_gate_up)
+                wgrad_observable(grad_gate_up),
+                wgrad_observable(ref_grad_gate_up))
         ):
             mismatch_rows = (
-                grad_gate_up != ref_grad_gate_up
+                wgrad_observable(grad_gate_up) !=
+                wgrad_observable(ref_grad_gate_up)
             ).nonzero()[:8]
             mismatch_details = []
             for pool_row, col in mismatch_rows.tolist():
@@ -1384,7 +1539,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                                 pool_row, 0])),
                 })
             print(
-                f' > rank {rank_idx} GeGLU full-pool mismatch details: '
+                f' > rank {rank_idx} GeGLU WGrad-pool mismatch details: '
                 f'{mismatch_details}; '
                 f'expert_counts={expert_counts.tolist()}',
                 flush=True)
@@ -1394,7 +1549,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         ):
             assert_gradient_close(h_act, ref_h_act, 'h_act')
         assert_gradient_close(
-            h_weighted, ref_h_weighted,
+            wgrad_observable(h_weighted),
+            wgrad_observable(ref_h_weighted),
             'h_weighted')
         assert_gradient_close(x_pool, ref_x_pool, 'x_pool')
         if args.write_grad_x_pool:
@@ -1479,15 +1635,13 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             offsets,
             rhs_needs_transpose=False))
         if args.route_weight_mode == 'pre_down':
-            repeated_grad_route = (
-                repeated_grad_h.float() * h.float()
-            ).sum(dim=1)
+            repeated_grad_route = _native_route_dot(
+                repeated_grad_h, h)
         else:
             repeated_down = native_bf16_grouped_mm(
                 h, l2_weights_bf16, offsets)
-            repeated_grad_route = (
-                gye.float() * repeated_down.float()
-            ).sum(dim=1)
+            repeated_grad_route = _triton_route_dot(
+                gye, repeated_down)
         assert_gradient_close(
             repeated_grad_h, grad_h_w2,
             'native_repeat_grad_h')
