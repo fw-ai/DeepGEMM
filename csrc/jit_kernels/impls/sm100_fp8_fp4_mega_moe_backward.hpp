@@ -59,6 +59,7 @@ public:
         bool synchronize_after_dispatch = true;
         bool barrier_only = false;
         bool x_prepared = false;
+        int route_prelude_threads = 256;
         const int* expert_counts;
         layout::Workspace backward_workspace;
         layout::SymBuffer<> backward_sym_buffer;
@@ -86,7 +87,7 @@ using namespace deep_gemm;
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(
         &sm100_bf16_mega_moe_backward_post_down_prelude<
-            {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+            {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
         >);
 }};
 )",
@@ -101,7 +102,8 @@ static void __instantiate_kernel() {{
             args.synchronize_ranks ? "true" : "false",
             args.synchronize_after_dispatch ? "true" : "false",
             args.barrier_only ? "true" : "false",
-            args.x_prepared ? "true" : "false");
+            args.x_prepared ? "true" : "false",
+            args.route_prelude_threads);
     }
 
     static void launch_impl(
@@ -780,7 +782,8 @@ static void sm100_bf16_mega_moe_backward_post_down_prelude(
     const bool& synchronize_ranks,
     const bool& synchronize_after_dispatch,
     const bool& barrier_only,
-    const bool& x_prepared) {
+    const bool& x_prepared,
+    const int& route_prelude_threads) {
     const auto [num_pool_rows, hidden] =
         get_shape<2>(grad_y_unweighted_output);
     const int num_experts =
@@ -798,6 +801,14 @@ static void sm100_bf16_mega_moe_backward_post_down_prelude(
     DG_HOST_ASSERT(hidden % 256 == 0);
     DG_HOST_ASSERT(block_m % 16 == 0);
     DG_HOST_ASSERT(num_topk > 0);
+    DG_HOST_ASSERT(
+        route_prelude_threads == 128 ||
+        route_prelude_threads == 256);
+    if (route_prelude_threads == 128) {
+        DG_HOST_ASSERT(hidden == 2048);
+        DG_HOST_ASSERT(compute_route_dot);
+        DG_HOST_ASSERT(combine_order_mode != "fixed_topk");
+    }
     const auto check_bf16_pool = [=](
         const torch::Tensor& tensor) {
         DG_HOST_ASSERT(
@@ -927,6 +938,8 @@ static void sm100_bf16_mega_moe_backward_post_down_prelude(
                 synchronize_after_dispatch,
             .barrier_only = barrier_only,
             .x_prepared = x_prepared,
+            .route_prelude_threads =
+                route_prelude_threads,
             .expert_counts = expert_counts.data_ptr<int>(),
             .backward_workspace = backward_workspace,
             .backward_sym_buffer = backward_sym_buffer,
@@ -977,11 +990,11 @@ static void sm100_bf16_mega_moe_backward_post_down_prelude(
         SM100BF16MegaMoEBackwardPostDownPreludeRuntime::
             generate(args);
     const auto runtime = compiler->build(fmt::format(
-        "sm100_bf16_mega_moe_backward_prelude_r{}_d{}_w{}_s{}_c{}_b{}_x{}",
+        "sm100_bf16_mega_moe_backward_prelude_r{}_d{}_w{}_s{}_c{}_b{}_x{}_t{}",
         do_reverse_dispatch, compute_route_dot,
         write_weighted, synchronize_ranks,
         synchronize_after_dispatch, barrier_only,
-        x_prepared), code);
+        x_prepared, route_prelude_threads), code);
     SM100BF16MegaMoEBackwardPostDownPreludeRuntime::launch(
         runtime, args);
 }

@@ -461,7 +461,8 @@ template <
     bool kSynchronizeRanks = true,
     bool kSynchronizeAfterDispatch = true,
     bool kBarrierOnly = false,
-    bool kXPrepared = false>
+    bool kXPrepared = false,
+    uint32_t kRoutePreludeThreads = 256>
 CUTLASS_GLOBAL __launch_bounds__(1024, 1) void
 sm100_bf16_mega_moe_backward_post_down_prelude(
     const int* expert_counts,
@@ -521,6 +522,31 @@ sm100_bf16_mega_moe_backward_post_down_prelude(
         kTritonRouteNumWarps * 32;
     constexpr uint32_t kTritonRouteValuesPerThread =
         kTritonRouteBlockH / kTritonRouteThreads;
+    constexpr bool kVirtualizeRouteLanes =
+        kRoutePreludeThreads == 128;
+    DG_STATIC_ASSERT(
+        kRoutePreludeThreads == 128 ||
+            kRoutePreludeThreads == 256,
+        "POST_DOWN route prelude requires 128 or 256 physical threads");
+    DG_STATIC_ASSERT(
+        !kVirtualizeRouteLanes ||
+            (kHidden == 2048 &&
+             kCombineOrderMode !=
+                 CombineOrderMode::FixedTopK &&
+             kComputeRouteDot),
+        "128-thread route prelude is only supported for the exact "
+        "non-fixed H=2048 route-dot path");
+    constexpr uint32_t kExactRouteGroupThreads =
+        kVirtualizeRouteLanes
+        ? kRoutePreludeThreads
+        : kTritonRouteThreads;
+    constexpr uint32_t kRouteVirtualLanes =
+        kTritonRouteThreads /
+        kExactRouteGroupThreads;
+    DG_STATIC_ASSERT(
+        kRouteVirtualLanes == 1 ||
+            kRouteVirtualLanes == 2,
+        "Unsupported POST_DOWN route lane virtualization");
     DG_STATIC_ASSERT(
         kTritonRouteValuesPerThread == 2 ||
             kTritonRouteValuesPerThread == 4 ||
@@ -570,7 +596,7 @@ sm100_bf16_mega_moe_backward_post_down_prelude(
         !kComputeRouteDot && !kWriteWeighted
         ? cute::min(kRouteInputPow2, 128u)
         : kCombineOrderMode != CombineOrderMode::FixedTopK
-        ? kTritonRouteThreads
+        ? kExactRouteGroupThreads
         : cute::min(
               kRouteInputPow2,
               512u / route_block_height);
@@ -715,108 +741,141 @@ sm100_bf16_mega_moe_backward_post_down_prelude(
             } else if constexpr (
                 kCombineOrderMode !=
                 CombineOrderMode::FixedTopK) {
-                float grad_y[
-                    kTritonRouteValuesPerThread];
-                float down[
-                    kTritonRouteValuesPerThread];
-                #pragma unroll
-                for (uint32_t i = 0;
-                     i < kTritonRouteValuesPerThread;
-                     ++i) {
-                    const uint32_t col =
+                if constexpr (kVirtualizeRouteLanes) {
+                    // Each physical lane evaluates logical lanes p and
+                    // p + 128. Their FMA and warp-XOR trees remain separate,
+                    // then the four physical warps publish all eight logical
+                    // Triton warp partials for the unchanged second level.
+                    float weighted_values
+                        [kRouteVirtualLanes]
+                        [kTritonRouteValuesPerThread];
+                    #pragma unroll
+                    for (uint32_t virtual_lane = 0;
+                     virtual_lane < kRouteVirtualLanes;
+                     ++virtual_lane) {
+                    const uint32_t logical_route_lane =
                         route_group_lane_idx +
-                        i * kTritonRouteThreads;
-                    grad_y[i] =
-                        col < kHidden
-                        ? static_cast<float>(
-                              remote_grad_y[col])
-                        : 0.0f;
-                    down[i] =
-                        col < kHidden
-                        ? static_cast<float>(
-                              down_unweighted[
-                                  static_cast<uint64_t>(
-                                      pool_row) *
-                                      kHidden +
-                                  col])
-                        : 0.0f;
-                    if constexpr (
-                        kDoReverseDispatch && !kXPrepared) {
-                        if (col < kHidden) {
-                            x_pool_output[
-                                static_cast<uint64_t>(
-                                    pool_row) *
-                                    kHidden +
-                                col] =
-                                remote_x[col];
+                        virtual_lane *
+                            kExactRouteGroupThreads;
+                    float grad_y[
+                        kTritonRouteValuesPerThread];
+                    float down[
+                        kTritonRouteValuesPerThread];
+                    #pragma unroll
+                    for (uint32_t i = 0;
+                         i <
+                             kTritonRouteValuesPerThread;
+                         ++i) {
+                        const uint32_t col =
+                            logical_route_lane +
+                            i * kTritonRouteThreads;
+                        grad_y[i] =
+                            col < kHidden
+                            ? static_cast<float>(
+                                  remote_grad_y[col])
+                            : 0.0f;
+                        down[i] =
+                            col < kHidden
+                            ? static_cast<float>(
+                                  down_unweighted[
+                                      static_cast<uint64_t>(
+                                          pool_row) *
+                                          kHidden +
+                                      col])
+                            : 0.0f;
+                        if constexpr (
+                            kDoReverseDispatch &&
+                            !kXPrepared) {
+                            if (col < kHidden) {
+                                x_pool_output[
+                                    static_cast<uint64_t>(
+                                        pool_row) *
+                                        kHidden +
+                                    col] =
+                                    remote_x[col];
+                            }
+                        }
+                        if constexpr (kWriteWeighted) {
+                            weighted_values[virtual_lane][i] =
+                                kWeightedSourceIsRhs
+                                ? down[i]
+                                : grad_y[i];
                         }
                     }
+                    float logical_grad_route;
+                    if constexpr (
+                        kTritonRouteValuesPerThread ==
+                        2) {
+                        logical_grad_route = __fmaf_rn(
+                            grad_y[0], down[0],
+                            __fmul_rn(
+                                grad_y[1], down[1]));
+                    } else if constexpr (
+                        kTritonRouteValuesPerThread ==
+                        4) {
+                        const float even = __fmaf_rn(
+                            grad_y[0], down[0],
+                            __fmul_rn(
+                                grad_y[2], down[2]));
+                        const float odd = __fmaf_rn(
+                            grad_y[1], down[1],
+                            __fmul_rn(
+                                grad_y[3], down[3]));
+                        logical_grad_route =
+                            __fadd_rn(even, odd);
+                    } else {
+                        const float pair_02 = __fmaf_rn(
+                            grad_y[0], down[0],
+                            __fmul_rn(
+                                grad_y[2], down[2]));
+                        const float pair_13 = __fmaf_rn(
+                            grad_y[1], down[1],
+                            __fmul_rn(
+                                grad_y[3], down[3]));
+                        const float pair_46 = __fmaf_rn(
+                            grad_y[4], down[4],
+                            __fmul_rn(
+                                grad_y[6], down[6]));
+                        const float pair_57 = __fmaf_rn(
+                            grad_y[5], down[5],
+                            __fmul_rn(
+                                grad_y[7], down[7]));
+                        logical_grad_route = __fadd_rn(
+                            __fadd_rn(
+                                pair_02, pair_46),
+                            __fadd_rn(
+                                pair_13, pair_57));
+                    }
+                    #pragma unroll
+                    for (uint32_t offset = 16;
+                         offset > 0; offset >>= 1) {
+                        logical_grad_route = __fadd_rn(
+                            logical_grad_route,
+                            __shfl_xor_sync(
+                                0xffffffff,
+                                logical_grad_route,
+                                offset));
+                    }
+                    const uint32_t lane_in_warp =
+                        route_group_lane_idx & 31;
+                    const uint32_t logical_warp =
+                        logical_route_lane / 32;
+                    if (lane_in_warp == 0) {
+                        route_lane_sums[
+                            route_group_idx *
+                                kTritonRouteNumWarps +
+                            logical_warp] =
+                            logical_grad_route;
+                    }
                 }
-                if constexpr (
-                    kTritonRouteValuesPerThread == 2) {
-                    grad_route = __fmaf_rn(
-                        grad_y[0], down[0],
-                        __fmul_rn(
-                            grad_y[1], down[1]));
-                } else if constexpr (
-                    kTritonRouteValuesPerThread == 4) {
-                    const float even = __fmaf_rn(
-                        grad_y[0], down[0],
-                        __fmul_rn(
-                            grad_y[2], down[2]));
-                    const float odd = __fmaf_rn(
-                        grad_y[1], down[1],
-                        __fmul_rn(
-                            grad_y[3], down[3]));
-                    grad_route =
-                        __fadd_rn(even, odd);
-                } else {
-                    const float pair_02 = __fmaf_rn(
-                        grad_y[0], down[0],
-                        __fmul_rn(
-                            grad_y[2], down[2]));
-                    const float pair_13 = __fmaf_rn(
-                        grad_y[1], down[1],
-                        __fmul_rn(
-                            grad_y[3], down[3]));
-                    const float pair_46 = __fmaf_rn(
-                        grad_y[4], down[4],
-                        __fmul_rn(
-                            grad_y[6], down[6]));
-                    const float pair_57 = __fmaf_rn(
-                        grad_y[5], down[5],
-                        __fmul_rn(
-                            grad_y[7], down[7]));
-                    grad_route = __fadd_rn(
-                        __fadd_rn(
-                            pair_02, pair_46),
-                        __fadd_rn(
-                            pair_13, pair_57));
-                }
-                #pragma unroll
-                for (uint32_t offset = 16;
-                     offset > 0; offset >>= 1) {
-                    grad_route = __fadd_rn(
-                        grad_route,
-                        __shfl_xor_sync(
-                            0xffffffff,
-                            grad_route, offset));
-                }
-                const uint32_t warp_in_group =
+                ptx::sync_aligned(
+                    kExactRouteGroupThreads,
+                    route_group_idx);
+                const uint32_t physical_warp_in_group =
                     route_group_lane_idx / 32;
                 const uint32_t lane_in_warp =
                     route_group_lane_idx & 31;
-                if (lane_in_warp == 0) {
-                    route_lane_sums[
-                        route_group_idx *
-                            kTritonRouteNumWarps +
-                        warp_in_group] =
-                        grad_route;
-                }
-                ptx::sync_aligned(
-                    kTritonRouteThreads,
-                    route_group_idx);
-                if (warp_in_group == 0) {
+                if (physical_warp_in_group == 0) {
                     grad_route = route_lane_sums[
                         route_group_idx *
                             kTritonRouteNumWarps +
@@ -837,23 +896,188 @@ sm100_bf16_mega_moe_backward_post_down_prelude(
                     const float route_weight =
                         route_weights_output[pool_row];
                     #pragma unroll
+                    for (uint32_t virtual_lane = 0;
+                         virtual_lane <
+                             kRouteVirtualLanes;
+                         ++virtual_lane) {
+                        #pragma unroll
+                        for (uint32_t i = 0;
+                             i <
+                                 kTritonRouteValuesPerThread;
+                             ++i) {
+                            const uint32_t col =
+                                route_group_lane_idx +
+                                virtual_lane *
+                                    kExactRouteGroupThreads +
+                                i *
+                                    kTritonRouteThreads;
+                            if (col < kHidden) {
+                                grad_y_weighted_output[
+                                    static_cast<uint64_t>(
+                                        pool_row) *
+                                        kHidden +
+                                    col] =
+                                    cutlass::bfloat16_t(
+                                        weighted_values[
+                                            virtual_lane]
+                                            [i] *
+                                        route_weight);
+                            }
+                        }
+                    }
+                }
+                } else {
+                    float grad_y[
+                        kTritonRouteValuesPerThread];
+                    float down[
+                        kTritonRouteValuesPerThread];
+                    #pragma unroll
                     for (uint32_t i = 0;
-                         i < kTritonRouteValuesPerThread;
+                         i <
+                             kTritonRouteValuesPerThread;
                          ++i) {
                         const uint32_t col =
                             route_group_lane_idx +
                             i * kTritonRouteThreads;
-                        if (col < kHidden) {
-                            grad_y_weighted_output[
-                                static_cast<uint64_t>(
-                                    pool_row) *
-                                    kHidden +
-                                col] =
-                                cutlass::bfloat16_t(
-                                    (kWeightedSourceIsRhs
-                                         ? down[i]
-                                         : grad_y[i]) *
-                                    route_weight);
+                        grad_y[i] =
+                            col < kHidden
+                            ? static_cast<float>(
+                                  remote_grad_y[col])
+                            : 0.0f;
+                        down[i] =
+                            col < kHidden
+                            ? static_cast<float>(
+                                  down_unweighted[
+                                      static_cast<uint64_t>(
+                                          pool_row) *
+                                          kHidden +
+                                      col])
+                            : 0.0f;
+                        if constexpr (
+                            kDoReverseDispatch &&
+                            !kXPrepared) {
+                            if (col < kHidden) {
+                                x_pool_output[
+                                    static_cast<uint64_t>(
+                                        pool_row) *
+                                        kHidden +
+                                    col] =
+                                    remote_x[col];
+                            }
+                        }
+                    }
+                    if constexpr (
+                        kTritonRouteValuesPerThread ==
+                        2) {
+                        grad_route = __fmaf_rn(
+                            grad_y[0], down[0],
+                            __fmul_rn(
+                                grad_y[1], down[1]));
+                    } else if constexpr (
+                        kTritonRouteValuesPerThread ==
+                        4) {
+                        const float even = __fmaf_rn(
+                            grad_y[0], down[0],
+                            __fmul_rn(
+                                grad_y[2], down[2]));
+                        const float odd = __fmaf_rn(
+                            grad_y[1], down[1],
+                            __fmul_rn(
+                                grad_y[3], down[3]));
+                        grad_route =
+                            __fadd_rn(even, odd);
+                    } else {
+                        const float pair_02 = __fmaf_rn(
+                            grad_y[0], down[0],
+                            __fmul_rn(
+                                grad_y[2], down[2]));
+                        const float pair_13 = __fmaf_rn(
+                            grad_y[1], down[1],
+                            __fmul_rn(
+                                grad_y[3], down[3]));
+                        const float pair_46 = __fmaf_rn(
+                            grad_y[4], down[4],
+                            __fmul_rn(
+                                grad_y[6], down[6]));
+                        const float pair_57 = __fmaf_rn(
+                            grad_y[5], down[5],
+                            __fmul_rn(
+                                grad_y[7], down[7]));
+                        grad_route = __fadd_rn(
+                            __fadd_rn(
+                                pair_02, pair_46),
+                            __fadd_rn(
+                                pair_13, pair_57));
+                    }
+                    #pragma unroll
+                    for (uint32_t offset = 16;
+                         offset > 0; offset >>= 1) {
+                        grad_route = __fadd_rn(
+                            grad_route,
+                            __shfl_xor_sync(
+                                0xffffffff,
+                                grad_route, offset));
+                    }
+                    const uint32_t warp_in_group =
+                        route_group_lane_idx / 32;
+                    const uint32_t lane_in_warp =
+                        route_group_lane_idx & 31;
+                    if (lane_in_warp == 0) {
+                        route_lane_sums[
+                            route_group_idx *
+                                kTritonRouteNumWarps +
+                            warp_in_group] =
+                            grad_route;
+                    }
+                    ptx::sync_aligned(
+                        kTritonRouteThreads,
+                        route_group_idx);
+                    if (warp_in_group == 0) {
+                        grad_route = route_lane_sums[
+                            route_group_idx *
+                                kTritonRouteNumWarps +
+                            (lane_in_warp &
+                             (kTritonRouteNumWarps -
+                              1))];
+                        #pragma unroll
+                        for (uint32_t offset =
+                                 kTritonRouteNumWarps /
+                                 2;
+                             offset > 0;
+                             offset >>= 1) {
+                            grad_route = __fadd_rn(
+                                grad_route,
+                                __shfl_xor_sync(
+                                    0xffffffff,
+                                    grad_route,
+                                    offset));
+                        }
+                    }
+                    if constexpr (kWriteWeighted) {
+                        const float route_weight =
+                            route_weights_output[
+                                pool_row];
+                        #pragma unroll
+                        for (uint32_t i = 0;
+                             i <
+                                 kTritonRouteValuesPerThread;
+                             ++i) {
+                            const uint32_t col =
+                                route_group_lane_idx +
+                                i *
+                                    kTritonRouteThreads;
+                            if (col < kHidden) {
+                                grad_y_weighted_output[
+                                    static_cast<uint64_t>(
+                                        pool_row) *
+                                        kHidden +
+                                    col] =
+                                    cutlass::bfloat16_t(
+                                        (kWeightedSourceIsRhs
+                                             ? down[i]
+                                             : grad_y[i]) *
+                                        route_weight);
+                            }
                         }
                     }
                 }
