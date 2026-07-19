@@ -451,10 +451,17 @@ template <
     uint32_t kNumSMs, uint32_t kNumRanks,
     CombineOrderMode kCombineOrderMode,
     bool kDoReverseDispatch = true,
-    bool kPrepareRouteAndWeighted = true>
+    bool kComputeRouteDot = true,
+    bool kWriteWeighted = true,
+    bool kWeightedSourceIsRhs = false,
+    bool kSynchronizeRanks = true,
+    bool kSynchronizeAfterDispatch = true,
+    bool kBarrierOnly = false>
 CUTLASS_GLOBAL __launch_bounds__(1024, 1) void
 sm100_bf16_mega_moe_backward_post_down_prelude(
     const int* expert_counts,
+    const __grid_constant__ layout::Workspace
+        backward_workspace,
     const __grid_constant__ layout::SymBuffer<kNumRanks>
         backward_sym_buffer,
     const cutlass::bfloat16_t* backward_grad_y,
@@ -471,6 +478,29 @@ sm100_bf16_mega_moe_backward_post_down_prelude(
     float* grad_route_output) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)) || defined(__CLION_IDE__)
     constexpr uint32_t kNumThreads = 1024;
+    if constexpr (kSynchronizeRanks) {
+        comm::nvlink_barrier<
+            kNumRanks, kNumSMs, kNumThreads, 0, 71>(
+            backward_workspace,
+            backward_sym_buffer,
+            blockIdx.x,
+            threadIdx.x,
+            []() { __syncthreads(); });
+    }
+    if constexpr (kBarrierOnly) {
+        if constexpr (kSynchronizeAfterDispatch) {
+            // Profiling-only completion barrier. Production folds this into
+            // the dispatch launch below to avoid an extra kernel launch.
+            comm::nvlink_barrier<
+                kNumRanks, kNumSMs, kNumThreads, 1, 72>(
+                backward_workspace,
+                backward_sym_buffer,
+                blockIdx.x,
+                threadIdx.x,
+                []() { __syncthreads(); });
+        }
+        return;
+    }
     constexpr uint32_t kTritonRouteBlockH = [] {
         uint32_t value = 1;
         while (value < kHidden && value < 8192)
@@ -601,7 +631,47 @@ sm100_bf16_mega_moe_backward_post_down_prelude(
             }
 
             float grad_route = 0.0f;
-            if constexpr (!kPrepareRouteAndWeighted) {
+            if constexpr (!kComputeRouteDot && !kWriteWeighted) {
+                constexpr uint32_t kBF16ValuesPerVector =
+                    sizeof(uint4) /
+                    sizeof(cutlass::bfloat16_t);
+                DG_STATIC_ASSERT(
+                    kHidden % kBF16ValuesPerVector == 0,
+                    "BF16 dispatch requires vector-aligned hidden");
+                for (uint32_t col =
+                         route_group_lane_idx *
+                         kBF16ValuesPerVector;
+                     col < kHidden;
+                     col += route_group_threads *
+                            kBF16ValuesPerVector) {
+                    const uint64_t offset =
+                        static_cast<uint64_t>(
+                            pool_row) *
+                            kHidden +
+                        col;
+                    reinterpret_cast<uint4*>(
+                        grad_y_unweighted_output)[
+                        offset /
+                        kBF16ValuesPerVector] =
+                        reinterpret_cast<
+                            const uint4*>(
+                            remote_grad_y)[
+                            col /
+                            kBF16ValuesPerVector];
+                    reinterpret_cast<uint4*>(
+                        x_pool_output)[
+                        offset /
+                        kBF16ValuesPerVector] =
+                        reinterpret_cast<
+                            const uint4*>(
+                            remote_x)[
+                            col /
+                            kBF16ValuesPerVector];
+                }
+            } else if constexpr (
+                !kComputeRouteDot && kWriteWeighted) {
+                const float route_weight =
+                    route_weights_output[pool_row];
                 for (uint32_t col =
                          route_group_lane_idx;
                      col < kHidden;
@@ -611,10 +681,17 @@ sm100_bf16_mega_moe_backward_post_down_prelude(
                             pool_row) *
                             kHidden +
                         col;
-                    grad_y_unweighted_output[offset] =
-                        remote_grad_y[col];
-                    x_pool_output[offset] =
-                        remote_x[col];
+                    grad_y_weighted_output[offset] =
+                        cutlass::bfloat16_t(
+                            static_cast<float>(
+                                (kWeightedSourceIsRhs
+                                     ? down_unweighted[
+                                           static_cast<uint64_t>(
+                                               pool_row) *
+                                               kHidden +
+                                           col]
+                                     : remote_grad_y[col])) *
+                            route_weight);
                 }
             } else if constexpr (
                 kCombineOrderMode !=
@@ -644,20 +721,15 @@ sm100_bf16_mega_moe_backward_post_down_prelude(
                                       kHidden +
                                   col])
                         : 0.0f;
-                    if (col < kHidden) {
-                        grad_y_unweighted_output[
-                            static_cast<uint64_t>(
-                                pool_row) *
-                                kHidden +
-                            col] =
-                            cutlass::bfloat16_t(
-                                grad_y[i]);
-                        x_pool_output[
-                            static_cast<uint64_t>(
-                                pool_row) *
-                                kHidden +
-                            col] =
-                            remote_x[col];
+                    if constexpr (kDoReverseDispatch) {
+                        if (col < kHidden) {
+                            x_pool_output[
+                                static_cast<uint64_t>(
+                                    pool_row) *
+                                    kHidden +
+                                col] =
+                                remote_x[col];
+                        }
                     }
                 }
                 if constexpr (
@@ -739,6 +811,30 @@ sm100_bf16_mega_moe_backward_post_down_prelude(
                             __shfl_xor_sync(
                                 0xffffffff,
                                 grad_route, offset));
+                    }
+                }
+                if constexpr (kWriteWeighted) {
+                    const float route_weight =
+                        route_weights_output[pool_row];
+                    #pragma unroll
+                    for (uint32_t i = 0;
+                         i < kTritonRouteValuesPerThread;
+                         ++i) {
+                        const uint32_t col =
+                            route_group_lane_idx +
+                            i * kTritonRouteThreads;
+                        if (col < kHidden) {
+                            grad_y_weighted_output[
+                                static_cast<uint64_t>(
+                                    pool_row) *
+                                    kHidden +
+                                col] =
+                                cutlass::bfloat16_t(
+                                    (kWeightedSourceIsRhs
+                                         ? down[i]
+                                         : grad_y[i]) *
+                                    route_weight);
+                        }
                     }
                 }
             } else {
@@ -826,7 +922,7 @@ sm100_bf16_mega_moe_backward_post_down_prelude(
                     }
                 }
             }
-            if constexpr (kPrepareRouteAndWeighted) {
+            if constexpr (kComputeRouteDot) {
                 if (route_group_lane_idx == 0)
                     grad_route_output[pool_row] =
                         grad_route;
@@ -837,23 +933,30 @@ sm100_bf16_mega_moe_backward_post_down_prelude(
                 } else {
                     __syncwarp();
                 }
-                const float route_weight =
-                    route_weights_output[pool_row];
-                for (uint32_t col =
-                         route_group_lane_idx;
-                     col < kHidden;
-                     col += route_group_threads) {
-                    const uint64_t offset =
-                        static_cast<uint64_t>(
-                            pool_row) *
-                            kHidden +
-                        col;
-                    grad_y_weighted_output[offset] =
-                        cutlass::bfloat16_t(
-                            static_cast<float>(
-                                grad_y_unweighted_output[
-                                    offset]) *
-                            route_weight);
+                if constexpr (
+                    kWriteWeighted &&
+                    kCombineOrderMode ==
+                    CombineOrderMode::FixedTopK) {
+                    const float route_weight =
+                        route_weights_output[pool_row];
+                    for (uint32_t col =
+                             route_group_lane_idx;
+                         col < kHidden;
+                         col += route_group_threads) {
+                        const uint64_t offset =
+                            static_cast<uint64_t>(
+                                pool_row) *
+                                kHidden +
+                            col;
+                        grad_y_weighted_output[offset] =
+                            cutlass::bfloat16_t(
+                                static_cast<float>(
+                                    (kWeightedSourceIsRhs
+                                         ? down_unweighted[offset]
+                                         : grad_y_unweighted_output[
+                                               offset])) *
+                                route_weight);
+                    }
                 }
             }
         }
@@ -897,14 +1000,16 @@ sm100_bf16_mega_moe_backward_post_down_prelude(
                 static_cast<uint64_t>(pool_row) *
                     kHidden +
                 col;
-            grad_y_unweighted_output[offset] =
-                cutlass::bfloat16_t(0.0f);
-            if constexpr (kPrepareRouteAndWeighted) {
+            if constexpr (kDoReverseDispatch) {
+                grad_y_unweighted_output[offset] =
+                    cutlass::bfloat16_t(0.0f);
+                x_pool_output[offset] =
+                    cutlass::bfloat16_t(0.0f);
+            }
+            if constexpr (kWriteWeighted) {
                 grad_y_weighted_output[offset] =
                     cutlass::bfloat16_t(0.0f);
             }
-            x_pool_output[offset] =
-                cutlass::bfloat16_t(0.0f);
         }
         for (uint32_t padding_row =
                  blockIdx.x * kNumThreads +
@@ -915,52 +1020,30 @@ sm100_bf16_mega_moe_backward_post_down_prelude(
             const uint32_t pool_row =
                 padded_pool_blocks * BLOCK_M +
                 num_tokens + padding_row;
-            route_weights_output[pool_row] = 0.0f;
-            if constexpr (kPrepareRouteAndWeighted)
+            if constexpr (kDoReverseDispatch)
+                route_weights_output[pool_row] = 0.0f;
+            if constexpr (kComputeRouteDot)
                 grad_route_output[pool_row] = 0.0f;
         }
         padded_pool_blocks += num_blocks;
     }
-    const uint32_t capacity_tail_start =
-        padded_pool_blocks * BLOCK_M;
-    const uint32_t capacity_tail_rows =
-        num_pool_rows - capacity_tail_start;
-    for (uint64_t linear =
-             static_cast<uint64_t>(blockIdx.x) *
-                 kNumThreads +
-             threadIdx.x;
-         linear <
-             static_cast<uint64_t>(
-                 capacity_tail_rows) *
-                 kHidden;
-         linear +=
-             static_cast<uint64_t>(kNumSMs) *
-                 kNumThreads) {
-        const uint64_t offset =
-            static_cast<uint64_t>(
-                capacity_tail_start) *
-                kHidden +
-            linear;
-        grad_y_unweighted_output[offset] =
-            cutlass::bfloat16_t(0.0f);
-        if constexpr (kPrepareRouteAndWeighted) {
-            grad_y_weighted_output[offset] =
-                cutlass::bfloat16_t(0.0f);
-        }
-        x_pool_output[offset] =
-            cutlass::bfloat16_t(0.0f);
+    if constexpr (kSynchronizeAfterDispatch) {
+        // Every rank may reuse its local symmetric grad-y plane as the
+        // direct-write grad-x destination as soon as this producer returns.
+        // Publish completion only after all peers have finished their remote
+        // reads; an entry-only barrier permits checkpoint/replay rank skew to
+        // corrupt those in-flight pulls.
+        comm::nvlink_barrier<
+            kNumRanks, kNumSMs, kNumThreads, 1, 72>(
+            backward_workspace,
+            backward_sym_buffer,
+            blockIdx.x,
+            threadIdx.x,
+            []() { __syncthreads(); });
     }
-    for (uint32_t tail_row =
-             blockIdx.x * kNumThreads +
-             threadIdx.x;
-         tail_row < capacity_tail_rows;
-         tail_row += kNumSMs * kNumThreads) {
-        const uint32_t pool_row =
-            capacity_tail_start + tail_row;
-        route_weights_output[pool_row] = 0.0f;
-        if constexpr (kPrepareRouteAndWeighted)
-            grad_route_output[pool_row] = 0.0f;
-    }
+    // Rows beyond the final padded expert block are capacity only. No
+    // downstream kernel addresses them, so clearing that high-water tail
+    // wastes bandwidth and grows with the cached pool margin.
 #endif
 }
 
@@ -2229,48 +2312,67 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                 // backward_grad_y aliases combine plane zero. All ranks must
                 // finish remotely pulling it before any W13 dgrad epilogue
                 // reuses the combine planes for direct grad-x writes.
-                constexpr uint32_t kBeforeDirectGradXGridSyncIndex = 2;
-                constexpr uint32_t kBeforeDirectGradXBarrierTag = 7;
-                comm::nvlink_barrier<
-                    kNumRanks, kNumSMs, kNumThreads,
-                    kBeforeDirectGradXGridSyncIndex,
-                    kBeforeDirectGradXBarrierTag>(
-                    backward_workspace, backward_sym_buffer,
-                    blockIdx.x, threadIdx.x,
-                    []() { __syncthreads(); });
-
-                // Plane zero held grad-y during reverse dispatch. Clear it
-                // after every rank has completed its pulls; otherwise masked
-                // top-k slot zero would contribute stale grad-y to grad-x.
-                auto* combine_buffer = const_cast<cd_dtype_t*>(
-                    backward_grad_y);
-                const uint64_t num_plane_values =
-                    static_cast<uint64_t>(
-                        backward_workspace
-                            .num_max_tokens_per_rank) *
-                    kHidden;
-                for (uint64_t linear =
-                         static_cast<uint64_t>(blockIdx.x) *
-                             kNumThreads +
-                         threadIdx.x;
-                     linear < num_plane_values;
-                     linear +=
-                         static_cast<uint64_t>(kNumSMs) *
-                         kNumThreads) {
-                    combine_buffer[linear] = cd_dtype_t(0.0f);
+                if constexpr (
+                    !(kBF16Mode && kInputsPrepared)) {
+                    constexpr uint32_t
+                        kBeforeDirectGradXGridSyncIndex = 2;
+                    constexpr uint32_t
+                        kBeforeDirectGradXBarrierTag = 7;
+                    comm::nvlink_barrier<
+                        kNumRanks, kNumSMs, kNumThreads,
+                        kBeforeDirectGradXGridSyncIndex,
+                        kBeforeDirectGradXBarrierTag>(
+                        backward_workspace,
+                        backward_sym_buffer,
+                        blockIdx.x, threadIdx.x,
+                        []() { __syncthreads(); });
                 }
 
-                // Do not let a rank remotely write direct grad-x until every
-                // destination rank has finished clearing its local plane.
-                constexpr uint32_t kAfterGradYClearGridSyncIndex = 3;
-                constexpr uint32_t kAfterGradYClearBarrierTag = 8;
-                comm::nvlink_barrier<
-                    kNumRanks, kNumSMs, kNumThreads,
-                    kAfterGradYClearGridSyncIndex,
-                    kAfterGradYClearBarrierTag>(
-                    backward_workspace, backward_sym_buffer,
-                    blockIdx.x, threadIdx.x,
-                    []() { __syncthreads(); });
+                if constexpr (
+                    kCombineOrderMode ==
+                    CombineOrderMode::FixedTopK) {
+                    // Fixed-top-k combine consumes invalid slots, so plane
+                    // zero must be cleared after every peer has completed its
+                    // grad-y pull. DeepEP-ordered combine skips invalid slots,
+                    // and Kernel A overwrites every valid slot before combine.
+                    auto* combine_buffer =
+                        const_cast<cd_dtype_t*>(
+                            backward_grad_y);
+                    const uint64_t num_plane_values =
+                        static_cast<uint64_t>(
+                            backward_workspace
+                                .num_max_tokens_per_rank) *
+                        kHidden;
+                    for (uint64_t linear =
+                             static_cast<uint64_t>(
+                                 blockIdx.x) *
+                                 kNumThreads +
+                             threadIdx.x;
+                         linear < num_plane_values;
+                         linear +=
+                             static_cast<uint64_t>(
+                                 kNumSMs) *
+                             kNumThreads) {
+                        combine_buffer[linear] =
+                            cd_dtype_t(0.0f);
+                    }
+
+                    // Do not let a rank remotely write direct grad-x until
+                    // every destination has finished clearing its local
+                    // plane.
+                    constexpr uint32_t
+                        kAfterGradYClearGridSyncIndex = 3;
+                    constexpr uint32_t
+                        kAfterGradYClearBarrierTag = 8;
+                    comm::nvlink_barrier<
+                        kNumRanks, kNumSMs, kNumThreads,
+                        kAfterGradYClearGridSyncIndex,
+                        kAfterGradYClearBarrierTag>(
+                        backward_workspace,
+                        backward_sym_buffer,
+                        blockIdx.x, threadIdx.x,
+                        []() { __syncthreads(); });
+                }
             }
         }
         if constexpr (!kBF16Mode) {
@@ -3690,7 +3792,8 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
             }
             if constexpr (
                 kBF16Mode &&
-                kRouteWeightMode == RouteWeightMode::PreDown) {
+                kRouteWeightMode == RouteWeightMode::PreDown &&
+                !kInputsPrepared) {
                 if (h_act_output == h_weighted_output) {
                     // Every route reduction must consume unweighted h before
                     // the shared storage becomes the W2-wgrad input.

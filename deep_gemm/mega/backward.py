@@ -1,10 +1,31 @@
-from typing import Any, Optional, Tuple
+import time
+from typing import Any, Callable, Optional, Tuple
 
 import torch
 import torch.distributed as dist
 
 from .. import _C
 from . import CombineOrderMode, RouteWeightMode
+
+_BF16_BACKWARD_TIMING_HOOK: Optional[
+    Callable[[str, torch.cuda.Event, torch.cuda.Event, float], None]
+] = None
+_BF16_BACKWARD_DECOMPOSE_PRELUDE = False
+
+
+def _timed_cuda_phase(name: str, operation: Callable[[], Any]) -> Any:
+    hook = _BF16_BACKWARD_TIMING_HOOK
+    if hook is None:
+        return operation()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    wall_start = time.perf_counter()
+    result = operation()
+    wall_ms = (time.perf_counter() - wall_start) * 1_000
+    end.record()
+    hook(name, start, end, wall_ms)
+    return result
 
 
 def _storage_byte_range(tensor: torch.Tensor) -> tuple[int, int]:
@@ -13,10 +34,7 @@ def _storage_byte_range(tensor: torch.Tensor) -> tuple[int, int]:
 
 
 def _exact_alias(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
-    return (
-        lhs.data_ptr() == rhs.data_ptr() and
-        lhs.numel() == rhs.numel()
-    )
+    return lhs.data_ptr() == rhs.data_ptr() and lhs.numel() == rhs.numel()
 
 
 def _validate_bf16_backward_alias_contract(
@@ -37,8 +55,8 @@ def _validate_bf16_backward_alias_contract(
     """Validate every overlapping BF16 pool against the phase contract."""
     if memory_mode not in ("legacy", "phase_ordered"):
         raise ValueError(
-            "memory_mode must be 'legacy' or 'phase_ordered', got "
-            f"{memory_mode!r}")
+            "memory_mode must be 'legacy' or 'phase_ordered', got " f"{memory_mode!r}"
+        )
 
     tensors = {
         "gate_up": gate_up_output,
@@ -62,7 +80,7 @@ def _validate_bf16_backward_alias_contract(
     names = list(ranges)
     for idx, lhs_name in enumerate(names):
         lhs_start, lhs_end = ranges[lhs_name]
-        for rhs_name in names[idx + 1:]:
+        for rhs_name in names[idx + 1 :]:
             rhs_start, rhs_end = ranges[rhs_name]
             if max(lhs_start, rhs_start) < min(lhs_end, rhs_end):
                 overlaps.add(frozenset((lhs_name, rhs_name)))
@@ -72,49 +90,41 @@ def _validate_bf16_backward_alias_contract(
     if route_weight_mode is RouteWeightMode.PRE_DOWN:
         allowed.add(frozenset(("grad_ye", "grad_y_unweighted")))
         allowed.add(frozenset(("grad_ye", "down_unweighted")))
-        allowed.add(
-            frozenset(("grad_y_unweighted", "down_unweighted")))
+        allowed.add(frozenset(("grad_y_unweighted", "down_unweighted")))
     else:
         allowed.add(frozenset(("h_act", "h_weighted")))
 
     if memory_mode == "phase_ordered":
         if route_weight_mode is RouteWeightMode.POST_DOWN:
             required_exact = (
-                ("grad_ye", grad_ye,
-                 "down_unweighted", down_unweighted_output),
+                ("grad_ye", grad_ye, "down_unweighted", down_unweighted_output),
                 ("h_act", h_act_output, "grad_h", grad_h_output),
-                ("h_weighted", h_weighted_output,
-                 "grad_h", grad_h_output),
-                ("grad_gate_up", grad_gate_up_output,
-                 "gate_up", gate_up_output),
+                ("h_weighted", h_weighted_output, "grad_h", grad_h_output),
+                ("grad_gate_up", grad_gate_up_output, "gate_up", gate_up_output),
             )
             if (
-                grad_h_output.data_ptr() !=
-                grad_y_unweighted_output.data_ptr() or
-                grad_h_output.numel() >
-                grad_y_unweighted_output.numel()
+                grad_h_output.data_ptr() != grad_y_unweighted_output.data_ptr()
+                or grad_h_output.numel() > grad_y_unweighted_output.numel()
             ):
                 raise ValueError(
                     "phase_ordered post_down requires grad_h to be a "
-                    "contiguous prefix view of grad_y_unweighted")
+                    "contiguous prefix view of grad_y_unweighted"
+                )
             allowed.add(frozenset(("grad_h", "grad_y_unweighted")))
             allowed.add(frozenset(("h_act", "grad_y_unweighted")))
-            allowed.add(
-                frozenset(("h_weighted", "grad_y_unweighted")))
+            allowed.add(frozenset(("h_weighted", "grad_y_unweighted")))
         else:
             required_exact = (
-                ("grad_ye", grad_ye,
-                 "grad_y_unweighted", grad_y_unweighted_output),
-                ("h_act", h_act_output,
-                 "h_weighted", h_weighted_output),
-                ("grad_gate_up", grad_gate_up_output,
-                 "gate_up", gate_up_output),
+                ("grad_ye", grad_ye, "grad_y_unweighted", grad_y_unweighted_output),
+                ("h_act", h_act_output, "h_weighted", h_weighted_output),
+                ("grad_gate_up", grad_gate_up_output, "gate_up", gate_up_output),
             )
         for lhs_name, lhs, rhs_name, rhs in required_exact:
             if not _exact_alias(lhs, rhs):
                 raise ValueError(
                     f"phase_ordered {route_weight_mode.value} requires "
-                    f"{lhs_name} to exactly alias {rhs_name}")
+                    f"{lhs_name} to exactly alias {rhs_name}"
+                )
             allowed.add(frozenset((lhs_name, rhs_name)))
 
     unexpected = overlaps - allowed
@@ -122,7 +132,8 @@ def _validate_bf16_backward_alias_contract(
         pairs = sorted("/".join(sorted(pair)) for pair in unexpected)
         raise ValueError(
             f"unsafe BF16 backward storage overlap for {memory_mode}: "
-            + ", ".join(pairs))
+            + ", ".join(pairs)
+        )
 
 
 def _sort_bf16_pool_in_deepep_order(
@@ -147,14 +158,11 @@ def _sort_bf16_pool_in_deepep_order(
         expert_counts.to(torch.long),
     )
     if expert_ids.numel() != pool_rows.numel():
-        raise RuntimeError(
-            "valid BF16 pool rows do not match expert counts")
+        raise RuntimeError("valid BF16 pool rows do not match expert counts")
     metadata = token_src_metadata[pool_rows].long()
     routes_per_rank = num_max_tokens_per_rank * num_topk
     route_keys = (
-        metadata[:, 0] * routes_per_rank +
-        metadata[:, 1] * num_topk +
-        metadata[:, 2]
+        metadata[:, 0] * routes_per_rank + metadata[:, 1] * num_topk + metadata[:, 2]
     )
     order = torch.argsort(
         expert_ids * (num_ranks * routes_per_rank) + route_keys,
@@ -224,24 +232,20 @@ def bf16_mega_moe_backward_dgrad(
         raise ValueError("grad-x requires a local or direct remote output")
     if grad_x_pool_output is None:
         if write_grad_x_pool:
-            raise ValueError(
-                "write_grad_x_pool requires grad_x_pool_output")
-        grad_x_pool_output = grad_ye.new_empty(
-            (0, grad_ye.size(1)))
+            raise ValueError("write_grad_x_pool requires grad_x_pool_output")
+        grad_x_pool_output = grad_ye.new_empty((0, grad_ye.size(1)))
     if python_numerical_correction and not write_grad_x_pool:
-        raise ValueError(
-            "Python numerical correction requires grad_x_pool_output")
+        raise ValueError("Python numerical correction requires grad_x_pool_output")
     if python_numerical_correction and memory_mode != "legacy":
         raise ValueError(
             "Python numerical correction does not support destructive "
-            "phase-ordered aliases")
+            "phase-ordered aliases"
+        )
     if route_weight_mode is RouteWeightMode.POST_DOWN:
         if grad_y_unweighted_output is None:
-            raise ValueError(
-                "post_down requires grad_y_unweighted_output")
+            raise ValueError("post_down requires grad_y_unweighted_output")
         if down_unweighted_output is None:
-            raise ValueError(
-                "post_down requires saved down_unweighted_output")
+            raise ValueError("post_down requires saved down_unweighted_output")
     else:
         if grad_y_unweighted_output is None:
             grad_y_unweighted_output = grad_ye
@@ -268,12 +272,15 @@ def bf16_mega_moe_backward_dgrad(
         # those different specializations deadlocks at the first grid sync.
         # Canonicalize at the API boundary so every caller is safe.
         rank_uniform_block_m = torch.tensor(
-            block_m, dtype=torch.int32, device=grad_y.device)
-        dist.all_reduce(
-            rank_uniform_block_m,
-            op=dist.ReduceOp.MAX,
-            group=sym_buffer.group)
-        block_m = int(rank_uniform_block_m.item())
+            block_m, dtype=torch.int32, device=grad_y.device
+        )
+        _timed_cuda_phase(
+            "block_m_all_reduce",
+            lambda: dist.all_reduce(
+                rank_uniform_block_m, op=dist.ReduceOp.MAX, group=sym_buffer.group
+            ),
+        )
+        block_m = int(_timed_cuda_phase("block_m_host_item", rank_uniform_block_m.item))
     num_tokens = grad_y.shape[0]
     backward_grad_y = sym_buffer.backward_grad_y
     if direct_remote_grad_x:
@@ -293,78 +300,211 @@ def bf16_mega_moe_backward_dgrad(
                 1,
             ),
         )
-        backward_grad_y.zero_()
-        backward_grad_y[0, :num_tokens].copy_(
-            grad_y.to(torch.bfloat16).contiguous()
+        if combine_order_mode is CombineOrderMode.FIXED_TOPK:
+            # Fixed-top-k combine consumes every slot, including invalid
+            # routes. DeepEP-ordered combine reads top-k IDs and skips invalid
+            # slots, while Kernel A overwrites every valid slot after the
+            # reverse-dispatch barrier, so its large slot-major pool does not
+            # need a standalone clear.
+            _timed_cuda_phase("grad_y_plane_clear", backward_grad_y.zero_)
+        _timed_cuda_phase(
+            "grad_y_expose_copy",
+            lambda: backward_grad_y[0, :num_tokens].copy_(
+                grad_y.to(torch.bfloat16).contiguous()
+            ),
         )
     else:
-        backward_grad_y[:num_tokens].copy_(
-            grad_y.to(torch.bfloat16).contiguous()
+        _timed_cuda_phase(
+            "grad_y_expose_copy",
+            lambda: backward_grad_y[:num_tokens].copy_(
+                grad_y.to(torch.bfloat16).contiguous()
+            ),
         )
-    grad_route_output.zero_()
-    if (
+    inputs_prepared = (
         memory_mode == "phase_ordered"
         and route_weight_mode is RouteWeightMode.POST_DOWN
-    ):
-        if sym_buffer.group.size() > 1:
-            # Publish each rank's local grad-y before the prelude performs
-            # direct symmetric-buffer loads. Kernel A's existing NVLink
-            # barrier remains responsible for protecting later combine-plane
-            # reuse; the prelude itself has no inter-CTA or inter-rank barrier.
-            dist.barrier(group=sym_buffer.group)
-        _C.bf16_mega_moe_backward_post_down_prelude(
-            grad_y_unweighted_output,
-            grad_ye,
+    )
+    if inputs_prepared:
+        # The prelude starts with a device-side NVLink barrier. It publishes
+        # local grad-y before pulling grad-y, x, and route weights with the
+        # full persistent grid. POST_DOWN also performs its exact route dot
+        # and weighted-grad write; PRE_DOWN needs only the input dispatch.
+        prepare_route_and_weighted = route_weight_mode is RouteWeightMode.POST_DOWN
+
+        def launch_prelude(
+            *,
+            do_reverse_dispatch: bool,
+            compute_route_dot: bool,
+            write_weighted: bool,
+            synchronize_ranks: bool,
+            synchronize_after_dispatch: bool,
+            barrier_only: bool = False,
+        ) -> None:
+            _C.bf16_mega_moe_backward_post_down_prelude(
+                grad_y_unweighted_output,
+                grad_ye,
+                x_pool_output,
+                route_weights,
+                grad_route_output,
+                down_unweighted_output,
+                expert_counts,
+                sym_buffer.backward_grad_y,
+                sym_buffer.x,
+                sym_buffer.topk_weights,
+                sym_buffer.token_src_metadata,
+                sym_buffer.handle.buffer_ptrs,
+                sym_buffer.group.rank(),
+                sym_buffer.num_topk,
+                block_m,
+                combine_order_mode.value,
+                do_reverse_dispatch,
+                compute_route_dot,
+                write_weighted,
+                synchronize_ranks,
+                synchronize_after_dispatch,
+                barrier_only,
+            )
+
+        def launch_decomposed_route_prelude() -> None:
+            _timed_cuda_phase(
+                "rank_arrival_barrier",
+                lambda: launch_prelude(
+                    do_reverse_dispatch=False,
+                    compute_route_dot=False,
+                    write_weighted=False,
+                    synchronize_ranks=True,
+                    synchronize_after_dispatch=False,
+                    barrier_only=True,
+                ),
+            )
+            _timed_cuda_phase(
+                "reverse_dispatch_nvlink_pull",
+                lambda: launch_prelude(
+                    do_reverse_dispatch=True,
+                    compute_route_dot=False,
+                    write_weighted=False,
+                    synchronize_ranks=False,
+                    synchronize_after_dispatch=False,
+                ),
+            )
+            _timed_cuda_phase(
+                "final_rank_synchronization",
+                lambda: launch_prelude(
+                    do_reverse_dispatch=False,
+                    compute_route_dot=False,
+                    write_weighted=False,
+                    synchronize_ranks=False,
+                    synchronize_after_dispatch=True,
+                    barrier_only=True,
+                ),
+            )
+            _timed_cuda_phase(
+                "exact_route_dot_reduction",
+                lambda: launch_prelude(
+                    do_reverse_dispatch=False,
+                    compute_route_dot=True,
+                    write_weighted=False,
+                    synchronize_ranks=False,
+                    synchronize_after_dispatch=False,
+                ),
+            )
+            _timed_cuda_phase(
+                "route_weight_multiply_write",
+                lambda: launch_prelude(
+                    do_reverse_dispatch=False,
+                    compute_route_dot=False,
+                    write_weighted=True,
+                    synchronize_ranks=False,
+                    synchronize_after_dispatch=False,
+                ),
+            )
+
+        def launch_chunked_route_prelude() -> None:
+            # Pull the two remote BF16 planes with the dispatch-only vector
+            # path, then preserve the exact Triton route reduction tree while
+            # consuming the local grad-y plane.  Splitting here avoids coupling
+            # NVLink load coalescing to Triton's strided reduction lane map.
+            _timed_cuda_phase(
+                "reverse_dispatch_nvlink_pull",
+                lambda: launch_prelude(
+                    do_reverse_dispatch=True,
+                    compute_route_dot=False,
+                    write_weighted=False,
+                    synchronize_ranks=True,
+                    synchronize_after_dispatch=True,
+                ),
+            )
+            _timed_cuda_phase(
+                "exact_route_dot_weighted_write",
+                lambda: launch_prelude(
+                    do_reverse_dispatch=False,
+                    compute_route_dot=True,
+                    write_weighted=True,
+                    synchronize_ranks=False,
+                    synchronize_after_dispatch=False,
+                ),
+            )
+
+        _timed_cuda_phase(
+            (
+                "reverse_dispatch_route_prelude"
+                if prepare_route_and_weighted
+                else "reverse_dispatch_input_prelude"
+            ),
+            (
+                launch_decomposed_route_prelude
+                if prepare_route_and_weighted and _BF16_BACKWARD_DECOMPOSE_PRELUDE
+                else (
+                    launch_chunked_route_prelude
+                    if prepare_route_and_weighted
+                    else lambda: launch_prelude(
+                        do_reverse_dispatch=True,
+                        compute_route_dot=False,
+                        write_weighted=False,
+                        synchronize_ranks=True,
+                        synchronize_after_dispatch=True,
+                    )
+                )
+            ),
+        )
+    _timed_cuda_phase(
+        "kernel_a_dgrad",
+        lambda: _C.bf16_mega_moe_backward_dgrad(
+            gate_up_output,
+            grad_h_output,
+            grad_gate_up_output,
+            h_act_output,
+            h_weighted_output,
             x_pool_output,
-            route_weights,
+            grad_x_pool_output,
             grad_route_output,
-            down_unweighted_output,
+            grad_ye,
+            grad_y_unweighted_output,
+            route_weights,
+            w2_weights,
+            w13_weights,
             expert_counts,
+            grid_sync_counter,
+            activation_limit,
+            activation,
+            fast_math,
+            route_weight_mode.value,
+            down_unweighted_output,
+            block_m,
+            direct_remote_grad_x,
+            write_grad_x_pool,
+            clear_wgrad_padding,
             sym_buffer.backward_grad_y,
             sym_buffer.x,
             sym_buffer.topk_weights,
             sym_buffer.token_src_metadata,
             sym_buffer.handle.buffer_ptrs,
             sym_buffer.group.rank(),
+            sym_buffer.num_max_tokens_per_rank,
             sym_buffer.num_topk,
-            block_m,
             combine_order_mode.value,
-        )
-    _C.bf16_mega_moe_backward_dgrad(
-        gate_up_output,
-        grad_h_output,
-        grad_gate_up_output,
-        h_act_output,
-        h_weighted_output,
-        x_pool_output,
-        grad_x_pool_output,
-        grad_route_output,
-        grad_ye,
-        grad_y_unweighted_output,
-        route_weights,
-        w2_weights,
-        w13_weights,
-        expert_counts,
-        grid_sync_counter,
-        activation_limit,
-        activation,
-        fast_math,
-        route_weight_mode.value,
-        down_unweighted_output,
-        block_m,
-        direct_remote_grad_x,
-        write_grad_x_pool,
-        clear_wgrad_padding,
-        sym_buffer.backward_grad_y,
-        sym_buffer.x,
-        sym_buffer.topk_weights,
-        sym_buffer.token_src_metadata,
-        sym_buffer.handle.buffer_ptrs,
-        sym_buffer.group.rank(),
-        sym_buffer.num_max_tokens_per_rank,
-        sym_buffer.num_topk,
-        combine_order_mode.value,
-        memory_mode,
+            memory_mode,
+        ),
     )
     if not python_numerical_correction:
         return
@@ -381,30 +521,26 @@ def bf16_mega_moe_backward_dgrad(
         # separate BF16 multiply. Reuse ATen's native BF16 forward/backward
         # operations so both materialization boundaries and SiLU's derivative
         # operation order match exactly.
-        gate = gate_up_output[
-            row_indices, :intermediate_hidden].contiguous()
-        up = gate_up_output[
-            row_indices, intermediate_hidden:].contiguous()
+        gate = gate_up_output[row_indices, :intermediate_hidden].contiguous()
+        up = gate_up_output[row_indices, intermediate_hidden:].contiguous()
         native_silu = torch.nn.functional.silu(gate)
         native_h = native_silu * up
         native_grad_h = grad_h_output[row_indices]
         if route_weight_mode is RouteWeightMode.PRE_DOWN:
             native_grad_h = (
-                native_grad_h.float() *
-                route_weights[row_indices].float().unsqueeze(1)
+                native_grad_h.float() * route_weights[row_indices].float().unsqueeze(1)
             ).to(native_grad_h.dtype)
         native_grad_silu = native_grad_h * up
-        native_grad_gate = torch.ops.aten.silu_backward(
-            native_grad_silu, gate)
+        native_grad_gate = torch.ops.aten.silu_backward(native_grad_silu, gate)
         native_grad_up = native_grad_h * native_silu
         grad_gate_up_output[row_indices] = torch.cat(
-            (native_grad_gate, native_grad_up), dim=1)
+            (native_grad_gate, native_grad_up), dim=1
+        )
         h_act_output[row_indices] = native_h
         h_weighted_output[row_indices] = (
-            (
-                native_h.float() *
-                route_weights[row_indices].float().unsqueeze(1)
-            ).to(native_h.dtype)
+            (native_h.float() * route_weights[row_indices].float().unsqueeze(1)).to(
+                native_h.dtype
+            )
             if route_weight_mode is RouteWeightMode.PRE_DOWN
             else native_h
         )
@@ -413,12 +549,9 @@ def bf16_mega_moe_backward_dgrad(
         # operations in FireTitan. Preserve each materialization point here;
         # reassociating the polynomial or derivative in CUDA changes rare
         # BF16 round-to-nearest ties.
-        gate_unclamped = gate_up_output[
-            row_indices, :intermediate_hidden].contiguous()
-        up_unclamped = gate_up_output[
-            row_indices, intermediate_hidden:].contiguous()
-        gate = torch.clamp(
-            gate_unclamped, max=activation_limit).float()
+        gate_unclamped = gate_up_output[row_indices, :intermediate_hidden].contiguous()
+        up_unclamped = gate_up_output[row_indices, intermediate_hidden:].contiguous()
+        gate = torch.clamp(gate_unclamped, max=activation_limit).float()
         up = torch.clamp(
             up_unclamped,
             min=-activation_limit,
@@ -435,34 +568,30 @@ def bf16_mega_moe_backward_dgrad(
         native_grad_h = grad_h_output[row_indices]
         if route_weight_mode is RouteWeightMode.PRE_DOWN:
             native_grad_h = (
-                native_grad_h.float() *
-                route_weights[row_indices].float().unsqueeze(1)
+                native_grad_h.float() * route_weights[row_indices].float().unsqueeze(1)
             ).to(native_grad_h.dtype)
-        activation_grad = (
-            sig + gate * sig * (1.0 - sig) * dz)
-        native_grad_gate = (
-            native_grad_h.float() * up * activation_grad)
+        activation_grad = sig + gate * sig * (1.0 - sig) * dz
+        native_grad_gate = native_grad_h.float() * up * activation_grad
         native_grad_gate = torch.where(
             gate_unclamped.float() <= activation_limit,
             native_grad_gate,
             torch.zeros_like(native_grad_gate),
         ).to(torch.bfloat16)
-        native_grad_up = (
-            native_grad_h.float() * activated_gate)
+        native_grad_up = native_grad_h.float() * activated_gate
         native_grad_up = torch.where(
-            (up_unclamped.float() >= -activation_limit) &
-            (up_unclamped.float() <= activation_limit),
+            (up_unclamped.float() >= -activation_limit)
+            & (up_unclamped.float() <= activation_limit),
             native_grad_up,
             torch.zeros_like(native_grad_up),
         ).to(torch.bfloat16)
         grad_gate_up_output[row_indices] = torch.cat(
-            (native_grad_gate, native_grad_up), dim=1)
+            (native_grad_gate, native_grad_up), dim=1
+        )
         h_act_output[row_indices] = native_h
         h_weighted_output[row_indices] = (
-            (
-                native_h.float() *
-                route_weights[row_indices].float().unsqueeze(1)
-            ).to(native_h.dtype)
+            (native_h.float() * route_weights[row_indices].float().unsqueeze(1)).to(
+                native_h.dtype
+            )
             if route_weight_mode is RouteWeightMode.PRE_DOWN
             else native_h
         )
@@ -471,20 +600,19 @@ def bf16_mega_moe_backward_dgrad(
     w3_weights = w13_weights[:, intermediate_hidden:].contiguous()
     if row_indices.numel():
         native_grad_x = torch._grouped_mm(
-            grad_gate_up_output[
-                row_indices, :intermediate_hidden].contiguous(),
+            grad_gate_up_output[row_indices, :intermediate_hidden].contiguous(),
             w1_weights,
             offs=offsets,
         )
-        native_grad_x.add_(torch._grouped_mm(
-            grad_gate_up_output[
-                row_indices, intermediate_hidden:].contiguous(),
-            w3_weights,
-            offs=offsets,
-        ))
+        native_grad_x.add_(
+            torch._grouped_mm(
+                grad_gate_up_output[row_indices, intermediate_hidden:].contiguous(),
+                w3_weights,
+                offs=offsets,
+            )
+        )
     else:
-        native_grad_x = grad_x_pool_output.new_empty(
-            (0, grad_x_pool_output.size(1)))
+        native_grad_x = grad_x_pool_output.new_empty((0, grad_x_pool_output.size(1)))
     grad_x_pool_output.zero_()
     grad_x_pool_output[row_indices] = native_grad_x
 
@@ -496,11 +624,9 @@ def bf16_mega_moe_backward_dgrad(
     else:
         route_lhs = grad_h_output[row_indices]
         route_rhs = h_act_output[row_indices]
-    native_grad_route = (
-        route_lhs.float() * route_rhs.float()).sum(dim=1)
+    native_grad_route = (route_lhs.float() * route_rhs.float()).sum(dim=1)
     grad_route_output.zero_()
-    grad_route_output[row_indices] = native_grad_route.to(
-        grad_route_output.dtype)
+    grad_route_output[row_indices] = native_grad_route.to(grad_route_output.dtype)
 
     if direct_remote_grad_x:
         metadata = sym_buffer.token_src_metadata[row_indices].long()
@@ -514,18 +640,16 @@ def bf16_mega_moe_backward_dgrad(
             dtype=grad_x_pool_output.dtype,
             device=grad_x_pool_output.device,
         )
-        native_grad_x_planes[
-            metadata[:, 0], metadata[:, 1], metadata[:, 2]
-        ] = native_grad_x
+        native_grad_x_planes[metadata[:, 0], metadata[:, 1], metadata[:, 2]] = (
+            native_grad_x
+        )
         dist.all_reduce(native_grad_x_planes, group=sym_buffer.group)
         # Install the corrected values into the real slot-major symmetric
         # planes before the fused W13 combine. Reducing a shadow tensor after
         # combine masks destination/slot bugs and leaves direct-plane users
         # observing the fused W13 dgrad's different accumulation boundary.
         backward_grad_y.copy_(
-            native_grad_x_planes[
-                sym_buffer.group.rank()
-            ].permute(1, 0, 2)
+            native_grad_x_planes[sym_buffer.group.rank()].permute(1, 0, 2)
         )
 
     # MegaMoE's communication scheduler deliberately interleaves source
@@ -717,8 +841,7 @@ def bf16_mega_moe_backward_w13_combine(
     pool_block_m: int,
     grad_x_output: torch.Tensor,
     sym_buffer: Any,
-    combine_order_mode: CombineOrderMode =
-    CombineOrderMode.FIXED_TOPK,
+    combine_order_mode: CombineOrderMode = CombineOrderMode.FIXED_TOPK,
 ) -> None:
     """Run W13 wgrad while reducing direct-write grad-x planes."""
     combine_order_mode = CombineOrderMode(combine_order_mode)

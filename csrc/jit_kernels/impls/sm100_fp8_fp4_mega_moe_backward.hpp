@@ -53,8 +53,13 @@ public:
         int num_ranks;
         std::string combine_order_mode = "fixed_topk";
         bool do_reverse_dispatch = true;
-        bool prepare_route_and_weighted = true;
+        bool compute_route_dot = true;
+        bool write_weighted = true;
+        bool synchronize_ranks = true;
+        bool synchronize_after_dispatch = true;
+        bool barrier_only = false;
         const int* expert_counts;
+        layout::Workspace backward_workspace;
         layout::SymBuffer<> backward_sym_buffer;
         const cutlass::bfloat16_t* backward_grad_y;
         const cutlass::bfloat16_t* backward_x;
@@ -80,7 +85,7 @@ using namespace deep_gemm;
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(
         &sm100_bf16_mega_moe_backward_post_down_prelude<
-            {}, {}, {}, {}, {}, {}, {}, {}
+            {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
         >);
 }};
 )",
@@ -89,7 +94,12 @@ static void __instantiate_kernel() {{
             get_backward_combine_order_mode_name(
                 args.combine_order_mode),
             args.do_reverse_dispatch ? "true" : "false",
-            args.prepare_route_and_weighted ? "true" : "false");
+            args.compute_route_dot ? "true" : "false",
+            args.write_weighted ? "true" : "false",
+            "false",
+            args.synchronize_ranks ? "true" : "false",
+            args.synchronize_after_dispatch ? "true" : "false",
+            args.barrier_only ? "true" : "false");
     }
 
     static void launch_impl(
@@ -99,6 +109,7 @@ static void __instantiate_kernel() {{
         DG_CUDA_UNIFIED_CHECK(launch_kernel(
             kernel, config,
             args.expert_counts,
+            args.backward_workspace,
             args.backward_sym_buffer,
             args.backward_grad_y,
             args.backward_x,
@@ -746,7 +757,13 @@ static void sm100_bf16_mega_moe_backward_post_down_prelude(
     const int& backward_rank,
     const int& num_topk,
     const int& block_m,
-    const std::string& combine_order_mode) {
+    const std::string& combine_order_mode,
+    const bool& do_reverse_dispatch,
+    const bool& compute_route_dot,
+    const bool& write_weighted,
+    const bool& synchronize_ranks,
+    const bool& synchronize_after_dispatch,
+    const bool& barrier_only) {
     const auto [num_pool_rows, hidden] =
         get_shape<2>(grad_y_unweighted_output);
     const int num_experts =
@@ -774,9 +791,13 @@ static void sm100_bf16_mega_moe_backward_post_down_prelude(
             torch::IntArrayRef({num_pool_rows, hidden}));
     };
     check_bf16_pool(grad_y_unweighted_output);
-    check_bf16_pool(grad_y_weighted_output);
     check_bf16_pool(x_pool_output);
-    check_bf16_pool(down_unweighted_output);
+    if (write_weighted) {
+        check_bf16_pool(grad_y_weighted_output);
+    }
+    if (compute_route_dot) {
+        check_bf16_pool(down_unweighted_output);
+    }
     DG_HOST_ASSERT(
         backward_grad_y.scalar_type() ==
             torch::kBFloat16 &&
@@ -804,11 +825,13 @@ static void sm100_bf16_mega_moe_backward_post_down_prelude(
             torch::kFloat &&
         route_weights_output.is_contiguous() &&
         route_weights_output.numel() == num_pool_rows);
-    DG_HOST_ASSERT(
-        grad_route_output.scalar_type() ==
-            torch::kFloat &&
-        grad_route_output.is_contiguous() &&
-        grad_route_output.numel() == num_pool_rows);
+    if (compute_route_dot) {
+        DG_HOST_ASSERT(
+            grad_route_output.scalar_type() ==
+                torch::kFloat &&
+            grad_route_output.is_contiguous() &&
+            grad_route_output.numel() == num_pool_rows);
+    }
 
     const auto exact_alias = [](
         const torch::Tensor& lhs,
@@ -830,31 +853,47 @@ static void sm100_bf16_mega_moe_backward_post_down_prelude(
         return std::max(lhs_begin, rhs_begin) <
                std::min(lhs_end, rhs_end);
     };
-    // The weighted destination may replace the retained down pool only
-    // because every row is read and overwritten by the same route group.
-    DG_HOST_ASSERT(
-        exact_alias(
-            grad_y_weighted_output,
-            down_unweighted_output) ||
-        !overlaps(
-            grad_y_weighted_output,
-            down_unweighted_output));
-    DG_HOST_ASSERT(!overlaps(
-        grad_y_unweighted_output,
-        down_unweighted_output));
-    DG_HOST_ASSERT(!overlaps(
-        x_pool_output, down_unweighted_output));
-    DG_HOST_ASSERT(!overlaps(
-        grad_y_unweighted_output,
-        grad_y_weighted_output));
-    DG_HOST_ASSERT(!overlaps(
-        x_pool_output, grad_y_weighted_output));
     DG_HOST_ASSERT(!overlaps(
         x_pool_output, grad_y_unweighted_output));
+    if (compute_route_dot || write_weighted) {
+        // The weighted destination may replace the retained down pool only
+        // because every row is read and overwritten by the same route group.
+        if (compute_route_dot && write_weighted) {
+            DG_HOST_ASSERT(
+                exact_alias(
+                    grad_y_weighted_output,
+                    down_unweighted_output) ||
+                !overlaps(
+                    grad_y_weighted_output,
+                    down_unweighted_output));
+        }
+        if (compute_route_dot) {
+            DG_HOST_ASSERT(!overlaps(
+                grad_y_unweighted_output,
+                down_unweighted_output));
+            DG_HOST_ASSERT(!overlaps(
+                x_pool_output, down_unweighted_output));
+        }
+        if (write_weighted) {
+            DG_HOST_ASSERT(!overlaps(
+                grad_y_unweighted_output,
+                grad_y_weighted_output));
+            DG_HOST_ASSERT(!overlaps(
+                x_pool_output, grad_y_weighted_output));
+        }
+    }
 
     const int num_sms = device_runtime->get_num_sms();
     const auto backward_sym_buffer = layout::SymBuffer<>(
         backward_sym_buffer_ptrs, backward_rank);
+    const auto backward_workspace = layout::Workspace(
+        reinterpret_cast<void*>(
+            backward_sym_buffer_ptrs[backward_rank]),
+        num_ranks,
+        num_experts * num_ranks,
+        static_cast<uint32_t>(backward_grad_y.size(0)),
+        static_cast<uint32_t>(num_topk),
+        0);
     SM100BF16MegaMoEBackwardPostDownPreludeRuntime::Args
         args = {
             .hidden = hidden,
@@ -863,9 +902,15 @@ static void sm100_bf16_mega_moe_backward_post_down_prelude(
             .num_sms = num_sms,
             .num_ranks = num_ranks,
             .combine_order_mode = combine_order_mode,
-            .do_reverse_dispatch = true,
-            .prepare_route_and_weighted = false,
+            .do_reverse_dispatch = do_reverse_dispatch,
+            .compute_route_dot = compute_route_dot,
+            .write_weighted = write_weighted,
+            .synchronize_ranks = synchronize_ranks,
+            .synchronize_after_dispatch =
+                synchronize_after_dispatch,
+            .barrier_only = barrier_only,
             .expert_counts = expert_counts.data_ptr<int>(),
+            .backward_workspace = backward_workspace,
             .backward_sym_buffer = backward_sym_buffer,
             .backward_grad_y =
                 reinterpret_cast<
@@ -913,25 +958,13 @@ static void sm100_bf16_mega_moe_backward_post_down_prelude(
     const auto code =
         SM100BF16MegaMoEBackwardPostDownPreludeRuntime::
             generate(args);
-    const auto runtime = compiler->build(
-        "sm100_bf16_mega_moe_backward_post_down_dispatch",
-        code);
+    const auto runtime = compiler->build(fmt::format(
+        "sm100_bf16_mega_moe_backward_prelude_r{}_d{}_w{}_s{}_c{}_b{}",
+        do_reverse_dispatch, compute_route_dot,
+        write_weighted, synchronize_ranks,
+        synchronize_after_dispatch, barrier_only), code);
     SM100BF16MegaMoEBackwardPostDownPreludeRuntime::launch(
         runtime, args);
-    // A launch boundary makes the dispatched BF16 pool globally visible.
-    // The second kernel owns each row from its exact FP32 dot through the
-    // destructive weighted-grad write, so no grid barrier is required.
-    args.combine_order_mode = "fixed_topk";
-    args.do_reverse_dispatch = false;
-    args.prepare_route_and_weighted = true;
-    const auto route_code =
-        SM100BF16MegaMoEBackwardPostDownPreludeRuntime::
-            generate(args);
-    const auto route_runtime = compiler->build(
-        "sm100_bf16_mega_moe_backward_post_down_route",
-        route_code);
-    SM100BF16MegaMoEBackwardPostDownPreludeRuntime::launch(
-        route_runtime, args);
 }
 
 static void sm100_bf16_mega_moe_backward_dgrad(

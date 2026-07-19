@@ -125,7 +125,13 @@ static void bf16_mega_moe_backward_post_down_prelude(
     const int& backward_rank,
     const int& num_topk,
     const int& block_m,
-    const std::string& combine_order_mode) {
+    const std::string& combine_order_mode,
+    const bool& do_reverse_dispatch,
+    const bool& compute_route_dot,
+    const bool& write_weighted,
+    const bool& synchronize_ranks,
+    const bool& synchronize_after_dispatch,
+    const bool& barrier_only) {
     deep_gemm::
         sm100_bf16_mega_moe_backward_post_down_prelude(
             grad_y_unweighted_output,
@@ -135,7 +141,11 @@ static void bf16_mega_moe_backward_post_down_prelude(
             backward_grad_y, backward_x,
             backward_topk_weights, token_src_metadata,
             backward_sym_buffer_ptrs, backward_rank,
-            num_topk, block_m, combine_order_mode);
+            num_topk, block_m, combine_order_mode,
+            do_reverse_dispatch, compute_route_dot,
+            write_weighted, synchronize_ranks,
+            synchronize_after_dispatch,
+            barrier_only);
 }
 
 static void bf16_mega_moe_backward_w2(
@@ -368,7 +378,13 @@ static void register_apis(pybind11::module_& m) {
         py::arg("backward_rank"),
         py::arg("num_topk"),
         py::arg("block_m"),
-        py::arg("combine_order_mode") = "fixed_topk");
+        py::arg("combine_order_mode") = "fixed_topk",
+        py::arg("do_reverse_dispatch") = true,
+        py::arg("compute_route_dot") = true,
+        py::arg("write_weighted") = true,
+        py::arg("synchronize_ranks") = true,
+        py::arg("synchronize_after_dispatch") = true,
+        py::arg("barrier_only") = false);
     m.def("bf16_mega_moe_backward_w2",
           &bf16_mega_moe_backward_w2,
           py::arg("grad_w2_output"), py::arg("grad_ye"),
