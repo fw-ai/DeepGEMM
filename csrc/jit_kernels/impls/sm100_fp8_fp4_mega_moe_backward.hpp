@@ -802,9 +802,11 @@ static void sm100_bf16_mega_moe_backward_post_down_prelude(
     DG_HOST_ASSERT(block_m % 16 == 0);
     DG_HOST_ASSERT(num_topk > 0);
     DG_HOST_ASSERT(
+        route_prelude_threads == 32 ||
+        route_prelude_threads == 64 ||
         route_prelude_threads == 128 ||
         route_prelude_threads == 256);
-    if (route_prelude_threads == 128) {
+    if (route_prelude_threads != 256) {
         DG_HOST_ASSERT(hidden == 2048);
         DG_HOST_ASSERT(compute_route_dot);
         DG_HOST_ASSERT(combine_order_mode != "fixed_topk");

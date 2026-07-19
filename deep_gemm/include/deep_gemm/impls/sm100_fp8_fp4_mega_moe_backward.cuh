@@ -523,18 +523,21 @@ sm100_bf16_mega_moe_backward_post_down_prelude(
     constexpr uint32_t kTritonRouteValuesPerThread =
         kTritonRouteBlockH / kTritonRouteThreads;
     constexpr bool kVirtualizeRouteLanes =
-        kRoutePreludeThreads == 128;
+        kRoutePreludeThreads != 256;
     DG_STATIC_ASSERT(
-        kRoutePreludeThreads == 128 ||
+        kRoutePreludeThreads == 32 ||
+            kRoutePreludeThreads == 64 ||
+            kRoutePreludeThreads == 128 ||
             kRoutePreludeThreads == 256,
-        "POST_DOWN route prelude requires 128 or 256 physical threads");
+        "POST_DOWN route prelude requires 32, 64, 128, or 256 "
+        "physical threads");
     DG_STATIC_ASSERT(
         !kVirtualizeRouteLanes ||
             (kHidden == 2048 &&
              kCombineOrderMode !=
                  CombineOrderMode::FixedTopK &&
              kComputeRouteDot),
-        "128-thread route prelude is only supported for the exact "
+        "Virtual route prelude threads are only supported for the exact "
         "non-fixed H=2048 route-dot path");
     constexpr uint32_t kExactRouteGroupThreads =
         kVirtualizeRouteLanes
@@ -545,8 +548,16 @@ sm100_bf16_mega_moe_backward_post_down_prelude(
         kExactRouteGroupThreads;
     DG_STATIC_ASSERT(
         kRouteVirtualLanes == 1 ||
-            kRouteVirtualLanes == 2,
+            kRouteVirtualLanes == 2 ||
+            kRouteVirtualLanes == 4 ||
+            kRouteVirtualLanes == 8,
         "Unsupported POST_DOWN route lane virtualization");
+    DG_STATIC_ASSERT(
+        kExactRouteGroupThreads == 32 ||
+            kNumThreads /
+                    kExactRouteGroupThreads <=
+                16,
+        "Sub-CTA route groups exceed the 16 named barriers");
     DG_STATIC_ASSERT(
         kTritonRouteValuesPerThread == 2 ||
             kTritonRouteValuesPerThread == 4 ||
@@ -672,6 +683,19 @@ sm100_bf16_mega_moe_backward_post_down_prelude(
                     static_cast<uint64_t>(pool_row) *
                         kHidden;
             }
+            float virtual_route_weight = 0.0f;
+            if constexpr (
+                kVirtualizeRouteLanes &&
+                kWriteWeighted &&
+                kRouteVirtualLanes == 8) {
+                // The 32-thread route group is one warp. Publish lane zero's
+                // remote route-weight load before consuming it, then write
+                // weighted values per virtual lane instead of retaining 64
+                // floats per thread across the reduction barrier.
+                __syncwarp();
+                virtual_route_weight =
+                    route_weights_output[pool_row];
+            }
 
             float grad_route = 0.0f;
             if constexpr (!kComputeRouteDot && !kWriteWeighted) {
@@ -742,12 +766,15 @@ sm100_bf16_mega_moe_backward_post_down_prelude(
                 kCombineOrderMode !=
                 CombineOrderMode::FixedTopK) {
                 if constexpr (kVirtualizeRouteLanes) {
-                    // Each physical lane evaluates logical lanes p and
-                    // p + 128. Their FMA and warp-XOR trees remain separate,
-                    // then the four physical warps publish all eight logical
-                    // Triton warp partials for the unchanged second level.
+                    // Physical lane p evaluates logical lanes
+                    // p + v * kExactRouteGroupThreads. Their FMA and
+                    // warp-XOR trees remain separate; the physical warps
+                    // publish all eight logical Triton warp partials for the
+                    // unchanged second level.
                     float weighted_values
-                        [kRouteVirtualLanes]
+                        [kRouteVirtualLanes == 8
+                             ? 1
+                             : kRouteVirtualLanes]
                         [kTritonRouteValuesPerThread];
                     #pragma unroll
                     for (uint32_t virtual_lane = 0;
@@ -796,10 +823,28 @@ sm100_bf16_mega_moe_backward_post_down_prelude(
                             }
                         }
                         if constexpr (kWriteWeighted) {
-                            weighted_values[virtual_lane][i] =
+                            const float weighted_value =
                                 kWeightedSourceIsRhs
                                 ? down[i]
                                 : grad_y[i];
+                            if constexpr (
+                                kRouteVirtualLanes == 8) {
+                                if (col < kHidden) {
+                                    grad_y_weighted_output[
+                                        static_cast<
+                                            uint64_t>(
+                                            pool_row) *
+                                            kHidden +
+                                        col] =
+                                        cutlass::bfloat16_t(
+                                            weighted_value *
+                                            virtual_route_weight);
+                                }
+                            } else {
+                                weighted_values[
+                                    virtual_lane][i] =
+                                    weighted_value;
+                            }
                         }
                     }
                     float logical_grad_route;
@@ -868,9 +913,17 @@ sm100_bf16_mega_moe_backward_post_down_prelude(
                             logical_grad_route;
                     }
                 }
-                ptx::sync_aligned(
-                    kExactRouteGroupThreads,
-                    route_group_idx);
+                if constexpr (
+                    kExactRouteGroupThreads > 32) {
+                    ptx::sync_aligned(
+                        kExactRouteGroupThreads,
+                        route_group_idx);
+                } else {
+                    // A 32-thread group is one physical warp, so it needs no
+                    // named barrier ID. This permits 32 independent route
+                    // groups despite the CTA's 16 named-barrier limit.
+                    __syncwarp();
+                }
                 const uint32_t physical_warp_in_group =
                     route_group_lane_idx / 32;
                 const uint32_t lane_in_warp =
@@ -892,7 +945,9 @@ sm100_bf16_mega_moe_backward_post_down_prelude(
                                 grad_route, offset));
                     }
                 }
-                if constexpr (kWriteWeighted) {
+                if constexpr (
+                    kWriteWeighted &&
+                    kRouteVirtualLanes != 8) {
                     const float route_weight =
                         route_weights_output[pool_row];
                     #pragma unroll

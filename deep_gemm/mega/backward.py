@@ -361,12 +361,14 @@ def bf16_mega_moe_backward_dgrad(
                     route_prelude_threads = int(_BF16_ROUTE_PRELUDE_THREADS)
                 except ValueError as exc:
                     raise ValueError(
-                        "DG_BF16_ROUTE_PRELUDE_THREADS must be 128 or 256, got "
+                        "DG_BF16_ROUTE_PRELUDE_THREADS must be one of "
+                        "32, 64, 128, or 256, got "
                         f"{_BF16_ROUTE_PRELUDE_THREADS!r}"
                     ) from exc
-                if route_prelude_threads not in (128, 256):
+                if route_prelude_threads not in (32, 64, 128, 256):
                     raise ValueError(
-                        "DG_BF16_ROUTE_PRELUDE_THREADS must be 128 or 256, got "
+                        "DG_BF16_ROUTE_PRELUDE_THREADS must be one of "
+                        "32, 64, 128, or 256, got "
                         f"{route_prelude_threads}"
                     )
             _C.bf16_mega_moe_backward_post_down_prelude(
