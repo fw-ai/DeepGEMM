@@ -229,7 +229,8 @@ def bf16_mega_moe(y: torch.Tensor,
                   precomputed_route_counts: Optional[torch.Tensor] = None,
                   active_pool_rows: Optional[int] = None,
                   route_count_mismatch: Optional[torch.Tensor] = None,
-                  num_config_tokens: Optional[int] = None):
+                  num_config_tokens: Optional[int] = None,
+                  saved_x: Optional[torch.Tensor] = None):
     """Run BF16 MegaMoE with an explicit route-weight boundary.
 
     The optional stage saves expose unweighted/weighted activation and W2
@@ -300,4 +301,5 @@ def bf16_mega_moe(y: torch.Tensor,
         precomputed_route_counts,
         active_pool_rows,
         route_count_mismatch,
+        saved_x,
     )

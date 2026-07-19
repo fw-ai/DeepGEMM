@@ -40,6 +40,7 @@ template <
     RouteWeightMode kRouteWeightMode,
     CombineOrderMode kCombineOrderMode,
     bool kSaveDownUnweighted,
+    bool kSaveX,
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
     uint32_t L2_SHAPE_N = kHidden,
@@ -58,6 +59,7 @@ sm100_bf16_mega_moe_impl(void* y,
                          nv_bfloat16* saved_l1_preact,
                          nv_bfloat16* saved_h_unweighted,
                          nv_bfloat16* saved_h_weighted,
+                         nv_bfloat16* saved_x,
                          int* cumulative_local_expert_recv_stats,
                          const int* precomputed_route_counts,
                          int* route_count_mismatch,
@@ -651,6 +653,17 @@ sm100_bf16_mega_moe_impl(void* y,
                     pull_buffer.get_base_ptr(), kNumBytesPerPull
                 );
                 cute::tma_store_arrive();
+                if constexpr (kSaveX) {
+                    ptx::tma_store_1d(
+                        saved_x +
+                            static_cast<uint64_t>(pool_token_idx) *
+                                kHidden +
+                            i * kNumBytesPerPull /
+                                sizeof(nv_bfloat16),
+                        pull_buffer.get_base_ptr(), kNumBytesPerPull
+                    );
+                    cute::tma_store_arrive();
+                }
                 ptx::tma_store_wait<0>();
             };
             if (cute::elect_one_sync()) {
@@ -713,6 +726,27 @@ sm100_bf16_mega_moe_impl(void* y,
 
                 // Wait read count ready
                 ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+
+                if constexpr (kSaveX) {
+                    // The dispatch path stores only real routes. W13 wgrad
+                    // consumes BLOCK_M-padded expert ranges, so initialize
+                    // just the short per-expert tails instead of clearing the
+                    // entire multi-GiB saved pool before every forward.
+                    const uint32_t num_padding_tokens =
+                        num_recv_m_blocks * BLOCK_M - num_recv_tokens;
+                    const uint64_t padding_start =
+                        static_cast<uint64_t>(expert_pool_block_offset) *
+                            BLOCK_M +
+                        num_recv_tokens;
+                    for (uint64_t linear = thread_idx;
+                         linear <
+                         static_cast<uint64_t>(num_padding_tokens) *
+                             kHidden;
+                         linear += kNumDispatchThreads) {
+                        saved_x[padding_start * kHidden + linear] =
+                            nv_bfloat16(0.0f);
+                    }
+                }
 
                 // Clean expert token count, and add cumulative results
                 DG_STATIC_ASSERT(kNumDispatchWarps >= 2, "Not enough dispatch warps");

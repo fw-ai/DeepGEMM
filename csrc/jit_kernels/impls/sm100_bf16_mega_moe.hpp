@@ -60,6 +60,7 @@ public:
         std::string route_weight_mode;
         std::string combine_order_mode;
         bool save_down_unweighted;
+        bool save_x;
         MegaMoEConfig config;
 
         // Runtime arguments
@@ -67,6 +68,7 @@ public:
         void* saved_l1_preact;
         void* saved_h_unweighted;
         void* saved_h_weighted;
+        void* saved_x;
         int* cumulative_local_expert_recv_stats;
         const int* precomputed_route_counts;
         int* route_count_mismatch;
@@ -112,6 +114,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
         {}
     >);
 }};
@@ -133,7 +136,8 @@ static void __instantiate_kernel() {{
     args.save_stage_activations ? "true" : "false",
     get_route_weight_mode_name(args.route_weight_mode),
     get_combine_order_mode_name(args.combine_order_mode),
-    args.save_down_unweighted ? "true" : "false");
+    args.save_down_unweighted ? "true" : "false",
+    args.save_x ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -143,6 +147,7 @@ static void __instantiate_kernel() {{
             args.saved_l1_preact,
             args.saved_h_unweighted,
             args.saved_h_weighted,
+            args.saved_x,
             args.cumulative_local_expert_recv_stats,
             args.precomputed_route_counts,
             args.route_count_mismatch,
@@ -181,7 +186,8 @@ static void sm100_bf16_mega_moe(
     const std::string& combine_order_mode,
     const std::optional<torch::Tensor>& precomputed_route_counts,
     const std::optional<int>& active_pool_rows,
-    const std::optional<torch::Tensor>& route_count_mismatch
+    const std::optional<torch::Tensor>& route_count_mismatch,
+    const std::optional<torch::Tensor>& saved_x
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -237,6 +243,13 @@ static void sm100_bf16_mega_moe(
         DG_HOST_ASSERT(saved_down_unweighted->is_contiguous());
         DG_HOST_ASSERT(
             saved_down_unweighted->sizes() ==
+            torch::IntArrayRef({num_saved_pool_tokens, hidden}));
+    }
+    if (saved_x.has_value()) {
+        DG_HOST_ASSERT(saved_x->scalar_type() == torch::kBFloat16);
+        DG_HOST_ASSERT(saved_x->is_contiguous());
+        DG_HOST_ASSERT(
+            saved_x->sizes() ==
             torch::IntArrayRef({num_saved_pool_tokens, hidden}));
     }
 
@@ -298,6 +311,7 @@ static void sm100_bf16_mega_moe(
         .combine_order_mode = combine_order_mode,
         .save_down_unweighted =
             saved_down_unweighted.has_value(),
+        .save_x = saved_x.has_value(),
         .config = config,
         .y = y.data_ptr(),
         .saved_l1_preact = saved_l1_preact.has_value()
@@ -310,6 +324,9 @@ static void sm100_bf16_mega_moe(
         .saved_h_weighted =
             saved_h_weighted.has_value()
             ? saved_h_weighted->data_ptr()
+            : nullptr,
+        .saved_x = saved_x.has_value()
+            ? saved_x->data_ptr()
             : nullptr,
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,
         .precomputed_route_counts =

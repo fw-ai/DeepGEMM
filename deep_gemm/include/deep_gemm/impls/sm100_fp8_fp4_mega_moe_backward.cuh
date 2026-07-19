@@ -375,6 +375,10 @@ bf16_mega_moe_reduce_post_down_route(
             } else {
                 float lane_sums[4] = {
                     0.0f, 0.0f, 0.0f, 0.0f};
+                const float route_weight =
+                    kWriteWeighted
+                    ? route_weights_output[pool_row]
+                    : 0.0f;
                 for (uint32_t col_base =
                          route_group_lane_idx * 4;
                      col_base < kHidden;
@@ -456,7 +460,8 @@ template <
     bool kWeightedSourceIsRhs = false,
     bool kSynchronizeRanks = true,
     bool kSynchronizeAfterDispatch = true,
-    bool kBarrierOnly = false>
+    bool kBarrierOnly = false,
+    bool kXPrepared = false>
 CUTLASS_GLOBAL __launch_bounds__(1024, 1) void
 sm100_bf16_mega_moe_backward_post_down_prelude(
     const int* expert_counts,
@@ -605,13 +610,20 @@ sm100_bf16_mega_moe_backward_post_down_prelude(
                                 metadata.token_idx) *
                                 kHidden,
                         metadata.rank_idx);
-                remote_x =
-                    backward_sym_buffer.map(
-                        backward_x +
-                            static_cast<uint64_t>(
-                                metadata.token_idx) *
-                                kHidden,
-                        metadata.rank_idx);
+                if constexpr (kXPrepared) {
+                    remote_x =
+                        x_pool_output +
+                        static_cast<uint64_t>(pool_row) *
+                            kHidden;
+                } else {
+                    remote_x =
+                        backward_sym_buffer.map(
+                            backward_x +
+                                static_cast<uint64_t>(
+                                    metadata.token_idx) *
+                                    kHidden,
+                            metadata.rank_idx);
+                }
                 if (route_group_lane_idx == 0) {
                     const auto* remote_weight =
                         backward_sym_buffer.map(
@@ -663,15 +675,17 @@ sm100_bf16_mega_moe_backward_post_down_prelude(
                             remote_grad_y)[
                             col /
                             kBF16ValuesPerVector];
-                    reinterpret_cast<uint4*>(
-                        x_pool_output)[
-                        offset /
-                        kBF16ValuesPerVector] =
-                        reinterpret_cast<
-                            const uint4*>(
-                            remote_x)[
-                            col /
-                            kBF16ValuesPerVector];
+                    if constexpr (!kXPrepared) {
+                        reinterpret_cast<uint4*>(
+                            x_pool_output)[
+                            offset /
+                            kBF16ValuesPerVector] =
+                            reinterpret_cast<
+                                const uint4*>(
+                                remote_x)[
+                                col /
+                                kBF16ValuesPerVector];
+                    }
                 }
             } else if constexpr (
                 !kComputeRouteDot && kWriteWeighted) {
@@ -726,7 +740,8 @@ sm100_bf16_mega_moe_backward_post_down_prelude(
                                       kHidden +
                                   col])
                         : 0.0f;
-                    if constexpr (kDoReverseDispatch) {
+                    if constexpr (
+                        kDoReverseDispatch && !kXPrepared) {
                         if (col < kHidden) {
                             x_pool_output[
                                 static_cast<uint64_t>(
@@ -845,6 +860,10 @@ sm100_bf16_mega_moe_backward_post_down_prelude(
             } else {
                 float lane_sums[4] = {
                     0.0f, 0.0f, 0.0f, 0.0f};
+                const float route_weight =
+                    kWriteWeighted
+                    ? route_weights_output[pool_row]
+                    : 0.0f;
                 for (uint32_t col_base =
                          route_group_lane_idx * 4;
                      col_base < kHidden;
@@ -864,6 +883,18 @@ sm100_bf16_mega_moe_backward_post_down_prelude(
                                         pool_row) *
                                         kHidden +
                                     col]);
+                        if constexpr (kWriteWeighted) {
+                            grad_y_weighted_output[
+                                static_cast<uint64_t>(
+                                    pool_row) *
+                                    kHidden +
+                                col] =
+                                cutlass::bfloat16_t(
+                                    (kWeightedSourceIsRhs
+                                         ? down
+                                         : grad_y) *
+                                    route_weight);
+                        }
                         if constexpr (kDoReverseDispatch) {
                             grad_y_unweighted_output[
                                 static_cast<uint64_t>(
@@ -872,12 +903,14 @@ sm100_bf16_mega_moe_backward_post_down_prelude(
                                 col] =
                                 cutlass::bfloat16_t(
                                     grad_y);
-                            x_pool_output[
-                                static_cast<uint64_t>(
-                                    pool_row) *
-                                    kHidden +
-                                col] =
-                                remote_x[col];
+                            if constexpr (!kXPrepared) {
+                                x_pool_output[
+                                    static_cast<uint64_t>(
+                                        pool_row) *
+                                        kHidden +
+                                    col] =
+                                    remote_x[col];
+                            }
                         }
                         lane_sums[i] = __fadd_rn(
                             lane_sums[i],
@@ -928,40 +961,30 @@ sm100_bf16_mega_moe_backward_post_down_prelude(
                 }
             }
             if constexpr (kComputeRouteDot) {
-                if (route_group_lane_idx == 0)
+                if (route_group_lane_idx == 0) {
                     grad_route_output[pool_row] =
                         grad_route;
+                    if constexpr (kNumRanks > 1) {
+                        const auto metadata =
+                            token_src_metadata[pool_row];
+                        auto* remote_grad_route =
+                            backward_sym_buffer.map(
+                                const_cast<float*>(
+                                    backward_topk_weights) +
+                                    static_cast<uint64_t>(
+                                        metadata.token_idx) *
+                                        num_topk +
+                                    metadata.topk_idx,
+                                metadata.rank_idx);
+                        *remote_grad_route = grad_route;
+                    }
+                }
                 if (route_group_threads > 32) {
                     ptx::sync_aligned(
                         route_group_threads,
                         route_group_idx);
                 } else {
                     __syncwarp();
-                }
-                if constexpr (
-                    kWriteWeighted &&
-                    kCombineOrderMode ==
-                    CombineOrderMode::FixedTopK) {
-                    const float route_weight =
-                        route_weights_output[pool_row];
-                    for (uint32_t col =
-                             route_group_lane_idx;
-                         col < kHidden;
-                         col += route_group_threads) {
-                        const uint64_t offset =
-                            static_cast<uint64_t>(
-                                pool_row) *
-                                kHidden +
-                            col;
-                        grad_y_weighted_output[offset] =
-                            cutlass::bfloat16_t(
-                                static_cast<float>(
-                                    (kWeightedSourceIsRhs
-                                         ? down_unweighted[offset]
-                                         : grad_y_unweighted_output[
-                                               offset])) *
-                                route_weight);
-                    }
                 }
             }
         }
@@ -1008,8 +1031,10 @@ sm100_bf16_mega_moe_backward_post_down_prelude(
             if constexpr (kDoReverseDispatch) {
                 grad_y_unweighted_output[offset] =
                     cutlass::bfloat16_t(0.0f);
-                x_pool_output[offset] =
-                    cutlass::bfloat16_t(0.0f);
+                if constexpr (!kXPrepared) {
+                    x_pool_output[offset] =
+                        cutlass::bfloat16_t(0.0f);
+                }
             }
             if constexpr (kWriteWeighted) {
                 grad_y_weighted_output[offset] =

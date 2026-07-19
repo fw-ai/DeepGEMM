@@ -301,7 +301,8 @@ static void bf16_mega_moe(
     const std::string& combine_order_mode,
     const std::optional<torch::Tensor>& precomputed_route_counts,
     const std::optional<int>& active_pool_rows,
-    const std::optional<torch::Tensor>& route_count_mismatch
+    const std::optional<torch::Tensor>& route_count_mismatch,
+    const std::optional<torch::Tensor>& saved_x
 ) {
     // Config checks
     const auto num_tokens = static_cast<int>(y.size(0));
@@ -400,7 +401,8 @@ static void bf16_mega_moe(
                             combine_order_mode,
                             precomputed_route_counts,
                             active_pool_rows,
-                            route_count_mismatch);
+                            route_count_mismatch,
+                            saved_x);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }

@@ -58,6 +58,7 @@ public:
         bool synchronize_ranks = true;
         bool synchronize_after_dispatch = true;
         bool barrier_only = false;
+        bool x_prepared = false;
         const int* expert_counts;
         layout::Workspace backward_workspace;
         layout::SymBuffer<> backward_sym_buffer;
@@ -85,7 +86,7 @@ using namespace deep_gemm;
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(
         &sm100_bf16_mega_moe_backward_post_down_prelude<
-            {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+            {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
         >);
 }};
 )",
@@ -99,7 +100,8 @@ static void __instantiate_kernel() {{
             "false",
             args.synchronize_ranks ? "true" : "false",
             args.synchronize_after_dispatch ? "true" : "false",
-            args.barrier_only ? "true" : "false");
+            args.barrier_only ? "true" : "false",
+            args.x_prepared ? "true" : "false");
     }
 
     static void launch_impl(
@@ -766,7 +768,8 @@ static void sm100_bf16_mega_moe_backward_post_down_prelude(
     const bool& write_weighted,
     const bool& synchronize_ranks,
     const bool& synchronize_after_dispatch,
-    const bool& barrier_only) {
+    const bool& barrier_only,
+    const bool& x_prepared) {
     const auto [num_pool_rows, hidden] =
         get_shape<2>(grad_y_unweighted_output);
     const int num_experts =
@@ -912,6 +915,7 @@ static void sm100_bf16_mega_moe_backward_post_down_prelude(
             .synchronize_after_dispatch =
                 synchronize_after_dispatch,
             .barrier_only = barrier_only,
+            .x_prepared = x_prepared,
             .expert_counts = expert_counts.data_ptr<int>(),
             .backward_workspace = backward_workspace,
             .backward_sym_buffer = backward_sym_buffer,
@@ -962,10 +966,11 @@ static void sm100_bf16_mega_moe_backward_post_down_prelude(
         SM100BF16MegaMoEBackwardPostDownPreludeRuntime::
             generate(args);
     const auto runtime = compiler->build(fmt::format(
-        "sm100_bf16_mega_moe_backward_prelude_r{}_d{}_w{}_s{}_c{}_b{}",
+        "sm100_bf16_mega_moe_backward_prelude_r{}_d{}_w{}_s{}_c{}_b{}_x{}",
         do_reverse_dispatch, compute_route_dot,
         write_weighted, synchronize_ranks,
-        synchronize_after_dispatch, barrier_only), code);
+        synchronize_after_dispatch, barrier_only,
+        x_prepared), code);
     SM100BF16MegaMoEBackwardPostDownPreludeRuntime::launch(
         runtime, args);
 }

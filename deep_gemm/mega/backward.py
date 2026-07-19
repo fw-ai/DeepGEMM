@@ -212,6 +212,7 @@ def bf16_mega_moe_backward_dgrad(
     combine_order_mode: CombineOrderMode = CombineOrderMode.FIXED_TOPK,
     memory_mode: str = "legacy",
     rank_uniform_block_m: bool = False,
+    x_prepared: bool = False,
 ) -> None:
     """Run BF16 reverse dispatch, dgrad, activation, and direct grad-x.
 
@@ -241,6 +242,8 @@ def bf16_mega_moe_backward_dgrad(
             "Python numerical correction does not support destructive "
             "phase-ordered aliases"
         )
+    if x_prepared and memory_mode != "phase_ordered":
+        raise ValueError("prepared x pool requires phase_ordered memory")
     if route_weight_mode is RouteWeightMode.POST_DOWN:
         if grad_y_unweighted_output is None:
             raise ValueError("post_down requires grad_y_unweighted_output")
@@ -360,6 +363,7 @@ def bf16_mega_moe_backward_dgrad(
                 synchronize_ranks,
                 synchronize_after_dispatch,
                 barrier_only,
+                x_prepared,
             )
 
         def launch_decomposed_route_prelude() -> None:
@@ -472,6 +476,10 @@ def bf16_mega_moe_backward_dgrad(
                     compute_route_dot=True,
                     write_weighted=True,
                     synchronize_ranks=False,
+                    # Route gradients are written directly into each source
+                    # rank's symmetric top-k plane. W2 combine's entry
+                    # barrier publishes these earlier same-stream writes
+                    # before W13 combine and the source-plane clone.
                     synchronize_after_dispatch=False,
                 ),
             )
