@@ -1101,6 +1101,7 @@ template <
     bool kClearWgradPadding = false,
     bool kTraceKernel = false,
     bool kVectorizedGradXStore = false,
+    bool kWideGradXStore = false,
     uint32_t kNumNonEpilogueThreads = 128,
     uint32_t kNumEpilogueThreads = 128,
     uint32_t kNumThreads =
@@ -4625,6 +4626,113 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                     0);
 
                             if constexpr (
+                                kWideGradXStore) {
+                                DG_STATIC_ASSERT(
+                                    BLOCK_N % 8 == 0,
+                                    "Wide grad-x stores require eight-column alignment");
+                                DG_STATIC_ASSERT(
+                                    kHidden % 8 == 0,
+                                    "Wide grad-x stores require aligned output rows");
+                                #pragma unroll
+                                for (uint32_t linear =
+                                         epilogue_thread_idx;
+                                     linear <
+                                         STORE_BLOCK_M *
+                                             (BLOCK_N / 8);
+                                     linear +=
+                                         kNumDgradEpilogueThreads) {
+                                    const uint32_t row =
+                                        linear /
+                                        (BLOCK_N / 8);
+                                    const uint32_t n =
+                                        (linear -
+                                         row *
+                                             (BLOCK_N / 8)) *
+                                        8;
+                                    const uint32_t local_m =
+                                        s * STORE_BLOCK_M +
+                                        row;
+                                    if (local_m >= valid_m)
+                                        continue;
+                                    const uint32_t n_atom =
+                                        n / 64;
+                                    const uint32_t
+                                        n_in_atom =
+                                            n -
+                                            n_atom * 64;
+                                    const uint32_t
+                                        row_in_atom =
+                                            row & 7;
+                                    const uint32_t
+                                        smem_byte_offset =
+                                            n_atom *
+                                                STORE_BLOCK_M *
+                                                128 +
+                                            (row >> 3) *
+                                                8 * 128 +
+                                            row_in_atom * 128 +
+                                            ((n_in_atom >> 3) ^
+                                             row_in_atom) *
+                                                16;
+                                    const auto packed =
+                                        *reinterpret_cast<
+                                            const uint4*>(
+                                            reinterpret_cast<
+                                                const uint8_t*>(
+                                                smem_cd[0]) +
+                                            smem_byte_offset);
+                                    const uint32_t pool_row =
+                                        (pool_block_offset +
+                                         m_block_idx) *
+                                            BLOCK_M +
+                                        local_m;
+                                    const uint32_t out_col =
+                                        n_block_idx *
+                                            BLOCK_N +
+                                        n;
+                                    if constexpr (
+                                        kWriteGradXPool) {
+                                        *reinterpret_cast<
+                                            uint4*>(
+                                            grad_x_pool_output +
+                                            static_cast<
+                                                uint64_t>(
+                                                pool_row) *
+                                                kHidden +
+                                            out_col) = packed;
+                                    }
+                                    if constexpr (
+                                        kDirectRemoteGradX) {
+                                        const auto metadata =
+                                            token_src_metadata[
+                                                pool_row];
+                                        auto* combine_buffer =
+                                            const_cast<
+                                                cd_dtype_t*>(
+                                                backward_grad_y);
+                                        auto* dst =
+                                            combine_buffer +
+                                            ((static_cast<
+                                                  uint64_t>(
+                                                  metadata
+                                                      .topk_idx) *
+                                                  backward_workspace
+                                                      .num_max_tokens_per_rank +
+                                              metadata
+                                                  .token_idx) *
+                                                 kHidden +
+                                             out_col);
+                                        *reinterpret_cast<
+                                            uint4*>(
+                                            backward_sym_buffer
+                                                .map(
+                                                    dst,
+                                                    metadata
+                                                        .rank_idx)) =
+                                            packed;
+                                    }
+                                }
+                            } else if constexpr (
                                 kVectorizedGradXStore) {
                                 #pragma unroll
                                 for (uint32_t linear =

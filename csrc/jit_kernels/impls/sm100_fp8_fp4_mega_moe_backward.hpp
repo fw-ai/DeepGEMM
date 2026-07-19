@@ -203,6 +203,7 @@ public:
         bool clear_wgrad_padding;
         bool trace_kernel = false;
         bool vectorized_grad_x_store = false;
+        bool wide_grad_x_store = false;
         uint64_t* kernel_trace = nullptr;
         bool inputs_prepared = false;
         bool dispatch_inputs_prepared = false;
@@ -222,6 +223,7 @@ static void __instantiate_kernel() {{
             {},
             {}, {}, {},
             {}, {},
+            {},
             {},
             {},
             {},
@@ -264,7 +266,8 @@ static void __instantiate_kernel() {{
             args.write_grad_x_pool ? "true" : "false",
             args.clear_wgrad_padding ? "true" : "false",
             args.trace_kernel ? "true" : "false",
-            args.vectorized_grad_x_store ? "true" : "false");
+            args.vectorized_grad_x_store ? "true" : "false",
+            args.wide_grad_x_store ? "true" : "false");
     }
 
     static void launch_impl(
@@ -1482,6 +1485,9 @@ static void sm100_bf16_mega_moe_backward_dgrad(
         .vectorized_grad_x_store = get_env<int>(
             "DG_BF16_MEGA_MOE_VECTORIZED_GRAD_X_STORE",
             1) == 1,
+        .wide_grad_x_store = get_env<int>(
+            "DG_BF16_MEGA_MOE_WIDE_GRAD_X_STORE",
+            0) == 1,
         .kernel_trace =
             kernel_trace.has_value()
             ? reinterpret_cast<uint64_t*>(
@@ -1499,9 +1505,10 @@ static void sm100_bf16_mega_moe_backward_dgrad(
         SM100FP8FP4MegaMoEBackwardWaveRuntime::generate(args);
     const auto runtime = compiler->build(
         fmt::format(
-            "sm100_bf16_mega_moe_backward_dgrad_trace{}_vec{}",
+            "sm100_bf16_mega_moe_backward_dgrad_trace{}_vec{}_wide{}",
             kernel_trace.has_value(),
-            args.vectorized_grad_x_store),
+            args.vectorized_grad_x_store,
+            args.wide_grad_x_store),
         code);
     SM100FP8FP4MegaMoEBackwardWaveRuntime::launch(
         runtime, args);
