@@ -48,23 +48,29 @@ static void sm100_bf16_mega_moe_wgrad_1sm(
         pool_block_m == 16 || pool_block_m == 32 ||
         pool_block_m == 64 || pool_block_m == 96 ||
         pool_block_m == 128 || pool_block_m == 192);
-    constexpr int kBlockM = 128;
+    const int kBlockM = get_env<int>(
+        "DG_BF16_MEGA_MOE_WGRAD_BLOCK_M", 128);
     // Amortize each A tile and scheduler assignment across twice as much
     // tensor-core work whenever the output width permits a full 256-column
     // tile. Keep the 128-column fallback for non-divisible model dimensions.
-    const int kBlockN = n % 256 == 0 ? 256 : 128;
+    const int kBlockN = get_env<int>(
+        "DG_BF16_MEGA_MOE_WGRAD_BLOCK_N",
+        n % 256 == 0 ? 256 : 128);
     // The K-grouped scheduler addresses each expert in the shared physical
     // pool. Its K tile must divide the forward pool alignment; otherwise the
     // final tile of one expert reads rows from the next expert. In particular,
     // BLOCK_M=96 previously contaminated Qwen top-8 wgrads while BLOCK_M=128
     // happened to pass.
-    const int kBlockK =
+    const int kBlockK = get_env<int>(
+        "DG_BF16_MEGA_MOE_WGRAD_BLOCK_K",
         pool_block_m % 64 == 0 ? 64 :
-        pool_block_m % 32 == 0 ? 32 : 16;
-    constexpr int kNumStages = 4;
+        pool_block_m % 32 == 0 ? 32 : 16);
+    const int kNumStages = get_env<int>(
+        "DG_BF16_MEGA_MOE_WGRAD_NUM_STAGES", 4);
     const int kSwizzle =
         kBlockK * static_cast<int>(sizeof(cutlass::bfloat16_t));
-    constexpr int kStoreBlockN = 64;
+    const int kStoreBlockN = get_env<int>(
+        "DG_BF16_MEGA_MOE_WGRAD_STORE_BLOCK_N", 64);
     constexpr int kNumNonEpilogueThreads = 128;
     constexpr int kNumEpilogueThreads = 128;
     // Production combine always uses four warps: the two original non-MMA

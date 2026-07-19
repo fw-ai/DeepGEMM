@@ -295,7 +295,11 @@ static void sm100_bf16_mega_moe(
         cumulative_local_expert_recv_stats_ptr = cumulative_local_expert_recv_stats->data_ptr<int>();
 
     // Launch
-    const auto num_sms = device_runtime->get_num_sms();
+    const auto physical_num_sms = device_runtime->get_num_sms();
+    const auto num_sms = get_env<int>(
+        "DG_BF16_MEGA_MOE_NUM_SMS",
+        physical_num_sms);
+    DG_HOST_ASSERT(num_sms > 0 && num_sms <= physical_num_sms);
     const SM100BF16MegaMoERuntime::Args args = {
         .num_max_tokens_per_rank = num_max_tokens_per_rank,
         .hidden = hidden, .intermediate_hidden = intermediate_hidden,
