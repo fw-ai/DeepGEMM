@@ -1099,6 +1099,8 @@ template <
     bool kDirectRemoteGradX = false,
     bool kWriteGradXPool = true,
     bool kClearWgradPadding = false,
+    bool kTraceKernel = false,
+    bool kVectorizedGradXStore = false,
     uint32_t kNumNonEpilogueThreads = 128,
     uint32_t kNumEpilogueThreads = 128,
     uint32_t kNumThreads =
@@ -1152,7 +1154,8 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
     float* grad_route_output,
     uint32_t* weight_tile_states,
     const uint32_t launch_epoch,
-    const float activation_limit) {
+    const float activation_limit,
+    uint64_t* kernel_trace) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)) || defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::TMEM::Allocator2Sm;
@@ -1220,7 +1223,55 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
         weight_tile_states + kNumW2WeightTileStates +
         kNumW13WeightTileStates;
     auto* phase_sense = phase_count + 1;
-    const auto full_grid_phase_barrier = [&]() {
+    constexpr uint32_t kTraceSiteCount = 21;
+    constexpr uint32_t kTraceValueCount = 5;
+    constexpr uint32_t kTraceBeginCycle = 0;
+    constexpr uint32_t kTraceEndCycle = 1;
+    constexpr uint32_t kTraceBeginGlobalNs = 2;
+    constexpr uint32_t kTraceEndGlobalNs = 3;
+    constexpr uint32_t kTraceSM = 4;
+    const auto globaltimer = [] {
+        uint64_t value;
+        asm volatile(
+            "mov.u64 %0, %%globaltimer;" : "=l"(value));
+        return value;
+    };
+    const auto trace_begin = [&](const uint32_t site) {
+        if constexpr (kTraceKernel) {
+            if (threadIdx.x == 0) {
+                auto* values =
+                    kernel_trace +
+                    (static_cast<uint64_t>(site) * kNumSMs +
+                     blockIdx.x) *
+                        kTraceValueCount;
+                values[kTraceBeginCycle] = clock64();
+                values[kTraceBeginGlobalNs] = globaltimer();
+                values[kTraceSM] = ptx::get_sm_idx();
+            }
+        }
+    };
+    const auto trace_end = [&](const uint32_t site) {
+        if constexpr (kTraceKernel) {
+            if (threadIdx.x == 0) {
+                auto* values =
+                    kernel_trace +
+                    (static_cast<uint64_t>(site) * kNumSMs +
+                     blockIdx.x) *
+                        kTraceValueCount;
+                values[kTraceEndCycle] = clock64();
+                values[kTraceEndGlobalNs] = globaltimer();
+            }
+        }
+    };
+    if constexpr (kTraceKernel) {
+        DG_STATIC_ASSERT(
+            kTraceSiteCount == 21,
+            "Update the host trace-site schema with the kernel");
+        trace_begin(0);
+    }
+    const auto full_grid_phase_barrier =
+        [&](const uint32_t trace_site) {
+        trace_begin(trace_site);
         if (threadIdx.x == 0) {
             const uint32_t old_sense =
                 atomicAdd(phase_sense, 0u);
@@ -1238,6 +1289,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
             }
         }
         __syncthreads();
+        trace_end(trace_site);
     };
 
     const bool is_leader_cta = cute::block_rank_in_cluster() == 0;
@@ -1706,7 +1758,9 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
             }
         }
     }
+    trace_begin(1);
     comm::cluster_sync_with_relaxed_arrive();
+    trace_end(1);
     if (warp_idx == 0 && cute::elect_one_sync()) {
         #pragma unroll
         for (uint32_t i = 0; i < kNumStages; ++i) {
@@ -1725,7 +1779,9 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
     } else if (warp_idx == 1) {
         Allocator().allocate(kNumTmemCols, tmem_ptr_in_smem);
     }
+    trace_begin(2);
     comm::cluster_sync_with_relaxed_arrive();
+    trace_end(2);
 
     // Every role walks this deterministic schedule independently.  Pool offsets
     // are prefixes of ceil(count/BLOCK_M), matching the forward MegaMoE layout.
@@ -2032,6 +2088,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
 
             // All ranks stage their local BF16 grad-y before launch. This
             // system-scope barrier publishes those stores before remote TMA.
+            trace_begin(3);
             comm::nvlink_barrier<
                 kNumRanks, kNumSMs, kNumDispatchThreads,
                 kDispatchGridSyncIndex,
@@ -2044,6 +2101,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                         kDispatchNamedBarrierIdx);
                 },
                 true, true);
+            trace_end(3);
 
             auto* pull_buffer =
                 reinterpret_cast<cd_dtype_t*>(smem_buffer) +
@@ -2128,6 +2186,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
             // Stronger than the eventual per-expert handshake: every L2 tile
             // sees every dispatched row. This barrier runs concurrently with
             // recompute and joins only at the phase boundary below.
+            trace_begin(4);
             comm::grid_sync<
                 kNumSMs, kDispatchDoneGridSyncIndex>(
                 backward_workspace, blockIdx.x,
@@ -2137,6 +2196,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                         kNumDispatchThreads,
                         kDispatchNamedBarrierIdx);
                 });
+            trace_end(4);
         }
     } else if (warp_idx >= 12) {
         // W13 wgrad needs the exact BF16 value represented by the forward
@@ -2271,10 +2331,12 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
             // assignment, so a cluster barrier is insufficient before W2
             // dgrad starts consuming the completed expert pool.
             constexpr uint32_t kLocalDispatchDoneGridSyncIndex = 1;
+            trace_begin(5);
             comm::grid_sync<
                 kNumSMs, kLocalDispatchDoneGridSyncIndex>(
                 backward_workspace, blockIdx.x, threadIdx.x,
                 []() { __syncthreads(); });
+            trace_end(5);
         }
         if constexpr (kBF16Mode && !kDispatchInputsPrepared) {
             uint32_t grad_pool_block_offset = 0;
@@ -2333,10 +2395,12 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                     math::ceil_div(num_tokens, BLOCK_M);
             }
             constexpr uint32_t kW2GradInputGridSyncIndex = 0;
+            trace_begin(6);
             comm::grid_sync<
                 kNumSMs, kW2GradInputGridSyncIndex>(
                 backward_workspace, blockIdx.x, threadIdx.x,
                 []() { __syncthreads(); });
+            trace_end(6);
         }
         if constexpr (kNumRanks > 1) {
             if constexpr (kDirectRemoteGradX) {
@@ -2349,6 +2413,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                         kBeforeDirectGradXGridSyncIndex = 2;
                     constexpr uint32_t
                         kBeforeDirectGradXBarrierTag = 7;
+                    trace_begin(7);
                     comm::nvlink_barrier<
                         kNumRanks, kNumSMs, kNumThreads,
                         kBeforeDirectGradXGridSyncIndex,
@@ -2357,6 +2422,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                         backward_sym_buffer,
                         blockIdx.x, threadIdx.x,
                         []() { __syncthreads(); });
+                    trace_end(7);
                 }
 
                 if constexpr (
@@ -2395,6 +2461,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                         kAfterGradYClearGridSyncIndex = 3;
                     constexpr uint32_t
                         kAfterGradYClearBarrierTag = 8;
+                    trace_begin(8);
                     comm::nvlink_barrier<
                         kNumRanks, kNumSMs, kNumThreads,
                         kAfterGradYClearGridSyncIndex,
@@ -2403,6 +2470,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                         backward_sym_buffer,
                         blockIdx.x, threadIdx.x,
                         []() { __syncthreads(); });
+                    trace_end(8);
                 }
             }
         }
@@ -2459,9 +2527,13 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
             }
         };
 
+        trace_begin(9);
         comm::cluster_sync_with_relaxed_arrive();
+        trace_end(9);
 
+        trace_begin(10);
         comm::cluster_sync_with_relaxed_arrive();
+        trace_end(10);
 
         // Reinitialize the drained pipelines in-place.  The FP32 accumulator
         // columns are phase-aliased; dgrad does not need the SFA/SFB columns.
@@ -2480,7 +2552,9 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
             }
             cutlass::arch::fence_barrier_init();
         }
+        trace_begin(11);
         comm::cluster_sync_with_relaxed_arrive();
+        trace_end(11);
 
         stage_idx = 0;
         phase = 0;
@@ -3275,7 +3349,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
             // the preceding L2-dgrad/SwiGLU phase. Cluster synchronization is
             // insufficient here: an early cluster can otherwise read rows
             // whose owning cluster has not stored them yet.
-            full_grid_phase_barrier();
+            full_grid_phase_barrier(12);
 
             if constexpr (kBF16Mode) {
                 // In phase-ordered mode these outputs may still contain the
@@ -3413,7 +3487,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                         linear] =
                         cd_dtype_t(0.0f);
                 }
-                full_grid_phase_barrier();
+                full_grid_phase_barrier(13);
             }
 
             if constexpr (
@@ -3828,7 +3902,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                 if (h_act_output == h_weighted_output) {
                     // Every route reduction must consume unweighted h before
                     // the shared storage becomes the W2-wgrad input.
-                    full_grid_phase_barrier();
+                    full_grid_phase_barrier(14);
                     uint32_t pool_block_offset = 0;
                     #pragma unroll
                     for (uint32_t expert_idx = 0;
@@ -3953,7 +4027,9 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                     }
                 };
 
+            trace_begin(15);
             comm::cluster_sync_with_relaxed_arrive();
+            trace_end(15);
             if (warp_idx == 0 &&
                 cute::elect_one_sync()) {
                 #pragma unroll
@@ -3972,7 +4048,9 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                 }
                 cutlass::arch::fence_barrier_init();
             }
+            trace_begin(16);
             comm::cluster_sync_with_relaxed_arrive();
+            trace_end(16);
 
             stage_idx = 0;
             phase = 0;
@@ -4546,95 +4624,224 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                     kNumDgradEpilogueThreads,
                                     0);
 
-                            #pragma unroll
-                            for (uint32_t linear =
-                                     epilogue_thread_idx;
-                                 linear <
-                                     STORE_BLOCK_M *
-                                         BLOCK_N;
-                                 linear +=
-                                     kNumDgradEpilogueThreads) {
-                                const uint32_t row =
-                                    linear / BLOCK_N;
-                                const uint32_t n =
-                                    linear -
-                                    row * BLOCK_N;
-                                const uint32_t local_m =
-                                    s *
-                                        STORE_BLOCK_M +
-                                    row;
-                                if (local_m >= valid_m)
-                                    continue;
-                                const uint32_t n_atom =
-                                    n / 64;
-                                const uint32_t
-                                    n_in_atom =
-                                        n -
-                                        n_atom * 64;
-                                const uint32_t
-                                    row_in_atom =
-                                        row & 7;
-                                const uint32_t
-                                    smem_byte_offset =
-                                        n_atom *
-                                            STORE_BLOCK_M *
-                                            128 +
-                                        (row >> 3) *
-                                            8 * 128 +
-                                        row_in_atom *
-                                            128 +
-                                        ((n_in_atom >> 3) ^
-                                         row_in_atom) *
-                                            16 +
-                                        (n_in_atom & 7) *
-                                            sizeof(
-                                                cd_dtype_t);
-                                const uint32_t pool_row =
-                                    (pool_block_offset +
-                                     m_block_idx) *
-                                        BLOCK_M +
-                                    local_m;
-                                const uint32_t out_col =
-                                    n_block_idx *
-                                        BLOCK_N +
-                                    n;
-                                const auto value =
-                                    *reinterpret_cast<
-                                        cd_dtype_t*>(
-                                        reinterpret_cast<
-                                            uint8_t*>(
-                                            smem_cd[0]) +
-                                        smem_byte_offset);
-                                if constexpr (kWriteGradXPool) {
-                                    grad_x_pool_output[
-                                        static_cast<uint64_t>(
-                                            pool_row) *
-                                            kHidden +
-                                        out_col] = value;
-                                }
-                                if constexpr (kDirectRemoteGradX) {
-                                    const auto metadata =
-                                        token_src_metadata[
-                                            pool_row];
-                                    auto* combine_buffer =
-                                        const_cast<
-                                            cd_dtype_t*>(
-                                            backward_grad_y);
-                                    auto* dst =
-                                        combine_buffer +
-                                        ((static_cast<
-                                              uint64_t>(
+                            if constexpr (
+                                kVectorizedGradXStore) {
+                                #pragma unroll
+                                for (uint32_t linear =
+                                         epilogue_thread_idx;
+                                     linear <
+                                         STORE_BLOCK_M *
+                                             (BLOCK_N / 2);
+                                     linear +=
+                                         kNumDgradEpilogueThreads) {
+                                    const uint32_t row =
+                                        linear /
+                                        (BLOCK_N / 2);
+                                    const uint32_t n =
+                                        (linear -
+                                         row *
+                                             (BLOCK_N / 2)) *
+                                        2;
+                                    const uint32_t local_m =
+                                        s * STORE_BLOCK_M +
+                                        row;
+                                    if (local_m >= valid_m)
+                                        continue;
+                                    const uint32_t
+                                        row_in_atom =
+                                            row & 7;
+                                    const auto load_bf16_bits =
+                                        [&](const uint32_t
+                                                element_n) {
+                                            const uint32_t
+                                                n_atom =
+                                                    element_n /
+                                                    64;
+                                            const uint32_t
+                                                n_in_atom =
+                                                    element_n -
+                                                    n_atom *
+                                                        64;
+                                            const uint32_t
+                                                smem_byte_offset =
+                                                    n_atom *
+                                                        STORE_BLOCK_M *
+                                                        128 +
+                                                    (row >> 3) *
+                                                        8 *
+                                                        128 +
+                                                    row_in_atom *
+                                                        128 +
+                                                    ((n_in_atom >>
+                                                      3) ^
+                                                     row_in_atom) *
+                                                        16 +
+                                                    (n_in_atom &
+                                                     7) *
+                                                        sizeof(
+                                                            cd_dtype_t);
+                                            return *reinterpret_cast<
+                                                uint16_t*>(
+                                                reinterpret_cast<
+                                                    uint8_t*>(
+                                                    smem_cd[0]) +
+                                                smem_byte_offset);
+                                        };
+                                    const uint32_t packed =
+                                        static_cast<uint32_t>(
+                                            load_bf16_bits(n)) |
+                                        (static_cast<uint32_t>(
+                                             load_bf16_bits(
+                                                 n + 1))
+                                         << 16);
+                                    const uint32_t pool_row =
+                                        (pool_block_offset +
+                                         m_block_idx) *
+                                            BLOCK_M +
+                                        local_m;
+                                    const uint32_t out_col =
+                                        n_block_idx *
+                                            BLOCK_N +
+                                        n;
+                                    if constexpr (
+                                        kWriteGradXPool) {
+                                        *reinterpret_cast<
+                                            uint32_t*>(
+                                            grad_x_pool_output +
+                                            static_cast<
+                                                uint64_t>(
+                                                pool_row) *
+                                                kHidden +
+                                            out_col) = packed;
+                                    }
+                                    if constexpr (
+                                        kDirectRemoteGradX) {
+                                        const auto metadata =
+                                            token_src_metadata[
+                                                pool_row];
+                                        auto* combine_buffer =
+                                            const_cast<
+                                                cd_dtype_t*>(
+                                                backward_grad_y);
+                                        auto* dst =
+                                            combine_buffer +
+                                            ((static_cast<
+                                                  uint64_t>(
+                                                  metadata
+                                                      .topk_idx) *
+                                                  backward_workspace
+                                                      .num_max_tokens_per_rank +
                                               metadata
-                                                  .topk_idx) *
-                                              backward_workspace
-                                                  .num_max_tokens_per_rank +
-                                          metadata.token_idx) *
-                                             kHidden +
-                                         out_col);
-                                    *backward_sym_buffer.map(
-                                        dst,
-                                        metadata.rank_idx) =
-                                        value;
+                                                  .token_idx) *
+                                                 kHidden +
+                                             out_col);
+                                        *reinterpret_cast<
+                                            uint32_t*>(
+                                            backward_sym_buffer
+                                                .map(
+                                                    dst,
+                                                    metadata
+                                                        .rank_idx)) =
+                                            packed;
+                                    }
+                                }
+                            } else {
+                                #pragma unroll
+                                for (uint32_t linear =
+                                         epilogue_thread_idx;
+                                     linear <
+                                         STORE_BLOCK_M *
+                                             BLOCK_N;
+                                     linear +=
+                                         kNumDgradEpilogueThreads) {
+                                    const uint32_t row =
+                                        linear / BLOCK_N;
+                                    const uint32_t n =
+                                        linear -
+                                        row * BLOCK_N;
+                                    const uint32_t local_m =
+                                        s *
+                                            STORE_BLOCK_M +
+                                        row;
+                                    if (local_m >= valid_m)
+                                        continue;
+                                    const uint32_t n_atom =
+                                        n / 64;
+                                    const uint32_t
+                                        n_in_atom =
+                                            n -
+                                            n_atom * 64;
+                                    const uint32_t
+                                        row_in_atom =
+                                            row & 7;
+                                    const uint32_t
+                                        smem_byte_offset =
+                                            n_atom *
+                                                STORE_BLOCK_M *
+                                                128 +
+                                            (row >> 3) *
+                                                8 * 128 +
+                                            row_in_atom *
+                                                128 +
+                                            ((n_in_atom >> 3) ^
+                                             row_in_atom) *
+                                                16 +
+                                            (n_in_atom & 7) *
+                                                sizeof(
+                                                    cd_dtype_t);
+                                    const uint32_t pool_row =
+                                        (pool_block_offset +
+                                         m_block_idx) *
+                                            BLOCK_M +
+                                        local_m;
+                                    const uint32_t out_col =
+                                        n_block_idx *
+                                            BLOCK_N +
+                                        n;
+                                    const auto value =
+                                        *reinterpret_cast<
+                                            cd_dtype_t*>(
+                                            reinterpret_cast<
+                                                uint8_t*>(
+                                                smem_cd[0]) +
+                                            smem_byte_offset);
+                                    if constexpr (
+                                        kWriteGradXPool) {
+                                        grad_x_pool_output[
+                                            static_cast<
+                                                uint64_t>(
+                                                pool_row) *
+                                                kHidden +
+                                            out_col] = value;
+                                    }
+                                    if constexpr (
+                                        kDirectRemoteGradX) {
+                                        const auto metadata =
+                                            token_src_metadata[
+                                                pool_row];
+                                        auto* combine_buffer =
+                                            const_cast<
+                                                cd_dtype_t*>(
+                                                backward_grad_y);
+                                        auto* dst =
+                                            combine_buffer +
+                                            ((static_cast<
+                                                  uint64_t>(
+                                                  metadata
+                                                      .topk_idx) *
+                                                  backward_workspace
+                                                      .num_max_tokens_per_rank +
+                                              metadata
+                                                  .token_idx) *
+                                                 kHidden +
+                                             out_col);
+                                        *backward_sym_buffer
+                                             .map(
+                                                 dst,
+                                                 metadata
+                                                     .rank_idx) =
+                                            value;
+                                    }
                                 }
                             }
                         }
@@ -4657,15 +4864,55 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                     kDirectGradXDoneGridSyncIndex = 1;
                 constexpr uint32_t
                     kDirectGradXDoneBarrierTag = 9;
-                comm::nvlink_barrier<
-                    kNumRanks, kNumSMs, kNumThreads,
-                    kDirectGradXDoneGridSyncIndex,
-                    kDirectGradXDoneBarrierTag>(
-                    backward_workspace,
-                    backward_sym_buffer,
-                    blockIdx.x,
-                    threadIdx.x,
-                    []() { __syncthreads(); });
+                if constexpr (kTraceKernel) {
+                    // Decompose the otherwise identical NVLink barrier so the
+                    // trace distinguishes local compute/grid skew from the
+                    // cross-rank signal and its publication grid sync.
+                    trace_begin(17);
+                    comm::grid_sync<
+                        kNumSMs,
+                        kDirectGradXDoneGridSyncIndex>(
+                        backward_workspace,
+                        blockIdx.x,
+                        threadIdx.x,
+                        []() { __syncthreads(); });
+                    trace_end(17);
+
+                    if (blockIdx.x == 0)
+                        trace_begin(18);
+                    comm::nvlink_barrier<
+                        kNumRanks, kNumSMs, kNumThreads,
+                        kDirectGradXDoneGridSyncIndex,
+                        kDirectGradXDoneBarrierTag>(
+                        backward_workspace,
+                        backward_sym_buffer,
+                        blockIdx.x,
+                        threadIdx.x,
+                        []() { __syncthreads(); },
+                        false, false);
+                    if (blockIdx.x == 0)
+                        trace_end(18);
+
+                    trace_begin(19);
+                    comm::grid_sync<
+                        kNumSMs,
+                        kDirectGradXDoneGridSyncIndex>(
+                        backward_workspace,
+                        blockIdx.x,
+                        threadIdx.x,
+                        []() { __syncthreads(); });
+                    trace_end(19);
+                } else {
+                    comm::nvlink_barrier<
+                        kNumRanks, kNumSMs, kNumThreads,
+                        kDirectGradXDoneGridSyncIndex,
+                        kDirectGradXDoneBarrierTag>(
+                        backward_workspace,
+                        backward_sym_buffer,
+                        blockIdx.x,
+                        threadIdx.x,
+                        []() { __syncthreads(); });
+                }
             }
         }
 
@@ -4747,7 +4994,10 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
             clear_wgrad_padding_rows();
 
         __syncthreads();
+        trace_begin(20);
         comm::cluster_sync_with_relaxed_arrive();
+        trace_end(20);
+        trace_end(0);
         if (warp_idx == 0)
             Allocator().free(0, kNumTmemCols);
     }

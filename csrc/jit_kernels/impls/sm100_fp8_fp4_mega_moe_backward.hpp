@@ -201,6 +201,9 @@ public:
         bool direct_remote_grad_x;
         bool write_grad_x_pool;
         bool clear_wgrad_padding;
+        bool trace_kernel = false;
+        bool vectorized_grad_x_store = false;
+        uint64_t* kernel_trace = nullptr;
         bool inputs_prepared = false;
         bool dispatch_inputs_prepared = false;
         LaunchArgs launch_args;
@@ -219,6 +222,8 @@ static void __instantiate_kernel() {{
             {},
             {}, {}, {},
             {}, {},
+            {},
+            {},
             {},
             {},
             {},
@@ -257,7 +262,9 @@ static void __instantiate_kernel() {{
             args.dispatch_inputs_prepared ? "true" : "false",
             args.direct_remote_grad_x ? "true" : "false",
             args.write_grad_x_pool ? "true" : "false",
-            args.clear_wgrad_padding ? "true" : "false");
+            args.clear_wgrad_padding ? "true" : "false",
+            args.trace_kernel ? "true" : "false",
+            args.vectorized_grad_x_store ? "true" : "false");
     }
 
     static void launch_impl(
@@ -312,7 +319,8 @@ static void __instantiate_kernel() {{
             args.grad_route_output,
             args.grid_sync_counter,
             args.launch_epoch,
-            args.activation_limit));
+            args.activation_limit,
+            args.kernel_trace));
     }
 };
 
@@ -1009,7 +1017,9 @@ static void sm100_bf16_mega_moe_backward_dgrad(
     const int& backward_rank,
     const int& num_max_tokens_per_rank,
     const int& num_topk,
-    const std::string& memory_mode) {
+    const std::string& memory_mode,
+    const std::optional<torch::Tensor>& kernel_trace =
+        std::nullopt) {
     constexpr int block_n = 128;
     constexpr int block_k = 128;
     constexpr int dgrad_block_k = 64;
@@ -1128,6 +1138,13 @@ static void sm100_bf16_mega_moe_backward_dgrad(
         token_src_metadata.size(0) >= num_pool_rows &&
         token_src_metadata.size(1) == 3);
     DG_HOST_ASSERT(write_grad_x_pool || direct_remote_grad_x);
+    if (kernel_trace.has_value()) {
+        DG_HOST_ASSERT(kernel_trace->is_cuda());
+        DG_HOST_ASSERT(
+            kernel_trace->scalar_type() == torch::kInt64);
+        DG_HOST_ASSERT(kernel_trace->is_contiguous());
+        DG_HOST_ASSERT(kernel_trace->device() == grad_ye.device());
+    }
 
     const auto exact_alias = [](
         const torch::Tensor& lhs,
@@ -1324,6 +1341,15 @@ static void sm100_bf16_mega_moe_backward_dgrad(
 
     const int num_sms = device_runtime->get_num_sms();
     DG_HOST_ASSERT(num_sms % 2 == 0);
+    constexpr int num_trace_sites = 21;
+    constexpr int num_trace_values = 5;
+    if (kernel_trace.has_value()) {
+        DG_HOST_ASSERT(
+            kernel_trace->dim() == 3 &&
+            kernel_trace->size(0) == num_trace_sites &&
+            kernel_trace->size(1) == num_sms &&
+            kernel_trace->size(2) == num_trace_values);
+    }
     static std::atomic<uint32_t> next_launch_epoch{1};
     uint32_t launch_epoch =
         next_launch_epoch.fetch_add(
@@ -1452,6 +1478,15 @@ static void sm100_bf16_mega_moe_backward_dgrad(
         .direct_remote_grad_x = direct_remote_grad_x,
         .write_grad_x_pool = write_grad_x_pool,
         .clear_wgrad_padding = clear_wgrad_padding,
+        .trace_kernel = kernel_trace.has_value(),
+        .vectorized_grad_x_store = get_env<int>(
+            "DG_BF16_MEGA_MOE_VECTORIZED_GRAD_X_STORE",
+            1) == 1,
+        .kernel_trace =
+            kernel_trace.has_value()
+            ? reinterpret_cast<uint64_t*>(
+                  kernel_trace->data_ptr<int64_t>())
+            : nullptr,
         .inputs_prepared =
             memory_mode == "phase_ordered" &&
             route_weight_mode == "post_down",
@@ -1463,7 +1498,11 @@ static void sm100_bf16_mega_moe_backward_dgrad(
     const auto code =
         SM100FP8FP4MegaMoEBackwardWaveRuntime::generate(args);
     const auto runtime = compiler->build(
-        "sm100_bf16_mega_moe_backward_dgrad", code);
+        fmt::format(
+            "sm100_bf16_mega_moe_backward_dgrad_trace{}_vec{}",
+            kernel_trace.has_value(),
+            args.vectorized_grad_x_store),
+        code);
     SM100FP8FP4MegaMoEBackwardWaveRuntime::launch(
         runtime, args);
 }
