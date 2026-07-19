@@ -1344,7 +1344,7 @@ static void sm100_bf16_mega_moe_backward_dgrad(
 
     const int num_sms = device_runtime->get_num_sms();
     DG_HOST_ASSERT(num_sms % 2 == 0);
-    constexpr int num_trace_sites = 21;
+    constexpr int num_trace_sites = 22;
     constexpr int num_trace_values = 5;
     if (kernel_trace.has_value()) {
         DG_HOST_ASSERT(

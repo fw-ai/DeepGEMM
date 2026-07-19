@@ -1224,7 +1224,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
         weight_tile_states + kNumW2WeightTileStates +
         kNumW13WeightTileStates;
     auto* phase_sense = phase_count + 1;
-    constexpr uint32_t kTraceSiteCount = 21;
+    constexpr uint32_t kTraceSiteCount = 22;
     constexpr uint32_t kTraceValueCount = 5;
     constexpr uint32_t kTraceBeginCycle = 0;
     constexpr uint32_t kTraceEndCycle = 1;
@@ -1266,7 +1266,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
     };
     if constexpr (kTraceKernel) {
         DG_STATIC_ASSERT(
-            kTraceSiteCount == 21,
+            kTraceSiteCount == 22,
             "Update the host trace-site schema with the kernel");
         trace_begin(0);
     }
@@ -4052,6 +4052,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
             trace_begin(16);
             comm::cluster_sync_with_relaxed_arrive();
             trace_end(16);
+            trace_begin(21);
 
             stage_idx = 0;
             phase = 0;
@@ -4964,6 +4965,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
             }
         }
 
+        trace_end(21);
         if constexpr (kNumRanks > 1) {
             if constexpr (kDirectRemoteGradX) {
                 // Publish every direct NVLink store before any destination

@@ -34,6 +34,7 @@ _BF16_BACKWARD_KERNEL_TRACE_SITES = (
     "direct_grad_x_rank_signal",
     "direct_grad_x_publish_grid_completion",
     "kernel_final_cluster_sync",
+    "w13_compute_and_grad_x_publication",
 )
 _BF16_BACKWARD_KERNEL_TRACE_FIELDS = (
     "begin_cycle",
