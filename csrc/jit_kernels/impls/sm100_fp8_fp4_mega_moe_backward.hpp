@@ -203,6 +203,7 @@ public:
         bool direct_remote_grad_x;
         bool write_grad_x_pool;
         bool clear_wgrad_padding;
+        bool compute_route_grad = false;
         bool trace_kernel = false;
         bool vectorized_grad_x_store = false;
         bool wide_grad_x_store = false;
@@ -225,6 +226,7 @@ static void __instantiate_kernel() {{
             {},
             {}, {}, {},
             {}, {},
+            {},
             {},
             {},
             {},
@@ -267,6 +269,7 @@ static void __instantiate_kernel() {{
             args.direct_remote_grad_x ? "true" : "false",
             args.write_grad_x_pool ? "true" : "false",
             args.clear_wgrad_padding ? "true" : "false",
+            args.compute_route_grad ? "true" : "false",
             args.trace_kernel ? "true" : "false",
             args.vectorized_grad_x_store ? "true" : "false",
             args.wide_grad_x_store ? "true" : "false");
@@ -363,7 +366,14 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
     const int& num_topk = 0,
     const std::optional<torch::Tensor>& backward_grad_y = std::nullopt,
     const std::optional<torch::Tensor>& backward_topk_weights = std::nullopt,
-    const std::optional<torch::Tensor>& token_src_metadata = std::nullopt) {
+    const std::optional<torch::Tensor>& token_src_metadata = std::nullopt,
+    const std::string& route_weight_mode = "pre_down",
+    const std::optional<torch::Tensor>& grad_y_unweighted_output =
+        std::nullopt,
+    const std::optional<torch::Tensor>& down_unweighted_output =
+        std::nullopt,
+    const std::optional<torch::Tensor>& grad_route_output =
+        std::nullopt) {
     constexpr int block_n = 128;
     constexpr int block_k = 128;
     constexpr int dgrad_block_k = 64;
@@ -392,6 +402,9 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
 
     DG_HOST_ASSERT(device_runtime->get_arch_major() == 10);
     DG_HOST_ASSERT(num_ranks >= 1);
+    DG_HOST_ASSERT(
+        route_weight_mode == "pre_down" ||
+        route_weight_mode == "post_down");
     DG_HOST_ASSERT(num_ranks == 1 ||
                    (backward_rank >= 0 && backward_rank < num_ranks));
     DG_HOST_ASSERT(block_m % 16 == 0);
@@ -435,9 +448,55 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
     DG_HOST_ASSERT(h_weighted_output.is_contiguous());
     DG_HOST_ASSERT(x_pool_output.is_contiguous());
     DG_HOST_ASSERT(grad_x_pool_output.is_contiguous());
-    DG_HOST_ASSERT(route_weights.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(
+        route_weights.scalar_type() == torch::kFloat ||
+        route_weights.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(route_weights.numel() == num_pool_rows);
     DG_HOST_ASSERT(route_weights.is_contiguous());
+    const auto check_bf16_hidden_pool =
+        [&](const torch::Tensor& tensor) {
+            DG_HOST_ASSERT(
+                tensor.scalar_type() == torch::kBFloat16);
+            DG_HOST_ASSERT(tensor.is_contiguous());
+            DG_HOST_ASSERT(
+                tensor.sizes() ==
+                torch::IntArrayRef(
+                    {num_pool_rows, hidden}));
+        };
+    if (grad_y_unweighted_output.has_value())
+        check_bf16_hidden_pool(
+            *grad_y_unweighted_output);
+    if (down_unweighted_output.has_value()) {
+        DG_HOST_ASSERT(
+            down_unweighted_output->scalar_type() ==
+            torch::kBFloat16);
+        DG_HOST_ASSERT(down_unweighted_output->is_contiguous());
+        DG_HOST_ASSERT(down_unweighted_output->dim() == 2);
+        DG_HOST_ASSERT(
+            down_unweighted_output->size(1) == hidden);
+        DG_HOST_ASSERT(
+            down_unweighted_output->size(0) > 0 &&
+            down_unweighted_output->size(0) <= num_pool_rows);
+    }
+    if (grad_route_output.has_value()) {
+        DG_HOST_ASSERT(compute_w13_dgrad);
+        DG_HOST_ASSERT(
+            grad_route_output->scalar_type() ==
+            torch::kFloat);
+        DG_HOST_ASSERT(grad_route_output->is_contiguous());
+        DG_HOST_ASSERT(
+            grad_route_output->numel() ==
+            num_pool_rows);
+    }
+    if (route_weight_mode == "post_down") {
+        DG_HOST_ASSERT(
+            route_weights.scalar_type() == torch::kFloat);
+        DG_HOST_ASSERT(
+            grad_y_unweighted_output.has_value());
+        DG_HOST_ASSERT(
+            down_unweighted_output.has_value());
+        DG_HOST_ASSERT(grad_route_output.has_value());
+    }
     DG_HOST_ASSERT(
         w2_weights.scalar_type() ==
         torch::kFloat8_e4m3fn);
@@ -656,6 +715,7 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
         .num_stages = num_stages,
         .num_sms = num_sms,
         .num_ranks = num_ranks,
+        .route_weight_mode = route_weight_mode,
         .expert_counts = expert_counts.data_ptr<int>(),
         .backward_sym_buffer = backward_sym_buffer,
         .backward_workspace = backward_workspace,
@@ -715,11 +775,18 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
                 grad_ye.data_ptr<at::BFloat16>()),
         .grad_y_unweighted_output =
             reinterpret_cast<cutlass::bfloat16_t*>(
-                grad_ye.data_ptr<at::BFloat16>()),
+                grad_y_unweighted_output
+                    .value_or(grad_ye)
+                    .data_ptr<at::BFloat16>()),
         .route_weights =
-            reinterpret_cast<cutlass::bfloat16_t*>(
-                route_weights.data_ptr<at::BFloat16>()),
-        .route_weights_fp32 = nullptr,
+            route_weights.scalar_type() == torch::kBFloat16
+            ? reinterpret_cast<cutlass::bfloat16_t*>(
+                  route_weights.data_ptr<at::BFloat16>())
+            : nullptr,
+        .route_weights_fp32 =
+            route_weights.scalar_type() == torch::kFloat
+            ? route_weights.data_ptr<float>()
+            : nullptr,
         .grad_h_output =
             reinterpret_cast<cutlass::bfloat16_t*>(
                 grad_h_output.data_ptr<at::BFloat16>()),
@@ -738,8 +805,17 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
         .grad_x_pool_output =
             reinterpret_cast<cutlass::bfloat16_t*>(
                 grad_x_pool_output.data_ptr<at::BFloat16>()),
-        .down_unweighted_output = nullptr,
-        .grad_route_output = nullptr,
+        .down_unweighted_output =
+            down_unweighted_output.has_value()
+            ? reinterpret_cast<
+                  const cutlass::bfloat16_t*>(
+                  down_unweighted_output
+                      ->data_ptr<at::BFloat16>())
+            : nullptr,
+        .grad_route_output =
+            grad_route_output.has_value()
+            ? grad_route_output->data_ptr<float>()
+            : nullptr,
         .grid_sync_counter =
             reinterpret_cast<uint32_t*>(
                 grid_sync_counter.data_ptr<int>()),
@@ -749,13 +825,17 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
         .direct_remote_grad_x = direct_remote_grad_x,
         .write_grad_x_pool = write_grad_x_pool,
         .clear_wgrad_padding = clear_wgrad_padding,
+        .compute_route_grad =
+            grad_route_output.has_value(),
         .launch_args = LaunchArgs(
             num_sms, 1024, smem_size, 2),
     };
     const auto code =
         SM100FP8FP4MegaMoEBackwardWaveRuntime::generate(args);
-    const auto runtime = compiler->build(
-        "sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu", code);
+    const auto runtime = compiler->build(fmt::format(
+        "sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu_{}_r{}",
+        route_weight_mode,
+        grad_route_output.has_value()), code);
     SM100FP8FP4MegaMoEBackwardWaveRuntime::launch(runtime, args);
 }
 
@@ -1494,6 +1574,7 @@ static void sm100_bf16_mega_moe_backward_dgrad(
         .direct_remote_grad_x = direct_remote_grad_x,
         .write_grad_x_pool = write_grad_x_pool,
         .clear_wgrad_padding = clear_wgrad_padding,
+        .compute_route_grad = true,
         .trace_kernel = kernel_trace.has_value(),
         .vectorized_grad_x_store = get_env<int>(
             "DG_BF16_MEGA_MOE_VECTORIZED_GRAD_X_STORE",

@@ -36,7 +36,11 @@ static void fp8_fp4_mega_moe_backward_dgrad_swiglu(
     const std::vector<int64_t>& backward_sym_buffer_ptrs,
     const int& backward_rank,
     const int& num_max_tokens_per_rank,
-    const int& num_topk) {
+    const int& num_topk,
+    const std::string& route_weight_mode,
+    const std::optional<torch::Tensor>& grad_y_unweighted_output,
+    const std::optional<torch::Tensor>& down_unweighted_output,
+    const std::optional<torch::Tensor>& grad_route_output) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [w2_weights, w2_scales] = w2_weights_tuple;
     const auto [w13_weights, w13_scales] = w13_weights_tuple;
@@ -54,7 +58,9 @@ static void fp8_fp4_mega_moe_backward_dgrad_swiglu(
         backward_sym_buffer_ptrs, backward_rank,
         num_max_tokens_per_rank, num_topk,
         backward_grad_y, backward_topk_weights,
-        token_src_metadata);
+        token_src_metadata, route_weight_mode,
+        grad_y_unweighted_output.value_or(grad_ye),
+        down_unweighted_output, grad_route_output);
 }
 
 static void bf16_mega_moe_backward_dgrad(
@@ -328,7 +334,11 @@ static void register_apis(pybind11::module_& m) {
               std::vector<int64_t>{},
           py::arg("backward_rank") = 0,
           py::arg("num_max_tokens_per_rank") = 0,
-          py::arg("num_topk") = 0);
+          py::arg("num_topk") = 0,
+          py::arg("route_weight_mode") = "pre_down",
+          py::arg("grad_y_unweighted_output") = py::none(),
+          py::arg("down_unweighted_output") = py::none(),
+          py::arg("grad_route_output") = py::none());
     m.def(
         "bf16_mega_moe_backward_dgrad",
         &bf16_mega_moe_backward_dgrad,

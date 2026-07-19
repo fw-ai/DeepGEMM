@@ -195,7 +195,9 @@ static void fp8_fp4_mega_moe(
     const std::optional<float>& activation_clamp_opt,
     const bool& fast_math,
     const int& num_ring_tokens,
-    const std::optional<torch::Tensor>& saved_l1_preact
+    const std::optional<torch::Tensor>& saved_l1_preact,
+    const std::string& route_weight_mode,
+    const std::optional<torch::Tensor>& saved_down_unweighted
 ) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
@@ -205,6 +207,9 @@ static void fp8_fp4_mega_moe(
     const auto [rm, rn, rk] = recipe;
     DG_HOST_ASSERT(rm == 1 and rn == 1 and rk == 32);
     DG_HOST_ASSERT(activation == "swiglu" or activation == "geglu");
+    DG_HOST_ASSERT(
+        route_weight_mode == "pre_down" ||
+        route_weight_mode == "post_down");
 
     // Activation checks
     const auto activation_clamp =
@@ -242,6 +247,22 @@ static void fp8_fp4_mega_moe(
     // Check buffer bytes
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts_ = num_experts_per_rank * num_ranks;
+    const auto num_max_pool_tokens =
+        layout::get_num_max_pool_tokens(
+            num_ranks, num_max_tokens_per_rank, num_topk,
+            num_experts_per_rank);
+    if (saved_down_unweighted.has_value()) {
+        DG_HOST_ASSERT(
+            saved_down_unweighted->scalar_type() ==
+            torch::kBFloat16);
+        DG_HOST_ASSERT(saved_down_unweighted->is_contiguous());
+        DG_HOST_ASSERT(saved_down_unweighted->dim() == 2);
+        DG_HOST_ASSERT(saved_down_unweighted->size(1) == hidden);
+        DG_HOST_ASSERT(saved_down_unweighted->size(0) > 0);
+        DG_HOST_ASSERT(
+            saved_down_unweighted->size(0) <=
+            num_max_pool_tokens);
+    }
     const auto [num_required_bytes, slice] = get_symm_buffer_size_for_mega_moe(
         num_ranks, num_experts,
         num_max_tokens_per_rank, num_topk,
@@ -268,7 +289,9 @@ static void fp8_fp4_mega_moe(
                                num_experts_per_rank,
                                num_tokens, num_topk,
                                hidden, intermediate_hidden,
-                               activation, activation_clamp, fast_math);
+                               activation, activation_clamp, fast_math,
+                               route_weight_mode,
+                               saved_down_unweighted);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -418,7 +441,26 @@ static void register_apis(pybind11::module_& m) {
     m.def("get_token_alignment_for_mega_moe", &get_token_alignment_for_mega_moe);
     m.def("get_ring_limit_for_mega_moe", &get_ring_limit_for_mega_moe);
     m.def("get_symm_buffer_size_for_mega_moe", &get_symm_buffer_size_for_mega_moe);
-    m.def("fp8_fp4_mega_moe", &fp8_fp4_mega_moe);
+    m.def(
+        "fp8_fp4_mega_moe", &fp8_fp4_mega_moe,
+        py::arg("y"),
+        py::arg("l1_weights_tuple"),
+        py::arg("l2_weights_tuple"),
+        py::arg("cumulative_local_expert_recv_stats"),
+        py::arg("sym_buffer"),
+        py::arg("sym_buffer_ptrs"),
+        py::arg("rank_idx"),
+        py::arg("num_max_tokens_per_rank"),
+        py::arg("num_experts"),
+        py::arg("num_topk"),
+        py::arg("recipe"),
+        py::arg("activation"),
+        py::arg("activation_clamp_opt"),
+        py::arg("fast_math"),
+        py::arg("num_ring_tokens"),
+        py::arg("saved_l1_preact"),
+        py::arg("route_weight_mode") = "pre_down",
+        py::arg("saved_down_unweighted") = py::none());
     m.def("bf16_mega_moe", &bf16_mega_moe);
 #endif
 }

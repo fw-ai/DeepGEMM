@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 import os
 import random
@@ -212,7 +213,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
         mma_type=args.mma_type,
-        activation=args.activation
+        activation=args.activation,
+        num_ring_tokens=args.num_ring_tokens,
     )
 
     # Cast weights into FP4
@@ -235,6 +237,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         global cumulative_local_expert_recv_stats_fused
         global cumulative_local_expert_recv_stats_baseline
         global precomputed_route_counts, active_pool_rows
+        global pool_block_m, local_expert_counts
+        global local_padded_pool_rows, destination_counts
         global route_count_mismatch, num_config_tokens
         x = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
         l1_weights = torch.randn(
@@ -274,50 +278,52 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             topk_idx.masked_fill_(rand_mask < args.masked_ratio, -1)
             topk_weights.masked_fill_(topk_idx < 0, 0)
 
+        source_route_counts = torch.bincount(
+            topk_idx[(topk_idx >= 0) & (topk_idx < num_experts)],
+            minlength=num_experts).to(torch.int32)
+        global_route_counts = source_route_counts.clone()
+        if num_ranks > 1:
+            dist.all_reduce(global_route_counts, group=group)
+        num_config_tokens_tensor = torch.tensor(
+            num_tokens, dtype=torch.int32, device='cuda')
+        if num_ranks > 1:
+            dist.all_reduce(
+                num_config_tokens_tensor,
+                op=dist.ReduceOp.MAX,
+                group=group)
+        num_config_tokens = int(num_config_tokens_tensor.item())
+        expected_tokens_per_expert = (
+            num_config_tokens * num_ranks * num_topk /
+            num_experts)
+        if expected_tokens_per_expert <= 8.5:
+            pool_block_m = 16
+        elif expected_tokens_per_expert <= 16.5:
+            pool_block_m = 32
+        elif expected_tokens_per_expert <= 32.5:
+            pool_block_m = 64
+        elif expected_tokens_per_expert <= 64.5:
+            pool_block_m = 96
+        elif expected_tokens_per_expert <= 96.5:
+            pool_block_m = 128
+        else:
+            pool_block_m = 192
+        destination_counts = global_route_counts.view(
+            num_ranks, num_experts_per_rank)
+        local_expert_counts = destination_counts[rank_idx].clone()
+        padded_destination_counts = (
+            (destination_counts + pool_block_m - 1) //
+            pool_block_m * pool_block_m)
+        local_padded_pool_rows = int(
+            padded_destination_counts[rank_idx].sum().item())
+
         precomputed_route_counts = None
         active_pool_rows = None
         route_count_mismatch = None
-        num_config_tokens = None
         if args.active_saved_pool:
-            assert is_bf16xbf16
-            valid_routes = topk_idx[
-                (topk_idx >= 0) & (topk_idx < num_experts)]
-            precomputed_route_counts = torch.bincount(
-                valid_routes,
-                minlength=num_experts).to(torch.int32)
-            global_route_counts = precomputed_route_counts.clone()
-            if num_ranks > 1:
-                dist.all_reduce(global_route_counts, group=group)
-            num_config_tokens_tensor = torch.tensor(
-                num_tokens, dtype=torch.int32, device='cuda')
-            if num_ranks > 1:
-                dist.all_reduce(
-                    num_config_tokens_tensor,
-                    op=dist.ReduceOp.MAX,
-                    group=group)
-            num_config_tokens = int(num_config_tokens_tensor.item())
-            expected_tokens_per_expert = (
-                num_config_tokens * num_ranks * num_topk /
-                num_experts)
-            if expected_tokens_per_expert <= 8.5:
-                active_block_m = 16
-            elif expected_tokens_per_expert <= 16.5:
-                active_block_m = 32
-            elif expected_tokens_per_expert <= 32.5:
-                active_block_m = 64
-            elif expected_tokens_per_expert <= 64.5:
-                active_block_m = 96
-            elif expected_tokens_per_expert <= 96.5:
-                active_block_m = 128
-            else:
-                active_block_m = 192
-            destination_counts = global_route_counts.view(
-                num_ranks, num_experts_per_rank)
-            padded_destination_counts = (
-                (destination_counts + active_block_m - 1) //
-                active_block_m * active_block_m)
             active_pool_rows = int(
                 padded_destination_counts.sum(dim=1).max().item())
+        if args.active_saved_pool and is_bf16xbf16:
+            precomputed_route_counts = source_route_counts
             route_count_mismatch = torch.zeros(
                 1, dtype=torch.int32, device='cuda')
 
@@ -335,12 +341,12 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         saved_h_unweighted = None
         saved_h_weighted = None
         saved_down_unweighted = None
-        if is_bf16xbf16 and (
+        if (
             args.save_l1_preact or args.test_backward
         ):
             saved_l1_preact = torch.full(
                 (
-                    active_pool_rows or
+                    (active_pool_rows if is_bf16xbf16 else None) or
                     buffer.token_src_metadata.size(0),
                     2 * intermediate_hidden),
                 float('nan'), dtype=torch.bfloat16, device='cuda')
@@ -358,7 +364,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             saved_h_weighted = torch.full_like(
                 saved_h_unweighted, float('nan'))
         if (
-            is_bf16xbf16 and
             (args.save_forward_stages or
              args.route_weight_mode == 'post_down') and
             (
@@ -392,15 +397,16 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             activation_clamp=args.activation_clamp,
             fast_math=bool(args.fast_math),
             saved_l1_preact=saved_l1_preact)
+        kernel_kwargs.update(
+            route_weight_mode=deep_gemm.RouteWeightMode(
+                args.route_weight_mode),
+            saved_down_unweighted=saved_down_unweighted)
         if is_bf16xbf16:
             kernel_kwargs.update(
-                route_weight_mode=deep_gemm.RouteWeightMode(
-                    args.route_weight_mode),
                 combine_order_mode=deep_gemm.CombineOrderMode(
                     args.combine_order_mode),
                 saved_h_unweighted=saved_h_unweighted,
                 saved_h_weighted=saved_h_weighted,
-                saved_down_unweighted=saved_down_unweighted,
                 precomputed_route_counts=precomputed_route_counts,
                 active_pool_rows=active_pool_rows,
                 route_count_mismatch=route_count_mismatch,
@@ -414,6 +420,238 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                     group=group)
             assert route_count_mismatch.item() == 0
         return y, cumulative_local_expert_recv_stats_fused
+
+    def active_pool_route_rows(
+        destination_rank: int = rank_idx,
+    ) -> torch.Tensor:
+        """Return logical route rows, excluding per-expert block padding."""
+        rows = []
+        pool_offset = 0
+        counts = destination_counts[destination_rank]
+        for count in counts.cpu().tolist():
+            rows.extend(range(pool_offset, pool_offset + count))
+            pool_offset += (
+                (count + pool_block_m - 1) //
+                pool_block_m * pool_block_m)
+        if destination_rank == rank_idx:
+            assert pool_offset == local_padded_pool_rows
+        return torch.tensor(rows, dtype=torch.long, device='cuda')
+
+    def check_fp8_fp4_predown_regression(
+        explicit_y: torch.Tensor,
+        stats_before: torch.Tensor,
+    ) -> None:
+        """Default and explicit PRE_DOWN must preserve every legacy bit."""
+        explicit_l2_acts = buffer.l2_acts.clone()
+        explicit_l2_acts_sf = buffer.l2_acts_sf.clone()
+        explicit_stats = (
+            cumulative_local_expert_recv_stats_fused.clone())
+        if args.check_predown_golden:
+            golden_config = (
+                num_ranks, num_tokens, num_max_tokens_per_rank,
+                hidden, intermediate_hidden, num_experts, num_topk,
+                args.routing, args.activation, args.activation_clamp,
+                bool(args.fast_math),
+            )
+            assert golden_config == (
+                1, 64, 384, 1024, 1024, 8, 1,
+                'balanced', 'swiglu', 10.0, True,
+            ), f'PRE_DOWN golden requires the canonical config, got {golden_config}'
+
+            def digest(tensor: torch.Tensor) -> str:
+                payload = (
+                    tensor.detach().contiguous().cpu()
+                    .view(torch.uint8).numpy().tobytes())
+                return hashlib.sha256(payload).hexdigest()
+
+            active_rows = active_pool_route_rows()
+            actual = {
+                'y': digest(explicit_y),
+                'l2_acts': digest(explicit_l2_acts[active_rows]),
+            }
+            expected = {
+                # Canonical pre-POST_DOWN MXFP4 contract on SM100.
+                'y': (
+                    'cba343d11238766747367c6b3f285cb7a495f269'
+                    'cd4491bb4fb76c7e22ea4522'),
+                'l2_acts': (
+                    '49d8335ec6159bd3b1fa009ea1590c22dc9df0f54'
+                    'f04a962d3a4f6c86aff57b3'),
+            }
+            assert actual == expected, (
+                'PRE_DOWN no longer matches the legacy golden: '
+                f'{actual}')
+        cumulative_local_expert_recv_stats_fused.copy_(
+            stats_before)
+        buffer.x[:num_tokens].copy_(x[0])
+        buffer.x_sf[:num_tokens].copy_(x[1])
+        buffer.topk_idx[:num_tokens].copy_(topk_idx)
+        buffer.topk_weights[:num_tokens].copy_(topk_weights)
+        default_y = torch.empty_like(explicit_y)
+        deep_gemm.fp8_fp4_mega_moe(
+            y=default_y,
+            l1_weights=transformed_l1_weights,
+            l2_weights=transformed_l2_weights,
+            sym_buffer=buffer,
+            cumulative_local_expert_recv_stats=(
+                cumulative_local_expert_recv_stats_fused),
+            activation=args.activation,
+            activation_clamp=args.activation_clamp,
+            fast_math=bool(args.fast_math),
+            saved_l1_preact=saved_l1_preact)
+        assert torch.equal(default_y, explicit_y), (
+            'explicit PRE_DOWN changed the legacy final output')
+        assert torch.equal(
+            buffer.l2_acts, explicit_l2_acts), (
+                'explicit PRE_DOWN changed quantized W2 inputs')
+        assert torch.equal(
+            buffer.l2_acts_sf, explicit_l2_acts_sf), (
+                'explicit PRE_DOWN changed W2 input scales')
+        assert torch.equal(
+            cumulative_local_expert_recv_stats_fused,
+            explicit_stats), (
+                'explicit PRE_DOWN changed receive accounting')
+
+    def check_fp8_fp4_postdown_route_semantics(
+        fused_y: torch.Tensor,
+        stats_before: torch.Tensor,
+    ) -> None:
+        assert saved_down_unweighted is not None
+        if args.require_ring_wrap:
+            assert local_padded_pool_rows > buffer.num_ring_tokens, (
+                'ring-wrap test did not exceed the reusable ring: '
+                f'{local_padded_pool_rows=} '
+                f'{buffer.num_ring_tokens=}')
+        first_down = saved_down_unweighted.clone()
+        first_stats = (
+            cumulative_local_expert_recv_stats_fused.clone())
+        active_rows = active_pool_route_rows()
+        assert torch.isfinite(
+            first_down[active_rows].float()).all(), (
+                'every routed row must be saved')
+        if args.active_saved_pool:
+            assert first_down.size(0) == active_pool_rows
+            assert local_padded_pool_rows <= first_down.size(0)
+            route_mask = torch.zeros(
+                first_down.size(0), dtype=torch.bool, device='cuda')
+            route_mask[active_rows] = True
+            local_pool_mask = torch.arange(
+                first_down.size(0), device='cuda'
+            ) < local_padded_pool_rows
+            padding_rows = (
+                local_pool_mask & ~route_mask).nonzero().flatten()
+            assert padding_rows.numel() == (
+                local_padded_pool_rows -
+                int(local_expert_counts.sum().item()))
+            assert torch.isfinite(
+                first_down[padding_rows].float()).all(), (
+                    'saved pool must retain expert block padding')
+            # Rank-uniform allocation may include a tail after this rank's
+            # block-padded local pool. It is not a route and must stay
+            # untouched; route validity comes from counts, never sentinels.
+            if local_padded_pool_rows < first_down.size(0):
+                assert torch.isnan(
+                    first_down[local_padded_pool_rows:].float()).all()
+        metadata = buffer.token_src_metadata[active_rows].long()
+
+        def expected_output(
+            down_pool: torch.Tensor,
+            weights: torch.Tensor,
+        ) -> torch.Tensor:
+            if num_ranks == 1:
+                all_down = [down_pool]
+                all_metadata = [buffer.token_src_metadata]
+                all_weights = weights.unsqueeze(0)
+            else:
+                all_down = [torch.empty_like(down_pool)
+                            for _ in range(num_ranks)]
+                all_metadata = [
+                    torch.empty_like(buffer.token_src_metadata)
+                    for _ in range(num_ranks)]
+                dist.all_gather(all_down, down_pool, group=group)
+                dist.all_gather(
+                    all_metadata, buffer.token_src_metadata, group=group)
+                all_weights = gather_rank_padded(weights, 0.0)
+            route_planes = torch.zeros(
+                (num_topk, num_tokens, hidden),
+                dtype=torch.bfloat16, device='cuda')
+            for destination_rank in range(num_ranks):
+                destination_rows = active_pool_route_rows(
+                    destination_rank)
+                destination_metadata = all_metadata[
+                    destination_rank][destination_rows].long()
+                local_mask = (
+                    destination_metadata[:, 0] == rank_idx)
+                local_metadata = destination_metadata[local_mask]
+                route_planes[
+                    local_metadata[:, 2],
+                    local_metadata[:, 1]] = (
+                    all_down[destination_rank][
+                        destination_rows[local_mask]].float() *
+                    all_weights[
+                        local_metadata[:, 0],
+                        local_metadata[:, 1],
+                        local_metadata[:, 2]].float().unsqueeze(1)
+                ).to(torch.bfloat16)
+            # The production combine accumulates BF16 route planes in
+            # top-k-slot order in FP32, then rounds once.
+            expected = torch.zeros(
+                (num_tokens, hidden),
+                dtype=torch.float32, device='cuda')
+            for slot in range(num_topk):
+                expected += route_planes[slot].float()
+            return expected.to(torch.bfloat16)
+
+        assert torch.equal(
+            fused_y,
+            expected_output(first_down, topk_weights)), (
+                'POST_DOWN must multiply the BF16 down output at '
+                'the remote combine write')
+
+        changed_weights = torch.where(
+            topk_idx >= 0,
+            topk_weights * -0.375 + 0.125,
+            torch.zeros_like(topk_weights))
+        second_down = torch.full_like(
+            saved_down_unweighted, float('nan'))
+        cumulative_local_expert_recv_stats_fused.copy_(
+            stats_before)
+        buffer.x[:num_tokens].copy_(x[0])
+        buffer.x_sf[:num_tokens].copy_(x[1])
+        buffer.topk_idx[:num_tokens].copy_(topk_idx)
+        buffer.topk_weights[:num_tokens].copy_(
+            changed_weights)
+        changed_y = torch.empty_like(fused_y)
+        deep_gemm.fp8_fp4_mega_moe(
+            y=changed_y,
+            l1_weights=transformed_l1_weights,
+            l2_weights=transformed_l2_weights,
+            sym_buffer=buffer,
+            cumulative_local_expert_recv_stats=(
+                cumulative_local_expert_recv_stats_fused),
+            activation=args.activation,
+            activation_clamp=args.activation_clamp,
+            fast_math=bool(args.fast_math),
+            saved_l1_preact=saved_l1_preact,
+            route_weight_mode=(
+                deep_gemm.RouteWeightMode.POST_DOWN),
+            saved_down_unweighted=second_down)
+        assert torch.isfinite(
+            second_down[active_rows].float()).all()
+        assert torch.equal(
+            second_down[active_rows],
+            first_down[active_rows]), (
+                'POST_DOWN W2 quantization must not depend on route scores')
+        assert torch.equal(
+            changed_y,
+            expected_output(second_down, changed_weights)), (
+                'changed route scores must be applied after the '
+                'saved BF16 down boundary')
+        assert torch.equal(
+            cumulative_local_expert_recv_stats_fused,
+            first_stats), (
+                'POST_DOWN changed receive accounting')
+        saved_down_unweighted.copy_(first_down)
 
     # Self-contained PyTorch reference. Distributed routing/combine is modeled
     # for BF16; the quantized reference remains single-rank.
@@ -764,7 +1002,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
                 # Requantize to FP8 (per-32 UE8M0), matching the
                 # quantized kernel's L1 output.
-                act = act * weight[mask].unsqueeze(1)
+                if args.route_weight_mode == 'pre_down':
+                    act = act * weight[mask].unsqueeze(1)
                 act_fp8, act_sf = per_token_cast_to_fp8(
                     act, use_ue8m0=True, gran_k=32)
                 n_groups = intermediate_hidden // 32
@@ -772,10 +1011,19 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                     act_fp8.float().view(-1, n_groups, 32) *
                     act_sf[:, :n_groups].unsqueeze(2)
                 ).view(-1, intermediate_hidden)
-                l2_out = act_deq @ l2_w[e].t()
+                down = (
+                    act_deq @ l2_w[e].t()
+                ).to(torch.bfloat16)
+                route_output = (
+                    down
+                    if args.route_weight_mode == 'pre_down'
+                    else (
+                        down.float() *
+                        weight[mask].unsqueeze(1)
+                    ).to(torch.bfloat16))
 
                 # L2 GEMM, accumulate across the top-k experts
-                y[mask] += l2_out.float()
+                y[mask] += route_output.float()
         return y.to(torch.bfloat16)
 
     def bf16_ulp_distance(
@@ -1817,6 +2065,191 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             'native FireTitan gradient mismatches: '
             f'{gradient_mismatches}')
 
+    def run_fp8_fp4_route_backward_test():
+        assert num_ranks == 1, (
+            'focused MXFP4 route backward test is single-rank')
+        assert args.activation == 'swiglu'
+        assert saved_l1_preact is not None
+        pool_rows = saved_l1_preact.size(0)
+        block_m = pool_block_m
+        active_rows = active_pool_route_rows()
+        expert_counts = local_expert_counts
+        metadata = buffer.token_src_metadata[active_rows].long()
+        route_weights = torch.zeros(
+            pool_rows, dtype=torch.float32, device='cuda')
+        exact_route_weights = topk_weights[
+            metadata[:, 1], metadata[:, 2]]
+        assert torch.any(
+            exact_route_weights !=
+            exact_route_weights.to(torch.bfloat16).float()), (
+                'test route scores must exercise non-BF16 FP32 bits')
+        route_weights[active_rows] = exact_route_weights
+        grad_y_unweighted = torch.zeros(
+            (pool_rows, hidden),
+            dtype=torch.bfloat16, device='cuda')
+        grad_y_unweighted[active_rows] = torch.randn(
+            (active_rows.numel(), hidden),
+            dtype=torch.bfloat16, device='cuda')
+
+        def cast_backward_weight(
+            weight: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            packed = torch.empty(
+                (*weight.shape[:-1], weight.size(-1) // 2),
+                dtype=torch.int8, device='cuda')
+            scales = torch.empty(
+                (*weight.shape[:-1], weight.size(-1) // 32),
+                dtype=torch.float32, device='cuda')
+            for expert in range(weight.size(0)):
+                packed[expert], scales[expert] = (
+                    per_token_cast_to_fp4(
+                        weight[expert],
+                        use_ue8m0=True, gran_k=32))
+            return packed.view(torch.float8_e4m3fn), scales
+
+        backward_l1_weights = cast_backward_weight(
+            l1_weights_bf16)
+        backward_l2_weights = cast_backward_weight(
+            l2_weights_bf16)
+        w13_weights = (
+            backward_l1_weights[0].view(
+                2 * num_experts_per_rank,
+                intermediate_hidden, hidden // 2),
+            backward_l1_weights[1].view(
+                2 * num_experts_per_rank,
+                intermediate_hidden, hidden // 32),
+        )
+        num_grid_states = (
+            num_experts_per_rank *
+            ((hidden // 64) *
+             (intermediate_hidden // 128) +
+             ((2 * intermediate_hidden) // 64) *
+             (hidden // 128)) +
+            2)
+
+        def allocate_outputs(grad_ye_input=None):
+            return {
+                'grad_h': torch.zeros(
+                    (pool_rows, intermediate_hidden),
+                    dtype=torch.bfloat16, device='cuda'),
+                'grad_gate_up': torch.zeros_like(
+                    saved_l1_preact),
+                'h_act': torch.zeros(
+                    (pool_rows, intermediate_hidden),
+                    dtype=torch.bfloat16, device='cuda'),
+                'h_weighted': torch.zeros(
+                    (pool_rows, intermediate_hidden),
+                    dtype=torch.bfloat16, device='cuda'),
+                'x_pool': torch.zeros(
+                    (pool_rows, hidden),
+                    dtype=torch.bfloat16, device='cuda'),
+                'grad_x_pool': torch.zeros(
+                    (pool_rows, hidden),
+                    dtype=torch.bfloat16, device='cuda'),
+                'grad_ye': (
+                    torch.zeros(
+                        (pool_rows, hidden),
+                        dtype=torch.bfloat16, device='cuda')
+                    if grad_ye_input is None
+                    else grad_ye_input.clone()),
+                'w2_scratch': torch.empty(
+                    (
+                        num_experts_per_rank, hidden,
+                        intermediate_hidden),
+                    dtype=torch.bfloat16, device='cuda'),
+                'w13_scratch': torch.empty(
+                    (
+                        num_experts_per_rank,
+                        2 * intermediate_hidden, hidden),
+                    dtype=torch.bfloat16, device='cuda'),
+                'grid': torch.zeros(
+                    num_grid_states,
+                    dtype=torch.int32, device='cuda'),
+            }
+
+        def run_backward(outputs, **route_kwargs):
+            deep_gemm.fp8_fp4_mega_moe_backward_dgrad_swiglu(
+                gate_up_output=saved_l1_preact,
+                grad_h_output=outputs['grad_h'],
+                grad_gate_up_output=outputs['grad_gate_up'],
+                h_act_output=outputs['h_act'],
+                h_weighted_output=outputs['h_weighted'],
+                x_pool_output=outputs['x_pool'],
+                grad_x_pool_output=outputs['grad_x_pool'],
+                l1_acts=buffer.l1_acts,
+                l1_acts_sf=buffer.l1_acts_sf,
+                l1_weights=transformed_l1_weights,
+                grad_ye=outputs['grad_ye'],
+                route_weights=route_weights,
+                w2_weights=backward_l2_weights,
+                w2_dequant_scratch=outputs['w2_scratch'],
+                w13_weights=w13_weights,
+                w13_dequant_scratch=outputs['w13_scratch'],
+                expert_counts=expert_counts,
+                grid_sync_counter=outputs['grid'],
+                activation_limit=float(args.activation_clamp),
+                block_m=block_m,
+                compute_w13_dgrad=True,
+                clear_wgrad_padding=True,
+                **route_kwargs)
+
+        if args.route_weight_mode == 'post_down':
+            assert saved_down_unweighted is not None
+            grad_route = torch.zeros(
+                pool_rows, dtype=torch.float32, device='cuda')
+            outputs = allocate_outputs()
+            run_backward(
+                outputs,
+                route_weight_mode=deep_gemm.RouteWeightMode.POST_DOWN,
+                grad_y_unweighted_output=grad_y_unweighted,
+                down_unweighted_output=saved_down_unweighted,
+                grad_route_output=grad_route)
+            assert torch.equal(
+                route_weights[active_rows], exact_route_weights), (
+                    'MXFP4 backward must preserve FP32 route scores exactly')
+            expected_grad_down = (
+                grad_y_unweighted[active_rows].float() *
+                route_weights[active_rows].float().unsqueeze(1)
+            ).to(torch.bfloat16)
+            assert torch.equal(
+                outputs['grad_ye'][active_rows],
+                expected_grad_down), (
+                    'POST_DOWN grad_down must be BF16(score * grad_y)')
+            assert torch.equal(
+                outputs['h_weighted'][active_rows],
+                outputs['h_act'][active_rows]), (
+                    'POST_DOWN W2 wgrad must consume unweighted h')
+            expected_grad_route = (
+                grad_y_unweighted[active_rows].float() *
+                saved_down_unweighted[active_rows].float()
+            ).sum(dim=1)
+            torch.testing.assert_close(
+                grad_route[active_rows],
+                expected_grad_route,
+                rtol=2e-6, atol=2e-4)
+        else:
+            # The explicit mode must instantiate the same PRE_DOWN kernel and
+            # preserve all historical output bits.
+            initial_grad_ye = torch.randn(
+                (pool_rows, hidden),
+                dtype=torch.bfloat16, device='cuda')
+            default_outputs = allocate_outputs(initial_grad_ye)
+            explicit_outputs = allocate_outputs(initial_grad_ye)
+            run_backward(default_outputs)
+            run_backward(
+                explicit_outputs,
+                route_weight_mode=(
+                    deep_gemm.RouteWeightMode.PRE_DOWN))
+            for name in (
+                'grad_h', 'grad_gate_up', 'h_act',
+                'h_weighted', 'x_pool', 'grad_x_pool',
+                'grad_ye',
+            ):
+                assert torch.equal(
+                    default_outputs[name],
+                    explicit_outputs[name]), (
+                        f'explicit PRE_DOWN changed {name}')
+
     dist_print('Config:', once_in_node=True)
     dist_print(f' > MMA: {args.mma_type}', once_in_node=True)
     dist_print(f' > Tokens: {num_tokens}/{num_max_tokens_per_rank}', once_in_node=True)
@@ -1940,7 +2373,21 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         dist_print(f'Running correctness tests ({args.activation}, numerical reference):', once_in_node=True)
         for i in range(num_correctness_tests):
             create_inputs()
+            stats_before = (
+                cumulative_local_expert_recv_stats_fused.clone())
             fused_y, _ = run_fused()
+            if (
+                not is_bf16xbf16 and
+                args.route_weight_mode == 'pre_down'
+            ):
+                check_fp8_fp4_predown_regression(
+                    fused_y, stats_before)
+            elif (
+                not is_bf16xbf16 and
+                args.route_weight_mode == 'post_down'
+            ):
+                check_fp8_fp4_postdown_route_semantics(
+                    fused_y, stats_before)
             ref_y = run_reference()
             if is_bf16xbf16:
                 check_native_forward_repeatability(ref_y)
@@ -1951,8 +2398,38 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             else:
                 diff = calc_diff(fused_y, ref_y)
                 assert diff < max_diff, f'{args.activation} diff too large: {diff:.5f} >= {max_diff}'
+                if args.test_backward:
+                    run_fp8_fp4_route_backward_test()
             if (i + 1) % 100 == 0 or i == num_correctness_tests - 1:
                 dist_print(f' > Correctness test #{i + 1}/{num_correctness_tests} passed (diff {diff:.5f})', once_in_node=True)
+        dist_print(once_in_node=True)
+        ran_correctness = True
+
+    if (
+        not args.benchmark_backward and
+        not is_bf16xbf16 and
+        num_ranks > 1 and
+        args.route_weight_mode == 'post_down' and
+        num_correctness_tests > 0
+    ):
+        dist_print(
+            'Running distributed POST_DOWN route-boundary tests:',
+            once_in_node=True)
+        for i in range(num_correctness_tests):
+            create_inputs()
+            stats_before = (
+                cumulative_local_expert_recv_stats_fused.clone())
+            fused_y, _ = run_fused()
+            check_fp8_fp4_postdown_route_semantics(
+                fused_y, stats_before)
+            if (
+                (i + 1) % 100 == 0 or
+                i == num_correctness_tests - 1
+            ):
+                dist_print(
+                    f' > Distributed route test '
+                    f'#{i + 1}/{num_correctness_tests} passed',
+                    once_in_node=True)
         dist_print(once_in_node=True)
         ran_correctness = True
 
@@ -2032,6 +2509,15 @@ if __name__ == '__main__':
 
     # Model settings
     parser.add_argument('--num-max-tokens-per-rank', type=int, default=8192, help='Number of maximum tokens per rank')
+    parser.add_argument(
+        '--num-ring-tokens',
+        type=int,
+        default=None,
+        help='Override ring capacity to exercise multi-wave ring reuse')
+    parser.add_argument(
+        '--require-ring-wrap',
+        action='store_true',
+        help='Fail unless the active logical pool exceeds the ring capacity')
     parser.add_argument('--num-tokens', type=int, default=0, help='Number of tokens per rank (follow max minus removed if 0)')
     parser.add_argument('--zero-tokens', action='store_true', help='Launch a rank with exactly zero tokens')
     parser.add_argument('--zero-rank', type=int, default=-1, help='Rank that launches with zero tokens')
@@ -2087,6 +2573,10 @@ if __name__ == '__main__':
     # Test settings
     parser.add_argument('--num-correctness-tests', type=int, default=None, help='Pressure test')
     parser.add_argument('--correctness-only', action='store_true', help='Exit after correctness validation')
+    parser.add_argument(
+        '--check-predown-golden',
+        action='store_true',
+        help='Check canonical MXFP4 PRE_DOWN output against legacy digests')
     parser.add_argument('--dump-profile-traces', type=str, default='', help='Dump profiling trace JSONs')
     parser.add_argument('--local-rank-idx', type=int, default=None, help='Run as single process with this local rank (e.g. for NCU prof)')
     args = parser.parse_args()

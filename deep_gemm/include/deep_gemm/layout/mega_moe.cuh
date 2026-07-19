@@ -102,6 +102,11 @@ struct Workspace {
         // Combine push source indices (full)
         num_bytes += num_max_pool_tokens * sizeof(TokenSrcMetadata);
 
+        // Route scores must outlive the reusable L1 ring. L2 can consume a
+        // logical pool row after dispatch has released and refilled its ring
+        // slot, so POST_DOWN reads scores from this full-pool region.
+        num_bytes += num_max_pool_tokens * sizeof(float);
+
         // Align to TMA descriptor requirements
         num_bytes = math::align<uint64_t>(num_bytes, 16);
         return num_bytes;
@@ -193,6 +198,13 @@ struct Workspace {
     CUTLASS_HOST_DEVICE
     TokenSrcMetadata* get_token_src_metadata_ptr(const uint32_t& pool_token_idx = 0) const {
         const auto base = reinterpret_cast<TokenSrcMetadata*>(get_src_token_topk_idx_ptr(num_experts_per_rank));
+        return base + pool_token_idx;
+    }
+
+    CUTLASS_HOST_DEVICE
+    float* get_route_weight_ptr(const uint32_t& pool_token_idx = 0) const {
+        const auto base = reinterpret_cast<float*>(
+            get_token_src_metadata_ptr(num_max_pool_tokens));
         return base + pool_token_idx;
     }
 };

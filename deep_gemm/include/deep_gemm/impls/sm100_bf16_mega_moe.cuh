@@ -845,6 +845,7 @@ sm100_bf16_mega_moe_impl(void* y,
                     input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
                     current_rank_in_expert_idx);
                 *l1_topk_weights_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).template get_base_ptr<float>() = weight;
+                *workspace.get_route_weight_ptr(pool_token_idx) = weight;
 
                 // Write source metadata for combine write-back (logical pool token)
                 *workspace.get_token_src_metadata_ptr(pool_token_idx) =
@@ -1601,8 +1602,10 @@ sm100_bf16_mega_moe_impl(void* y,
                             pool_m_idx +
                             epilogue_wg_idx * WG_BLOCK_M +
                             s * STORE_BLOCK_M;
-                        if (saved_store_row < num_saved_pool_tokens &&
-                            warp_idx_in_wg == 0 &&
+                        DG_DEVICE_ASSERT(
+                            saved_store_row + STORE_BLOCK_M <=
+                            num_saved_pool_tokens);
+                        if (warp_idx_in_wg == 0 &&
                             cute::elect_one_sync()) {
                             cute::tma_store_fence();
                             #pragma unroll
@@ -1667,11 +1670,8 @@ sm100_bf16_mega_moe_impl(void* y,
                             kCombineOrderMode ==
                                 CombineOrderMode::FixedTopK) {
                             const float route_weight =
-                                *l1_topk_weights_buffer
-                                     .get_data_buffer(
-                                         ring_m_idx +
-                                         m_idx_in_block)
-                                     .template get_base_ptr<float>();
+                                *workspace.get_route_weight_ptr(
+                                    pool_m_idx + m_idx_in_block);
                             auto* values =
                                 reinterpret_cast<nv_bfloat16*>(
                                     &packed);

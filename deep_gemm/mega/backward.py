@@ -818,8 +818,33 @@ def fp8_fp4_mega_moe_backward_dgrad_swiglu(
     grad_y: Optional[torch.Tensor] = None,
     topk_weights: Optional[torch.Tensor] = None,
     token_src_metadata: Optional[torch.Tensor] = None,
+    route_weight_mode: RouteWeightMode = RouteWeightMode.PRE_DOWN,
+    grad_y_unweighted_output: Optional[torch.Tensor] = None,
+    down_unweighted_output: Optional[torch.Tensor] = None,
+    grad_route_output: Optional[torch.Tensor] = None,
 ) -> None:
-    """Run the production L1 replay, dgrad/SwiGLU, and grad-x dispatch."""
+    """Run the production L1 replay, dgrad/SwiGLU, and grad-x dispatch.
+
+    POST_DOWN writes BF16 ``score * grad_y`` to ``grad_ye``, retains
+    unweighted ``h_act`` in ``h_weighted_output`` for W2 wgrad, and computes
+    ``grad_route_output = dot(grad_y_unweighted, down_unweighted)``.
+    """
+    route_weight_mode = RouteWeightMode(route_weight_mode)
+    if route_weight_mode is RouteWeightMode.POST_DOWN:
+        if route_weights.dtype != torch.float32:
+            raise TypeError(
+                "post_down requires FP32 route_weights")
+        if grad_y_unweighted_output is None:
+            raise ValueError(
+                "post_down requires grad_y_unweighted_output")
+        if down_unweighted_output is None:
+            raise ValueError(
+                "post_down requires saved down_unweighted_output")
+        if grad_route_output is None:
+            raise ValueError(
+                "post_down requires grad_route_output")
+    elif grad_y_unweighted_output is None:
+        grad_y_unweighted_output = grad_ye
     backward_grad_y = None
     backward_topk_weights = None
     backward_sym_buffer_ptrs = []
@@ -877,6 +902,10 @@ def fp8_fp4_mega_moe_backward_dgrad_swiglu(
         backward_rank,
         num_max_tokens_per_rank,
         num_topk,
+        route_weight_mode.value,
+        grad_y_unweighted_output,
+        down_unweighted_output,
+        grad_route_output,
     )
 
 

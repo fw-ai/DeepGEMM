@@ -38,6 +38,8 @@ template <
     bool kFastMath,
     ActivationType kActivationType,
     bool kSaveL1Preact,
+    RouteWeightMode kRouteWeightMode = RouteWeightMode::PreDown,
+    bool kSaveDownUnweighted = false,
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
     uint32_t L2_SHAPE_N = kHidden,
@@ -56,6 +58,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             nv_bfloat16* saved_l1_preact,
                             int* cumulative_local_expert_recv_stats,
                             const uint32_t num_tokens,
+                            const uint32_t num_saved_pool_tokens,
                             const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts_sf,
@@ -65,7 +68,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts_sf,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights,
-                            const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights_sf) {
+                            const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights_sf,
+                            const __grid_constant__ cute::TmaDescriptor tensor_map_down_unweighted) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::TMEM::Allocator2Sm;
@@ -94,6 +98,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         cute::prefetch_tma_descriptor(&tensor_map_l2_acts_sf);
         cute::prefetch_tma_descriptor(&tensor_map_l2_weights);
         cute::prefetch_tma_descriptor(&tensor_map_l2_weights_sf);
+        if constexpr (kSaveDownUnweighted)
+            cute::prefetch_tma_descriptor(
+                &tensor_map_down_unweighted);
     }
 
     // Workspaces
@@ -588,6 +595,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
                     current_rank_in_expert_idx);
                 *l1_topk_weights_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).template get_base_ptr<float>() = weight;
+                *workspace.get_route_weight_ptr(pool_token_idx) = weight;
 
                 // Write source metadata for combine write-back (logical pool token)
                 *workspace.get_token_src_metadata_ptr(pool_token_idx) =
@@ -1109,7 +1117,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             } else {
                                 activated = {gate.x / denom.x, gate.y / denom.y};
                             }
-                            activation_values[i][k] = __fmul2_rn(__fmul2_rn(activated, up), weights);
+                            if constexpr (
+                                kRouteWeightMode ==
+                                RouteWeightMode::PreDown) {
+                                // Keep the legacy expression intact: PRE_DOWN
+                                // must remain bitwise identical.
+                                activation_values[i][k] = __fmul2_rn(__fmul2_rn(activated, up), weights);
+                            } else {
+                                activation_values[i][k] =
+                                    __fmul2_rn(activated, up);
+                            }
                         }
 
                         // Amax reduction (thread-level)
@@ -1289,6 +1306,46 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     // Wait shared memory ready
                     ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
 
+                    if constexpr (kSaveDownUnweighted) {
+                        const uint32_t saved_store_row =
+                            pool_m_idx +
+                            epilogue_wg_idx * WG_BLOCK_M +
+                            s * STORE_BLOCK_M;
+                        DG_DEVICE_ASSERT(
+                            saved_store_row + STORE_BLOCK_M <=
+                            num_saved_pool_tokens);
+                        if (warp_idx_in_wg == 0 &&
+                            cute::elect_one_sync()) {
+                            cute::tma_store_fence();
+                            #pragma unroll
+                            for (uint32_t atom = 0;
+                                 atom <
+                                     BLOCK_N *
+                                         sizeof(nv_bfloat16) /
+                                         kSwizzleCDMode;
+                                 ++atom) {
+                                cute::SM90_TMA_STORE_2D::copy(
+                                    &tensor_map_down_unweighted,
+                                    shared_storage.smem_d
+                                        .l2[epilogue_wg_idx] +
+                                        atom * STORE_BLOCK_M *
+                                            (kSwizzleCDMode /
+                                             sizeof(
+                                                 nv_bfloat16)),
+                                    n_idx +
+                                        atom *
+                                            (kSwizzleCDMode /
+                                             sizeof(
+                                                 nv_bfloat16)),
+                                    saved_store_row);
+                                cute::tma_store_arrive();
+                            }
+                        }
+                        if (warp_idx_in_wg == 0)
+                            cute::tma_store_wait<0>();
+                        __syncwarp();
+                    }
+
                     // Write into remote buffers
                     // Each warp writes 2 rows (lane_idx/16 splits the warp into two halves, one per row)
                     const uint32_t row_in_atom = (warp_idx_in_wg * 2 + lane_idx / 16) % ATOM_M;
@@ -1313,7 +1370,27 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             (lane_idx % 16 / 8) * STORE_BLOCK_M * kSwizzleCDMode +
                             row_in_store * kSwizzleCDMode +
                             (bank_group_idx ^ row_in_atom) * kNumBankGroupBytes;
-                        const auto packed = ptx::ld_shared(reinterpret_cast<float4*>(smem_ptr));
+                        auto packed = ptx::ld_shared(reinterpret_cast<float4*>(smem_ptr));
+                        if constexpr (
+                            kRouteWeightMode ==
+                            RouteWeightMode::PostDown) {
+                            const float route_weight =
+                                *workspace.get_route_weight_ptr(
+                                    pool_m_idx + m_idx_in_block);
+                            auto* values =
+                                reinterpret_cast<
+                                    nv_bfloat16*>(&packed);
+                            #pragma unroll
+                            for (uint32_t value_idx = 0;
+                                 value_idx < 8;
+                                 ++value_idx) {
+                                values[value_idx] =
+                                    __float2bfloat16_rn(
+                                        __bfloat162float(
+                                            values[value_idx]) *
+                                        route_weight);
+                            }
+                        }
 
                         // Write into remote
                         const auto dst_token = combine_token_buffer.get_rank_buffer(dst_topk_idx)
