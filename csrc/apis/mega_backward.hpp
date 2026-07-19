@@ -135,7 +135,8 @@ static void bf16_mega_moe_backward_post_down_prelude(
     const bool& synchronize_ranks,
     const bool& synchronize_after_dispatch,
     const bool& barrier_only,
-    const bool& x_prepared) {
+    const bool& x_prepared,
+    const int& route_prelude_threads) {
     deep_gemm::
         sm100_bf16_mega_moe_backward_post_down_prelude(
             grad_y_unweighted_output,
@@ -149,7 +150,8 @@ static void bf16_mega_moe_backward_post_down_prelude(
             do_reverse_dispatch, compute_route_dot,
             write_weighted, synchronize_ranks,
             synchronize_after_dispatch,
-            barrier_only, x_prepared);
+            barrier_only, x_prepared,
+            route_prelude_threads);
 }
 
 static void bf16_mega_moe_backward_w2(
@@ -390,7 +392,8 @@ static void register_apis(pybind11::module_& m) {
         py::arg("synchronize_ranks") = true,
         py::arg("synchronize_after_dispatch") = true,
         py::arg("barrier_only") = false,
-        py::arg("x_prepared") = false);
+        py::arg("x_prepared") = false,
+        py::arg("route_prelude_threads") = 256);
     m.def("bf16_mega_moe_backward_w2",
           &bf16_mega_moe_backward_w2,
           py::arg("grad_w2_output"), py::arg("grad_ye"),

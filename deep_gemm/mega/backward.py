@@ -45,6 +45,7 @@ _BF16_BACKWARD_KERNEL_TRACE_FIELDS = (
 )
 _BF16_BACKWARD_DECOMPOSE_PRELUDE = False
 _BF16_BACKWARD_SPLIT_BARRIER_FUSED_ROUTE = os.getenv("DG_BF16_SPLIT_BARRIER_FUSED_ROUTE", "1") == "1"
+_BF16_ROUTE_PRELUDE_THREADS = os.getenv("DG_BF16_ROUTE_PRELUDE_THREADS", "256")
 
 
 def _timed_cuda_phase(name: str, operation: Callable[[], Any]) -> Any:
@@ -350,6 +351,24 @@ def bf16_mega_moe_backward_dgrad(
             synchronize_after_dispatch: bool,
             barrier_only: bool = False,
         ) -> None:
+            route_prelude_threads = 256
+            if (
+                compute_route_dot
+                and grad_y.shape[1] == 2048
+                and combine_order_mode is not CombineOrderMode.FIXED_TOPK
+            ):
+                try:
+                    route_prelude_threads = int(_BF16_ROUTE_PRELUDE_THREADS)
+                except ValueError as exc:
+                    raise ValueError(
+                        "DG_BF16_ROUTE_PRELUDE_THREADS must be 128 or 256, got "
+                        f"{_BF16_ROUTE_PRELUDE_THREADS!r}"
+                    ) from exc
+                if route_prelude_threads not in (128, 256):
+                    raise ValueError(
+                        "DG_BF16_ROUTE_PRELUDE_THREADS must be 128 or 256, got "
+                        f"{route_prelude_threads}"
+                    )
             _C.bf16_mega_moe_backward_post_down_prelude(
                 grad_y_unweighted_output,
                 grad_ye,
@@ -374,6 +393,7 @@ def bf16_mega_moe_backward_dgrad(
                 synchronize_after_dispatch,
                 barrier_only,
                 x_prepared,
+                route_prelude_threads,
             )
 
         def launch_decomposed_route_prelude() -> None:
