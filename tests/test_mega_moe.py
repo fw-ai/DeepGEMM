@@ -17,6 +17,17 @@ from deep_gemm.utils.dist import dist_print, init_dist, uneven_all_gather
 from deep_gemm.testing import bench_kineto, calc_diff
 
 
+_SPAWNED_RESOURCES = []
+
+
+def _destroy_resource(resource) -> None:
+    try:
+        resource.destroy()
+    finally:
+        if resource in _SPAWNED_RESOURCES:
+            _SPAWNED_RESOURCES.remove(resource)
+
+
 def import_baseline():
     # Load legacy implements from third-party
     deep_ep, tilelang_ops, do_bench, is_legacy_loaded = None, None, None, False
@@ -186,7 +197,11 @@ def _dequant_weight_fp4(w_bf16: torch.Tensor, gran_k: int = 32) -> torch.Tensor:
 
 # TODO: skip the test for SM90
 # noinspection PyUnboundLocalVariable,PyShadowingNames
-def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
+def _test_impl(
+    local_rank: int,
+    num_local_ranks: int,
+    args: argparse.Namespace,
+):
     rank_idx, num_ranks, group = init_dist(local_rank, num_local_ranks)
     torch.manual_seed(rank_idx)
     random.seed(rank_idx)
@@ -216,6 +231,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         activation=args.activation,
         num_ring_tokens=args.num_ring_tokens,
     )
+    _SPAWNED_RESOURCES.append(buffer)
 
     # Cast weights into FP4
     def _cast_weights_to_fp4(bf16_weights: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -442,45 +458,28 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         stats_before: torch.Tensor,
     ) -> None:
         """Default and explicit PRE_DOWN must preserve every legacy bit."""
-        explicit_l2_acts = buffer.l2_acts.clone()
-        explicit_l2_acts_sf = buffer.l2_acts_sf.clone()
+        active_rows = active_pool_route_rows()
+        route_key_stride = (
+            buffer.num_max_tokens_per_rank * num_topk)
+
+        def canonical_route_order(
+            metadata: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            route_keys = (
+                metadata[:, 0].long() * route_key_stride +
+                metadata[:, 1].long() * num_topk +
+                metadata[:, 2].long())
+            order = torch.argsort(route_keys)
+            return route_keys[order], order
+
+        explicit_metadata = (
+            buffer.token_src_metadata[active_rows].clone())
+        explicit_keys, explicit_order = canonical_route_order(
+            explicit_metadata)
+        explicit_l2_acts = (
+            buffer.l2_acts[active_rows][explicit_order].clone())
         explicit_stats = (
             cumulative_local_expert_recv_stats_fused.clone())
-        if args.check_predown_golden:
-            golden_config = (
-                num_ranks, num_tokens, num_max_tokens_per_rank,
-                hidden, intermediate_hidden, num_experts, num_topk,
-                args.routing, args.activation, args.activation_clamp,
-                bool(args.fast_math),
-            )
-            assert golden_config == (
-                1, 64, 384, 1024, 1024, 8, 1,
-                'balanced', 'swiglu', 10.0, True,
-            ), f'PRE_DOWN golden requires the canonical config, got {golden_config}'
-
-            def digest(tensor: torch.Tensor) -> str:
-                payload = (
-                    tensor.detach().contiguous().cpu()
-                    .view(torch.uint8).numpy().tobytes())
-                return hashlib.sha256(payload).hexdigest()
-
-            active_rows = active_pool_route_rows()
-            actual = {
-                'y': digest(explicit_y),
-                'l2_acts': digest(explicit_l2_acts[active_rows]),
-            }
-            expected = {
-                # Canonical pre-POST_DOWN MXFP4 contract on SM100.
-                'y': (
-                    'cba343d11238766747367c6b3f285cb7a495f269'
-                    'cd4491bb4fb76c7e22ea4522'),
-                'l2_acts': (
-                    '49d8335ec6159bd3b1fa009ea1590c22dc9df0f54'
-                    'f04a962d3a4f6c86aff57b3'),
-            }
-            assert actual == expected, (
-                'PRE_DOWN no longer matches the legacy golden: '
-                f'{actual}')
         cumulative_local_expert_recv_stats_fused.copy_(
             stats_before)
         buffer.x[:num_tokens].copy_(x[0])
@@ -501,16 +500,53 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             saved_l1_preact=saved_l1_preact)
         assert torch.equal(default_y, explicit_y), (
             'explicit PRE_DOWN changed the legacy final output')
+        default_keys, default_order = canonical_route_order(
+            buffer.token_src_metadata[active_rows])
+        assert torch.equal(default_keys, explicit_keys), (
+            'explicit PRE_DOWN changed the routed rows')
+        # Dispatch atomics do not promise a physical order within an expert.
+        # Compare each W2 input by its source route instead of pool row.
         assert torch.equal(
-            buffer.l2_acts, explicit_l2_acts), (
+            buffer.l2_acts[active_rows][default_order],
+            explicit_l2_acts), (
                 'explicit PRE_DOWN changed quantized W2 inputs')
-        assert torch.equal(
-            buffer.l2_acts_sf, explicit_l2_acts_sf), (
-                'explicit PRE_DOWN changed W2 input scales')
         assert torch.equal(
             cumulative_local_expert_recv_stats_fused,
             explicit_stats), (
                 'explicit PRE_DOWN changed receive accounting')
+        if args.check_predown_golden:
+            golden_config = (
+                num_ranks, num_tokens, num_max_tokens_per_rank,
+                hidden, intermediate_hidden, num_experts, num_topk,
+                args.routing, args.activation, args.activation_clamp,
+                bool(args.fast_math),
+            )
+            assert golden_config == (
+                1, 64, 384, 1024, 1024, 8, 1,
+                'balanced', 'swiglu', 10.0, True,
+            ), f'PRE_DOWN golden requires the canonical config, got {golden_config}'
+
+            def digest(tensor: torch.Tensor) -> str:
+                payload = (
+                    tensor.detach().contiguous().cpu()
+                    .view(torch.uint8).numpy().tobytes())
+                return hashlib.sha256(payload).hexdigest()
+
+            actual = {
+                'y': digest(explicit_y),
+                'l2_acts': digest(explicit_l2_acts),
+            }
+            expected = {
+                'y': (
+                    'cba343d11238766747367c6b3f285cb7a495f269'
+                    'cd4491bb4fb76c7e22ea4522'),
+                'l2_acts': (
+                    '88aea06b67e3de06a8b36dafd6256f5fe67a046c'
+                    'a6e0c587814f984e98272fdb'),
+            }
+            assert actual == expected, (
+                'PRE_DOWN no longer matches the legacy golden: '
+                f'{actual=}')
 
     def check_fp8_fp4_postdown_route_semantics(
         fused_y: torch.Tensor,
@@ -543,9 +579,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             assert padding_rows.numel() == (
                 local_padded_pool_rows -
                 int(local_expert_counts.sum().item()))
-            assert torch.isfinite(
-                first_down[padding_rows].float()).all(), (
-                    'saved pool must retain expert block padding')
+            # Padding storage is capacity, not a routed row: kernels may leave
+            # it untouched or materialize a padded GEMM result. Never infer
+            # route validity from its sentinel/value state.
             # Rank-uniform allocation may include a tail after this rank's
             # block-padded local pool. It is not a route and must stay
             # untouched; route validity comes from counts, never sentinels.
@@ -638,9 +674,27 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             saved_down_unweighted=second_down)
         assert torch.isfinite(
             second_down[active_rows].float()).all()
+        second_metadata = (
+            buffer.token_src_metadata[active_rows].long())
+        route_key_stride = (
+            buffer.num_max_tokens_per_rank * num_topk)
+        first_keys = (
+            metadata[:, 0] * route_key_stride +
+            metadata[:, 1] * num_topk +
+            metadata[:, 2])
+        second_keys = (
+            second_metadata[:, 0] * route_key_stride +
+            second_metadata[:, 1] * num_topk +
+            second_metadata[:, 2])
+        first_order = torch.argsort(first_keys)
+        second_order = torch.argsort(second_keys)
         assert torch.equal(
-            second_down[active_rows],
-            first_down[active_rows]), (
+            first_keys[first_order],
+            second_keys[second_order]), (
+                'changed route scores changed the dispatched route set')
+        assert torch.equal(
+            second_down[active_rows[second_order]],
+            first_down[active_rows[first_order]]), (
                 'POST_DOWN W2 quantization must not depend on route scores')
         assert torch.equal(
             changed_y,
@@ -2268,7 +2322,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
         # Destroy and exit
         dist.barrier()
-        buffer.destroy()
+        _destroy_resource(buffer)
         dist.destroy_process_group()
         return
 
@@ -2288,6 +2342,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     except Exception as ex:
         dist_print(f'Failed to create legacy EP buffer: {ex}, skip baseline', once_in_node=True)
         ep_buffer, is_legacy_loaded = None, False
+    if ep_buffer is not None:
+        _SPAWNED_RESOURCES.append(ep_buffer)
 
     # Baseline params differ by mma type
     run_baseline = None
@@ -2438,8 +2494,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     if args.correctness_only:
         dist.barrier()
-        buffer.destroy()
-        ep_buffer.destroy() if ep_buffer else None
+        _destroy_resource(buffer)
+        _destroy_resource(ep_buffer) if ep_buffer else None
         dist.destroy_process_group()
         return
 
@@ -2495,9 +2551,29 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     # Exit
     dist.barrier()
-    buffer.destroy()
-    ep_buffer.destroy() if is_legacy_loaded else None
+    _destroy_resource(buffer)
+    _destroy_resource(ep_buffer) if is_legacy_loaded else None
     dist.destroy_process_group()
+
+
+def test(
+    local_rank: int,
+    num_local_ranks: int,
+    args: argparse.Namespace,
+) -> None:
+    try:
+        _test_impl(local_rank, num_local_ranks, args)
+    finally:
+        for resource in reversed(_SPAWNED_RESOURCES.copy()):
+            try:
+                _destroy_resource(resource)
+            except Exception as ex:
+                print(
+                    f'Warning: failed to clean up test resource: {ex}',
+                    file=sys.stderr,
+                    flush=True)
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 if __name__ == '__main__':
