@@ -301,6 +301,13 @@ def bf16_mega_moe_backward_dgrad(
         block_m = int(_timed_cuda_phase("block_m_host_item", rank_uniform_block_m.item))
     num_tokens = grad_y.shape[0]
     backward_grad_y = sym_buffer.backward_grad_y
+    # This dedicated FP32 source plane is backward-only and retains one
+    # scalar per physical top-k slot. Every valid expert row publishes
+    # directly to its unique source slot; invalid routes remain zero.
+    _timed_cuda_phase(
+        "grad_route_plane_clear",
+        sym_buffer.backward_grad_route.zero_,
+    )
     if direct_remote_grad_x:
         # Kernel A reuses this region as [topk, token, hidden] direct-write
         # planes after every rank has pulled grad-y from plane zero. Clear all
@@ -318,13 +325,6 @@ def bf16_mega_moe_backward_dgrad(
                 1,
             ),
         )
-        if combine_order_mode is CombineOrderMode.FIXED_TOPK:
-            # Fixed-top-k combine consumes every slot, including invalid
-            # routes. DeepEP-ordered combine reads top-k IDs and skips invalid
-            # slots, while Kernel A overwrites every valid slot after the
-            # reverse-dispatch barrier, so its large slot-major pool does not
-            # need a standalone clear.
-            _timed_cuda_phase("grad_y_plane_clear", backward_grad_y.zero_)
         _timed_cuda_phase(
             "grad_y_expose_copy",
             lambda: backward_grad_y[0, :num_tokens].copy_(grad_y.to(torch.bfloat16).contiguous()),
@@ -369,7 +369,7 @@ def bf16_mega_moe_backward_dgrad(
                         "DG_BF16_ROUTE_PRELUDE_THREADS must be 128 or 256, got "
                         f"{route_prelude_threads}"
                     )
-            _C.bf16_mega_moe_backward_post_down_prelude(
+            _C.bf16_mega_moe_backward_post_down_prelude_v2(
                 grad_y_unweighted_output,
                 grad_ye,
                 x_pool_output,
@@ -380,6 +380,7 @@ def bf16_mega_moe_backward_dgrad(
                 sym_buffer.backward_grad_y,
                 sym_buffer.x,
                 sym_buffer.topk_weights,
+                sym_buffer.backward_grad_route,
                 sym_buffer.token_src_metadata,
                 sym_buffer.handle.buffer_ptrs,
                 sym_buffer.group.rank(),
@@ -591,7 +592,7 @@ def bf16_mega_moe_backward_dgrad(
         trace_clock_rate_khz = float(properties.clock_rate)
     _timed_cuda_phase(
         "kernel_a_dgrad",
-        lambda: _C.bf16_mega_moe_backward_dgrad(
+        lambda: _C.bf16_mega_moe_backward_dgrad_v2(
             gate_up_output,
             grad_h_output,
             grad_gate_up_output,
@@ -619,6 +620,7 @@ def bf16_mega_moe_backward_dgrad(
             sym_buffer.backward_grad_y,
             sym_buffer.x,
             sym_buffer.topk_weights,
+            sym_buffer.backward_grad_route,
             sym_buffer.token_src_metadata,
             sym_buffer.handle.buffer_ptrs,
             sym_buffer.group.rank(),
@@ -818,15 +820,46 @@ def fp8_fp4_mega_moe_backward_dgrad_swiglu(
     grad_y: Optional[torch.Tensor] = None,
     topk_weights: Optional[torch.Tensor] = None,
     token_src_metadata: Optional[torch.Tensor] = None,
+    route_weight_mode: RouteWeightMode = RouteWeightMode.PRE_DOWN,
+    grad_y_unweighted_output: Optional[torch.Tensor] = None,
+    down_unweighted_output: Optional[torch.Tensor] = None,
+    grad_route_output: Optional[torch.Tensor] = None,
 ) -> None:
-    """Run the production L1 replay, dgrad/SwiGLU, and grad-x dispatch."""
+    """Run the production L1 replay, dgrad/SwiGLU, and grad-x dispatch.
+
+    POST_DOWN writes BF16 ``score * grad_y`` to ``grad_ye``, retains
+    unweighted ``h_act`` in ``h_weighted_output`` for W2 wgrad, and computes
+    ``grad_route_output = dot(grad_y_unweighted, down_unweighted)``.
+    """
+    route_weight_mode = RouteWeightMode(route_weight_mode)
+    if route_weight_mode is RouteWeightMode.POST_DOWN:
+        if route_weights.dtype != torch.float32:
+            raise TypeError(
+                "post_down requires FP32 route_weights")
+        if grad_y_unweighted_output is None:
+            raise ValueError(
+                "post_down requires grad_y_unweighted_output")
+        if down_unweighted_output is None:
+            raise ValueError(
+                "post_down requires saved down_unweighted_output")
+        if grad_route_output is None and sym_buffer is None:
+            raise ValueError(
+                "post_down without a symmetric buffer requires "
+                "grad_route_output")
+    elif grad_y_unweighted_output is None:
+        grad_y_unweighted_output = grad_ye
     backward_grad_y = None
     backward_topk_weights = None
+    backward_grad_route = None
     backward_sym_buffer_ptrs = []
     backward_rank = 0
     num_max_tokens_per_rank = 0
     num_topk = 0
-    if not write_grad_x_pool and not direct_remote_grad_x:
+    if (
+        compute_w13_dgrad and
+        not write_grad_x_pool and
+        not direct_remote_grad_x
+    ):
         raise ValueError("grad-x requires a local or direct remote output")
     if direct_remote_grad_x and not compute_w13_dgrad:
         raise ValueError("direct remote grad-x requires W13 dgrad")
@@ -838,14 +871,22 @@ def fp8_fp4_mega_moe_backward_dgrad_swiglu(
         num_tokens = grad_y.shape[0]
         sym_buffer.backward_grad_y[:num_tokens].copy_(grad_y.to(torch.bfloat16).contiguous())
         sym_buffer.topk_weights[:num_tokens].copy_(topk_weights.float().contiguous())
+        sym_buffer.backward_grad_route.zero_()
         backward_grad_y = sym_buffer.backward_grad_y
         backward_topk_weights = sym_buffer.topk_weights
+        backward_grad_route = sym_buffer.backward_grad_route
         backward_sym_buffer_ptrs = sym_buffer.handle.buffer_ptrs
         backward_rank = sym_buffer.group.rank()
         num_max_tokens_per_rank = sym_buffer.num_max_tokens_per_rank
         num_topk = sym_buffer.num_topk
+        if grad_route_output is None:
+            grad_route_output = torch.empty(
+                route_weights.numel(),
+                dtype=torch.float32,
+                device=route_weights.device,
+            )
 
-    _C.fp8_fp4_mega_moe_backward_dgrad_swiglu(
+    _C.fp8_fp4_mega_moe_backward_dgrad_swiglu_v2(
         gate_up_output,
         grad_h_output,
         grad_gate_up_output,
@@ -872,11 +913,16 @@ def fp8_fp4_mega_moe_backward_dgrad_swiglu(
         clear_wgrad_padding,
         backward_grad_y,
         backward_topk_weights,
+        backward_grad_route,
         token_src_metadata,
         backward_sym_buffer_ptrs,
         backward_rank,
         num_max_tokens_per_rank,
         num_topk,
+        route_weight_mode.value,
+        grad_y_unweighted_output,
+        down_unweighted_output,
+        grad_route_output,
     )
 
 
@@ -914,6 +960,32 @@ def bf16_mega_moe_backward_w13(
         x_pool,
         padded_expert_counts,
         pool_block_m,
+    )
+
+
+def mega_moe_backward_combine_grad_x(
+    grad_x_output: torch.Tensor,
+    sym_buffer: Any,
+    combine_order_mode: CombineOrderMode = CombineOrderMode.FIXED_TOPK,
+) -> None:
+    """Reduce direct-write fixed-slot grad-x planes without a wgrad kernel."""
+    combine_order_mode = CombineOrderMode(combine_order_mode)
+    num_ranks = sym_buffer.group.size()
+    if sym_buffer.num_experts % num_ranks:
+        raise ValueError("num_experts must be divisible by the EP group size")
+    _C.mega_moe_backward_combine_grad_x(
+        grad_x_output,
+        sym_buffer.backward_grad_y,
+        sym_buffer.num_max_tokens_per_rank,
+        sym_buffer.num_topk,
+        num_ranks,
+        sym_buffer.num_experts // num_ranks,
+        (
+            None
+            if combine_order_mode is CombineOrderMode.FIXED_TOPK
+            else sym_buffer.topk_idx
+        ),
+        combine_order_mode.value,
     )
 
 
@@ -957,6 +1029,23 @@ def bf16_mega_moe_backward_w13_combine(
 ) -> None:
     """Run W13 wgrad while reducing direct-write grad-x planes."""
     combine_order_mode = CombineOrderMode(combine_order_mode)
+    if pool_block_m < 64:
+        # Small expert buckets commonly use the grouped-MM wgrad path. Keep
+        # the expert-major wgrad independent and consume the fixed source
+        # planes with the standalone reduction.
+        bf16_mega_moe_backward_w13(
+            grad_w13_output,
+            grad_gate_up,
+            x_pool,
+            padded_expert_counts,
+            pool_block_m,
+        )
+        mega_moe_backward_combine_grad_x(
+            grad_x_output,
+            sym_buffer,
+            combine_order_mode,
+        )
+        return
     _C.bf16_mega_moe_backward_w13_combine(
         grad_w13_output,
         grad_gate_up,

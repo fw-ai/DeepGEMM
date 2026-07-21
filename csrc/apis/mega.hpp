@@ -15,6 +15,15 @@
 
 namespace deep_gemm::mega {
 
+using MegaMoELegacySlices = std::tuple<
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor>;
+using MegaMoEExpandedSlices = std::tuple<
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor>;
+
 static int get_token_alignment_for_mega_moe() {
     return layout::kLCMCandidateBlockM;
 }
@@ -27,8 +36,10 @@ static std::pair<int, int> get_ring_limit_for_mega_moe(
     };
 }
 
-static std::tuple<int64_t, std::function<std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(const torch::Tensor&)>>
-get_symm_buffer_size_for_mega_moe(
+static std::tuple<
+    int64_t,
+    std::function<MegaMoEExpandedSlices(const torch::Tensor&)>>
+get_symm_buffer_size_for_mega_moe_v2(
     const int& num_ranks, const int& num_experts,
     const int& num_max_tokens_per_rank, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
@@ -109,6 +120,11 @@ get_symm_buffer_size_for_mega_moe(
     const auto combine_token_buffer = layout::Buffer(
         bf16_token_layout, num_topk, num_max_tokens_per_rank,
         with_sf ? l2_sf_buffer.get_end_ptr() : l2_token_buffer.get_end_ptr());
+    // Backward-only source-route gradients. Append this plane after every
+    // forward buffer so no forward offset or physical layout changes.
+    const auto backward_route_grad_buffer = layout::Buffer(
+        input_topk_weights_layout, 1, num_max_tokens_per_rank,
+        combine_token_buffer.get_end_ptr());
 
     // Check SF buffer requirements
     if (with_sf) {
@@ -175,10 +191,60 @@ get_symm_buffer_size_for_mega_moe(
             torch::TensorOptions().dtype(torch::kBFloat16).device(buffer.device()));
         auto backward_grad_y = backward_combine_planes.narrow(
             0, 0, num_max_tokens_per_rank);
+        auto backward_grad_route =
+            buffer.nbytes() >= static_cast<size_t>(
+                reinterpret_cast<int64_t>(
+                    backward_route_grad_buffer.get_end_ptr()))
+            ? torch::from_blob(
+                  math::advance_ptr(
+                      buffer.data_ptr(),
+                      reinterpret_cast<int64_t>(
+                          backward_route_grad_buffer.base)),
+                  {num_max_tokens_per_rank, num_topk},
+                  torch::TensorOptions()
+                      .dtype(torch::kFloat32)
+                      .device(buffer.device()))
+            : torch::Tensor();
         return std::make_tuple(x, x_sf, topk_idx, topk_weights, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf,
-                               token_src_metadata, backward_grad_y);
+                               token_src_metadata, backward_grad_y, backward_grad_route);
     };
-    return {reinterpret_cast<int64_t>(combine_token_buffer.get_end_ptr()), slice_input_buffers};
+    return {reinterpret_cast<int64_t>(backward_route_grad_buffer.get_end_ptr()), slice_input_buffers};
+}
+
+// Keep the original raw _C slicer ABI and allocation size. Training callers
+// opt in to the appended backward plane through the versioned v2 API.
+static std::tuple<
+    int64_t,
+    std::function<MegaMoELegacySlices(const torch::Tensor&)>>
+get_symm_buffer_size_for_mega_moe(
+    const int& num_ranks, const int& num_experts,
+    const int& num_max_tokens_per_rank, const int& num_topk,
+    const int& hidden, const int& intermediate_hidden,
+    const std::string& mma_type, const std::string& activation,
+    const int& num_ring_tokens) {
+    auto [expanded_num_bytes, expanded_slicer] =
+        get_symm_buffer_size_for_mega_moe_v2(
+            num_ranks, num_experts, num_max_tokens_per_rank,
+            num_topk, hidden, intermediate_hidden, mma_type,
+            activation, num_ring_tokens);
+    const int64_t route_plane_bytes =
+        static_cast<int64_t>(num_max_tokens_per_rank) *
+        num_topk * sizeof(float);
+    auto legacy_slicer =
+        [expanded_slicer](const torch::Tensor& buffer) {
+            auto [x, x_sf, topk_idx, topk_weights, l1_acts,
+                  l1_acts_sf, l2_acts, l2_acts_sf,
+                  token_src_metadata, backward_grad_y,
+                  _backward_grad_route] =
+                expanded_slicer(buffer);
+            return std::make_tuple(
+                x, x_sf, topk_idx, topk_weights, l1_acts,
+                l1_acts_sf, l2_acts, l2_acts_sf,
+                token_src_metadata, backward_grad_y);
+        };
+    return {
+        expanded_num_bytes - route_plane_bytes,
+        legacy_slicer};
 }
 
 static void fp8_fp4_mega_moe(
@@ -195,16 +261,24 @@ static void fp8_fp4_mega_moe(
     const std::optional<float>& activation_clamp_opt,
     const bool& fast_math,
     const int& num_ring_tokens,
-    const std::optional<torch::Tensor>& saved_l1_preact
+    const std::optional<torch::Tensor>& saved_l1_preact,
+    const std::string& route_weight_mode,
+    const std::optional<torch::Tensor>& saved_down_unweighted,
+    const std::optional<int>& num_config_tokens_opt
 ) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
 
     // Config checks
     const auto num_tokens = static_cast<int>(y.size(0));
+    const auto num_config_tokens =
+        num_config_tokens_opt.value_or(num_tokens);
     const auto [rm, rn, rk] = recipe;
     DG_HOST_ASSERT(rm == 1 and rn == 1 and rk == 32);
     DG_HOST_ASSERT(activation == "swiglu" or activation == "geglu");
+    DG_HOST_ASSERT(
+        route_weight_mode == "pre_down" ||
+        route_weight_mode == "post_down");
 
     // Activation checks
     const auto activation_clamp =
@@ -224,6 +298,8 @@ static void fp8_fp4_mega_moe(
     DG_HOST_ASSERT(hidden == hidden_);
     DG_HOST_ASSERT(intermediate_hidden_2 == 2 * intermediate_hidden);
     DG_HOST_ASSERT(l1_weights.is_contiguous() and l2_weights.is_contiguous());
+    DG_HOST_ASSERT(num_config_tokens >= num_tokens);
+    DG_HOST_ASSERT(num_config_tokens <= num_max_tokens_per_rank);
 
     // Check weight SF layout for UE8M0 packing, MN-major, and TMA alignment
     constexpr int kGranMN = 1, kGranK = 32;
@@ -242,7 +318,24 @@ static void fp8_fp4_mega_moe(
     // Check buffer bytes
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts_ = num_experts_per_rank * num_ranks;
-    const auto [num_required_bytes, slice] = get_symm_buffer_size_for_mega_moe(
+    const auto num_max_pool_tokens =
+        layout::get_num_max_pool_tokens(
+            num_ranks, num_max_tokens_per_rank, num_topk,
+            num_experts_per_rank);
+    if (saved_down_unweighted.has_value()) {
+        DG_HOST_ASSERT(
+            saved_down_unweighted->scalar_type() ==
+            torch::kBFloat16);
+        DG_HOST_ASSERT(saved_down_unweighted->is_contiguous());
+        DG_HOST_ASSERT(saved_down_unweighted->dim() == 2);
+        DG_HOST_ASSERT(saved_down_unweighted->size(1) == hidden);
+        DG_HOST_ASSERT(saved_down_unweighted->size(0) > 0);
+        DG_HOST_ASSERT(
+            saved_down_unweighted->size(0) <=
+            num_max_pool_tokens);
+    }
+    const auto [num_required_bytes, slice] =
+        get_symm_buffer_size_for_mega_moe_v2(
         num_ranks, num_experts,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
@@ -252,7 +345,7 @@ static void fp8_fp4_mega_moe(
 
     // Already registered tensors
     const auto [x, x_sf, topk_idx, topk_weights, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf,
-                token_src_metadata, backward_grad_y] = slice(sym_buffer);
+                token_src_metadata, backward_grad_y, _backward_grad_route] = slice(sym_buffer);
 
     // Dispatch into different architectures
     if (arch_major == 10) {
@@ -266,9 +359,11 @@ static void fp8_fp4_mega_moe(
                                sym_buffer_ptrs,
                                rank_idx, num_max_tokens_per_rank,
                                num_experts_per_rank,
-                               num_tokens, num_topk,
+                               num_tokens, num_config_tokens, num_topk,
                                hidden, intermediate_hidden,
-                               activation, activation_clamp, fast_math);
+                               activation, activation_clamp, fast_math,
+                               route_weight_mode,
+                               saved_down_unweighted);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -368,7 +463,8 @@ static void bf16_mega_moe(
     // Check buffer bytes
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts_ = num_experts_per_rank * num_ranks;
-    const auto [num_required_bytes, slice] = get_symm_buffer_size_for_mega_moe(
+    const auto [num_required_bytes, slice] =
+        get_symm_buffer_size_for_mega_moe_v2(
         num_ranks, num_experts,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
@@ -378,7 +474,7 @@ static void bf16_mega_moe(
 
     // Already registered tensors
     const auto [x, _x_sf, topk_idx, topk_weights, l1_acts, _l1_acts_sf, l2_acts, _l2_acts_sf,
-                _token_src_metadata, _backward_grad_y] = slice(sym_buffer);
+                _token_src_metadata, _backward_grad_y, _backward_grad_route] = slice(sym_buffer);
 
     // Dispatch into different architectures
     if (arch_major == 10) {
@@ -418,7 +514,29 @@ static void register_apis(pybind11::module_& m) {
     m.def("get_token_alignment_for_mega_moe", &get_token_alignment_for_mega_moe);
     m.def("get_ring_limit_for_mega_moe", &get_ring_limit_for_mega_moe);
     m.def("get_symm_buffer_size_for_mega_moe", &get_symm_buffer_size_for_mega_moe);
-    m.def("fp8_fp4_mega_moe", &fp8_fp4_mega_moe);
+    m.def("get_symm_buffer_size_for_mega_moe_v2",
+          &get_symm_buffer_size_for_mega_moe_v2);
+    m.def(
+        "fp8_fp4_mega_moe", &fp8_fp4_mega_moe,
+        py::arg("y"),
+        py::arg("l1_weights_tuple"),
+        py::arg("l2_weights_tuple"),
+        py::arg("cumulative_local_expert_recv_stats"),
+        py::arg("sym_buffer"),
+        py::arg("sym_buffer_ptrs"),
+        py::arg("rank_idx"),
+        py::arg("num_max_tokens_per_rank"),
+        py::arg("num_experts"),
+        py::arg("num_topk"),
+        py::arg("recipe"),
+        py::arg("activation"),
+        py::arg("activation_clamp_opt"),
+        py::arg("fast_math"),
+        py::arg("num_ring_tokens"),
+        py::arg("saved_l1_preact"),
+        py::arg("route_weight_mode") = "pre_down",
+        py::arg("saved_down_unweighted") = py::none(),
+        py::arg("num_config_tokens") = py::none());
     m.def("bf16_mega_moe", &bf16_mega_moe);
 #endif
 }
