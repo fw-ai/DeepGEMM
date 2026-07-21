@@ -1601,40 +1601,42 @@ sm100_bf16_mega_moe_impl(void* y,
                             pool_m_idx +
                             epilogue_wg_idx * WG_BLOCK_M +
                             s * STORE_BLOCK_M;
-                        DG_DEVICE_ASSERT(
-                            saved_store_row + STORE_BLOCK_M <=
-                            num_saved_pool_tokens);
-                        if (warp_idx_in_wg == 0 &&
-                            cute::elect_one_sync()) {
-                            cute::tma_store_fence();
-                            #pragma unroll
-                            for (uint32_t atom = 0;
-                                 atom <
-                                     BLOCK_N * sizeof(d_dtype_t) /
-                                         kSwizzleCDMode;
-                                 ++atom) {
-                                cute::SM90_TMA_STORE_2D::copy(
-                                    &tensor_map_down_unweighted,
-                                    shared_storage.smem_d
-                                        .l2[epilogue_wg_idx] +
-                                        atom * STORE_BLOCK_M *
-                                            (kSwizzleCDMode /
-                                             sizeof(d_dtype_t)),
-                                    n_idx +
-                                        atom *
-                                            (kSwizzleCDMode /
-                                             sizeof(d_dtype_t)),
-                                    pool_m_idx +
-                                        epilogue_wg_idx *
-                                            WG_BLOCK_M +
-                                        s * STORE_BLOCK_M);
-                                cute::tma_store_arrive();
+                        // A cached active-pool plan may underestimate a later
+                        // routing histogram. The caller publishes the required
+                        // size through route_count_mismatch and replays the
+                        // capture before backward; do not turn that recoverable
+                        // cache miss into an out-of-bounds TMA store.
+                        if (saved_store_row + STORE_BLOCK_M <=
+                            num_saved_pool_tokens) {
+                            if (warp_idx_in_wg == 0 &&
+                                cute::elect_one_sync()) {
+                                cute::tma_store_fence();
+                                #pragma unroll
+                                for (uint32_t atom = 0;
+                                     atom <
+                                         BLOCK_N * sizeof(d_dtype_t) /
+                                             kSwizzleCDMode;
+                                     ++atom) {
+                                    cute::SM90_TMA_STORE_2D::copy(
+                                        &tensor_map_down_unweighted,
+                                        shared_storage.smem_d
+                                            .l2[epilogue_wg_idx] +
+                                            atom * STORE_BLOCK_M *
+                                                (kSwizzleCDMode /
+                                                 sizeof(d_dtype_t)),
+                                        n_idx +
+                                            atom *
+                                                (kSwizzleCDMode /
+                                                 sizeof(d_dtype_t)),
+                                        saved_store_row);
+                                    cute::tma_store_arrive();
+                                }
                             }
+                            if (warp_idx_in_wg == 0) {
+                                cute::tma_store_wait<0>();
+                            }
+                            __syncwarp();
                         }
-                        if (warp_idx_in_wg == 0) {
-                            cute::tma_store_wait<0>();
-                        }
-                        __syncwarp();
                     }
 
                     // Write into remote buffers
