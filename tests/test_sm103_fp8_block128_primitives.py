@@ -83,6 +83,36 @@ def _blockwise_weight_dequantize(
     )
 
 
+def _ceil_to_ue8m0(scales: torch.Tensor) -> torch.Tensor:
+    bits = scales.abs().float().view(torch.int32)
+    exponent = ((bits >> 23) & 0xFF) + (bits & 0x7FFFFF).bool().to(torch.int32)
+    return (exponent.clamp(1, 254) << 23).view(torch.float32)
+
+
+def _ue8m0_per_token_quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    rows, columns = x.shape
+    grouped = x.float().view(rows, columns // 128, 128)
+    scales = _ceil_to_ue8m0(grouped.abs().amax(dim=-1).clamp_min(1e-4) / 448.0)
+    quantized = (grouped / scales.unsqueeze(-1)).to(torch.float8_e4m3fn).view_as(x)
+    return quantized.contiguous(), scales.contiguous()
+
+
+def _ue8m0_blockwise_weight_quantize(
+    weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    groups, rows, columns = weight.shape
+    blocks = weight.float().view(groups, rows // 128, 128, columns // 128, 128).permute(0, 1, 3, 2, 4)
+    scales = _ceil_to_ue8m0(blocks.abs().amax(dim=(-1, -2)).clamp_min(1e-4) / 448.0)
+    quantized = (
+        (blocks / scales[..., None, None])
+        .to(torch.float8_e4m3fn)
+        .permute(0, 1, 3, 2, 4)
+        .reshape_as(weight)
+        .contiguous()
+    )
+    return quantized, scales.contiguous()
+
+
 def test_build_provenance_and_capabilities_are_fail_closed() -> None:
     assert re.fullmatch(r"[0-9a-f]{40}", deep_gemm.__git_commit__)
     capabilities = deep_gemm._C.get_sm103_fp8_block128_capabilities()
@@ -290,6 +320,49 @@ def test_canonical_w13_gemm_presents_up_then_gate_without_weight_copy() -> None:
         offset += count
     expected = torch.cat(expected_parts).to(torch.bfloat16)
     torch.testing.assert_close(actual.float(), expected.float(), rtol=0.08, atol=0.08)
+
+
+def test_legacy_psum_grouped_gemm_accepts_deepep_column_major_scales() -> None:
+    """Preserve the expanded DeepEP API consumed by the existing routed stack."""
+    torch.manual_seed(5750)
+    alignment = 128
+    deep_gemm.set_mk_alignment_for_contiguous_layout(alignment)
+    groups, rows, n, k = 2, 2 * alignment, 256, 256
+    psum = torch.tensor([5, alignment + 5], device="cuda", dtype=torch.int32)
+
+    activations_bf16 = torch.zeros(rows, k, device="cuda", dtype=torch.bfloat16)
+    activations_bf16[:5].normal_()
+    activations_bf16[alignment : alignment + 5].normal_()
+    activations, contiguous_scales = _ue8m0_per_token_quantize(activations_bf16)
+    column_major_scales = torch.empty_strided(
+        contiguous_scales.shape,
+        (1, rows),
+        dtype=contiguous_scales.dtype,
+        device=contiguous_scales.device,
+    )
+    column_major_scales.copy_(contiguous_scales)
+    assert not column_major_scales.is_contiguous()
+    assert column_major_scales.stride() == (1, rows)
+
+    weights_bf16 = torch.randn(groups, n, k, device="cuda", dtype=torch.bfloat16)
+    weights, weight_scales = _ue8m0_blockwise_weight_quantize(weights_bf16)
+    expected = torch.empty(rows, n, device="cuda", dtype=torch.bfloat16)
+    actual = torch.empty_like(expected)
+    deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
+        (activations, contiguous_scales),
+        (weights, weight_scales),
+        expected,
+        psum,
+        use_psum_layout=True,
+    )
+    deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
+        (activations, column_major_scales),
+        (weights, weight_scales),
+        actual,
+        psum,
+        use_psum_layout=True,
+    )
+    assert torch.equal(actual, expected)
 
 
 def test_k_grouped_bf16_wgrad_supports_no_accumulator_and_empty_expert() -> None:
