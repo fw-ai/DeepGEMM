@@ -153,6 +153,39 @@ def _local_tensor(tensor: torch.Tensor) -> torch.Tensor:
     return to_local() if callable(to_local) else tensor
 
 
+def _validate_master_tensor(
+    tensor: torch.Tensor,
+    *,
+    name: str,
+    local_shape: tuple[int, int, int],
+    global_shape: tuple[int, int, int],
+    device: torch.device,
+    master_gradient_wrapper: Any,
+) -> None:
+    """Validate either a resident EP-local master or an at-rest DTensor shard.
+
+    The masters are autograd anchors only; MegaMoE never reads their values.
+    FireTitan may therefore keep them eFSDP-sharded while the active q/s
+    tensors are all-gathered. In that case the framework-provided gradient
+    wrapper maps the full EP-local wgrad back to the master's DTensor layout.
+    """
+    local = _local_tensor(tensor)
+    _check_tensor(local, name=name, ndim=3, dtype=torch.bfloat16, device=device)
+    if tuple(local.shape) == local_shape:
+        return
+    is_distributed = callable(getattr(tensor, "to_local", None))
+    if not is_distributed or master_gradient_wrapper is None:
+        raise ValueError(
+            f"{name} must have resident shape {local_shape}, got {tuple(local.shape)}"
+        )
+    if tuple(tensor.shape) != global_shape:
+        raise ValueError(
+            f"{name} distributed logical shape must be {global_shape}, got {tuple(tensor.shape)}"
+        )
+    if local.numel() == 0:
+        raise ValueError(f"{name} distributed local shard must be resident")
+
+
 def _validate_inputs(
     x: torch.Tensor,
     topk_ids: torch.Tensor,
@@ -165,6 +198,7 @@ def _validate_inputs(
     w2_master: torch.Tensor,
     w3_master: torch.Tensor,
     group_state: _GroupState,
+    master_gradient_wrapper: Any,
 ) -> tuple[int, int, int, int, int]:
     if not x.is_cuda:
         raise ValueError("FP8-block128 MegaMoE requires CUDA")
@@ -182,13 +216,6 @@ def _validate_inputs(
     _check_tensor(w13_scale, name="w13_scale", ndim=3, dtype=torch.float32, device=device)
     _check_tensor(w2_weight, name="w2_weight", ndim=3, dtype=torch.float8_e4m3fn, device=device)
     _check_tensor(w2_scale, name="w2_scale", ndim=3, dtype=torch.float32, device=device)
-    w1_master_local = _local_tensor(w1_master)
-    w2_master_local = _local_tensor(w2_master)
-    w3_master_local = _local_tensor(w3_master)
-    _check_tensor(w1_master_local, name="w1_master", ndim=3, dtype=torch.bfloat16, device=device)
-    _check_tensor(w2_master_local, name="w2_master", ndim=3, dtype=torch.bfloat16, device=device)
-    _check_tensor(w3_master_local, name="w3_master", ndim=3, dtype=torch.bfloat16, device=device)
-
     tokens, model_dim = x.shape
     if model_dim % _BLOCK:
         raise ValueError("model dimension must be divisible by 128")
@@ -218,15 +245,35 @@ def _validate_inputs(
         hidden // _BLOCK,
     ):
         raise ValueError("W2 scale shape does not match 128x128 weight blocks")
-    master_w13_shape = (local_experts, hidden, model_dim)
-    if tuple(w1_master_local.shape) != master_w13_shape:
-        raise ValueError("BF16 gate master must have shape [E, H, D]")
-    if tuple(w3_master_local.shape) != master_w13_shape:
-        raise ValueError("BF16 up master must have shape [E, H, D]")
-    if tuple(w2_master_local.shape) != tuple(w2_weight.shape):
-        raise ValueError("BF16 W2 master shape must match W2")
-
     global_experts = local_experts * group_state.world_size
+    local_w13_shape = (local_experts, hidden, model_dim)
+    global_w13_shape = (global_experts, hidden, model_dim)
+    local_w2_shape = tuple(w2_weight.shape)
+    global_w2_shape = (global_experts, model_dim, hidden)
+    _validate_master_tensor(
+        w1_master,
+        name="w1_master",
+        local_shape=local_w13_shape,
+        global_shape=global_w13_shape,
+        device=device,
+        master_gradient_wrapper=master_gradient_wrapper,
+    )
+    _validate_master_tensor(
+        w2_master,
+        name="w2_master",
+        local_shape=local_w2_shape,
+        global_shape=global_w2_shape,
+        device=device,
+        master_gradient_wrapper=master_gradient_wrapper,
+    )
+    _validate_master_tensor(
+        w3_master,
+        name="w3_master",
+        local_shape=local_w13_shape,
+        global_shape=global_w13_shape,
+        device=device,
+        master_gradient_wrapper=master_gradient_wrapper,
+    )
     if topk_ids.numel():
         minimum, maximum = torch.aminmax(topk_ids)
         if minimum.item() < 0 or maximum.item() >= global_experts:
@@ -374,6 +421,8 @@ class _FP8Block128MegaMoE(torch.autograd.Function):
         master_gradient_wrapper: Any,
     ) -> torch.Tensor:
         group_state = _resolve_group(group)
+        if master_gradient_wrapper is not None and not callable(master_gradient_wrapper):
+            raise TypeError("master_gradient_wrapper must be callable or None")
         tokens, model_dim, hidden, local_experts, topk = _validate_inputs(
             x,
             topk_ids,
@@ -386,9 +435,8 @@ class _FP8Block128MegaMoE(torch.autograd.Function):
             w2_master,
             w3_master,
             group_state,
+            master_gradient_wrapper,
         )
-        if master_gradient_wrapper is not None and not callable(master_gradient_wrapper):
-            raise TypeError("master_gradient_wrapper must be callable or None")
 
         with torch.autograd.profiler.record_function(
             "sm103_fp8_block128_megamoe_forward"

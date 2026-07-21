@@ -2,6 +2,7 @@ import pytest
 import torch
 
 import deep_gemm
+from deep_gemm.mega.fp8_block128 import _validate_master_tensor
 
 
 pytestmark = pytest.mark.skipif(
@@ -184,6 +185,48 @@ def _normalized_difference(actual: torch.Tensor, expected: torch.Tensor) -> floa
         * (actual_f @ expected_f)
         / (actual_f.square().sum() + expected_f.square().sum() + 1e-12)
     )
+
+
+class _DistributedMasterFixture:
+    def __init__(
+        self,
+        local: torch.Tensor,
+        logical_shape: tuple[int, int, int],
+    ) -> None:
+        self._local = local
+        self.shape = logical_shape
+
+    def to_local(self) -> torch.Tensor:
+        return self._local
+
+
+def test_distributed_master_validation_accepts_resident_efsdp_shard_with_wrapper() -> None:
+    local = torch.empty(1, 128, 256, device="cuda", dtype=torch.bfloat16)
+    master = _DistributedMasterFixture(local, (4, 128, 256))
+
+    _validate_master_tensor(
+        master,
+        name="w1_master",
+        local_shape=(2, 128, 256),
+        global_shape=(4, 128, 256),
+        device=local.device,
+        master_gradient_wrapper=lambda *_grads: None,
+    )
+
+
+def test_distributed_master_validation_requires_gradient_wrapper() -> None:
+    local = torch.empty(1, 128, 256, device="cuda", dtype=torch.bfloat16)
+    master = _DistributedMasterFixture(local, (4, 128, 256))
+
+    with pytest.raises(ValueError, match="resident shape"):
+        _validate_master_tensor(
+            master,
+            name="w1_master",
+            local_shape=(2, 128, 256),
+            global_shape=(4, 128, 256),
+            device=local.device,
+            master_gradient_wrapper=None,
+        )
 
 
 @pytest.mark.parametrize(
