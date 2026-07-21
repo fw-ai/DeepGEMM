@@ -100,9 +100,19 @@ def main() -> None:
         torch.randn(args.tokens, args.model_dim, device=device, dtype=torch.bfloat16)
         * 0.02
     ).requires_grad_()
-    canonical_w13 = (
+    w1_master = (
         torch.randn(
-            args.experts * 2,
+            args.experts,
+            args.hidden,
+            args.model_dim,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        * 0.02
+    ).requires_grad_()
+    w3_master = (
+        torch.randn(
+            args.experts,
             args.hidden,
             args.model_dim,
             device=device,
@@ -120,9 +130,11 @@ def main() -> None:
         )
         * 0.02
     ).requires_grad_()
-    canonical_w13_q, canonical_w13_s = _blockwise_quantize(canonical_w13.detach())
-    w13_q, w13_s = deep_gemm.transform_glm_w13_for_fp8_block128_mega_moe(
-        canonical_w13_q, canonical_w13_s
+    canonical_w13 = torch.stack(
+        (w1_master.detach(), w3_master.detach()), dim=1
+    ).flatten(0, 1)
+    w13_q, w13_s = _blockwise_quantize(
+        canonical_w13
     )
     w2_q, w2_s = _blockwise_quantize(w2_master.detach())
     routes = torch.arange(args.tokens * args.topk, device=device, dtype=torch.int64)
@@ -149,8 +161,9 @@ def main() -> None:
             w13_s,
             w2_q,
             w2_s,
-            canonical_w13,
+            w1_master,
             w2_master,
+            w3_master,
         )
 
     def forward_backward() -> None:
@@ -159,8 +172,9 @@ def main() -> None:
         latest_output.backward(upstream)
         x.grad = None
         scores.grad = None
-        canonical_w13.grad = None
+        w1_master.grad = None
         w2_master.grad = None
+        w3_master.grad = None
 
     for _ in range(args.warmup):
         forward_backward()

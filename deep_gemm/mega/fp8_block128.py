@@ -27,8 +27,10 @@ REQUIRED_NATIVE_SYMBOLS = (
     "sm103_fp8_block128_dequantize",
     "sm103_fp8_block128_grouped_gemm_nt",
     "sm103_fp8_block128_grouped_gemm_nn",
+    "sm103_fp8_block128_grouped_w13_gemm_nt_canonical",
     "sm103_fp8_block128_swiglu_quantize",
     "sm103_fp8_block128_swiglu_backward",
+    "sm103_fp8_block128_swiglu_backward_canonical",
     "sm103_fp8_block128_route_scale_quantize",
     "sm103_fp8_block128_post_down_combine",
     "sm103_fp8_block128_post_down_score_grad",
@@ -103,13 +105,6 @@ def transform_glm_w13_for_fp8_block128_mega_moe(
     return active_weight, active_scale
 
 
-def _active_w13_grad_to_canonical(active_grad: torch.Tensor) -> torch.Tensor:
-    experts, doubled_hidden, model_dim = active_grad.shape
-    hidden = doubled_hidden // 2
-    up, gate = active_grad.view(experts, 2, hidden, model_dim).unbind(dim=1)
-    return torch.stack((gate, up), dim=1).reshape(experts * 2, hidden, model_dim).contiguous()
-
-
 @dataclass(frozen=True)
 class _GroupState:
     group: Any
@@ -147,6 +142,17 @@ def _check_tensor(
         raise ValueError(f"{name} must be contiguous")
 
 
+def _local_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    """Return a plain local tensor without taking ownership from FireTitan.
+
+    Expert masters may be DTensors.  Their placement and gradient reduction
+    remain a FireTitan concern; this companion only validates their resident
+    local slice and returns local BF16 gradients through the optional wrapper.
+    """
+    to_local = getattr(tensor, "to_local", None)
+    return to_local() if callable(to_local) else tensor
+
+
 def _validate_inputs(
     x: torch.Tensor,
     topk_ids: torch.Tensor,
@@ -155,8 +161,9 @@ def _validate_inputs(
     w13_scale: torch.Tensor,
     w2_weight: torch.Tensor,
     w2_scale: torch.Tensor,
-    w13_master: torch.Tensor,
+    w1_master: torch.Tensor,
     w2_master: torch.Tensor,
+    w3_master: torch.Tensor,
     group_state: _GroupState,
 ) -> tuple[int, int, int, int, int]:
     if not x.is_cuda:
@@ -175,8 +182,12 @@ def _validate_inputs(
     _check_tensor(w13_scale, name="w13_scale", ndim=3, dtype=torch.float32, device=device)
     _check_tensor(w2_weight, name="w2_weight", ndim=3, dtype=torch.float8_e4m3fn, device=device)
     _check_tensor(w2_scale, name="w2_scale", ndim=3, dtype=torch.float32, device=device)
-    _check_tensor(w13_master, name="w13_master", ndim=3, dtype=torch.bfloat16, device=device)
-    _check_tensor(w2_master, name="w2_master", ndim=3, dtype=torch.bfloat16, device=device)
+    w1_master_local = _local_tensor(w1_master)
+    w2_master_local = _local_tensor(w2_master)
+    w3_master_local = _local_tensor(w3_master)
+    _check_tensor(w1_master_local, name="w1_master", ndim=3, dtype=torch.bfloat16, device=device)
+    _check_tensor(w2_master_local, name="w2_master", ndim=3, dtype=torch.bfloat16, device=device)
+    _check_tensor(w3_master_local, name="w3_master", ndim=3, dtype=torch.bfloat16, device=device)
 
     tokens, model_dim = x.shape
     if model_dim % _BLOCK:
@@ -187,16 +198,18 @@ def _validate_inputs(
     if topk <= 0:
         raise ValueError("top_k must be positive")
 
-    local_experts, doubled_hidden, w13_k = w13_weight.shape
-    if local_experts <= 0 or doubled_hidden % (2 * _BLOCK) or w13_k != model_dim:
-        raise ValueError("W13 must have shape [local_experts, 2H, D] with D/H divisible by 128")
-    hidden = doubled_hidden // 2
+    if w13_weight.shape[0] % 2:
+        raise ValueError("canonical W13 must contain gate/up pairs")
+    local_experts = w13_weight.shape[0] // 2
+    hidden, w13_k = w13_weight.shape[1:]
+    if local_experts <= 0 or hidden % _BLOCK or w13_k != model_dim:
+        raise ValueError("canonical W13 must have shape [2E, H, D] with D/H divisible by 128")
     if tuple(w13_scale.shape) != (
-        local_experts,
-        doubled_hidden // _BLOCK,
+        local_experts * 2,
+        hidden // _BLOCK,
         model_dim // _BLOCK,
     ):
-        raise ValueError("W13 scale shape does not match 128x128 weight blocks")
+        raise ValueError("canonical W13 scale shape does not match 128x128 weight blocks")
     if tuple(w2_weight.shape) != (local_experts, model_dim, hidden):
         raise ValueError("W2 must have shape [local_experts, D, H]")
     if tuple(w2_scale.shape) != (
@@ -205,9 +218,12 @@ def _validate_inputs(
         hidden // _BLOCK,
     ):
         raise ValueError("W2 scale shape does not match 128x128 weight blocks")
-    if tuple(w13_master.shape) != (local_experts * 2, hidden, model_dim):
-        raise ValueError("canonical BF16 W13 master must have shape [2E, H, D]")
-    if tuple(w2_master.shape) != tuple(w2_weight.shape):
+    master_w13_shape = (local_experts, hidden, model_dim)
+    if tuple(w1_master_local.shape) != master_w13_shape:
+        raise ValueError("BF16 gate master must have shape [E, H, D]")
+    if tuple(w3_master_local.shape) != master_w13_shape:
+        raise ValueError("BF16 up master must have shape [E, H, D]")
+    if tuple(w2_master_local.shape) != tuple(w2_weight.shape):
         raise ValueError("BF16 W2 master shape must match W2")
 
     global_experts = local_experts * group_state.world_size
@@ -351,9 +367,11 @@ class _FP8Block128MegaMoE(torch.autograd.Function):
         w13_scale: torch.Tensor,
         w2_weight: torch.Tensor,
         w2_scale: torch.Tensor,
-        w13_master: torch.Tensor,
+        w1_master: torch.Tensor,
         w2_master: torch.Tensor,
+        w3_master: torch.Tensor,
         group: Any,
+        master_gradient_wrapper: Any,
     ) -> torch.Tensor:
         group_state = _resolve_group(group)
         tokens, model_dim, hidden, local_experts, topk = _validate_inputs(
@@ -364,10 +382,13 @@ class _FP8Block128MegaMoE(torch.autograd.Function):
             w13_scale,
             w2_weight,
             w2_scale,
-            w13_master,
+            w1_master,
             w2_master,
+            w3_master,
             group_state,
         )
+        if master_gradient_wrapper is not None and not callable(master_gradient_wrapper):
+            raise TypeError("master_gradient_wrapper must be callable or None")
 
         with torch.autograd.profiler.record_function(
             "sm103_fp8_block128_megamoe_forward"
@@ -433,7 +454,7 @@ class _FP8Block128MegaMoE(torch.autograd.Function):
                 fill_value=1,
             )
 
-            preactivation = _C.sm103_fp8_block128_grouped_gemm_nt(
+            preactivation = _C.sm103_fp8_block128_grouped_w13_gemm_nt_canonical(
                 padded_activations,
                 padded_activation_scales,
                 w13_weight,
@@ -484,6 +505,7 @@ class _FP8Block128MegaMoE(torch.autograd.Function):
         ctx.hidden = hidden
         ctx.local_experts = local_experts
         ctx.topk = topk
+        ctx.master_gradient_wrapper = master_gradient_wrapper
         ctx.save_for_backward(
             topk_scores,
             send_order,
@@ -576,7 +598,7 @@ class _FP8Block128MegaMoE(torch.autograd.Function):
                 w2_scale,
                 ctx.padded_counts,
             )
-            grad_preactivation = _C.sm103_fp8_block128_swiglu_backward(
+            grad_preactivation = _C.sm103_fp8_block128_swiglu_backward_canonical(
                 grad_hidden, preactivation
             )
             grad_preactivation_quantized, grad_preactivation_scales = (
@@ -585,8 +607,14 @@ class _FP8Block128MegaMoE(torch.autograd.Function):
             grad_input_padded = _C.sm103_fp8_block128_grouped_gemm_nn(
                 grad_preactivation_quantized,
                 grad_preactivation_scales,
-                w13_weight,
-                w13_scale,
+                w13_weight.view(
+                    ctx.local_experts, ctx.hidden * 2, ctx.model_dim
+                ),
+                w13_scale.view(
+                    ctx.local_experts,
+                    ctx.hidden * 2 // _BLOCK,
+                    ctx.model_dim // _BLOCK,
+                ),
                 ctx.padded_counts,
             )
 
@@ -604,12 +632,13 @@ class _FP8Block128MegaMoE(torch.autograd.Function):
             input_dequantized = _C.sm103_fp8_block128_dequantize(
                 padded_activations, padded_activation_scales
             )
-            grad_w13_active = _bf16_grouped_wgrad(
+            grad_w13_canonical = _bf16_grouped_wgrad(
                 grad_preactivation,
                 input_dequantized,
                 ctx.padded_counts,
             )
-            grad_w13 = _active_w13_grad_to_canonical(grad_w13_active)
+            grad_w1 = grad_w13_canonical[:, : ctx.hidden].contiguous()
+            grad_w3 = grad_w13_canonical[:, ctx.hidden :].contiguous()
 
             grad_input_grouped = _unpad_rows(
                 grad_input_padded, actual_to_padded
@@ -636,6 +665,10 @@ class _FP8Block128MegaMoE(torch.autograd.Function):
                 grad_input_routes, ctx.tokens, ctx.topk
             )
 
+        wrapper = ctx.master_gradient_wrapper
+        if wrapper is not None:
+            grad_w1, grad_w2, grad_w3 = wrapper(grad_w1, grad_w2, grad_w3)
+
         return (
             grad_input,
             None,
@@ -644,8 +677,10 @@ class _FP8Block128MegaMoE(torch.autograd.Function):
             None,
             None,
             None,
-            grad_w13,
+            grad_w1,
             grad_w2,
+            grad_w3,
+            None,
             None,
         )
 
@@ -658,17 +693,23 @@ def fp8_block128_mega_moe(
     w13_scale: torch.Tensor,
     w2_weight: torch.Tensor,
     w2_scale: torch.Tensor,
-    w13_master: torch.Tensor,
+    w1_master: torch.Tensor,
     w2_master: torch.Tensor,
+    w3_master: torch.Tensor,
     group: Any = None,
+    master_gradient_wrapper: Any = None,
 ) -> torch.Tensor:
     """Run the complete SM103 FP8-block128 routed branch.
 
-    W13 quantized tensors use active ``[up; gate]`` ordering while the BF16
-    W13 master remains canonical interleaved ``[gate, up]`` storage.  Route
-    scores are applied only after W2 and their gradients are accumulated in
-    FP32.  ``group`` is the expert-parallel process group; no other token
-    transport may wrap this operation.
+    Quantized W13 tensors retain FireTitan's canonical interleaved
+    ``[gate, up]`` storage.  The native grouped W13 launch presents its
+    preactivation as ``[up; gate]`` without copying that storage.  BF16 gate,
+    down, and up masters are passed separately, matching their checkpoint
+    FQNs without a packed-master allocation.  Route scores are applied only
+    after W2 and their gradients are accumulated in FP32.  ``group`` is the
+    expert-parallel process group; no other token transport may wrap this
+    operation.  ``master_gradient_wrapper`` lets the owning framework restore
+    DTensor placement/reduction metadata to the three local BF16 gradients.
     """
     return _FP8Block128MegaMoE.apply(
         x,
@@ -678,7 +719,9 @@ def fp8_block128_mega_moe(
         w13_scale,
         w2_weight,
         w2_scale,
-        w13_master,
+        w1_master,
         w2_master,
+        w3_master,
         group,
+        master_gradient_wrapper,
     )

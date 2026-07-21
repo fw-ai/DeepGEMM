@@ -47,15 +47,18 @@ def _make_case(tokens: int, *, all_to_one: bool = False) -> dict[str, torch.Tens
     torch.manual_seed(7000 + tokens + int(all_to_one))
     experts, model_dim, hidden, topk = 4, 256, 128, 2
     x = (torch.randn(tokens, model_dim, device="cuda", dtype=torch.bfloat16) * 0.1).requires_grad_()
-    canonical_w13 = (
-        torch.randn(experts * 2, hidden, model_dim, device="cuda", dtype=torch.bfloat16) * 0.05
+    w1_master = (
+        torch.randn(experts, hidden, model_dim, device="cuda", dtype=torch.bfloat16) * 0.05
+    ).requires_grad_()
+    w3_master = (
+        torch.randn(experts, hidden, model_dim, device="cuda", dtype=torch.bfloat16) * 0.05
     ).requires_grad_()
     w2_master = (
         torch.randn(experts, model_dim, hidden, device="cuda", dtype=torch.bfloat16) * 0.05
     ).requires_grad_()
-    canonical_w13_q, canonical_w13_s = _blockwise_weight_quantize(canonical_w13.detach())
-    w13_q, w13_s = deep_gemm.transform_glm_w13_for_fp8_block128_mega_moe(
-        canonical_w13_q, canonical_w13_s
+    canonical_w13 = torch.stack((w1_master.detach(), w3_master.detach()), dim=1).flatten(0, 1)
+    w13_q, w13_s = _blockwise_weight_quantize(
+        canonical_w13
     )
     w2_q, w2_s = _blockwise_weight_quantize(w2_master.detach())
     if all_to_one:
@@ -73,15 +76,23 @@ def _make_case(tokens: int, *, all_to_one: bool = False) -> dict[str, torch.Tens
         "w13_s": w13_s,
         "w2_q": w2_q,
         "w2_s": w2_s,
-        "w13_master": canonical_w13,
+        "w1_master": w1_master,
         "w2_master": w2_master,
+        "w3_master": w3_master,
     }
 
 
 def _forward_reference(case: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
     x_q, x_s = deep_gemm._C.sm103_fp8_block128_quantize(case["x"].detach())
     x_dequantized = deep_gemm._C.sm103_fp8_block128_dequantize(x_q, x_s).float()
-    w13 = _blockwise_weight_dequantize(case["w13_q"], case["w13_s"])
+    canonical_w13 = _blockwise_weight_dequantize(case["w13_q"], case["w13_s"])
+    experts = case["w2_q"].shape[0]
+    hidden = case["w2_q"].shape[2]
+    model_dim = case["w2_q"].shape[1]
+    canonical_pairs = canonical_w13.view(experts, 2, hidden, model_dim)
+    w13 = torch.stack((canonical_pairs[:, 1], canonical_pairs[:, 0]), dim=1).reshape(
+        experts, hidden * 2, model_dim
+    )
     w2 = _blockwise_weight_dequantize(case["w2_q"], case["w2_s"])
     flat_ids = case["ids"].flatten()
     route_x = x_dequantized.repeat_interleave(case["ids"].shape[1], dim=0)
@@ -104,22 +115,26 @@ def _ste_reference_backward(
 ) -> dict[str, torch.Tensor]:
     x = case["x"].detach().clone().requires_grad_()
     scores = case["scores"].detach().clone().requires_grad_()
-    canonical_w13 = case["w13_master"].detach().clone().requires_grad_()
+    w1_master = case["w1_master"].detach().clone().requires_grad_()
     w2_master = case["w2_master"].detach().clone().requires_grad_()
+    w3_master = case["w3_master"].detach().clone().requires_grad_()
     experts, model_dim, hidden = w2_master.shape
 
     x_q, x_s = deep_gemm._C.sm103_fp8_block128_quantize(x.detach())
     x_dequantized = deep_gemm._C.sm103_fp8_block128_dequantize(x_q, x_s).float()
     x_effective = x.float() + (x_dequantized - x.float()).detach()
-    w13_dequantized = _blockwise_weight_dequantize(
-        case["w13_q"], case["w13_s"]
+    w13_active_master = torch.stack((w3_master, w1_master), dim=1).reshape(
+        experts, hidden * 2, model_dim
     )
-    canonical_pairs = canonical_w13.view(experts, 2, hidden, model_dim)
-    w13_active_master = torch.stack(
-        (canonical_pairs[:, 1], canonical_pairs[:, 0]), dim=1
-    ).reshape(experts, hidden * 2, model_dim)
+    canonical_w13_dequantized = _blockwise_weight_dequantize(
+        case["w13_q"], case["w13_s"]
+    ).view(experts, 2, hidden, model_dim)
     w13_effective = w13_active_master.float() + (
-        w13_dequantized - w13_active_master.float()
+        torch.stack(
+            (canonical_w13_dequantized[:, 1], canonical_w13_dequantized[:, 0]),
+            dim=1,
+        ).reshape(experts, hidden * 2, model_dim)
+        - w13_active_master.float()
     ).detach()
     w2_dequantized = _blockwise_weight_dequantize(case["w2_q"], case["w2_s"])
     w2_effective = w2_master.float() + (
@@ -154,8 +169,9 @@ def _ste_reference_backward(
         "output": output.detach(),
         "x_grad": x.grad.detach(),
         "score_grad": scores.grad.detach(),
-        "w13_grad": canonical_w13.grad.detach(),
+        "w1_grad": w1_master.grad.detach(),
         "w2_grad": w2_master.grad.detach(),
+        "w3_grad": w3_master.grad.detach(),
     }
 
 
@@ -186,8 +202,9 @@ def test_single_rank_forward_matches_reference_across_padding_boundaries(
         case["w13_s"],
         case["w2_q"],
         case["w2_s"],
-        case["w13_master"],
+        case["w1_master"],
         case["w2_master"],
+        case["w3_master"],
     )
     expected, _ = _forward_reference(case)
     torch.testing.assert_close(actual.float(), expected.float(), rtol=0.08, atol=0.08)
@@ -223,8 +240,9 @@ def test_single_rank_backward_returns_input_score_and_canonical_master_grads() -
         case["w13_s"],
         case["w2_q"],
         case["w2_s"],
-        case["w13_master"],
+        case["w1_master"],
         case["w2_master"],
+        case["w3_master"],
     )
     output.backward(upstream)
 
@@ -236,10 +254,13 @@ def test_single_rank_backward_returns_input_score_and_canonical_master_grads() -
     )
     assert case["x"].grad.shape == case["x"].shape
     assert case["x"].grad.dtype == torch.bfloat16
-    assert case["w13_master"].grad.shape == case["w13_master"].shape
-    assert case["w13_master"].grad.dtype == torch.bfloat16
+    assert case["w1_master"].grad.shape == case["w1_master"].shape
+    assert case["w1_master"].grad.dtype == torch.bfloat16
     assert case["w2_master"].grad.shape == case["w2_master"].shape
     assert case["w2_master"].grad.dtype == torch.bfloat16
+    assert case["w3_master"].grad.shape == case["w3_master"].shape
+    assert case["w3_master"].grad.dtype == torch.bfloat16
     assert _normalized_difference(case["x"].grad, expected["x_grad"]) < 0.12
-    assert _normalized_difference(case["w13_master"].grad, expected["w13_grad"]) < 0.15
+    assert _normalized_difference(case["w1_master"].grad, expected["w1_grad"]) < 0.15
     assert _normalized_difference(case["w2_master"].grad, expected["w2_grad"]) < 0.12
+    assert _normalized_difference(case["w3_master"].grad, expected["w3_grad"]) < 0.15

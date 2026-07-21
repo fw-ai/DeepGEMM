@@ -168,7 +168,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         full_w13_q_canonical, full_w13_s_canonical = _weight_quantize(
             full_w13_master
         )
-        full_w13_q, full_w13_s = (
+        full_w13_q_active, full_w13_s_active = (
             deep_gemm.transform_glm_w13_for_fp8_block128_mega_moe(
                 full_w13_q_canonical, full_w13_s_canonical
             )
@@ -176,12 +176,22 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         full_w2_q, full_w2_s = _weight_quantize(full_w2_master)
         expert_start = rank * local_experts
         expert_end = expert_start + local_experts
-        local_w13_q = full_w13_q[expert_start:expert_end].contiguous()
-        local_w13_s = full_w13_s[expert_start:expert_end].contiguous()
+        local_w13_q = full_w13_q_canonical[
+            expert_start * 2 : expert_end * 2
+        ].contiguous()
+        local_w13_s = full_w13_s_canonical[
+            expert_start * 2 : expert_end * 2
+        ].contiguous()
         local_w2_q = full_w2_q[expert_start:expert_end].contiguous()
         local_w2_s = full_w2_s[expert_start:expert_end].contiguous()
-        local_w13_master = (
-            full_w13_master[expert_start * 2 : expert_end * 2]
+        local_w1_master = (
+            full_w13_master[expert_start * 2 : expert_end * 2 : 2]
+            .clone()
+            .detach()
+            .requires_grad_()
+        )
+        local_w3_master = (
+            full_w13_master[expert_start * 2 + 1 : expert_end * 2 : 2]
             .clone()
             .detach()
             .requires_grad_()
@@ -198,8 +208,8 @@ def _worker(rank: int, world_size: int, port: int) -> None:
             x,
             ids,
             scores,
-            full_w13_q,
-            full_w13_s,
+            full_w13_q_active,
+            full_w13_s_active,
             full_w2_q,
             full_w2_s,
             upstream,
@@ -213,8 +223,9 @@ def _worker(rank: int, world_size: int, port: int) -> None:
             local_w13_s,
             local_w2_q,
             local_w2_s,
-            local_w13_master,
+            local_w1_master,
             local_w2_master,
+            local_w3_master,
             group=dist.group.WORLD,
         )
         output.backward(upstream)
@@ -225,13 +236,19 @@ def _worker(rank: int, world_size: int, port: int) -> None:
             scores.grad, expected_score_grad, rtol=3e-4, atol=3e-3
         )
         assert _normalized_difference(x.grad, expected_x_grad) < 0.12
-        for gradient in (x.grad, local_w13_master.grad, local_w2_master.grad):
+        for gradient in (
+            x.grad,
+            local_w1_master.grad,
+            local_w2_master.grad,
+            local_w3_master.grad,
+        ):
             assert gradient is not None
             assert gradient.dtype == torch.bfloat16
             assert torch.isfinite(gradient).all()
         if rank == 1:
             # Global expert 3 has no routes on either source rank.
-            assert torch.count_nonzero(local_w13_master.grad[2:]) == 0
+            assert torch.count_nonzero(local_w1_master.grad[1]) == 0
+            assert torch.count_nonzero(local_w3_master.grad[1]) == 0
             assert torch.count_nonzero(local_w2_master.grad[1]) == 0
         dist.barrier()
     finally:

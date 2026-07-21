@@ -269,6 +269,38 @@ __global__ void sm103_swiglu_backward_kernel(
 #endif
 }
 
+// The forward W13 ABI is [up; gate], while FireTitan's canonical gradient
+// ownership is the interleaved [gate, up] expert layout.  Emit the activation
+// gradient in canonical order so both dgrad and wgrad can consume the resident
+// canonical W13 buffers directly without allocating a reordered weight copy.
+__global__ void sm103_swiglu_backward_canonical_kernel(
+    const __nv_bfloat16* grad_output,
+    const __nv_bfloat16* preactivation,
+    __nv_bfloat16* grad_preactivation,
+    int64_t rows,
+    int64_t hidden
+) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1030
+    const int64_t linear_idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t numel = rows * hidden;
+    if (linear_idx >= numel) {
+        return;
+    }
+    const int64_t row = linear_idx / hidden;
+    const int64_t column = linear_idx - row * hidden;
+    const int64_t pre_row_offset = row * hidden * 2;
+    const float up = __bfloat162float(preactivation[pre_row_offset + column]);
+    const float gate = __bfloat162float(preactivation[pre_row_offset + hidden + column]);
+    const float grad = __bfloat162float(grad_output[linear_idx]);
+    const float sigmoid_gate = 1.0f / (1.0f + expf(-gate));
+    const float silu_gate = gate * sigmoid_gate;
+    const float silu_grad = sigmoid_gate * (1.0f + gate * (1.0f - sigmoid_gate));
+    // Canonical W13 order: gate, then up.
+    grad_preactivation[pre_row_offset + column] = __float2bfloat16_rn(grad * up * silu_grad);
+    grad_preactivation[pre_row_offset + hidden + column] = __float2bfloat16_rn(grad * silu_gate);
+#endif
+}
+
 __global__ void sm103_route_scale_quantize_group128_kernel(
     const __nv_bfloat16* grad_output,
     const float* route_scores,
@@ -677,6 +709,217 @@ torch::Tensor grouped_fp8_block128_gemm_impl(
     return output;
 }
 
+template <bool kWeightIsKByN>
+torch::Tensor grouped_fp8_block128_w13_gemm_nt_canonical_impl(
+    const torch::Tensor& activations,
+    const torch::Tensor& activation_scales,
+    const torch::Tensor& canonical_weights,
+    const torch::Tensor& canonical_weight_scales,
+    const std::vector<int64_t>& group_counts
+) {
+    // FireTitan stores [gate_0, up_0, gate_1, up_1, ...].  Submit two
+    // independent N=H problems per active expert, pointing the first at the up
+    // weight and output columns [0,H), and the second at the gate weight and
+    // output columns [H,2H).  This preserves the fused [up; gate] ABI without
+    // materializing a multi-gigabyte reordered weight tensor.
+    static_assert(!kWeightIsKByN, "canonical W13 forward requires NT weights");
+    using Config = SM103GroupedBlockwiseGemm<kWeightIsKByN>;
+    using Problem = typename Config::ProblemShape::UnderlyingProblemShape;
+    using ElementA = typename Config::ElementA;
+    using ElementB = typename Config::ElementB;
+    using ElementC = typename Config::ElementC;
+    using ElementD = typename Config::ElementD;
+
+    check_fp8_matrix_and_scales(activations, activation_scales, "activations");
+    check_sm103_device(canonical_weights);
+    DG_CHECK_CONTIGUOUS(canonical_weights);
+    DG_CHECK_CUDA(canonical_weight_scales);
+    DG_CHECK_CONTIGUOUS(canonical_weight_scales);
+    TORCH_CHECK(canonical_weights.scalar_type() == torch::kFloat8_e4m3fn,
+                "canonical W13 weights must be float8_e4m3fn");
+    TORCH_CHECK(canonical_weights.dim() == 3 && canonical_weights.size(0) % 2 == 0,
+                "canonical W13 weights must have shape [2E, H, D]");
+    TORCH_CHECK(canonical_weight_scales.scalar_type() == torch::kFloat32 &&
+                    canonical_weight_scales.dim() == 3,
+                "canonical W13 scales must be contiguous rank-3 float32");
+    TORCH_CHECK(canonical_weights.device() == activations.device() &&
+                    canonical_weight_scales.device() == activations.device(),
+                "activations, canonical W13 weights, and scales must share a device");
+
+    const int64_t groups = canonical_weights.size(0) / 2;
+    const int64_t hidden = canonical_weights.size(1);
+    const int64_t k = canonical_weights.size(2);
+    const int64_t doubled_hidden = hidden * 2;
+    TORCH_CHECK(static_cast<int64_t>(group_counts.size()) == groups,
+                "group_counts must contain one entry per local expert");
+    TORCH_CHECK(hidden > 0 && k > 0 && hidden % kBlockK == 0 && k % kBlockK == 0,
+                "canonical W13 H and D dimensions must be positive multiples of 128");
+    TORCH_CHECK(activations.size(1) == k,
+                "activation K dimension does not match canonical W13 weights");
+    TORCH_CHECK(canonical_weight_scales.sizes() ==
+                    torch::IntArrayRef({groups * 2, hidden / kBlockK, k / kBlockK}),
+                "canonical W13 scales must have shape [2E, H/128, D/128]");
+
+    int64_t total_rows = 0;
+    int64_t active_groups = 0;
+    for (const int64_t count : group_counts) {
+        TORCH_CHECK(count >= 0, "group counts must be non-negative");
+        TORCH_CHECK(count == 0 || count % 4 == 0,
+                    "active group counts must be padded to a multiple of four");
+        total_rows += count;
+        active_groups += count != 0;
+    }
+    TORCH_CHECK(total_rows == activations.size(0),
+                "sum(group_counts) must equal activation rows");
+
+    auto output = torch::empty(
+        {total_rows, doubled_hidden}, activations.options().dtype(torch::kBFloat16));
+    if (active_groups == 0) {
+        return output;
+    }
+
+    c10::cuda::CUDAGuard guard(activations.device());
+    const auto stream = at::cuda::getCurrentCUDAStream(activations.get_device());
+    const int64_t active_problems = active_groups * 2;
+
+    std::vector<Problem> problems;
+    std::vector<const ElementA*> ptr_a;
+    std::vector<const ElementB*> ptr_b;
+    std::vector<const ElementC*> ptr_c;
+    std::vector<ElementD*> ptr_d;
+    std::vector<const float*> ptr_sfa;
+    std::vector<const float*> ptr_sfb;
+    std::vector<typename Config::StrideA> stride_a;
+    std::vector<typename Config::StrideB> stride_b;
+    std::vector<typename Config::StrideC> stride_c;
+    std::vector<typename Config::StrideD> stride_d;
+    std::vector<typename Config::LayoutSFA> layout_sfa;
+    std::vector<typename Config::LayoutSFB> layout_sfb;
+    problems.reserve(active_problems);
+    ptr_a.reserve(active_problems);
+    ptr_b.reserve(active_problems);
+    ptr_c.reserve(active_problems);
+    ptr_d.reserve(active_problems);
+    ptr_sfa.reserve(active_problems);
+    ptr_sfb.reserve(active_problems);
+    stride_a.reserve(active_problems);
+    stride_b.reserve(active_problems);
+    stride_c.reserve(active_problems);
+    stride_d.reserve(active_problems);
+    layout_sfa.reserve(active_problems);
+    layout_sfb.reserve(active_problems);
+
+    auto* activation_ptr = reinterpret_cast<const ElementA*>(activations.data_ptr());
+    auto* activation_scale_ptr = activation_scales.data_ptr<float>();
+    auto* weight_ptr = reinterpret_cast<const ElementB*>(canonical_weights.data_ptr());
+    auto* weight_scale_ptr = canonical_weight_scales.data_ptr<float>();
+    auto* output_ptr = reinterpret_cast<ElementD*>(output.data_ptr());
+    const int64_t weight_elements = hidden * k;
+    const int64_t weight_scale_elements = (hidden / kBlockK) * (k / kBlockK);
+    int64_t row_offset = 0;
+    constexpr int64_t canonical_pair_for_output_half[2] = {1, 0};  // up, gate
+    for (int64_t expert = 0; expert < groups; ++expert) {
+        const int64_t m = group_counts[expert];
+        if (m == 0) {
+            continue;
+        }
+        for (int64_t output_half = 0; output_half < 2; ++output_half) {
+            const int64_t canonical_pair = canonical_pair_for_output_half[output_half];
+            const int64_t canonical_index = expert * 2 + canonical_pair;
+            problems.emplace_back(cute::make_shape(
+                static_cast<int>(m), static_cast<int>(hidden), static_cast<int>(k)));
+            ptr_a.push_back(activation_ptr + row_offset * k);
+            ptr_b.push_back(weight_ptr + canonical_index * weight_elements);
+            auto* output_half_ptr =
+                output_ptr + row_offset * doubled_hidden + output_half * hidden;
+            ptr_c.push_back(reinterpret_cast<const ElementC*>(output_half_ptr));
+            ptr_d.push_back(output_half_ptr);
+            ptr_sfa.push_back(activation_scale_ptr + row_offset * (k / kBlockK));
+            ptr_sfb.push_back(weight_scale_ptr + canonical_index * weight_scale_elements);
+            stride_a.push_back(cutlass::make_cute_packed_stride(
+                typename Config::StrideA{},
+                cute::make_shape(static_cast<int>(m), static_cast<int>(k), 1)));
+            stride_b.push_back(cutlass::make_cute_packed_stride(
+                typename Config::StrideB{},
+                cute::make_shape(static_cast<int>(hidden), static_cast<int>(k), 1)));
+            // Use the full 2H row extent for C/D while each problem writes only
+            // one H-wide half.  The two problems therefore never overlap.
+            stride_c.push_back(cutlass::make_cute_packed_stride(
+                typename Config::StrideC{},
+                cute::make_shape(static_cast<int>(m), static_cast<int>(doubled_hidden), 1)));
+            stride_d.push_back(cutlass::make_cute_packed_stride(
+                typename Config::StrideD{},
+                cute::make_shape(static_cast<int>(m), static_cast<int>(doubled_hidden), 1)));
+            layout_sfa.push_back(Config::ScaleConfig::tile_atom_to_shape_SFA(
+                cute::make_shape(static_cast<int>(m), static_cast<int>(hidden), static_cast<int>(k), 1)));
+            layout_sfb.push_back(Config::ScaleConfig::tile_atom_to_shape_SFB(
+                cute::make_shape(static_cast<int>(m), static_cast<int>(hidden), static_cast<int>(k), 1)));
+        }
+        row_offset += m;
+    }
+
+    const auto metadata_options = activations.options().dtype(torch::kUInt8);
+    auto problems_device = copy_metadata_to_device(problems, metadata_options, stream);
+    auto ptr_a_device = copy_metadata_to_device(ptr_a, metadata_options, stream);
+    auto ptr_b_device = copy_metadata_to_device(ptr_b, metadata_options, stream);
+    auto ptr_c_device = copy_metadata_to_device(ptr_c, metadata_options, stream);
+    auto ptr_d_device = copy_metadata_to_device(ptr_d, metadata_options, stream);
+    auto ptr_sfa_device = copy_metadata_to_device(ptr_sfa, metadata_options, stream);
+    auto ptr_sfb_device = copy_metadata_to_device(ptr_sfb, metadata_options, stream);
+    auto stride_a_device = copy_metadata_to_device(stride_a, metadata_options, stream);
+    auto stride_b_device = copy_metadata_to_device(stride_b, metadata_options, stream);
+    auto stride_c_device = copy_metadata_to_device(stride_c, metadata_options, stream);
+    auto stride_d_device = copy_metadata_to_device(stride_d, metadata_options, stream);
+    auto layout_sfa_device = copy_metadata_to_device(layout_sfa, metadata_options, stream);
+    auto layout_sfb_device = copy_metadata_to_device(layout_sfb, metadata_options, stream);
+
+    cutlass::KernelHardwareInfo hardware_info;
+    hardware_info.device_id = activations.get_device();
+    hardware_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(
+        hardware_info.device_id);
+
+    typename Config::Gemm::Arguments arguments{
+        cutlass::gemm::GemmUniversalMode::kGrouped,
+        {static_cast<int>(active_problems),
+         reinterpret_cast<Problem*>(problems_device.data_ptr()),
+         problems.data()},
+        {reinterpret_cast<const ElementA**>(ptr_a_device.data_ptr()),
+         reinterpret_cast<typename Config::StrideA*>(stride_a_device.data_ptr()),
+         reinterpret_cast<const ElementB**>(ptr_b_device.data_ptr()),
+         reinterpret_cast<typename Config::StrideB*>(stride_b_device.data_ptr()),
+         reinterpret_cast<const float**>(ptr_sfa_device.data_ptr()),
+         reinterpret_cast<typename Config::LayoutSFA*>(layout_sfa_device.data_ptr()),
+         reinterpret_cast<const float**>(ptr_sfb_device.data_ptr()),
+         reinterpret_cast<typename Config::LayoutSFB*>(layout_sfb_device.data_ptr())},
+        {{},
+         reinterpret_cast<const ElementC**>(ptr_c_device.data_ptr()),
+         reinterpret_cast<typename Config::StrideC*>(stride_c_device.data_ptr()),
+         reinterpret_cast<ElementD**>(ptr_d_device.data_ptr()),
+         reinterpret_cast<typename Config::StrideD*>(stride_d_device.data_ptr())},
+        hardware_info};
+    arguments.epilogue.thread.alpha = 1.0f;
+    arguments.epilogue.thread.beta = 0.0f;
+
+    typename Config::Gemm gemm;
+    const auto implement_status = gemm.can_implement(arguments);
+    TORCH_CHECK(implement_status == cutlass::Status::kSuccess,
+                "SM103 canonical W13 grouped GEMM cannot implement the requested problem: ",
+                cutlassGetStatusString(implement_status));
+    const int64_t workspace_bytes = static_cast<int64_t>(gemm.get_workspace_size(arguments));
+    auto workspace = torch::empty(
+        {std::max<int64_t>(workspace_bytes, 1)}, metadata_options);
+    const auto initialize_status = gemm.initialize(arguments, workspace.data_ptr(), stream);
+    TORCH_CHECK(initialize_status == cutlass::Status::kSuccess,
+                "SM103 canonical W13 grouped GEMM initialization failed: ",
+                cutlassGetStatusString(initialize_status));
+    const auto run_status = gemm.run(stream);
+    TORCH_CHECK(run_status == cutlass::Status::kSuccess,
+                "SM103 canonical W13 grouped GEMM launch failed: ",
+                cutlassGetStatusString(run_status));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
+
 torch::Tensor grouped_fp8_block128_gemm_nt(
     const torch::Tensor& activations,
     const torch::Tensor& activation_scales,
@@ -780,6 +1023,37 @@ torch::Tensor swiglu_backward(
         const auto blocks = (grad_output.numel() + threads - 1) / threads;
         const auto stream = at::cuda::getCurrentCUDAStream(grad_output.get_device());
         sm103_swiglu_backward_kernel<<<blocks, threads, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(grad_output.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(preactivation.data_ptr()),
+            reinterpret_cast<__nv_bfloat16*>(grad_preactivation.data_ptr()),
+            grad_output.size(0), grad_output.size(1)
+        );
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    return grad_preactivation;
+}
+
+torch::Tensor swiglu_backward_canonical(
+    const torch::Tensor& grad_output,
+    const torch::Tensor& preactivation
+) {
+    check_bf16_matrix(grad_output, "grad_output");
+    check_sm103_device(preactivation);
+    DG_CHECK_CONTIGUOUS(preactivation);
+    TORCH_CHECK(preactivation.scalar_type() == torch::kBFloat16,
+                "preactivation must be bfloat16");
+    TORCH_CHECK(preactivation.dim() == 2, "preactivation must be rank 2");
+    TORCH_CHECK(preactivation.size(0) == grad_output.size(0), "row count mismatch");
+    TORCH_CHECK(preactivation.size(1) == grad_output.size(1) * 2,
+                "preactivation width mismatch");
+    TORCH_CHECK(preactivation.device() == grad_output.device(), "device mismatch");
+    c10::cuda::CUDAGuard guard(grad_output.device());
+    auto grad_preactivation = torch::empty_like(preactivation);
+    if (grad_output.numel() != 0) {
+        constexpr int threads = 256;
+        const auto blocks = (grad_output.numel() + threads - 1) / threads;
+        const auto stream = at::cuda::getCurrentCUDAStream(grad_output.get_device());
+        sm103_swiglu_backward_canonical_kernel<<<blocks, threads, 0, stream>>>(
             reinterpret_cast<const __nv_bfloat16*>(grad_output.data_ptr()),
             reinterpret_cast<const __nv_bfloat16*>(preactivation.data_ptr()),
             reinterpret_cast<__nv_bfloat16*>(grad_preactivation.data_ptr()),
@@ -925,8 +1199,10 @@ pybind11::dict capabilities() {
         "sm103_fp8_block128_dequantize",
         "sm103_fp8_block128_grouped_gemm_nt",
         "sm103_fp8_block128_grouped_gemm_nn",
+        "sm103_fp8_block128_grouped_w13_gemm_nt_canonical",
         "sm103_fp8_block128_swiglu_quantize",
         "sm103_fp8_block128_swiglu_backward",
+        "sm103_fp8_block128_swiglu_backward_canonical",
         "sm103_fp8_block128_route_scale_quantize",
         "sm103_fp8_block128_post_down_combine",
         "sm103_fp8_block128_post_down_score_grad",
@@ -950,9 +1226,16 @@ void register_apis(pybind11::module_& m) {
           pybind11::arg("activations"), pybind11::arg("activation_scales"),
           pybind11::arg("weights"), pybind11::arg("weight_scales"),
           pybind11::arg("group_counts"));
+    m.def("sm103_fp8_block128_grouped_w13_gemm_nt_canonical",
+          &grouped_fp8_block128_w13_gemm_nt_canonical_impl<false>,
+          pybind11::arg("activations"), pybind11::arg("activation_scales"),
+          pybind11::arg("canonical_weights"), pybind11::arg("canonical_weight_scales"),
+          pybind11::arg("group_counts"));
     m.def("sm103_fp8_block128_swiglu_quantize", &swiglu_quantize,
           pybind11::arg("preactivation"));
     m.def("sm103_fp8_block128_swiglu_backward", &swiglu_backward,
+          pybind11::arg("grad_output"), pybind11::arg("preactivation"));
+    m.def("sm103_fp8_block128_swiglu_backward_canonical", &swiglu_backward_canonical,
           pybind11::arg("grad_output"), pybind11::arg("preactivation"));
     m.def("sm103_fp8_block128_route_scale_quantize", &route_scale_quantize,
           pybind11::arg("grad_output"), pybind11::arg("route_scores"), pybind11::arg("route_order"));

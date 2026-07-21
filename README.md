@@ -144,10 +144,13 @@ For the full example with multi-process setup and benchmarking, please refer to 
 `fp8_block128_mega_moe` is a separate SM103-only training backend. It accepts
 compact BF16 source tokens, global top-k expert IDs and FP32 route scores, and
 GLM-style E4M3 expert weights with FP32 inverse scales on exact 128 x 128
-blocks. The operation owns activation quantization, expert-parallel transport,
-W13/SwiGLU/W2, post-down route scaling and combine, and the complete routed
-backward. It returns BF16 input and master-weight gradients and FP32 route-score
-gradients through autograd.
+blocks in canonical interleaved `[gate, up]` storage. The W13 launch presents
+`[up; gate]` to fused SwiGLU without copying those weights, and accepts the
+existing BF16 gate/down/up masters as three separate tensors. The operation
+owns activation quantization, expert-parallel transport, W13/SwiGLU/W2,
+post-down route scaling and combine, and the complete routed backward. It
+returns BF16 input and master-weight gradients and FP32 route-score gradients
+through autograd.
 
 The backend requires CUDA compute capability exactly 10.3. It has no SM100,
 SM90, generic, or compatibility fallback. Use

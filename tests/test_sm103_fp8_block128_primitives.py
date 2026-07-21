@@ -130,6 +130,17 @@ def test_swiglu_forward_and_backward_match_reference(rows: int) -> None:
     torch.testing.assert_close(
         actual_grad.float(), preactivation_ref.grad.to(torch.bfloat16).float(), rtol=3e-2, atol=2e-2
     )
+    canonical_grad = deep_gemm._C.sm103_fp8_block128_swiglu_backward_canonical(
+        grad_output, preactivation
+    )
+    active_up_grad, active_gate_grad = preactivation_ref.grad.chunk(2, dim=-1)
+    expected_canonical = torch.cat((active_gate_grad, active_up_grad), dim=-1)
+    torch.testing.assert_close(
+        canonical_grad.float(),
+        expected_canonical.to(torch.bfloat16).float(),
+        rtol=3e-2,
+        atol=2e-2,
+    )
 
 
 def test_post_down_combine_score_grad_and_route_sum() -> None:
@@ -241,6 +252,44 @@ def test_grouped_fp8_block128_gemm_covers_zero_routes_and_rejects_unpadded_group
         deep_gemm._C.sm103_fp8_block128_grouped_gemm_nt(
             one_q, one_s, weights, weight_scales, [1, 0, 0]
         )
+
+
+def test_canonical_w13_gemm_presents_up_then_gate_without_weight_copy() -> None:
+    torch.manual_seed(5500)
+    counts = [4, 0, 8]
+    experts, hidden, model_dim = len(counts), 128, 256
+    activations_bf16 = torch.randn(
+        sum(counts), model_dim, device="cuda", dtype=torch.bfloat16
+    )
+    activations, activation_scales = deep_gemm._C.sm103_fp8_block128_quantize(
+        activations_bf16
+    )
+    canonical_bf16 = torch.randn(
+        experts * 2, hidden, model_dim, device="cuda", dtype=torch.bfloat16
+    )
+    canonical, canonical_scales = _blockwise_weight_quantize(canonical_bf16)
+    actual = deep_gemm._C.sm103_fp8_block128_grouped_w13_gemm_nt_canonical(
+        activations,
+        activation_scales,
+        canonical,
+        canonical_scales,
+        counts,
+    )
+
+    x_dequantized = deep_gemm._C.sm103_fp8_block128_dequantize(
+        activations, activation_scales
+    ).float()
+    w_dequantized = _blockwise_weight_dequantize(canonical, canonical_scales)
+    expected_parts = []
+    offset = 0
+    for expert, count in enumerate(counts):
+        if count:
+            gate = x_dequantized[offset : offset + count] @ w_dequantized[2 * expert].t()
+            up = x_dequantized[offset : offset + count] @ w_dequantized[2 * expert + 1].t()
+            expected_parts.append(torch.cat((up, gate), dim=-1))
+        offset += count
+    expected = torch.cat(expected_parts).to(torch.bfloat16)
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=0.08, atol=0.08)
 
 
 def test_k_grouped_bf16_wgrad_supports_no_accumulator_and_empty_expert() -> None:
