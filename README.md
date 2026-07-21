@@ -26,7 +26,7 @@ Despite its lightweight design, DeepGEMM's performance matches or exceeds expert
 
 ### Requirements
 
-- NVIDIA SM90 or SM100 architecture GPU
+- NVIDIA SM90, SM100, or SM103 architecture GPU
 - Python 3.8 or higher
 - Compilers with C++20 support
 - CUDA Toolkit:
@@ -138,6 +138,24 @@ deep_gemm.fp8_fp4_mega_moe(y, transformed_l1, transformed_l2, buffer)
 ```
 
 For the full example with multi-process setup and benchmarking, please refer to `tests/test_mega_moe.py`.
+
+#### SM103 FP8-block128 Mega MoE training
+
+`fp8_block128_mega_moe` is a separate SM103-only training backend. It accepts
+compact BF16 source tokens, global top-k expert IDs and FP32 route scores, and
+GLM-style E4M3 expert weights with FP32 inverse scales on exact 128 x 128
+blocks. The operation owns activation quantization, expert-parallel transport,
+W13/SwiGLU/W2, post-down route scaling and combine, and the complete routed
+backward. It returns BF16 input and master-weight gradients and FP32 route-score
+gradients through autograd.
+
+The backend requires CUDA compute capability exactly 10.3. It has no SM100,
+SM90, generic, or compatibility fallback. Use
+`get_fp8_block128_mega_moe_capabilities()` for a non-launching capability
+manifest and `deep_gemm.__git_commit__` for the full source OID embedded in the
+native extension. Reference, adversarial, distributed, and performance
+examples live in `tests/test_fp8_block128_*` and
+`tests/benchmark_fp8_block128_mega_moe.py`.
 
 #### Utilities
 
