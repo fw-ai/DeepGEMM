@@ -1601,8 +1601,10 @@ sm100_bf16_mega_moe_impl(void* y,
                             pool_m_idx +
                             epilogue_wg_idx * WG_BLOCK_M +
                             s * STORE_BLOCK_M;
-                        if (saved_store_row < num_saved_pool_tokens &&
-                            warp_idx_in_wg == 0 &&
+                        DG_DEVICE_ASSERT(
+                            saved_store_row + STORE_BLOCK_M <=
+                            num_saved_pool_tokens);
+                        if (warp_idx_in_wg == 0 &&
                             cute::elect_one_sync()) {
                             cute::tma_store_fence();
                             #pragma unroll
@@ -1666,12 +1668,18 @@ sm100_bf16_mega_moe_impl(void* y,
                                 RouteWeightMode::PostDown &&
                             kCombineOrderMode ==
                                 CombineOrderMode::FixedTopK) {
+                            // Keep forward offsets unchanged: recover the
+                            // immutable source token/slot score directly from
+                            // the existing symmetric input plane.
                             const float route_weight =
-                                *l1_topk_weights_buffer
-                                     .get_data_buffer(
-                                         ring_m_idx +
-                                         m_idx_in_block)
-                                     .template get_base_ptr<float>();
+                                *sym_buffer.map(
+                                    input_topk_weights_buffer
+                                            .get_base_ptr<float>() +
+                                        static_cast<uint64_t>(
+                                            src_metadata.token_idx) *
+                                            kNumTopk +
+                                        src_metadata.topk_idx,
+                                    src_metadata.rank_idx);
                             auto* values =
                                 reinterpret_cast<nv_bfloat16*>(
                                     &packed);

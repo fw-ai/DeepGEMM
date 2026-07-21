@@ -106,6 +106,7 @@ from .mega.backward import (
     bf16_mega_moe_backward_w2,
     bf16_mega_moe_backward_w2_combine,
     fp8_fp4_mega_moe_backward_dgrad_swiglu,
+    mega_moe_backward_combine_grad_x,
 )
 
 # Some utils

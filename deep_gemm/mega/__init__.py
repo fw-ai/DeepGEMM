@@ -47,7 +47,8 @@ class SymmBuffer:
         self.num_ring_tokens = num_ring_tokens
 
         # Allocate a symmetric buffer
-        num_bytes, slice_input_buffers = _C.get_symm_buffer_size_for_mega_moe(
+        num_bytes, slice_input_buffers = \
+            _C.get_symm_buffer_size_for_mega_moe_v2(
             group.size(), num_experts,
             num_max_tokens_per_rank, num_topk,
             hidden, intermediate_hidden,
@@ -80,6 +81,7 @@ class SymmBuffer:
             self.l2_acts_sf,
             self.token_src_metadata,
             self.backward_grad_y,
+            self.backward_grad_route,
         ) = slice_input_buffers(self.buffer)
 
     def destroy(self):
@@ -90,6 +92,7 @@ class SymmBuffer:
         self.x_sf = None
         self.token_src_metadata = None
         self.backward_grad_y = None
+        self.backward_grad_route = None
 
 
 def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
@@ -98,7 +101,9 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
                                  hidden: int, intermediate_hidden: int,
                                  use_fp8_dispatch: Union[bool, None] = None,
                                  mma_type: str = 'fp8xfp4',
-                                 activation: str = 'swiglu') -> SymmBuffer:
+                                 activation: str = 'swiglu',
+                                 num_ring_tokens: Optional[int] = None
+                                 ) -> SymmBuffer:
     # Align token count
     num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
 
@@ -108,7 +113,17 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
     # TODO: finer-grained wave
     num_min_ring_tokens, num_max_ring_tokens = \
         _C.get_ring_limit_for_mega_moe(num_max_tokens_per_rank, num_experts // group.size(), num_topk, group.size())
-    if num_max_tokens_per_rank >= 6144:
+    if num_ring_tokens is not None:
+        if num_ring_tokens % _C.get_token_alignment_for_mega_moe() != 0:
+            raise ValueError(
+                "num_ring_tokens must satisfy MegaMoE token alignment")
+        if not (
+            num_min_ring_tokens <= num_ring_tokens <= num_max_ring_tokens
+        ):
+            raise ValueError(
+                "num_ring_tokens must be within the supported ring limits "
+                f"[{num_min_ring_tokens}, {num_max_ring_tokens}]")
+    elif num_max_tokens_per_rank >= 6144:
         # We assume must be prefill (decode cannot have such size)
         # We try to give ~8 GB budget (within V4 Pro config)
         # And batch size is mostly stable, to save buffer size, we use 1 expert per wave
@@ -192,7 +207,35 @@ def fp8_fp4_mega_moe(
     activation_clamp: Optional[float] = None,
     fast_math: bool = True,
     saved_l1_preact: Optional[torch.Tensor] = None,
+    route_weight_mode: RouteWeightMode = RouteWeightMode.PRE_DOWN,
+    saved_down_unweighted: Optional[torch.Tensor] = None,
+    num_config_tokens: Optional[int] = None,
 ):
+    """Run MXFP8/FP4 MegaMoE with an explicit route-weight boundary.
+
+    POST_DOWN quantizes the unweighted gated activation for W2 and optionally
+    saves each route's exact BF16 unweighted W2 output before applying its
+    score at the remote combine write.
+    """
+    route_weight_mode = RouteWeightMode(route_weight_mode)
+    has_explicit_config_tokens = num_config_tokens is not None
+    if num_config_tokens is None:
+        num_config_tokens = y.size(0)
+    if (
+        not has_explicit_config_tokens and
+        sym_buffer.group.size() > 1
+    ):
+        # Every rank must instantiate the same persistent grid/barrier
+        # specialization, including empty source ranks. Select from the
+        # collective maximum source-token extent while retaining each rank's
+        # local runtime token count.
+        rank_uniform_num_tokens = torch.tensor(
+            num_config_tokens, dtype=torch.int32, device=y.device)
+        dist.all_reduce(
+            rank_uniform_num_tokens,
+            op=dist.ReduceOp.MAX,
+            group=sym_buffer.group)
+        num_config_tokens = int(rank_uniform_num_tokens.item())
     _C.fp8_fp4_mega_moe(
         y,
         l1_weights,
@@ -208,7 +251,10 @@ def fp8_fp4_mega_moe(
         activation, activation_clamp,
         fast_math,
         sym_buffer.num_ring_tokens,
-        saved_l1_preact
+        saved_l1_preact,
+        route_weight_mode.value,
+        saved_down_unweighted,
+        num_config_tokens,
     )
 
 def bf16_mega_moe(y: torch.Tensor,
