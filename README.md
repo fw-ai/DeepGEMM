@@ -152,6 +152,17 @@ post-down route scaling and combine, and the complete routed backward. It
 returns BF16 input and master-weight gradients and FP32 route-score gradients
 through autograd.
 
+Multi-rank execution uses one internally owned expanded
+`deep_ep.ElasticBuffer` route. Expert segments are aligned to 128 rows while
+the device PSUM retains each expert's real end. The SM103 companion zeros only
+undefined padding before grouped BF16-master reduction, explicitly zeros empty
+expert gradients, and uses deterministic routing with one combine reduction
+for bitwise activation-checkpoint replay. There is no outer dispatch/combine,
+dynamic `torch.distributed` split exchange, expert-weight dequantization,
+UE8M0 requantization, or MXFP4 transcode. The single-rank specialization is
+only for focused kernel validation and is not a distributed transport
+fallback.
+
 The backend requires CUDA compute capability exactly 10.3. It has no SM100,
 SM90, generic, or compatibility fallback. Use
 `get_fp8_block128_mega_moe_capabilities()` for a non-launching capability

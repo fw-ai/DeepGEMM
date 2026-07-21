@@ -8,15 +8,14 @@ MXFP4 transcode, or architecture fallback exists in this path.
 
 from __future__ import annotations
 
+from copy import copy
 from dataclasses import dataclass
-from itertools import accumulate
 from typing import Any, Sequence
 
 import torch
 import torch.distributed as dist
 
 from .. import _C
-
 
 _BLOCK = 128
 _PAD_ROWS = 128
@@ -28,6 +27,9 @@ REQUIRED_NATIVE_SYMBOLS = (
     "sm103_fp8_block128_grouped_gemm_nt",
     "sm103_fp8_block128_grouped_gemm_nn",
     "sm103_fp8_block128_grouped_w13_gemm_nt_canonical",
+    "sm103_fp8_block128_grouped_gemm_nt_expanded",
+    "sm103_fp8_block128_grouped_gemm_nn_expanded",
+    "sm103_fp8_block128_grouped_w13_gemm_nt_canonical_expanded",
     "sm103_fp8_block128_swiglu_quantize",
     "sm103_fp8_block128_swiglu_backward",
     "sm103_fp8_block128_swiglu_backward_canonical",
@@ -35,7 +37,13 @@ REQUIRED_NATIVE_SYMBOLS = (
     "sm103_fp8_block128_post_down_combine",
     "sm103_fp8_block128_post_down_score_grad",
     "sm103_fp8_block128_route_sum",
-    "k_grouped_bf16_gemm_tn_contiguous",
+    "sm103_fp8_block128_expanded_post_down_scale",
+    "sm103_fp8_block128_expand_compact_routes",
+    "sm103_fp8_block128_collapse_expanded_routes",
+    "sm103_fp8_block128_expanded_post_down_score_grad",
+    "sm103_fp8_block128_expanded_route_scale_quantize",
+    "sm103_fp8_block128_grouped_bf16_wgrad",
+    "sm103_fp8_block128_grouped_bf16_wgrad_expanded",
 )
 
 REQUIRED_PYTHON_SYMBOLS = (
@@ -49,13 +57,26 @@ def get_fp8_block128_mega_moe_capabilities() -> dict[str, Any]:
     """Return a non-launching, exact capability manifest for preflight."""
     native = dict(_C.get_sm103_fp8_block128_capabilities())
     missing = [name for name in REQUIRED_NATIVE_SYMBOLS if not hasattr(_C, name)]
+    try:
+        from deep_ep import ElasticBuffer
+
+        has_elastic_buffer = callable(ElasticBuffer)
+    except (AttributeError, ImportError):
+        has_elastic_buffer = False
+    if not has_elastic_buffer:
+        missing.append("deep_ep.ElasticBuffer")
     native.update(
         {
             "native_symbols": REQUIRED_NATIVE_SYMBOLS,
             "python_symbols": REQUIRED_PYTHON_SYMBOLS,
             "forward": not missing,
             "backward": not missing,
-            "distributed_transport": "torch.distributed.all_to_all_single",
+            "distributed_transport": "deep_ep.ElasticBuffer.expanded",
+            "transport_layout": "expert_aligned_128",
+            "transport_scale_layout": "row_major_fp32_group128",
+            "transport_deterministic": True,
+            "combine_reductions": 1,
+            "wgrad_backend": "sm103_companion_grouped_bf16",
             "missing_symbols": tuple(missing),
         }
     )
@@ -95,9 +116,7 @@ def transform_glm_w13_for_fp8_block128_mega_moe(
         .contiguous()
     )
     active_scale = (
-        canonical_scale.view(
-            experts, 2, hidden // _BLOCK, model_dim // _BLOCK
-        )
+        canonical_scale.view(experts, 2, hidden // _BLOCK, model_dim // _BLOCK)
         .index_select(1, pair_order)
         .reshape(experts, hidden * 2 // _BLOCK, model_dim // _BLOCK)
         .contiguous()
@@ -115,12 +134,15 @@ class _GroupState:
 def _resolve_group(group: Any) -> _GroupState:
     if not dist.is_available() or not dist.is_initialized():
         if group is not None:
-            raise RuntimeError("a process group was provided before torch.distributed initialization")
+            raise RuntimeError(
+                "a process group was provided before torch.distributed initialization"
+            )
         return _GroupState(group=None, rank=0, world_size=1)
+    resolved_group = dist.group.WORLD if group is None else group
     return _GroupState(
-        group=group,
-        rank=dist.get_rank(group),
-        world_size=dist.get_world_size(group),
+        group=resolved_group,
+        rank=dist.get_rank(resolved_group),
+        world_size=dist.get_world_size(resolved_group),
     )
 
 
@@ -211,10 +233,18 @@ def _validate_inputs(
     device = x.device
     _check_tensor(x, name="x", ndim=2, dtype=torch.bfloat16, device=device)
     _check_tensor(topk_ids, name="topk_ids", ndim=2, dtype=torch.int64, device=device)
-    _check_tensor(topk_scores, name="topk_scores", ndim=2, dtype=torch.float32, device=device)
-    _check_tensor(w13_weight, name="w13_weight", ndim=3, dtype=torch.float8_e4m3fn, device=device)
-    _check_tensor(w13_scale, name="w13_scale", ndim=3, dtype=torch.float32, device=device)
-    _check_tensor(w2_weight, name="w2_weight", ndim=3, dtype=torch.float8_e4m3fn, device=device)
+    _check_tensor(
+        topk_scores, name="topk_scores", ndim=2, dtype=torch.float32, device=device
+    )
+    _check_tensor(
+        w13_weight, name="w13_weight", ndim=3, dtype=torch.float8_e4m3fn, device=device
+    )
+    _check_tensor(
+        w13_scale, name="w13_scale", ndim=3, dtype=torch.float32, device=device
+    )
+    _check_tensor(
+        w2_weight, name="w2_weight", ndim=3, dtype=torch.float8_e4m3fn, device=device
+    )
     _check_tensor(w2_scale, name="w2_scale", ndim=3, dtype=torch.float32, device=device)
     tokens, model_dim = x.shape
     if model_dim % _BLOCK:
@@ -230,13 +260,17 @@ def _validate_inputs(
     local_experts = w13_weight.shape[0] // 2
     hidden, w13_k = w13_weight.shape[1:]
     if local_experts <= 0 or hidden % _BLOCK or w13_k != model_dim:
-        raise ValueError("canonical W13 must have shape [2E, H, D] with D/H divisible by 128")
+        raise ValueError(
+            "canonical W13 must have shape [2E, H, D] with D/H divisible by 128"
+        )
     if tuple(w13_scale.shape) != (
         local_experts * 2,
         hidden // _BLOCK,
         model_dim // _BLOCK,
     ):
-        raise ValueError("canonical W13 scale shape does not match 128x128 weight blocks")
+        raise ValueError(
+            "canonical W13 scale shape does not match 128x128 weight blocks"
+        )
     if tuple(w2_weight.shape) != (local_experts, model_dim, hidden):
         raise ValueError("W2 must have shape [local_experts, D, H]")
     if tuple(w2_scale.shape) != (
@@ -275,12 +309,190 @@ def _validate_inputs(
         master_gradient_wrapper=master_gradient_wrapper,
     )
     if topk_ids.numel():
-        minimum, maximum = torch.aminmax(topk_ids)
-        if minimum.item() < 0 or maximum.item() >= global_experts:
-            raise ValueError(
-                f"top-k IDs must lie in [0, {global_experts}); got [{minimum.item()}, {maximum.item()}]"
-            )
+        # Keep the hot path free of a device-to-host scalar synchronization.
+        # The assertion is enqueued on the current CUDA stream and fails the
+        # operation rather than admitting an out-of-range route.
+        torch._assert_async(
+            ((topk_ids >= 0) & (topk_ids < global_experts)).all(),
+            f"top-k IDs must lie in [0, {global_experts})",
+        )
     return tokens, model_dim, hidden, local_experts, topk
+
+
+@dataclass(frozen=True)
+class _DeepEPBufferState:
+    buffer: Any
+    capacity: int
+    num_sms: int
+    num_qps: int
+
+
+_deepep_buffers: dict[tuple[int, int, int, int, int], _DeepEPBufferState] = {}
+_deepep_context_tokens_per_rank: dict[int, int] = {}
+
+
+def _configure_fp8_block128_mega_moe_transport(
+    group: Any,
+    *,
+    context_tokens_per_rank: int,
+) -> None:
+    """Register the owning model's existing context/CP envelope once."""
+    if (
+        isinstance(context_tokens_per_rank, bool)
+        or not isinstance(context_tokens_per_rank, int)
+        or context_tokens_per_rank < 1
+    ):
+        raise ValueError("context_tokens_per_rank must be a positive integer")
+    group_state = _resolve_group(group)
+    if group_state.world_size <= 1:
+        raise RuntimeError("expanded DeepEP transport requires a multi-rank group")
+    key = id(group_state.group)
+    existing = _deepep_context_tokens_per_rank.get(key)
+    if existing is not None and existing != context_tokens_per_rank:
+        raise RuntimeError(
+            "MegaMoE context envelope changed after transport configuration: "
+            f"configured={context_tokens_per_rank}, existing={existing}"
+        )
+    if existing is None and any(buffer_key[0] == key for buffer_key in _deepep_buffers):
+        raise RuntimeError("MegaMoE transport cannot be configured after arena construction")
+    if existing is None:
+        # DeepEP reads the native NCCL communicator while calculating its arena
+        # size. Materialize that communicator once during model setup; otherwise
+        # a first-use EP group can expose an uninitialized handle to
+        # ncclTeamWorld. This is not a per-layer sizing collective.
+        if dist.get_backend(group_state.group) == "nccl":
+            dist.barrier(
+                group=group_state.group,
+                device_ids=[torch.cuda.current_device()],
+            )
+        _deepep_context_tokens_per_rank[key] = context_tokens_per_rank
+
+
+def _get_deepep_buffer(
+    group_state: _GroupState,
+    *,
+    device: torch.device,
+    tokens: int,
+    model_dim: int,
+    topk: int,
+    global_experts: int,
+) -> _DeepEPBufferState:
+    """Create one runtime-context-sized DeepEP arena per EP/model shape.
+
+    FireTitan registers its already-resolved context/CP envelope when it
+    installs the EP group. Warmup shape therefore never affects sizing, while
+    changing the existing context length or CP configuration only requires a
+    normal trainer restart, not an image rebuild. No hot-path sizing collective
+    or caller-visible operation argument exists.
+    """
+    if group_state.world_size <= 1:
+        raise RuntimeError("expanded DeepEP requires a multi-rank process group")
+    capacity = _deepep_context_tokens_per_rank.get(id(group_state.group))
+    if capacity is None:
+        raise RuntimeError(
+            "MegaMoE transport was not configured from the owning model context"
+        )
+    if tokens > capacity:
+        raise RuntimeError(
+            "SM103 MegaMoE input exceeds the resolved context/CP envelope: "
+            f"actual={tokens}, capacity={capacity}"
+        )
+
+    device_index = (
+        device.index if device.index is not None else torch.cuda.current_device()
+    )
+    key = (id(group_state.group), device_index, model_dim, topk, global_experts)
+    cached = _deepep_buffers.get(key)
+    if cached is not None:
+        return cached
+
+    try:
+        from deep_ep import ElasticBuffer
+    except (AttributeError, ImportError) as exc:
+        raise RuntimeError(
+            "MegaMoE requires deep_ep.ElasticBuffer; no transport fallback exists"
+        ) from exc
+
+    buffer_kwargs = dict(
+        num_max_tokens_per_rank=capacity,
+        hidden=model_dim,
+        num_topk=topk,
+        allow_hybrid_mode=True,
+        allow_multiple_reduction=False,
+    )
+    fp8_bytes = ElasticBuffer.get_buffer_size_hint(
+        group_state.group, use_fp8_dispatch=True, **buffer_kwargs
+    )
+    bf16_bytes = ElasticBuffer.get_buffer_size_hint(
+        group_state.group, use_fp8_dispatch=False, **buffer_kwargs
+    )
+    buffer = ElasticBuffer(
+        group_state.group,
+        num_bytes=max(fp8_bytes, bf16_bytes),
+        use_fp8_dispatch=True,
+        deterministic=True,
+        prefer_overlap_with_compute=True,
+        **buffer_kwargs,
+    )
+    num_sms = int(buffer.get_theoretical_num_sms(global_experts, topk))
+    device_sms = torch.cuda.get_device_properties(device).multi_processor_count
+    if not 1 <= num_sms <= device_sms:
+        raise RuntimeError(
+            "DeepEP returned an invalid SM103 launch width: "
+            f"selected={num_sms}, device_sms={device_sms}"
+        )
+    num_qps = int(buffer.get_theoretical_num_qps(num_sms))
+    if num_qps < 1:
+        raise RuntimeError(f"DeepEP returned an invalid QP count: {num_qps}")
+    state = _DeepEPBufferState(
+        buffer=buffer,
+        capacity=capacity,
+        num_sms=num_sms,
+        num_qps=num_qps,
+    )
+    _deepep_buffers[key] = state
+    return state
+
+
+def _host_expanded_storage_counts(handle: Any, local_experts: int) -> tuple[int, ...]:
+    counts = getattr(handle, "num_recv_tokens_per_expert_list", None)
+    if counts is None:
+        raise RuntimeError(
+            "DeepEP expanded dispatch did not return host storage counts"
+        )
+    if isinstance(counts, torch.Tensor):
+        if counts.device.type != "cpu":
+            raise RuntimeError("DeepEP host expert counts unexpectedly reside on CUDA")
+        counts = counts.tolist()
+    result = tuple(int(value) for value in counts)
+    if (
+        len(result) != local_experts
+        or any(value < 0 for value in result)
+        or any(value and value % _PAD_ROWS for value in result)
+    ):
+        raise RuntimeError(
+            "DeepEP expanded storage counts violate the aligned local expert contract: "
+            f"expected={local_experts}, actual={result}"
+        )
+    return result
+
+
+def _expanded_routes(handle: Any) -> torch.Tensor:
+    metadata = getattr(handle, "recv_src_metadata", None)
+    if (
+        not isinstance(metadata, torch.Tensor)
+        or metadata.ndim != 2
+        or metadata.shape[1] < 3
+    ):
+        shape = tuple(metadata.shape) if isinstance(metadata, torch.Tensor) else None
+        raise RuntimeError(f"invalid DeepEP expanded route metadata: {shape}")
+    return metadata[:, 2:]
+
+
+def _shadow_compact_handle(handle: Any) -> Any:
+    shadow = copy(handle)
+    shadow.do_expand = False
+    return shadow
 
 
 def _exchange_counts(
@@ -308,7 +520,9 @@ def _all_to_all_rows(
         device=tensor.device,
     )
     source = tensor.view(torch.uint8) if tensor.dtype == torch.float8_e4m3fn else tensor
-    destination = output.view(torch.uint8) if output.dtype == torch.float8_e4m3fn else output
+    destination = (
+        output.view(torch.uint8) if output.dtype == torch.float8_e4m3fn else output
+    )
     dist.all_to_all_single(
         destination,
         source,
@@ -328,7 +542,10 @@ def _inverse_permutation(order: torch.Tensor) -> torch.Tensor:
 def _padding_state(
     counts: Sequence[int], device: torch.device
 ) -> tuple[list[int], torch.Tensor]:
-    padded_counts = [((count + _PAD_ROWS - 1) // _PAD_ROWS) * _PAD_ROWS if count else 0 for count in counts]
+    padded_counts = [
+        ((count + _PAD_ROWS - 1) // _PAD_ROWS) * _PAD_ROWS if count else 0
+        for count in counts
+    ]
     total_actual = sum(counts)
     if total_actual == 0:
         return padded_counts, torch.empty(0, dtype=torch.int64, device=device)
@@ -380,30 +597,26 @@ def _bf16_grouped_wgrad(
     right: torch.Tensor,
     padded_counts: Sequence[int],
 ) -> torch.Tensor:
-    output = torch.zeros(
-        (len(padded_counts), left.shape[1], right.shape[1]),
-        dtype=torch.bfloat16,
-        device=left.device,
-    )
-    if left.shape[0] == 0:
-        return output
-    grouped_layout = torch.tensor(
-        list(accumulate(padded_counts)), dtype=torch.int32, device=left.device
-    )
-    _C.k_grouped_bf16_gemm_tn_contiguous(
+    return _C.sm103_fp8_block128_grouped_bf16_wgrad(
         left.contiguous(),
         right.contiguous(),
-        output,
-        None,
-        grouped_layout,
-        None,
-        "mn",
-        True,
+        list(padded_counts),
     )
-    return output
 
 
-class _FP8Block128MegaMoE(torch.autograd.Function):
+def _bf16_grouped_wgrad_expanded(
+    left: torch.Tensor,
+    right: torch.Tensor,
+    psum: torch.Tensor,
+) -> torch.Tensor:
+    return _C.sm103_fp8_block128_grouped_bf16_wgrad_expanded(
+        left.contiguous(),
+        right.contiguous(),
+        psum,
+    )
+
+
+class _FP8Block128MegaMoELocal(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx: Any,
@@ -421,7 +634,11 @@ class _FP8Block128MegaMoE(torch.autograd.Function):
         master_gradient_wrapper: Any,
     ) -> torch.Tensor:
         group_state = _resolve_group(group)
-        if master_gradient_wrapper is not None and not callable(master_gradient_wrapper):
+        if group_state.world_size != 1:
+            raise RuntimeError("the packed local MegaMoE path is single-rank only")
+        if master_gradient_wrapper is not None and not callable(
+            master_gradient_wrapper
+        ):
             raise TypeError("master_gradient_wrapper must be callable or None")
         tokens, model_dim, hidden, local_experts, topk = _validate_inputs(
             x,
@@ -479,15 +696,11 @@ class _FP8Block128MegaMoE(torch.autograd.Function):
             grouped_local_ids = local_ids.index_select(0, group_order)
             actual_counts = [
                 int(value)
-                for value in torch.bincount(
-                    grouped_local_ids, minlength=local_experts
-                )
+                for value in torch.bincount(grouped_local_ids, minlength=local_experts)
                 .cpu()
                 .tolist()
             ]
-            padded_counts, actual_to_padded = _padding_state(
-                actual_counts, x.device
-            )
+            padded_counts, actual_to_padded = _padding_state(actual_counts, x.device)
             padded_rows = sum(padded_counts)
             padded_activations = _pad_rows(
                 grouped_activations,
@@ -509,8 +722,8 @@ class _FP8Block128MegaMoE(torch.autograd.Function):
                 w13_scale,
                 padded_counts,
             )
-            hidden_quantized, hidden_scales = (
-                _C.sm103_fp8_block128_swiglu_quantize(preactivation)
+            hidden_quantized, hidden_scales = _C.sm103_fp8_block128_swiglu_quantize(
+                preactivation
             )
             routed_output_padded = _C.sm103_fp8_block128_grouped_gemm_nt(
                 hidden_quantized,
@@ -519,9 +732,7 @@ class _FP8Block128MegaMoE(torch.autograd.Function):
                 w2_scale,
                 padded_counts,
             )
-            routed_output_grouped = _unpad_rows(
-                routed_output_padded, actual_to_padded
-            )
+            routed_output_grouped = _unpad_rows(routed_output_padded, actual_to_padded)
             routed_output_receive_order = routed_output_grouped.index_select(
                 0, ungroup_order
             )
@@ -537,12 +748,8 @@ class _FP8Block128MegaMoE(torch.autograd.Function):
                 device=x.device,
             )
             if routed_output.shape[0]:
-                routed_output.index_copy_(
-                    0, send_order, routed_output_send_order
-                )
-            output = _C.sm103_fp8_block128_post_down_combine(
-                routed_output, topk_scores
-            )
+                routed_output.index_copy_(0, send_order, routed_output_send_order)
+            output = _C.sm103_fp8_block128_post_down_combine(routed_output, topk_scores)
 
         ctx.group_state = group_state
         ctx.send_counts = send_counts
@@ -655,9 +862,7 @@ class _FP8Block128MegaMoE(torch.autograd.Function):
             grad_input_padded = _C.sm103_fp8_block128_grouped_gemm_nn(
                 grad_preactivation_quantized,
                 grad_preactivation_scales,
-                w13_weight.view(
-                    ctx.local_experts, ctx.hidden * 2, ctx.model_dim
-                ),
+                w13_weight.view(ctx.local_experts, ctx.hidden * 2, ctx.model_dim),
                 w13_scale.view(
                     ctx.local_experts,
                     ctx.hidden * 2 // _BLOCK,
@@ -688,12 +893,8 @@ class _FP8Block128MegaMoE(torch.autograd.Function):
             grad_w1 = grad_w13_canonical[:, : ctx.hidden].contiguous()
             grad_w3 = grad_w13_canonical[:, ctx.hidden :].contiguous()
 
-            grad_input_grouped = _unpad_rows(
-                grad_input_padded, actual_to_padded
-            )
-            grad_input_receive_order = grad_input_grouped.index_select(
-                0, ungroup_order
-            )
+            grad_input_grouped = _unpad_rows(grad_input_padded, actual_to_padded)
+            grad_input_receive_order = grad_input_grouped.index_select(0, ungroup_order)
             grad_input_send_order = _all_to_all_rows(
                 grad_input_receive_order,
                 ctx.receive_counts,
@@ -706,12 +907,340 @@ class _FP8Block128MegaMoE(torch.autograd.Function):
                 device=grad_output.device,
             )
             if grad_input_routes.shape[0]:
-                grad_input_routes.index_copy_(
-                    0, send_order, grad_input_send_order
-                )
+                grad_input_routes.index_copy_(0, send_order, grad_input_send_order)
             grad_input = _C.sm103_fp8_block128_route_sum(
                 grad_input_routes, ctx.tokens, ctx.topk
             )
+
+        wrapper = ctx.master_gradient_wrapper
+        if wrapper is not None:
+            grad_w1, grad_w2, grad_w3 = wrapper(grad_w1, grad_w2, grad_w3)
+
+        return (
+            grad_input,
+            None,
+            grad_scores,
+            None,
+            None,
+            None,
+            None,
+            grad_w1,
+            grad_w2,
+            grad_w3,
+            None,
+            None,
+        )
+
+
+class _FP8Block128MegaMoEDeepEP(torch.autograd.Function):
+    """Invocation-owned SM103 compute over DeepEP's expanded route layout."""
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        x: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_scores: torch.Tensor,
+        w13_weight: torch.Tensor,
+        w13_scale: torch.Tensor,
+        w2_weight: torch.Tensor,
+        w2_scale: torch.Tensor,
+        w1_master: torch.Tensor,
+        w2_master: torch.Tensor,
+        w3_master: torch.Tensor,
+        group: Any,
+        master_gradient_wrapper: Any,
+    ) -> torch.Tensor:
+        group_state = _resolve_group(group)
+        if group_state.world_size <= 1:
+            raise RuntimeError(
+                "the expanded DeepEP MegaMoE path requires multiple ranks"
+            )
+        if master_gradient_wrapper is not None and not callable(
+            master_gradient_wrapper
+        ):
+            raise TypeError("master_gradient_wrapper must be callable or None")
+        tokens, model_dim, hidden, local_experts, topk = _validate_inputs(
+            x,
+            topk_ids,
+            topk_scores,
+            w13_weight,
+            w13_scale,
+            w2_weight,
+            w2_scale,
+            w1_master,
+            w2_master,
+            w3_master,
+            group_state,
+            master_gradient_wrapper,
+        )
+        global_experts = local_experts * group_state.world_size
+        buffer_state = _get_deepep_buffer(
+            group_state,
+            device=x.device,
+            tokens=tokens,
+            model_dim=model_dim,
+            topk=topk,
+            global_experts=global_experts,
+        )
+
+        with torch.autograd.profiler.record_function(
+            "sm103_fp8_block128_megamoe_forward"
+        ):
+            token_quantized, token_scales = _C.sm103_fp8_block128_quantize(x)
+            payload, recv_ids, routed_scores, handle, event = (
+                buffer_state.buffer.dispatch(
+                    (token_quantized, token_scales),
+                    topk_idx=topk_ids,
+                    topk_weights=topk_scores,
+                    num_experts=global_experts,
+                    num_max_tokens_per_rank=buffer_state.capacity,
+                    expert_alignment=_PAD_ROWS,
+                    num_sms=buffer_state.num_sms,
+                    num_qps=buffer_state.num_qps,
+                    async_with_compute_stream=True,
+                    allocate_on_comm_stream=False,
+                    do_cpu_sync=True,
+                    do_expand=True,
+                    use_tma_aligned_col_major_sf=False,
+                )
+            )
+            event.current_stream_wait()
+            if recv_ids is not None or routed_scores is None:
+                raise RuntimeError(
+                    "DeepEP did not return an expanded scored FP8 payload"
+                )
+            if not isinstance(payload, tuple) or len(payload) != 2:
+                raise RuntimeError("DeepEP expanded dispatch did not return FP8 q/s")
+            receive_activations, receive_activation_scales = payload
+            if (
+                receive_activations.dtype != torch.float8_e4m3fn
+                or receive_activation_scales.dtype != torch.float32
+                or not receive_activations.is_contiguous()
+                or not receive_activation_scales.is_contiguous()
+            ):
+                raise RuntimeError(
+                    "DeepEP expanded payload must retain contiguous E4M3 q and row-major FP32 scales"
+                )
+            expanded_group_rows = _host_expanded_storage_counts(handle, local_experts)
+            expanded_rows = sum(expanded_group_rows)
+            if receive_activations.shape != (expanded_rows, model_dim):
+                raise RuntimeError(
+                    "DeepEP expanded activation shape disagrees with expert counts: "
+                    f"payload={tuple(receive_activations.shape)}, rows={expanded_rows}"
+                )
+            if receive_activation_scales.shape != (
+                expanded_rows,
+                model_dim // _BLOCK,
+            ):
+                raise RuntimeError("DeepEP expanded activation-scale shape mismatch")
+            routed_scores = routed_scores.contiguous().view(-1)
+            if (
+                routed_scores.dtype != torch.float32
+                or routed_scores.numel() != expanded_rows
+            ):
+                raise RuntimeError("DeepEP expanded route-score shape/dtype mismatch")
+            routes = _expanded_routes(handle)
+            psum = handle.psum_num_recv_tokens_per_expert
+            if (
+                routes.device != x.device
+                or routes.shape[1] != topk
+                or psum.device != x.device
+                or psum.dtype != torch.int32
+                or not psum.is_contiguous()
+                or psum.numel() != local_experts
+            ):
+                raise RuntimeError("DeepEP expanded metadata violates the MegaMoE ABI")
+
+            preactivation = (
+                _C.sm103_fp8_block128_grouped_w13_gemm_nt_canonical_expanded(
+                    receive_activations,
+                    receive_activation_scales,
+                    w13_weight,
+                    w13_scale,
+                    expanded_group_rows,
+                )
+            )
+            hidden_quantized, hidden_scales = _C.sm103_fp8_block128_swiglu_quantize(
+                preactivation
+            )
+            routed_output = _C.sm103_fp8_block128_grouped_gemm_nt_expanded(
+                hidden_quantized,
+                hidden_scales,
+                w2_weight,
+                w2_scale,
+                expanded_group_rows,
+            )
+            scaled_output = _C.sm103_fp8_block128_expanded_post_down_scale(
+                routed_output, routed_scores
+            )
+            output, combined_scores, event = buffer_state.buffer.combine(
+                scaled_output,
+                handle=handle,
+                num_sms=buffer_state.num_sms,
+                num_qps=buffer_state.num_qps,
+                async_with_compute_stream=True,
+                allocate_on_comm_stream=False,
+            )
+            event.current_stream_wait()
+            if combined_scores is not None or output.shape != x.shape:
+                raise RuntimeError(
+                    "DeepEP expanded combine violated the output contract"
+                )
+
+        ctx.group_state = group_state
+        ctx.buffer_state = buffer_state
+        ctx.handle = handle
+        ctx.expanded_group_rows = expanded_group_rows
+        ctx.tokens = tokens
+        ctx.model_dim = model_dim
+        ctx.hidden = hidden
+        ctx.local_experts = local_experts
+        ctx.topk = topk
+        ctx.expanded_rows = expanded_rows
+        ctx.master_gradient_wrapper = master_gradient_wrapper
+        ctx.save_for_backward(
+            routed_scores,
+            routes,
+            psum,
+            receive_activations,
+            receive_activation_scales,
+            preactivation,
+            hidden_quantized,
+            hidden_scales,
+            routed_output,
+            w13_weight,
+            w13_scale,
+            w2_weight,
+            w2_scale,
+        )
+        return output
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[Any, ...]:
+        (
+            routed_scores,
+            routes,
+            psum,
+            receive_activations,
+            receive_activation_scales,
+            preactivation,
+            hidden_quantized,
+            hidden_scales,
+            routed_output,
+            w13_weight,
+            w13_scale,
+            w2_weight,
+            w2_scale,
+        ) = ctx.saved_tensors
+        grad_output = grad_output.contiguous()
+        if grad_output.dtype != torch.bfloat16:
+            grad_output = grad_output.to(torch.bfloat16)
+
+        with torch.autograd.profiler.record_function(
+            "sm103_fp8_block128_megamoe_backward"
+        ):
+            (
+                grad_output_compact,
+                _recv_ids,
+                _recv_scores,
+                _reverse_handle,
+                event,
+            ) = ctx.buffer_state.buffer.dispatch(
+                grad_output,
+                handle=ctx.handle,
+                num_sms=ctx.buffer_state.num_sms,
+                num_qps=ctx.buffer_state.num_qps,
+                async_with_compute_stream=True,
+                allocate_on_comm_stream=False,
+                do_cpu_sync=False,
+                do_expand=False,
+            )
+            event.current_stream_wait()
+            if not isinstance(grad_output_compact, torch.Tensor):
+                raise RuntimeError(
+                    "DeepEP reverse dispatch returned a non-tensor payload"
+                )
+            if grad_output_compact.shape != (routes.shape[0], ctx.model_dim):
+                raise RuntimeError("DeepEP reverse dispatch compact shape mismatch")
+            grad_output_expanded = _C.sm103_fp8_block128_expand_compact_routes(
+                grad_output_compact.contiguous(), routes, ctx.expanded_rows
+            )
+            grad_scores_compact = _C.sm103_fp8_block128_expanded_post_down_score_grad(
+                routed_output, grad_output_expanded, routes
+            )
+            grad_route_quantized, grad_route_scales = (
+                _C.sm103_fp8_block128_expanded_route_scale_quantize(
+                    grad_output_expanded, routed_scores
+                )
+            )
+
+            grad_hidden = _C.sm103_fp8_block128_grouped_gemm_nn_expanded(
+                grad_route_quantized,
+                grad_route_scales,
+                w2_weight,
+                w2_scale,
+                ctx.expanded_group_rows,
+            )
+            grad_preactivation = _C.sm103_fp8_block128_swiglu_backward_canonical(
+                grad_hidden, preactivation
+            )
+            grad_preactivation_quantized, grad_preactivation_scales = (
+                _C.sm103_fp8_block128_quantize(grad_preactivation)
+            )
+            grad_input_expanded = _C.sm103_fp8_block128_grouped_gemm_nn_expanded(
+                grad_preactivation_quantized,
+                grad_preactivation_scales,
+                w13_weight.view(ctx.local_experts, ctx.hidden * 2, ctx.model_dim),
+                w13_scale.view(
+                    ctx.local_experts,
+                    ctx.hidden * 2 // _BLOCK,
+                    ctx.model_dim // _BLOCK,
+                ),
+                ctx.expanded_group_rows,
+            )
+
+            grad_route_dequantized = _C.sm103_fp8_block128_dequantize(
+                grad_route_quantized, grad_route_scales
+            )
+            hidden_dequantized = _C.sm103_fp8_block128_dequantize(
+                hidden_quantized, hidden_scales
+            )
+            grad_w2 = _bf16_grouped_wgrad_expanded(
+                grad_route_dequantized,
+                hidden_dequantized,
+                psum,
+            )
+            del grad_route_dequantized, hidden_dequantized
+            input_dequantized = _C.sm103_fp8_block128_dequantize(
+                receive_activations, receive_activation_scales
+            )
+            grad_w13_canonical = _bf16_grouped_wgrad_expanded(
+                grad_preactivation,
+                input_dequantized,
+                psum,
+            )
+            grad_w1 = grad_w13_canonical[:, : ctx.hidden].contiguous()
+            grad_w3 = grad_w13_canonical[:, ctx.hidden :].contiguous()
+
+            grad_input_compact = _C.sm103_fp8_block128_collapse_expanded_routes(
+                grad_input_expanded, routes
+            )
+            grad_input, grad_scores, event = ctx.buffer_state.buffer.combine(
+                grad_input_compact,
+                handle=_shadow_compact_handle(ctx.handle),
+                topk_weights=grad_scores_compact,
+                num_sms=ctx.buffer_state.num_sms,
+                num_qps=ctx.buffer_state.num_qps,
+                async_with_compute_stream=True,
+                allocate_on_comm_stream=False,
+            )
+            event.current_stream_wait()
+            if grad_scores is None:
+                raise RuntimeError(
+                    "DeepEP backward combine omitted route-score gradients"
+                )
+            grad_scores = grad_scores.to(torch.float32)
 
         wrapper = ctx.master_gradient_wrapper
         if wrapper is not None:
@@ -758,8 +1287,18 @@ def fp8_block128_mega_moe(
     expert-parallel process group; no other token transport may wrap this
     operation.  ``master_gradient_wrapper`` lets the owning framework restore
     DTensor placement/reduction metadata to the three local BF16 gradients.
+    Multi-rank execution owns one automatically sized expanded
+    ``deep_ep.ElasticBuffer`` transport path internally. The single-rank
+    specialization exists only for focused kernel validation; neither path
+    admits another GPU architecture or backend.
     """
-    return _FP8Block128MegaMoE.apply(
+    group_state = _resolve_group(group)
+    operation = (
+        _FP8Block128MegaMoELocal
+        if group_state.world_size == 1
+        else _FP8Block128MegaMoEDeepEP
+    )
+    return operation.apply(
         x,
         topk_ids,
         topk_scores,
@@ -770,6 +1309,6 @@ def fp8_block128_mega_moe(
         w1_master,
         w2_master,
         w3_master,
-        group,
+        group_state.group,
         master_gradient_wrapper,
     )

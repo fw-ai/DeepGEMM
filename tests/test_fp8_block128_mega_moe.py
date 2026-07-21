@@ -2,8 +2,10 @@ import pytest
 import torch
 
 import deep_gemm
-from deep_gemm.mega.fp8_block128 import _validate_master_tensor
-
+from deep_gemm.mega.fp8_block128 import (
+    _bf16_grouped_wgrad_expanded,
+    _validate_master_tensor,
+)
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3),
@@ -11,7 +13,9 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _blockwise_weight_quantize(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def _blockwise_weight_quantize(
+    weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
     groups, rows, columns = weight.shape
     blocks = (
         weight.float()
@@ -47,27 +51,34 @@ def _blockwise_weight_dequantize(
 def _make_case(tokens: int, *, all_to_one: bool = False) -> dict[str, torch.Tensor]:
     torch.manual_seed(7000 + tokens + int(all_to_one))
     experts, model_dim, hidden, topk = 4, 256, 128, 2
-    x = (torch.randn(tokens, model_dim, device="cuda", dtype=torch.bfloat16) * 0.1).requires_grad_()
+    x = (
+        torch.randn(tokens, model_dim, device="cuda", dtype=torch.bfloat16) * 0.1
+    ).requires_grad_()
     w1_master = (
-        torch.randn(experts, hidden, model_dim, device="cuda", dtype=torch.bfloat16) * 0.05
+        torch.randn(experts, hidden, model_dim, device="cuda", dtype=torch.bfloat16)
+        * 0.05
     ).requires_grad_()
     w3_master = (
-        torch.randn(experts, hidden, model_dim, device="cuda", dtype=torch.bfloat16) * 0.05
+        torch.randn(experts, hidden, model_dim, device="cuda", dtype=torch.bfloat16)
+        * 0.05
     ).requires_grad_()
     w2_master = (
-        torch.randn(experts, model_dim, hidden, device="cuda", dtype=torch.bfloat16) * 0.05
+        torch.randn(experts, model_dim, hidden, device="cuda", dtype=torch.bfloat16)
+        * 0.05
     ).requires_grad_()
-    canonical_w13 = torch.stack((w1_master.detach(), w3_master.detach()), dim=1).flatten(0, 1)
-    w13_q, w13_s = _blockwise_weight_quantize(
-        canonical_w13
-    )
+    canonical_w13 = torch.stack(
+        (w1_master.detach(), w3_master.detach()), dim=1
+    ).flatten(0, 1)
+    w13_q, w13_s = _blockwise_weight_quantize(canonical_w13)
     w2_q, w2_s = _blockwise_weight_quantize(w2_master.detach())
     if all_to_one:
         topk_ids = torch.zeros(tokens, topk, device="cuda", dtype=torch.int64)
     else:
         route = torch.arange(tokens * topk, device="cuda", dtype=torch.int64)
         topk_ids = torch.remainder(route * 3 + 1, experts).view(tokens, topk)
-    scores = torch.sigmoid(torch.randn(tokens, topk, device="cuda", dtype=torch.float32))
+    scores = torch.sigmoid(
+        torch.randn(tokens, topk, device="cuda", dtype=torch.float32)
+    )
     scores = (scores / scores.sum(dim=-1, keepdim=True) * 2.5).detach().requires_grad_()
     return {
         "x": x,
@@ -83,7 +94,9 @@ def _make_case(tokens: int, *, all_to_one: bool = False) -> dict[str, torch.Tens
     }
 
 
-def _forward_reference(case: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+def _forward_reference(
+    case: dict[str, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
     x_q, x_s = deep_gemm._C.sm103_fp8_block128_quantize(case["x"].detach())
     x_dequantized = deep_gemm._C.sm103_fp8_block128_dequantize(x_q, x_s).float()
     canonical_w13 = _blockwise_weight_dequantize(case["w13_q"], case["w13_s"])
@@ -97,14 +110,18 @@ def _forward_reference(case: dict[str, torch.Tensor]) -> tuple[torch.Tensor, tor
     w2 = _blockwise_weight_dequantize(case["w2_q"], case["w2_s"])
     flat_ids = case["ids"].flatten()
     route_x = x_dequantized.repeat_interleave(case["ids"].shape[1], dim=0)
-    preactivation = torch.bmm(
-        w13.index_select(0, flat_ids), route_x.unsqueeze(-1)
-    ).squeeze(-1).to(torch.bfloat16)
+    preactivation = (
+        torch.bmm(w13.index_select(0, flat_ids), route_x.unsqueeze(-1))
+        .squeeze(-1)
+        .to(torch.bfloat16)
+    )
     hidden_q, hidden_s = deep_gemm._C.sm103_fp8_block128_swiglu_quantize(preactivation)
     hidden = deep_gemm._C.sm103_fp8_block128_dequantize(hidden_q, hidden_s).float()
-    route_output = torch.bmm(
-        w2.index_select(0, flat_ids), hidden.unsqueeze(-1)
-    ).squeeze(-1).to(torch.bfloat16)
+    route_output = (
+        torch.bmm(w2.index_select(0, flat_ids), hidden.unsqueeze(-1))
+        .squeeze(-1)
+        .to(torch.bfloat16)
+    )
     output = deep_gemm._C.sm103_fp8_block128_post_down_combine(
         route_output, case["scores"]
     )
@@ -130,23 +147,26 @@ def _ste_reference_backward(
     canonical_w13_dequantized = _blockwise_weight_dequantize(
         case["w13_q"], case["w13_s"]
     ).view(experts, 2, hidden, model_dim)
-    w13_effective = w13_active_master.float() + (
-        torch.stack(
-            (canonical_w13_dequantized[:, 1], canonical_w13_dequantized[:, 0]),
-            dim=1,
-        ).reshape(experts, hidden * 2, model_dim)
-        - w13_active_master.float()
-    ).detach()
+    w13_effective = (
+        w13_active_master.float()
+        + (
+            torch.stack(
+                (canonical_w13_dequantized[:, 1], canonical_w13_dequantized[:, 0]),
+                dim=1,
+            ).reshape(experts, hidden * 2, model_dim)
+            - w13_active_master.float()
+        ).detach()
+    )
     w2_dequantized = _blockwise_weight_dequantize(case["w2_q"], case["w2_s"])
-    w2_effective = w2_master.float() + (
-        w2_dequantized - w2_master.float()
-    ).detach()
+    w2_effective = w2_master.float() + (w2_dequantized - w2_master.float()).detach()
 
     flat_ids = case["ids"].flatten()
     route_x = x_effective.repeat_interleave(case["ids"].shape[1], dim=0)
-    preactivation = torch.bmm(
-        w13_effective.index_select(0, flat_ids), route_x.unsqueeze(-1)
-    ).squeeze(-1).to(torch.bfloat16)
+    preactivation = (
+        torch.bmm(w13_effective.index_select(0, flat_ids), route_x.unsqueeze(-1))
+        .squeeze(-1)
+        .to(torch.bfloat16)
+    )
     up, gate = preactivation.float().chunk(2, dim=-1)
     hidden_raw = torch.nn.functional.silu(gate) * up
     hidden_q, hidden_s = deep_gemm._C.sm103_fp8_block128_swiglu_quantize(
@@ -156,14 +176,20 @@ def _ste_reference_backward(
         hidden_q, hidden_s
     ).float()
     hidden_effective = hidden_raw + (hidden_dequantized - hidden_raw).detach()
-    route_output = torch.bmm(
-        w2_effective.index_select(0, flat_ids), hidden_effective.unsqueeze(-1)
-    ).squeeze(-1).to(torch.bfloat16)
+    route_output = (
+        torch.bmm(
+            w2_effective.index_select(0, flat_ids), hidden_effective.unsqueeze(-1)
+        )
+        .squeeze(-1)
+        .to(torch.bfloat16)
+    )
     tokens, topk = case["ids"].shape
     output_float = torch.zeros(tokens, model_dim, device="cuda", dtype=torch.float32)
     route_output_view = route_output.view(tokens, topk, model_dim)
     for route in range(topk):
-        output_float = output_float + route_output_view[:, route].float() * scores[:, route, None]
+        output_float = (
+            output_float + route_output_view[:, route].float() * scores[:, route, None]
+        )
     output = output_float.to(torch.bfloat16)
     output.backward(upstream)
     return {
@@ -200,7 +226,9 @@ class _DistributedMasterFixture:
         return self._local
 
 
-def test_distributed_master_validation_accepts_resident_efsdp_shard_with_wrapper() -> None:
+def test_distributed_master_validation_accepts_resident_efsdp_shard_with_wrapper() -> (
+    None
+):
     local = torch.empty(1, 128, 256, device="cuda", dtype=torch.bfloat16)
     master = _DistributedMasterFixture(local, (4, 128, 256))
 
@@ -227,6 +255,27 @@ def test_distributed_master_validation_requires_gradient_wrapper() -> None:
             device=local.device,
             master_gradient_wrapper=None,
         )
+
+
+def test_expanded_bf16_wgrad_uses_only_psum_valid_rows() -> None:
+    torch.manual_seed(20260722)
+    psum = torch.tensor([3, 133], dtype=torch.int32, device="cuda")
+    left = torch.randn(256, 128, dtype=torch.bfloat16, device="cuda")
+    right = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
+    left[3:128].fill_(float("nan"))
+    left[133:].fill_(float("nan"))
+    right[3:128].fill_(float("nan"))
+    right[133:].fill_(float("nan"))
+
+    actual = _bf16_grouped_wgrad_expanded(left, right, psum)
+    expected = torch.stack(
+        (
+            left[:3].transpose(0, 1) @ right[:3],
+            left[128:133].transpose(0, 1) @ right[128:133],
+        )
+    )
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
 @pytest.mark.parametrize(

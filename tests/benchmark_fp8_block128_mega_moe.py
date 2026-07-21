@@ -3,22 +3,27 @@
 The defaults are intentionally small enough for routine companion validation.
 Use GLM-5.2 dimensions explicitly for integration evidence, for example::
 
-    python tests/benchmark_fp8_block128_mega_moe.py \
-      --tokens 15625 --experts 16 --model-dim 6144 --hidden 2048 --topk 8
+    torchrun --standalone --nproc-per-node 2 \
+      tests/benchmark_fp8_block128_mega_moe.py \
+      --tokens 15625 --experts 256 --model-dim 6144 --hidden 2048 --topk 8
 
-The process must be launched on an otherwise idle SM103 GPU.  The benchmark
-prints one JSON object so callers can archive the exact dimensions and metrics.
+``--experts`` is the global expert count; every rank owns an equal contiguous
+shard. The process(es) must be launched on otherwise idle SM103 GPUs. Rank zero
+prints one JSON object with every rank's metrics so callers can archive the
+exact dimensions and straggler behavior.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import statistics
 import time
 from typing import Callable
 
 import torch
+import torch.distributed as dist
 
 import deep_gemm
 
@@ -77,6 +82,12 @@ def main() -> None:
     parser.add_argument("--iterations", type=int, default=5)
     args = parser.parse_args()
 
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    rank = int(os.environ.get("RANK", "0"))
+    if world_size > 1:
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group("nccl")
     if not torch.cuda.is_available():
         raise RuntimeError("the performance benchmark requires CUDA")
     capability = torch.cuda.get_device_capability()
@@ -86,23 +97,28 @@ def main() -> None:
         )
     for name in ("model_dim", "hidden"):
         if getattr(args, name) <= 0 or getattr(args, name) % 128:
-            raise ValueError(f"--{name.replace('_', '-')} must be a positive multiple of 128")
+            raise ValueError(
+                f"--{name.replace('_', '-')} must be a positive multiple of 128"
+            )
     if args.tokens <= 0 or args.experts <= 0 or args.topk <= 0:
         raise ValueError("tokens, experts, and topk must be positive")
     if args.topk > args.experts:
         raise ValueError("topk cannot exceed experts")
+    if args.experts % world_size:
+        raise ValueError("global experts must be divisible by world size")
     if args.warmup < 0 or args.iterations <= 0:
         raise ValueError("warmup must be non-negative and iterations must be positive")
 
-    torch.manual_seed(20260721)
-    device = torch.device("cuda")
+    torch.manual_seed(20260721 + rank)
+    device = torch.device("cuda", local_rank)
+    local_experts = args.experts // world_size
     x = (
         torch.randn(args.tokens, args.model_dim, device=device, dtype=torch.bfloat16)
         * 0.02
     ).requires_grad_()
     w1_master = (
         torch.randn(
-            args.experts,
+            local_experts,
             args.hidden,
             args.model_dim,
             device=device,
@@ -112,7 +128,7 @@ def main() -> None:
     ).requires_grad_()
     w3_master = (
         torch.randn(
-            args.experts,
+            local_experts,
             args.hidden,
             args.model_dim,
             device=device,
@@ -122,7 +138,7 @@ def main() -> None:
     ).requires_grad_()
     w2_master = (
         torch.randn(
-            args.experts,
+            local_experts,
             args.model_dim,
             args.hidden,
             device=device,
@@ -133,9 +149,7 @@ def main() -> None:
     canonical_w13 = torch.stack(
         (w1_master.detach(), w3_master.detach()), dim=1
     ).flatten(0, 1)
-    w13_q, w13_s = _blockwise_quantize(
-        canonical_w13
-    )
+    w13_q, w13_s = _blockwise_quantize(canonical_w13)
     w2_q, w2_s = _blockwise_quantize(w2_master.detach())
     routes = torch.arange(args.tokens * args.topk, device=device, dtype=torch.int64)
     topk_ids = torch.remainder(routes * 17 + 3, args.experts).view(
@@ -145,8 +159,10 @@ def main() -> None:
         torch.randn(args.tokens, args.topk, device=device, dtype=torch.float32)
     )
     scores = (
-        raw_scores / raw_scores.sum(dim=-1, keepdim=True) * 2.5
-    ).detach().requires_grad_()
+        (raw_scores / raw_scores.sum(dim=-1, keepdim=True) * 2.5)
+        .detach()
+        .requires_grad_()
+    )
     upstream = torch.randn_like(x)
 
     latest_output: torch.Tensor | None = None
@@ -164,6 +180,7 @@ def main() -> None:
             w1_master,
             w2_master,
             w3_master,
+            group=dist.group.WORLD if world_size > 1 else None,
         )
 
     def forward_backward() -> None:
@@ -189,6 +206,20 @@ def main() -> None:
     forward_backward_times = _elapsed_ms(forward_backward, args.iterations)
     wall_seconds = time.monotonic() - started
 
+    rank_result = {
+        "rank": rank,
+        "forward": _summary(forward_times),
+        "forward_backward": _summary(forward_backward_times),
+        "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
+        "peak_reserved_bytes": torch.cuda.max_memory_reserved(),
+        "wall_seconds": wall_seconds,
+    }
+    rank_results: list[dict[str, object] | None] | None = None
+    if world_size > 1:
+        rank_results = [None] * world_size if rank == 0 else None
+        dist.gather_object(rank_result, rank_results, dst=0)
+    else:
+        rank_results = [rank_result]
     result = {
         "schema_version": 1,
         "backend": "fp8_block128_mega_moe",
@@ -199,19 +230,20 @@ def main() -> None:
         "dimensions": {
             "tokens": args.tokens,
             "experts": args.experts,
+            "local_experts": local_experts,
             "topk": args.topk,
             "model_dim": args.model_dim,
             "hidden": args.hidden,
         },
         "warmup": args.warmup,
         "iterations": args.iterations,
-        "forward": _summary(forward_times),
-        "forward_backward": _summary(forward_backward_times),
-        "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
-        "peak_reserved_bytes": torch.cuda.max_memory_reserved(),
-        "wall_seconds": wall_seconds,
+        "world_size": world_size,
+        "ranks": rank_results,
     }
-    print(json.dumps(result, sort_keys=True))
+    if rank == 0:
+        print(json.dumps(result, sort_keys=True))
+    if world_size > 1:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

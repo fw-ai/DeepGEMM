@@ -1,6 +1,7 @@
 #include "apis/sm103_fp8_block128.hpp"
 
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/ops/_grouped_mm.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
 #include <cuda_bf16.h>
@@ -20,6 +21,8 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstring>
+#include <limits>
 #include <numeric>
 #include <tuple>
 #include <type_traits>
@@ -88,6 +91,10 @@ constexpr int kRequiredMajor = 10;
 constexpr int kRequiredMinor = 3;
 constexpr int kBlockK = 128;
 constexpr float kE4M3Max = 448.0f;
+
+constexpr int64_t align_rows(const int64_t rows) {
+    return (rows + kBlockK - 1) / kBlockK * kBlockK;
+}
 
 #define DG_CHECK_CUDA(tensor) \
     TORCH_CHECK((tensor).is_cuda(), #tensor " must be a CUDA tensor")
@@ -428,6 +435,250 @@ __global__ void sm103_post_down_score_grad_kernel(
 #endif
 }
 
+__global__ void sm103_expanded_post_down_scale_kernel(
+    const __nv_bfloat16* route_output,
+    const float* route_scores,
+    __nv_bfloat16* scaled_output,
+    int64_t rows,
+    int64_t hidden
+) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1030
+    const int64_t linear_idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t numel = rows * hidden;
+    if (linear_idx >= numel) {
+        return;
+    }
+    const int64_t row = linear_idx / hidden;
+    const float value = __bfloat162float(route_output[linear_idx]) * route_scores[row];
+    scaled_output[linear_idx] = __float2bfloat16_rn(value);
+#endif
+}
+
+template <typename RouteIndex>
+__global__ void sm103_expand_compact_routes_kernel(
+    const __nv_bfloat16* compact,
+    const RouteIndex* routes,
+    __nv_bfloat16* expanded,
+    int64_t compact_rows,
+    int64_t topk,
+    int64_t hidden,
+    int64_t expanded_rows,
+    int64_t route_stride_0,
+    int64_t route_stride_1
+) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1030
+    const int64_t route_linear = blockIdx.x;
+    if (route_linear >= compact_rows * topk) {
+        return;
+    }
+    const int64_t compact_row = route_linear / topk;
+    const int64_t slot = route_linear - compact_row * topk;
+    const int64_t expanded_row = static_cast<int64_t>(
+        routes[compact_row * route_stride_0 + slot * route_stride_1]);
+    if (expanded_row < 0 || expanded_row >= expanded_rows) {
+        return;
+    }
+    for (int64_t column = threadIdx.x; column < hidden; column += blockDim.x) {
+        expanded[expanded_row * hidden + column] = compact[compact_row * hidden + column];
+    }
+#endif
+}
+
+template <typename RouteIndex>
+__global__ void sm103_collapse_expanded_routes_kernel(
+    const __nv_bfloat16* expanded,
+    const RouteIndex* routes,
+    __nv_bfloat16* compact,
+    int64_t compact_rows,
+    int64_t topk,
+    int64_t hidden,
+    int64_t expanded_rows,
+    int64_t route_stride_0,
+    int64_t route_stride_1
+) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1030
+    const int64_t compact_row = blockIdx.x;
+    if (compact_row >= compact_rows) {
+        return;
+    }
+    for (int64_t column = threadIdx.x; column < hidden; column += blockDim.x) {
+        float sum = 0.0f;
+        #pragma unroll 1
+        for (int64_t slot = 0; slot < topk; ++slot) {
+            const int64_t expanded_row = static_cast<int64_t>(
+                routes[compact_row * route_stride_0 + slot * route_stride_1]);
+            if (expanded_row >= 0 && expanded_row < expanded_rows) {
+                sum += __bfloat162float(expanded[expanded_row * hidden + column]);
+            }
+        }
+        compact[compact_row * hidden + column] = __float2bfloat16_rn(sum);
+    }
+#endif
+}
+
+template <typename RouteIndex>
+__global__ void sm103_expanded_post_down_score_grad_kernel(
+    const __nv_bfloat16* route_output,
+    const __nv_bfloat16* grad_output,
+    const RouteIndex* routes,
+    float* grad_scores,
+    int64_t compact_rows,
+    int64_t topk,
+    int64_t hidden,
+    int64_t expanded_rows,
+    int64_t route_stride_0,
+    int64_t route_stride_1
+) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1030
+    const int64_t route_linear = blockIdx.x;
+    if (route_linear >= compact_rows * topk) {
+        return;
+    }
+    const int64_t compact_row = route_linear / topk;
+    const int64_t slot = route_linear - compact_row * topk;
+    const int64_t expanded_row = static_cast<int64_t>(
+        routes[compact_row * route_stride_0 + slot * route_stride_1]);
+    if (expanded_row < 0 || expanded_row >= expanded_rows) {
+        if (threadIdx.x == 0) {
+            grad_scores[route_linear] = 0.0f;
+        }
+        return;
+    }
+    float partial = 0.0f;
+    for (int64_t column = threadIdx.x; column < hidden; column += blockDim.x) {
+        partial += __bfloat162float(route_output[expanded_row * hidden + column]) *
+                   __bfloat162float(grad_output[expanded_row * hidden + column]);
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        partial += __shfl_down_sync(0xffffffff, partial, offset);
+    }
+    __shared__ float warp_sums[8];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    if (lane == 0) {
+        warp_sums[warp] = partial;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float total = lane < 8 ? warp_sums[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            total += __shfl_down_sync(0xffffffff, total, offset);
+        }
+        if (lane == 0) {
+            grad_scores[route_linear] = total;
+        }
+    }
+#endif
+}
+
+__global__ void sm103_expanded_route_scale_quantize_group128_kernel(
+    const __nv_bfloat16* grad_output,
+    const float* route_scores,
+    __nv_fp8_e4m3* output,
+    float* scales,
+    int64_t rows,
+    int64_t hidden
+) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1030
+    const int64_t num_blocks_k = hidden / kBlockK;
+    const int64_t work_idx = blockIdx.x;
+    const int64_t row = work_idx / num_blocks_k;
+    const int64_t block_k = work_idx - row * num_blocks_k;
+    if (row >= rows) {
+        return;
+    }
+    const int64_t column = block_k * kBlockK + threadIdx.x;
+    const float value = __bfloat162float(grad_output[row * hidden + column]) * route_scores[row];
+    __shared__ float warp_values[4];
+    const float amax = block_max_128(fabsf(value), warp_values);
+    const float scale = amax == 0.0f ? 1.0f : amax / kE4M3Max;
+    if (threadIdx.x == 0) {
+        scales[row * num_blocks_k + block_k] = scale;
+    }
+    output[row * hidden + column] = __nv_fp8_e4m3(value / scale);
+#endif
+}
+
+__global__ void sm103_zero_expanded_wgrad_padding_kernel(
+    __nv_bfloat16* left,
+    __nv_bfloat16* right,
+    const int32_t* group_counts,
+    const int32_t* padded_offsets,
+    int64_t groups,
+    int64_t left_columns,
+    int64_t right_columns
+) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1030
+    const int64_t expert = blockIdx.x;
+    if (expert >= groups) {
+        return;
+    }
+    const int64_t start = expert == 0 ? 0 : padded_offsets[expert - 1];
+    const int64_t valid_end = start + group_counts[expert];
+    const int64_t padded_end = padded_offsets[expert];
+    const int64_t padding_rows = padded_end - valid_end;
+    const int64_t left_elements = padding_rows * left_columns;
+    const int64_t total_elements = left_elements + padding_rows * right_columns;
+    for (int64_t index = threadIdx.x; index < total_elements; index += blockDim.x) {
+        if (index < left_elements) {
+            const int64_t row = valid_end + index / left_columns;
+            const int64_t column = index - (row - valid_end) * left_columns;
+            left[row * left_columns + column] = __float2bfloat16(0.0f);
+        } else {
+            const int64_t right_index = index - left_elements;
+            const int64_t row = valid_end + right_index / right_columns;
+            const int64_t column = right_index - (row - valid_end) * right_columns;
+            right[row * right_columns + column] = __float2bfloat16(0.0f);
+        }
+    }
+#endif
+}
+
+__global__ void sm103_prepare_expanded_wgrad_metadata_kernel(
+    const int32_t* psum,
+    int32_t* padded_offsets,
+    int32_t* group_counts,
+    int64_t groups,
+    int64_t storage_rows
+) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1030
+    const int64_t expert = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (expert >= groups) {
+        return;
+    }
+    const int64_t previous_end = expert == 0 ? 0 : psum[expert - 1];
+    const int64_t start = (previous_end + kBlockK - 1) / kBlockK * kBlockK;
+    const int64_t end = psum[expert];
+    const int64_t padded_end = (end + kBlockK - 1) / kBlockK * kBlockK;
+    if (end < start || padded_end > storage_rows ||
+        (expert == groups - 1 && padded_end != storage_rows)) {
+        asm volatile("trap;");
+        return;
+    }
+    padded_offsets[expert] = static_cast<int32_t>(padded_end);
+    group_counts[expert] = static_cast<int32_t>(end - start);
+#endif
+}
+
+__global__ void sm103_zero_empty_wgrad_groups_kernel(
+    __nv_bfloat16* output,
+    const int32_t* group_counts,
+    int64_t groups,
+    int64_t elements_per_group
+) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1030
+    const int64_t expert = blockIdx.x;
+    if (expert >= groups || group_counts[expert] != 0) {
+        return;
+    }
+    for (int64_t index = threadIdx.x; index < elements_per_group; index += blockDim.x) {
+        output[expert * elements_per_group + index] = __float2bfloat16(0.0f);
+    }
+#endif
+}
+
 template <bool kWeightIsKByN>
 struct SM103GroupedBlockwiseGemm {
     using ProblemShape = cutlass::gemm::GroupProblemShape<cute::Shape<int, int, int>>;
@@ -507,20 +758,156 @@ struct SM103GroupedBlockwiseGemm {
     using StrideD = typename GemmKernel::InternalStrideD;
 };
 
-template <typename T>
-torch::Tensor copy_metadata_to_device(
-    const std::vector<T>& host,
-    const torch::TensorOptions& options,
-    cudaStream_t stream
-) {
-    const int64_t num_bytes = static_cast<int64_t>(host.size() * sizeof(T));
-    auto storage = torch::empty({std::max<int64_t>(num_bytes, 1)}, options.dtype(torch::kUInt8));
-    if (num_bytes != 0) {
-        C10_CUDA_CHECK(cudaMemcpyAsync(
-            storage.data_ptr(), host.data(), num_bytes, cudaMemcpyHostToDevice, stream
-        ));
+struct MetadataBlob {
+    std::vector<uint8_t> bytes;
+
+    template <typename T>
+    size_t append(const std::vector<T>& values) {
+        constexpr size_t kMinimumAlignment = 16;
+        const size_t alignment = std::max(kMinimumAlignment, alignof(T));
+        const size_t offset = (bytes.size() + alignment - 1) / alignment * alignment;
+        const size_t value_bytes = values.size() * sizeof(T);
+        bytes.resize(offset + value_bytes);
+        if (value_bytes != 0) {
+            std::memcpy(bytes.data() + offset, values.data(), value_bytes);
+        }
+        return offset;
     }
-    return storage;
+
+    torch::Tensor copy_to_device(
+        const torch::TensorOptions& options,
+        cudaStream_t stream
+    ) const {
+        auto storage = torch::empty(
+            {std::max<int64_t>(static_cast<int64_t>(bytes.size()), 1)},
+            options.dtype(torch::kUInt8));
+        if (!bytes.empty()) {
+            C10_CUDA_CHECK(cudaMemcpyAsync(
+                storage.data_ptr(), bytes.data(), bytes.size(),
+                cudaMemcpyHostToDevice, stream));
+        }
+        return storage;
+    }
+};
+
+void check_grouped_bf16_wgrad_inputs(
+    const torch::Tensor& left,
+    const torch::Tensor& right,
+    const int64_t groups
+) {
+    check_bf16_matrix(left, "left");
+    check_bf16_matrix(right, "right");
+    TORCH_CHECK(left.device() == right.device(), "left and right must share a device");
+    TORCH_CHECK(left.size(0) == right.size(0), "left and right row counts differ");
+    TORCH_CHECK(groups > 0 && groups < 1024,
+                "SM103 grouped BF16 wgrad requires between 1 and 1023 groups");
+}
+
+torch::Tensor launch_grouped_bf16_wgrad(
+    const torch::Tensor& left,
+    const torch::Tensor& right,
+    const torch::Tensor& metadata_device,
+    const bool zero_expanded_padding
+) {
+    const int64_t groups = metadata_device.numel() / 2;
+    if (left.size(0) == 0) {
+        return torch::zeros(
+            {groups, left.size(1), right.size(1)}, left.options());
+    }
+
+    c10::cuda::CUDAGuard guard(left.device());
+    const auto stream = at::cuda::getCurrentCUDAStream(left.get_device());
+    auto padded_offsets = metadata_device.narrow(0, 0, groups);
+    const auto* counts_device = metadata_device.data_ptr<int32_t>() + groups;
+    if (zero_expanded_padding) {
+        constexpr int threads = 256;
+        sm103_zero_expanded_wgrad_padding_kernel<<<groups, threads, 0, stream>>>(
+            reinterpret_cast<__nv_bfloat16*>(left.data_ptr()),
+            reinterpret_cast<__nv_bfloat16*>(right.data_ptr()),
+            counts_device,
+            padded_offsets.data_ptr<int32_t>(),
+            groups, left.size(1), right.size(1));
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+
+    // Exact SM103 validation above makes PyTorch's BF16 grouped tensor-core
+    // implementation the only reachable dispatch.  There is no architecture
+    // fallback in this companion entry point.
+    auto output = at::_grouped_mm(
+        left.transpose(0, 1), right, padded_offsets, std::nullopt, std::nullopt);
+    constexpr int threads = 256;
+    sm103_zero_empty_wgrad_groups_kernel<<<groups, threads, 0, stream>>>(
+        reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
+        counts_device,
+        groups, left.size(1) * right.size(1));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
+
+torch::Tensor grouped_bf16_wgrad(
+    const torch::Tensor& left,
+    const torch::Tensor& right,
+    const std::vector<int64_t>& padded_group_counts
+) {
+    check_grouped_bf16_wgrad_inputs(left, right, padded_group_counts.size());
+
+    std::vector<int32_t> metadata(padded_group_counts.size() * 2);
+    int64_t storage_rows = 0;
+    for (size_t expert = 0; expert < padded_group_counts.size(); ++expert) {
+        const int64_t count = padded_group_counts[expert];
+        TORCH_CHECK(count >= 0 && count <= std::numeric_limits<int32_t>::max(),
+                    "group counts must fit non-negative int32");
+        TORCH_CHECK(count == 0 || count % kBlockK == 0,
+                    "BF16 wgrad group storage must be padded to 128 rows");
+        storage_rows += count;
+        TORCH_CHECK(storage_rows <= std::numeric_limits<int32_t>::max(),
+                    "BF16 wgrad storage rows must fit int32");
+        metadata[expert] = static_cast<int32_t>(storage_rows);
+        metadata[padded_group_counts.size() + expert] = static_cast<int32_t>(count);
+    }
+    TORCH_CHECK(storage_rows == left.size(0),
+                "group counts do not match BF16 wgrad storage rows");
+
+    c10::cuda::CUDAGuard guard(left.device());
+    const auto stream = at::cuda::getCurrentCUDAStream(left.get_device());
+    auto metadata_device = torch::empty(
+        {static_cast<int64_t>(metadata.size())},
+        left.options().dtype(torch::kInt32));
+    C10_CUDA_CHECK(cudaMemcpyAsync(
+        metadata_device.data_ptr(), metadata.data(), metadata.size() * sizeof(int32_t),
+        cudaMemcpyHostToDevice, stream));
+    return launch_grouped_bf16_wgrad(left, right, metadata_device, false);
+}
+
+torch::Tensor grouped_bf16_wgrad_expanded(
+    const torch::Tensor& left,
+    const torch::Tensor& right,
+    const torch::Tensor& psum
+) {
+    check_sm103_device(psum);
+    DG_CHECK_CONTIGUOUS(psum);
+    TORCH_CHECK(psum.dim() == 1 && psum.scalar_type() == torch::kInt32,
+                "expanded PSUM must be contiguous rank-1 int32");
+    TORCH_CHECK(psum.device() == left.device(), "expanded PSUM device mismatch");
+    check_grouped_bf16_wgrad_inputs(left, right, psum.numel());
+    TORCH_CHECK(left.size(0) <= std::numeric_limits<int32_t>::max(),
+                "BF16 wgrad storage rows must fit int32");
+
+    auto metadata_device = torch::empty(
+        {psum.numel() * 2}, left.options().dtype(torch::kInt32));
+    auto padded_offsets = metadata_device.narrow(0, 0, psum.numel());
+    auto group_counts = metadata_device.narrow(0, psum.numel(), psum.numel());
+    c10::cuda::CUDAGuard guard(left.device());
+    const auto stream = at::cuda::getCurrentCUDAStream(left.get_device());
+    constexpr int threads = 256;
+    const int64_t blocks = (psum.numel() + threads - 1) / threads;
+    sm103_prepare_expanded_wgrad_metadata_kernel<<<blocks, threads, 0, stream>>>(
+        psum.data_ptr<int32_t>(),
+        padded_offsets.data_ptr<int32_t>(),
+        group_counts.data_ptr<int32_t>(),
+        psum.numel(), left.size(0));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return launch_grouped_bf16_wgrad(left, right, metadata_device, true);
 }
 
 template <bool kWeightIsKByN>
@@ -529,7 +916,8 @@ torch::Tensor grouped_fp8_block128_gemm_impl(
     const torch::Tensor& activation_scales,
     const torch::Tensor& weights,
     const torch::Tensor& weight_scales,
-    const std::vector<int64_t>& group_counts
+    const std::vector<int64_t>& group_counts,
+    const bool expanded_layout
 ) {
     using Config = SM103GroupedBlockwiseGemm<kWeightIsKByN>;
     using Problem = typename Config::ProblemShape::UnderlyingProblemShape;
@@ -566,18 +954,19 @@ torch::Tensor grouped_fp8_block128_gemm_impl(
                     "weight scales must have shape [G, N/128, K/128]");
     }
 
-    int64_t total_rows = 0;
+    int64_t storage_rows = 0;
     int64_t active_groups = 0;
     for (const int64_t count : group_counts) {
         TORCH_CHECK(count >= 0, "group counts must be non-negative");
-        TORCH_CHECK(count == 0 || count % 4 == 0,
-                    "active group counts must be padded to a multiple of four");
-        total_rows += count;
+        TORCH_CHECK(expanded_layout || count == 0 || count % 4 == 0,
+                    "packed active group counts must be padded to a multiple of four");
+        storage_rows += expanded_layout ? align_rows(count) : count;
         active_groups += count != 0;
     }
-    TORCH_CHECK(total_rows == activations.size(0), "sum(group_counts) must equal activation rows");
+    TORCH_CHECK(storage_rows == activations.size(0),
+                "group counts do not match the activation storage rows");
 
-    auto output = torch::empty({total_rows, n}, activations.options().dtype(torch::kBFloat16));
+    auto output = torch::empty({storage_rows, n}, activations.options().dtype(torch::kBFloat16));
     if (active_groups == 0) {
         return output;
     }
@@ -644,23 +1033,26 @@ torch::Tensor grouped_fp8_block128_gemm_impl(
             cute::make_shape(static_cast<int>(m), static_cast<int>(n), static_cast<int>(k), 1)));
         layout_sfb.push_back(Config::ScaleConfig::tile_atom_to_shape_SFB(
             cute::make_shape(static_cast<int>(m), static_cast<int>(n), static_cast<int>(k), 1)));
-        row_offset += m;
+        row_offset += expanded_layout ? align_rows(m) : m;
     }
 
     const auto metadata_options = activations.options().dtype(torch::kUInt8);
-    auto problems_device = copy_metadata_to_device(problems, metadata_options, stream);
-    auto ptr_a_device = copy_metadata_to_device(ptr_a, metadata_options, stream);
-    auto ptr_b_device = copy_metadata_to_device(ptr_b, metadata_options, stream);
-    auto ptr_c_device = copy_metadata_to_device(ptr_c, metadata_options, stream);
-    auto ptr_d_device = copy_metadata_to_device(ptr_d, metadata_options, stream);
-    auto ptr_sfa_device = copy_metadata_to_device(ptr_sfa, metadata_options, stream);
-    auto ptr_sfb_device = copy_metadata_to_device(ptr_sfb, metadata_options, stream);
-    auto stride_a_device = copy_metadata_to_device(stride_a, metadata_options, stream);
-    auto stride_b_device = copy_metadata_to_device(stride_b, metadata_options, stream);
-    auto stride_c_device = copy_metadata_to_device(stride_c, metadata_options, stream);
-    auto stride_d_device = copy_metadata_to_device(stride_d, metadata_options, stream);
-    auto layout_sfa_device = copy_metadata_to_device(layout_sfa, metadata_options, stream);
-    auto layout_sfb_device = copy_metadata_to_device(layout_sfb, metadata_options, stream);
+    MetadataBlob metadata_blob;
+    const auto problems_offset = metadata_blob.append(problems);
+    const auto ptr_a_offset = metadata_blob.append(ptr_a);
+    const auto ptr_b_offset = metadata_blob.append(ptr_b);
+    const auto ptr_c_offset = metadata_blob.append(ptr_c);
+    const auto ptr_d_offset = metadata_blob.append(ptr_d);
+    const auto ptr_sfa_offset = metadata_blob.append(ptr_sfa);
+    const auto ptr_sfb_offset = metadata_blob.append(ptr_sfb);
+    const auto stride_a_offset = metadata_blob.append(stride_a);
+    const auto stride_b_offset = metadata_blob.append(stride_b);
+    const auto stride_c_offset = metadata_blob.append(stride_c);
+    const auto stride_d_offset = metadata_blob.append(stride_d);
+    const auto layout_sfa_offset = metadata_blob.append(layout_sfa);
+    const auto layout_sfb_offset = metadata_blob.append(layout_sfb);
+    auto metadata_device = metadata_blob.copy_to_device(metadata_options, stream);
+    auto* metadata_base = metadata_device.data_ptr<uint8_t>();
 
     cutlass::KernelHardwareInfo hardware_info;
     hardware_info.device_id = activations.get_device();
@@ -670,21 +1062,21 @@ torch::Tensor grouped_fp8_block128_gemm_impl(
     typename Config::Gemm::Arguments arguments{
         cutlass::gemm::GemmUniversalMode::kGrouped,
         {static_cast<int>(active_groups),
-         reinterpret_cast<Problem*>(problems_device.data_ptr()),
+         reinterpret_cast<Problem*>(metadata_base + problems_offset),
          problems.data()},
-        {reinterpret_cast<const ElementA**>(ptr_a_device.data_ptr()),
-         reinterpret_cast<typename Config::StrideA*>(stride_a_device.data_ptr()),
-         reinterpret_cast<const ElementB**>(ptr_b_device.data_ptr()),
-         reinterpret_cast<typename Config::StrideB*>(stride_b_device.data_ptr()),
-         reinterpret_cast<const float**>(ptr_sfa_device.data_ptr()),
-         reinterpret_cast<typename Config::LayoutSFA*>(layout_sfa_device.data_ptr()),
-         reinterpret_cast<const float**>(ptr_sfb_device.data_ptr()),
-         reinterpret_cast<typename Config::LayoutSFB*>(layout_sfb_device.data_ptr())},
+        {reinterpret_cast<const ElementA**>(metadata_base + ptr_a_offset),
+         reinterpret_cast<typename Config::StrideA*>(metadata_base + stride_a_offset),
+         reinterpret_cast<const ElementB**>(metadata_base + ptr_b_offset),
+         reinterpret_cast<typename Config::StrideB*>(metadata_base + stride_b_offset),
+         reinterpret_cast<const float**>(metadata_base + ptr_sfa_offset),
+         reinterpret_cast<typename Config::LayoutSFA*>(metadata_base + layout_sfa_offset),
+         reinterpret_cast<const float**>(metadata_base + ptr_sfb_offset),
+         reinterpret_cast<typename Config::LayoutSFB*>(metadata_base + layout_sfb_offset)},
         {{},
-         reinterpret_cast<const ElementC**>(ptr_c_device.data_ptr()),
-         reinterpret_cast<typename Config::StrideC*>(stride_c_device.data_ptr()),
-         reinterpret_cast<ElementD**>(ptr_d_device.data_ptr()),
-         reinterpret_cast<typename Config::StrideD*>(stride_d_device.data_ptr())},
+         reinterpret_cast<const ElementC**>(metadata_base + ptr_c_offset),
+         reinterpret_cast<typename Config::StrideC*>(metadata_base + stride_c_offset),
+         reinterpret_cast<ElementD**>(metadata_base + ptr_d_offset),
+         reinterpret_cast<typename Config::StrideD*>(metadata_base + stride_d_offset)},
         hardware_info};
     arguments.epilogue.thread.alpha = 1.0f;
     arguments.epilogue.thread.beta = 0.0f;
@@ -715,7 +1107,8 @@ torch::Tensor grouped_fp8_block128_w13_gemm_nt_canonical_impl(
     const torch::Tensor& activation_scales,
     const torch::Tensor& canonical_weights,
     const torch::Tensor& canonical_weight_scales,
-    const std::vector<int64_t>& group_counts
+    const std::vector<int64_t>& group_counts,
+    const bool expanded_layout
 ) {
     // FireTitan stores [gate_0, up_0, gate_1, up_1, ...].  Submit two
     // independent N=H problems per active expert, pointing the first at the up
@@ -760,20 +1153,20 @@ torch::Tensor grouped_fp8_block128_w13_gemm_nt_canonical_impl(
                     torch::IntArrayRef({groups * 2, hidden / kBlockK, k / kBlockK}),
                 "canonical W13 scales must have shape [2E, H/128, D/128]");
 
-    int64_t total_rows = 0;
+    int64_t storage_rows = 0;
     int64_t active_groups = 0;
     for (const int64_t count : group_counts) {
         TORCH_CHECK(count >= 0, "group counts must be non-negative");
-        TORCH_CHECK(count == 0 || count % 4 == 0,
-                    "active group counts must be padded to a multiple of four");
-        total_rows += count;
+        TORCH_CHECK(expanded_layout || count == 0 || count % 4 == 0,
+                    "packed active group counts must be padded to a multiple of four");
+        storage_rows += expanded_layout ? align_rows(count) : count;
         active_groups += count != 0;
     }
-    TORCH_CHECK(total_rows == activations.size(0),
-                "sum(group_counts) must equal activation rows");
+    TORCH_CHECK(storage_rows == activations.size(0),
+                "group counts do not match the activation storage rows");
 
     auto output = torch::empty(
-        {total_rows, doubled_hidden}, activations.options().dtype(torch::kBFloat16));
+        {storage_rows, doubled_hidden}, activations.options().dtype(torch::kBFloat16));
     if (active_groups == 0) {
         return output;
     }
@@ -855,23 +1248,26 @@ torch::Tensor grouped_fp8_block128_w13_gemm_nt_canonical_impl(
             layout_sfb.push_back(Config::ScaleConfig::tile_atom_to_shape_SFB(
                 cute::make_shape(static_cast<int>(m), static_cast<int>(hidden), static_cast<int>(k), 1)));
         }
-        row_offset += m;
+        row_offset += expanded_layout ? align_rows(m) : m;
     }
 
     const auto metadata_options = activations.options().dtype(torch::kUInt8);
-    auto problems_device = copy_metadata_to_device(problems, metadata_options, stream);
-    auto ptr_a_device = copy_metadata_to_device(ptr_a, metadata_options, stream);
-    auto ptr_b_device = copy_metadata_to_device(ptr_b, metadata_options, stream);
-    auto ptr_c_device = copy_metadata_to_device(ptr_c, metadata_options, stream);
-    auto ptr_d_device = copy_metadata_to_device(ptr_d, metadata_options, stream);
-    auto ptr_sfa_device = copy_metadata_to_device(ptr_sfa, metadata_options, stream);
-    auto ptr_sfb_device = copy_metadata_to_device(ptr_sfb, metadata_options, stream);
-    auto stride_a_device = copy_metadata_to_device(stride_a, metadata_options, stream);
-    auto stride_b_device = copy_metadata_to_device(stride_b, metadata_options, stream);
-    auto stride_c_device = copy_metadata_to_device(stride_c, metadata_options, stream);
-    auto stride_d_device = copy_metadata_to_device(stride_d, metadata_options, stream);
-    auto layout_sfa_device = copy_metadata_to_device(layout_sfa, metadata_options, stream);
-    auto layout_sfb_device = copy_metadata_to_device(layout_sfb, metadata_options, stream);
+    MetadataBlob metadata_blob;
+    const auto problems_offset = metadata_blob.append(problems);
+    const auto ptr_a_offset = metadata_blob.append(ptr_a);
+    const auto ptr_b_offset = metadata_blob.append(ptr_b);
+    const auto ptr_c_offset = metadata_blob.append(ptr_c);
+    const auto ptr_d_offset = metadata_blob.append(ptr_d);
+    const auto ptr_sfa_offset = metadata_blob.append(ptr_sfa);
+    const auto ptr_sfb_offset = metadata_blob.append(ptr_sfb);
+    const auto stride_a_offset = metadata_blob.append(stride_a);
+    const auto stride_b_offset = metadata_blob.append(stride_b);
+    const auto stride_c_offset = metadata_blob.append(stride_c);
+    const auto stride_d_offset = metadata_blob.append(stride_d);
+    const auto layout_sfa_offset = metadata_blob.append(layout_sfa);
+    const auto layout_sfb_offset = metadata_blob.append(layout_sfb);
+    auto metadata_device = metadata_blob.copy_to_device(metadata_options, stream);
+    auto* metadata_base = metadata_device.data_ptr<uint8_t>();
 
     cutlass::KernelHardwareInfo hardware_info;
     hardware_info.device_id = activations.get_device();
@@ -881,21 +1277,21 @@ torch::Tensor grouped_fp8_block128_w13_gemm_nt_canonical_impl(
     typename Config::Gemm::Arguments arguments{
         cutlass::gemm::GemmUniversalMode::kGrouped,
         {static_cast<int>(active_problems),
-         reinterpret_cast<Problem*>(problems_device.data_ptr()),
+         reinterpret_cast<Problem*>(metadata_base + problems_offset),
          problems.data()},
-        {reinterpret_cast<const ElementA**>(ptr_a_device.data_ptr()),
-         reinterpret_cast<typename Config::StrideA*>(stride_a_device.data_ptr()),
-         reinterpret_cast<const ElementB**>(ptr_b_device.data_ptr()),
-         reinterpret_cast<typename Config::StrideB*>(stride_b_device.data_ptr()),
-         reinterpret_cast<const float**>(ptr_sfa_device.data_ptr()),
-         reinterpret_cast<typename Config::LayoutSFA*>(layout_sfa_device.data_ptr()),
-         reinterpret_cast<const float**>(ptr_sfb_device.data_ptr()),
-         reinterpret_cast<typename Config::LayoutSFB*>(layout_sfb_device.data_ptr())},
+        {reinterpret_cast<const ElementA**>(metadata_base + ptr_a_offset),
+         reinterpret_cast<typename Config::StrideA*>(metadata_base + stride_a_offset),
+         reinterpret_cast<const ElementB**>(metadata_base + ptr_b_offset),
+         reinterpret_cast<typename Config::StrideB*>(metadata_base + stride_b_offset),
+         reinterpret_cast<const float**>(metadata_base + ptr_sfa_offset),
+         reinterpret_cast<typename Config::LayoutSFA*>(metadata_base + layout_sfa_offset),
+         reinterpret_cast<const float**>(metadata_base + ptr_sfb_offset),
+         reinterpret_cast<typename Config::LayoutSFB*>(metadata_base + layout_sfb_offset)},
         {{},
-         reinterpret_cast<const ElementC**>(ptr_c_device.data_ptr()),
-         reinterpret_cast<typename Config::StrideC*>(stride_c_device.data_ptr()),
-         reinterpret_cast<ElementD**>(ptr_d_device.data_ptr()),
-         reinterpret_cast<typename Config::StrideD*>(stride_d_device.data_ptr())},
+         reinterpret_cast<const ElementC**>(metadata_base + ptr_c_offset),
+         reinterpret_cast<typename Config::StrideC*>(metadata_base + stride_c_offset),
+         reinterpret_cast<ElementD**>(metadata_base + ptr_d_offset),
+         reinterpret_cast<typename Config::StrideD*>(metadata_base + stride_d_offset)},
         hardware_info};
     arguments.epilogue.thread.alpha = 1.0f;
     arguments.epilogue.thread.beta = 0.0f;
@@ -928,7 +1324,7 @@ torch::Tensor grouped_fp8_block128_gemm_nt(
     const std::vector<int64_t>& group_counts
 ) {
     return grouped_fp8_block128_gemm_impl<false>(
-        activations, activation_scales, weights, weight_scales, group_counts);
+        activations, activation_scales, weights, weight_scales, group_counts, false);
 }
 
 torch::Tensor grouped_fp8_block128_gemm_nn(
@@ -939,7 +1335,61 @@ torch::Tensor grouped_fp8_block128_gemm_nn(
     const std::vector<int64_t>& group_counts
 ) {
     return grouped_fp8_block128_gemm_impl<true>(
-        activations, activation_scales, weights, weight_scales, group_counts);
+        activations, activation_scales, weights, weight_scales, group_counts, false);
+}
+
+torch::Tensor grouped_fp8_block128_gemm_nt_expanded(
+    const torch::Tensor& activations,
+    const torch::Tensor& activation_scales,
+    const torch::Tensor& weights,
+    const torch::Tensor& weight_scales,
+    const std::vector<int64_t>& group_counts
+) {
+    return grouped_fp8_block128_gemm_impl<false>(
+        activations, activation_scales, weights, weight_scales, group_counts, true);
+}
+
+torch::Tensor grouped_fp8_block128_gemm_nn_expanded(
+    const torch::Tensor& activations,
+    const torch::Tensor& activation_scales,
+    const torch::Tensor& weights,
+    const torch::Tensor& weight_scales,
+    const std::vector<int64_t>& group_counts
+) {
+    return grouped_fp8_block128_gemm_impl<true>(
+        activations, activation_scales, weights, weight_scales, group_counts, true);
+}
+
+torch::Tensor grouped_fp8_block128_w13_gemm_nt_canonical(
+    const torch::Tensor& activations,
+    const torch::Tensor& activation_scales,
+    const torch::Tensor& canonical_weights,
+    const torch::Tensor& canonical_weight_scales,
+    const std::vector<int64_t>& group_counts
+) {
+    return grouped_fp8_block128_w13_gemm_nt_canonical_impl<false>(
+        activations,
+        activation_scales,
+        canonical_weights,
+        canonical_weight_scales,
+        group_counts,
+        false);
+}
+
+torch::Tensor grouped_fp8_block128_w13_gemm_nt_canonical_expanded(
+    const torch::Tensor& activations,
+    const torch::Tensor& activation_scales,
+    const torch::Tensor& canonical_weights,
+    const torch::Tensor& canonical_weight_scales,
+    const std::vector<int64_t>& group_counts
+) {
+    return grouped_fp8_block128_w13_gemm_nt_canonical_impl<false>(
+        activations,
+        activation_scales,
+        canonical_weights,
+        canonical_weight_scales,
+        group_counts,
+        true);
 }
 
 std::tuple<torch::Tensor, torch::Tensor> quantize_bf16(const torch::Tensor& input) {
@@ -1180,6 +1630,185 @@ torch::Tensor post_down_score_grad(
     return output;
 }
 
+void check_expanded_routes(const torch::Tensor& routes, const torch::Device& device) {
+    check_sm103_device(routes);
+    TORCH_CHECK(routes.dim() == 2, "expanded routes must be rank 2");
+    TORCH_CHECK(routes.scalar_type() == torch::kInt32 || routes.scalar_type() == torch::kInt64,
+                "expanded routes must be int32 or int64");
+    TORCH_CHECK(routes.device() == device, "expanded routes must share the payload device");
+    TORCH_CHECK(routes.stride(1) > 0 && routes.stride(0) > 0,
+                "expanded routes must have positive strides");
+}
+
+torch::Tensor expanded_post_down_scale(
+    const torch::Tensor& route_output,
+    const torch::Tensor& route_scores
+) {
+    check_bf16_matrix(route_output, "route_output");
+    check_sm103_device(route_scores);
+    DG_CHECK_CONTIGUOUS(route_scores);
+    TORCH_CHECK(route_scores.scalar_type() == torch::kFloat32 && route_scores.dim() == 1,
+                "expanded route scores must be contiguous rank-1 float32");
+    TORCH_CHECK(route_scores.size(0) == route_output.size(0),
+                "expanded route score row count mismatch");
+    TORCH_CHECK(route_scores.device() == route_output.device(), "device mismatch");
+    auto output = torch::empty_like(route_output);
+    if (output.numel() != 0) {
+        constexpr int threads = 256;
+        const auto blocks = (output.numel() + threads - 1) / threads;
+        c10::cuda::CUDAGuard guard(route_output.device());
+        const auto stream = at::cuda::getCurrentCUDAStream(route_output.get_device());
+        sm103_expanded_post_down_scale_kernel<<<blocks, threads, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(route_output.data_ptr()),
+            route_scores.data_ptr<float>(),
+            reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
+            route_output.size(0),
+            route_output.size(1));
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    return output;
+}
+
+torch::Tensor expand_compact_routes(
+    const torch::Tensor& compact,
+    const torch::Tensor& routes,
+    const int64_t expanded_rows
+) {
+    check_bf16_matrix(compact, "compact");
+    check_expanded_routes(routes, compact.device());
+    TORCH_CHECK(expanded_rows >= 0, "expanded row count must be non-negative");
+    TORCH_CHECK(routes.size(0) == compact.size(0),
+                "route metadata and compact payload row counts differ");
+    auto output = torch::empty(
+        {expanded_rows, compact.size(1)}, compact.options().dtype(torch::kBFloat16));
+    if (routes.numel() != 0) {
+        constexpr int threads = 256;
+        c10::cuda::CUDAGuard guard(compact.device());
+        const auto stream = at::cuda::getCurrentCUDAStream(compact.get_device());
+        const auto blocks = routes.numel();
+        if (routes.scalar_type() == torch::kInt32) {
+            sm103_expand_compact_routes_kernel<int32_t><<<blocks, threads, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(compact.data_ptr()),
+                routes.data_ptr<int32_t>(),
+                reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
+                compact.size(0), routes.size(1), compact.size(1), expanded_rows,
+                routes.stride(0), routes.stride(1));
+        } else {
+            sm103_expand_compact_routes_kernel<int64_t><<<blocks, threads, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(compact.data_ptr()),
+                routes.data_ptr<int64_t>(),
+                reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
+                compact.size(0), routes.size(1), compact.size(1), expanded_rows,
+                routes.stride(0), routes.stride(1));
+        }
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    return output;
+}
+
+torch::Tensor collapse_expanded_routes(
+    const torch::Tensor& expanded,
+    const torch::Tensor& routes
+) {
+    check_bf16_matrix(expanded, "expanded");
+    check_expanded_routes(routes, expanded.device());
+    auto output = torch::empty(
+        {routes.size(0), expanded.size(1)}, expanded.options().dtype(torch::kBFloat16));
+    if (output.numel() != 0) {
+        constexpr int threads = 256;
+        c10::cuda::CUDAGuard guard(expanded.device());
+        const auto stream = at::cuda::getCurrentCUDAStream(expanded.get_device());
+        const auto blocks = routes.size(0);
+        if (routes.scalar_type() == torch::kInt32) {
+            sm103_collapse_expanded_routes_kernel<int32_t><<<blocks, threads, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(expanded.data_ptr()),
+                routes.data_ptr<int32_t>(),
+                reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
+                routes.size(0), routes.size(1), expanded.size(1), expanded.size(0),
+                routes.stride(0), routes.stride(1));
+        } else {
+            sm103_collapse_expanded_routes_kernel<int64_t><<<blocks, threads, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(expanded.data_ptr()),
+                routes.data_ptr<int64_t>(),
+                reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
+                routes.size(0), routes.size(1), expanded.size(1), expanded.size(0),
+                routes.stride(0), routes.stride(1));
+        }
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    return output;
+}
+
+torch::Tensor expanded_post_down_score_grad(
+    const torch::Tensor& route_output,
+    const torch::Tensor& grad_output,
+    const torch::Tensor& routes
+) {
+    check_bf16_matrix(route_output, "route_output");
+    check_bf16_matrix(grad_output, "grad_output");
+    check_expanded_routes(routes, route_output.device());
+    TORCH_CHECK(route_output.sizes() == grad_output.sizes(),
+                "expanded route output and gradient shapes differ");
+    TORCH_CHECK(route_output.device() == grad_output.device(), "device mismatch");
+    auto output = torch::empty(
+        routes.sizes(), route_output.options().dtype(torch::kFloat32));
+    if (routes.numel() != 0) {
+        constexpr int threads = 256;
+        c10::cuda::CUDAGuard guard(route_output.device());
+        const auto stream = at::cuda::getCurrentCUDAStream(route_output.get_device());
+        const auto blocks = routes.numel();
+        if (routes.scalar_type() == torch::kInt32) {
+            sm103_expanded_post_down_score_grad_kernel<int32_t><<<blocks, threads, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(route_output.data_ptr()),
+                reinterpret_cast<const __nv_bfloat16*>(grad_output.data_ptr()),
+                routes.data_ptr<int32_t>(), output.data_ptr<float>(),
+                routes.size(0), routes.size(1), route_output.size(1), route_output.size(0),
+                routes.stride(0), routes.stride(1));
+        } else {
+            sm103_expanded_post_down_score_grad_kernel<int64_t><<<blocks, threads, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(route_output.data_ptr()),
+                reinterpret_cast<const __nv_bfloat16*>(grad_output.data_ptr()),
+                routes.data_ptr<int64_t>(), output.data_ptr<float>(),
+                routes.size(0), routes.size(1), route_output.size(1), route_output.size(0),
+                routes.stride(0), routes.stride(1));
+        }
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    return output;
+}
+
+std::tuple<torch::Tensor, torch::Tensor> expanded_route_scale_quantize(
+    const torch::Tensor& grad_output,
+    const torch::Tensor& route_scores
+) {
+    check_bf16_matrix(grad_output, "grad_output");
+    check_sm103_device(route_scores);
+    DG_CHECK_CONTIGUOUS(route_scores);
+    TORCH_CHECK(route_scores.scalar_type() == torch::kFloat32 && route_scores.dim() == 1,
+                "expanded route scores must be contiguous rank-1 float32");
+    TORCH_CHECK(route_scores.size(0) == grad_output.size(0),
+                "expanded route score row count mismatch");
+    TORCH_CHECK(route_scores.device() == grad_output.device(), "device mismatch");
+    const auto rows = grad_output.size(0);
+    const auto hidden = grad_output.size(1);
+    auto output = torch::empty(
+        grad_output.sizes(), grad_output.options().dtype(torch::kFloat8_e4m3fn));
+    auto scales = torch::empty(
+        {rows, hidden / kBlockK}, grad_output.options().dtype(torch::kFloat32));
+    if (rows != 0) {
+        c10::cuda::CUDAGuard guard(grad_output.device());
+        const auto stream = at::cuda::getCurrentCUDAStream(grad_output.get_device());
+        sm103_expanded_route_scale_quantize_group128_kernel<<<
+            rows * (hidden / kBlockK), kBlockK, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(grad_output.data_ptr()),
+            route_scores.data_ptr<float>(),
+            reinterpret_cast<__nv_fp8_e4m3*>(output.data_ptr()),
+            scales.data_ptr<float>(), rows, hidden);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    return {output, scales};
+}
+
 pybind11::dict capabilities() {
     namespace py = pybind11;
     py::dict result;
@@ -1200,13 +1829,23 @@ pybind11::dict capabilities() {
         "sm103_fp8_block128_grouped_gemm_nt",
         "sm103_fp8_block128_grouped_gemm_nn",
         "sm103_fp8_block128_grouped_w13_gemm_nt_canonical",
+        "sm103_fp8_block128_grouped_gemm_nt_expanded",
+        "sm103_fp8_block128_grouped_gemm_nn_expanded",
+        "sm103_fp8_block128_grouped_w13_gemm_nt_canonical_expanded",
         "sm103_fp8_block128_swiglu_quantize",
         "sm103_fp8_block128_swiglu_backward",
         "sm103_fp8_block128_swiglu_backward_canonical",
         "sm103_fp8_block128_route_scale_quantize",
         "sm103_fp8_block128_post_down_combine",
         "sm103_fp8_block128_post_down_score_grad",
-        "sm103_fp8_block128_route_sum"
+        "sm103_fp8_block128_route_sum",
+        "sm103_fp8_block128_expanded_post_down_scale",
+        "sm103_fp8_block128_expand_compact_routes",
+        "sm103_fp8_block128_collapse_expanded_routes",
+        "sm103_fp8_block128_expanded_post_down_score_grad",
+        "sm103_fp8_block128_expanded_route_scale_quantize",
+        "sm103_fp8_block128_grouped_bf16_wgrad",
+        "sm103_fp8_block128_grouped_bf16_wgrad_expanded"
     );
     return result;
 }
@@ -1227,7 +1866,22 @@ void register_apis(pybind11::module_& m) {
           pybind11::arg("weights"), pybind11::arg("weight_scales"),
           pybind11::arg("group_counts"));
     m.def("sm103_fp8_block128_grouped_w13_gemm_nt_canonical",
-          &grouped_fp8_block128_w13_gemm_nt_canonical_impl<false>,
+          &grouped_fp8_block128_w13_gemm_nt_canonical,
+          pybind11::arg("activations"), pybind11::arg("activation_scales"),
+          pybind11::arg("canonical_weights"), pybind11::arg("canonical_weight_scales"),
+          pybind11::arg("group_counts"));
+    m.def("sm103_fp8_block128_grouped_gemm_nt_expanded",
+          &grouped_fp8_block128_gemm_nt_expanded,
+          pybind11::arg("activations"), pybind11::arg("activation_scales"),
+          pybind11::arg("weights"), pybind11::arg("weight_scales"),
+          pybind11::arg("group_counts"));
+    m.def("sm103_fp8_block128_grouped_gemm_nn_expanded",
+          &grouped_fp8_block128_gemm_nn_expanded,
+          pybind11::arg("activations"), pybind11::arg("activation_scales"),
+          pybind11::arg("weights"), pybind11::arg("weight_scales"),
+          pybind11::arg("group_counts"));
+    m.def("sm103_fp8_block128_grouped_w13_gemm_nt_canonical_expanded",
+          &grouped_fp8_block128_w13_gemm_nt_canonical_expanded,
           pybind11::arg("activations"), pybind11::arg("activation_scales"),
           pybind11::arg("canonical_weights"), pybind11::arg("canonical_weight_scales"),
           pybind11::arg("group_counts"));
@@ -1245,6 +1899,25 @@ void register_apis(pybind11::module_& m) {
           pybind11::arg("route_output"), pybind11::arg("grad_output"), pybind11::arg("topk"));
     m.def("sm103_fp8_block128_route_sum", &route_sum,
           pybind11::arg("route_grad"), pybind11::arg("num_tokens"), pybind11::arg("topk"));
+    m.def("sm103_fp8_block128_expanded_post_down_scale", &expanded_post_down_scale,
+          pybind11::arg("route_output"), pybind11::arg("route_scores"));
+    m.def("sm103_fp8_block128_expand_compact_routes", &expand_compact_routes,
+          pybind11::arg("compact"), pybind11::arg("routes"), pybind11::arg("expanded_rows"));
+    m.def("sm103_fp8_block128_collapse_expanded_routes", &collapse_expanded_routes,
+          pybind11::arg("expanded"), pybind11::arg("routes"));
+    m.def("sm103_fp8_block128_expanded_post_down_score_grad",
+          &expanded_post_down_score_grad,
+          pybind11::arg("route_output"), pybind11::arg("grad_output"), pybind11::arg("routes"));
+    m.def("sm103_fp8_block128_expanded_route_scale_quantize",
+          &expanded_route_scale_quantize,
+          pybind11::arg("grad_output"), pybind11::arg("route_scores"));
+    m.def("sm103_fp8_block128_grouped_bf16_wgrad",
+          &grouped_bf16_wgrad,
+          pybind11::arg("left"), pybind11::arg("right"),
+          pybind11::arg("padded_group_counts"));
+    m.def("sm103_fp8_block128_grouped_bf16_wgrad_expanded",
+          &grouped_bf16_wgrad_expanded,
+          pybind11::arg("left"), pybind11::arg("right"), pybind11::arg("psum"));
 }
 
 }  // namespace deep_gemm::sm103_fp8_block128

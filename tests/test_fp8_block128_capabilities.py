@@ -21,6 +21,12 @@ def test_fp8_block128_capability_manifest_is_exact_and_fail_closed() -> None:
     assert capabilities["weight_block_m"] == 128
     assert capabilities["weight_block_k"] == 128
     assert capabilities["route_score_placement"] == "post_down"
+    assert capabilities["distributed_transport"] == "deep_ep.ElasticBuffer.expanded"
+    assert capabilities["transport_layout"] == "expert_aligned_128"
+    assert capabilities["transport_scale_layout"] == "row_major_fp32_group128"
+    assert capabilities["transport_deterministic"] is True
+    assert capabilities["combine_reductions"] == 1
+    assert capabilities["wgrad_backend"] == "sm103_companion_grouped_bf16"
     assert capabilities["forward"] is True
     assert capabilities["backward"] is True
     assert capabilities["missing_symbols"] == ()
