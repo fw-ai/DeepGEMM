@@ -1941,7 +1941,7 @@ void launch_persistent_forward(
         kNumSMs,
         kNumRanks,
         0x7f800000u,
-        false,
+        true,
         deep_gemm::ActivationType::SwiGLU,
         true>);
     Kernel kernel = &deep_gemm::sm100_fp8_fp4_mega_moe_impl<
@@ -1964,7 +1964,7 @@ void launch_persistent_forward(
         kNumSMs,
         kNumRanks,
         0x7f800000u,
-        false,
+        true,
         deep_gemm::ActivationType::SwiGLU,
         true>;
 

@@ -6134,7 +6134,11 @@ sm103_fp8_block128_mega_moe_backward_impl(
             const float gate = static_cast<float>(
                 ring_bf16[static_cast<uint64_t>(row) * kHidden +
                             physical_gate]);
-            const float sigmoid = 1.0f / (1.0f + expf(-gate));
+            // Match the upstream MegaMoE default and the retained SM103
+            // control's fast-math SwiGLU.  Full libdevice expf over every
+            // routed feature is both a precision mismatch and a dominant
+            // large-M serialization cost.
+            const float sigmoid = math::fast_rcp(1.0f + __expf(-gate));
             const float h = up * gate * sigmoid;
             const float amax = reduce_group_128<true>(
                 cute::abs(h), storage, group_idx);
@@ -6236,7 +6240,7 @@ sm103_fp8_block128_mega_moe_backward_impl(
                                        2 * kIntermediate +
                                        col]) *
                                ring_scores[row];
-            const float sigmoid = 1.0f / (1.0f + expf(-gate));
+            const float sigmoid = math::fast_rcp(1.0f + __expf(-gate));
             const float grad_value = gate_plane
                 ? dy_h * up * sigmoid *
                       (1.0f + gate * (1.0f - sigmoid))
