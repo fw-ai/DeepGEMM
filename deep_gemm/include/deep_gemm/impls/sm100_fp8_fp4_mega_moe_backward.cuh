@@ -5404,10 +5404,10 @@ static constexpr uint32_t kUMMAN = kBlockM;
 static constexpr uint32_t kUMMAK = 32;
 static constexpr uint32_t kSwizzle = 128;
 static constexpr uint32_t kUTCCPAlignedElements = 128;
-// BAR 0 is owned by __syncthreads and BAR 8 by the 256-thread TMA epilogue.
-// Four independent reduction groups therefore use BAR 4..7. Reusing BAR 0
-// for a 128-thread group immediately before a 512-thread __syncthreads is a
-// barrier-count race when another group reaches the block barrier first.
+// BAR 0 is used both by __syncthreads and by the 256-thread TMA epilogue's
+// named barrier. Four independent reduction groups therefore use BAR 4..7,
+// and no block-wide barrier may run concurrently with a GEMM epilogue.
+// Reusing BAR 0 with a different arrival count is a barrier-count race.
 static constexpr uint32_t kReductionBarrierBase = 4;
 static constexpr uint32_t kNumTmemAccumCols =
     kUMMAN * kNumEpilogueStages;
@@ -5877,7 +5877,13 @@ CUTLASS_DEVICE void run_gemm_phase(
         cutlass::arch::warpgroup_reg_dealloc<40>();
     }
 
-    __syncthreads();
+    // The TMA epilogue uses named barrier 0 with a 256-thread arrival count.
+    // A block-wide __syncthreads here would reuse that physical barrier while
+    // the epilogue can still be draining, so non-epilogue warps could corrupt
+    // its count and strand the active CTA. The upstream 2-CTA GEMM terminates
+    // this role split with cluster synchronization only; the caller's next
+    // grid barrier supplies the subsequent block-wide synchronization after
+    // every thread has crossed this cluster boundary.
     comm::cluster_sync_with_relaxed_arrive();
 }
 
