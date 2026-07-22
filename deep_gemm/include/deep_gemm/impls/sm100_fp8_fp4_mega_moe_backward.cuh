@@ -6380,7 +6380,8 @@ sm103_fp8_block128_mega_moe_backward_persistent_impl(
     const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
     const __grid_constant__ layout::Workspace workspace,
     const bf16_t* compact_grad_y,
-    bf16_t* symmetric_bf16,
+    bf16_t* symmetric_grad_y,
+    bf16_t* symmetric_grad_x,
     fp8_t* ring_grad_y,
     uint32_t* ring_grad_y_sf,
     fp8_t* ring_grad_preact,
@@ -6396,7 +6397,6 @@ sm103_fp8_block128_mega_moe_backward_persistent_impl(
     bf16_t* grad_x,
     float* symmetric_grad_scores,
     float* grad_scores,
-    uint32_t* dispatch_done,
     const __grid_constant__ cute::TmaDescriptor tensor_map_ring_grad_y,
     const __grid_constant__ cute::TmaDescriptor tensor_map_ring_grad_y_sf,
     const __grid_constant__ cute::TmaDescriptor tensor_map_ring_grad_preact,
@@ -6444,16 +6444,15 @@ sm103_fp8_block128_mega_moe_backward_persistent_impl(
         cute::prefetch_tma_descriptor(&tensor_map_grad_x);
     }
 
-    // The forward combine plane is dead on entry. Reuse slot zero as the
-    // symmetric BF16 grad-y source until every reverse dispatch warp has
-    // completed its remote reads.
+    // Match upstream's separate input and combine transport lifetimes. The
+    // immutable grad-y plane may be pulled throughout dispatch while W13
+    // concurrently publishes dX into the independent combine plane. This is
+    // what permits ring generations to wrap without a global dispatch latch.
     for (uint64_t linear = global_thread;
          linear < static_cast<uint64_t>(num_tokens) * kHidden;
          linear += global_stride) {
-        symmetric_bf16[linear] = compact_grad_y[linear];
+        symmetric_grad_y[linear] = compact_grad_y[linear];
     }
-    if (global_thread == 0)
-        *dispatch_done = 0u;
     comm::nvlink_barrier<kNumRanks, kNumSMs, kThreads, 0, 91>(
         workspace, sym_buffer, blockIdx.x, threadIdx.x,
         []() { __syncthreads(); });
@@ -6518,7 +6517,7 @@ sm103_fp8_block128_mega_moe_backward_persistent_impl(
 
                 const auto metadata = token_src_metadata[pool_row];
                 const auto* remote_grad_y = sym_buffer.map(
-                    symmetric_bf16 +
+                    symmetric_grad_y +
                         static_cast<uint64_t>(metadata.token_idx) *
                             kHidden,
                     metadata.rank_idx);
@@ -6610,10 +6609,6 @@ sm103_fp8_block128_mega_moe_backward_persistent_impl(
                     ptx::sync_aligned(
                         kDispatchThreads, kDispatchNamedBarrier);
                 });
-        if (blockIdx.x == 0 && dispatch_warp == 0 && lane_idx == 0) {
-            __threadfence();
-            atomicExch(dispatch_done, 1u);
-        }
     } else if (warp_idx == 4) {
         cutlass::arch::warpgroup_reg_dealloc<40>();
         Scheduler scheduler(expert_counts);
@@ -7038,8 +7033,6 @@ sm103_fp8_block128_mega_moe_backward_persistent_impl(
                     }
                     __syncwarp();
                 } else {
-                    while (ptx::ld_acq(dispatch_done) != 1u) {
-                    }
                     constexpr uint32_t kVecElements =
                         sizeof(uint4) / sizeof(bf16_t);
                     constexpr uint32_t kVecsPerNBlock =
@@ -7064,7 +7057,7 @@ sm103_fp8_block128_mega_moe_backward_persistent_impl(
                                     kHidden)[source_vec];
                         auto* remote = sym_buffer.map(
                             reinterpret_cast<uint4*>(
-                                symmetric_bf16 +
+                                symmetric_grad_x +
                                 (static_cast<uint64_t>(
                                      metadata.topk_idx) *
                                      capacity +
@@ -7111,7 +7104,7 @@ sm103_fp8_block128_mega_moe_backward_persistent_impl(
             value = __fadd_rn(
                 value,
                 static_cast<float>(
-                    symmetric_bf16[
+                    symmetric_grad_x[
                         (static_cast<uint64_t>(slot) * capacity +
                          token) *
                             kHidden +
@@ -7132,8 +7125,6 @@ sm103_fp8_block128_mega_moe_backward_persistent_impl(
         *workspace.get_l2_full_count_ptr(block) = 0u;
         *workspace.get_l2_empty_count_ptr(block) = 0u;
     }
-    if (global_thread == 0)
-        *dispatch_done = 0u;
     comm::grid_sync<kNumSMs, 3>(
         workspace, blockIdx.x, threadIdx.x,
         []() { __syncthreads(); });

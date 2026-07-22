@@ -177,7 +177,6 @@ struct PersistentWorkspaceLayout {
     deep_gemm::layout::Buffer backward_grad_y_tokens;
     deep_gemm::layout::Buffer backward_grad_y_scales;
     deep_gemm::layout::Buffer backward_grad_scores;
-    deep_gemm::layout::Buffer backward_dispatch_done;
     deep_gemm::layout::Buffer backward_ring_grad_y;
     deep_gemm::layout::Buffer backward_ring_grad_y_scales;
     deep_gemm::layout::Buffer backward_ring_grad_preact;
@@ -283,20 +282,11 @@ struct PersistentWorkspaceLayout {
             1,
             capacity,
             backward_grad_y_scales.get_end_ptr()),
-        backward_dispatch_done(
-            // The control word itself is four bytes, but every following
-            // reverse-pipeline operand is TMA-addressed and therefore needs
-            // a 16-byte-aligned base.  Reserve one complete TMA alignment
-            // unit here instead of shifting the entire suffix by four bytes.
-            deep_gemm::layout::Data(16, false),
-            1,
-            1,
-            backward_grad_scores.get_end_ptr()),
         backward_ring_grad_y(
             deep_gemm::layout::Data(kPersistentHidden),
             1,
             ring_tokens,
-            backward_dispatch_done.get_end_ptr()),
+            backward_grad_scores.get_end_ptr()),
         backward_ring_grad_y_scales(
             deep_gemm::layout::Data(kPersistentHidden / 32),
             1,
@@ -2359,6 +2349,12 @@ void launch_persistent_backward_activation(
         sym_buffer, layout.workspace,
         reinterpret_cast<const cutlass::bfloat16_t*>(
             grad_output.data_ptr()),
+        // Reverse transport needs the same independent input/output
+        // lifetimes as upstream forward. Reuse the not-yet-live private
+        // wgrad-wide backing as the immutable symmetric grad-y plane; the
+        // normal combine plane remains the remote dX destination.
+        layout.backward_wgrad_bf16_wide
+            .get_base_ptr<cutlass::bfloat16_t>(),
         layout.combine_tokens.get_base_ptr<cutlass::bfloat16_t>(),
         layout.backward_ring_grad_y
             .get_base_ptr<cutlass::float_e4m3_t>(),
@@ -2378,7 +2374,6 @@ void launch_persistent_backward_activation(
         reinterpret_cast<cutlass::bfloat16_t*>(grad_x.data_ptr()),
         layout.backward_grad_scores.get_base_ptr<float>(),
         grad_scores.data_ptr<float>(),
-        layout.backward_dispatch_done.get_base_ptr<uint32_t>(),
         tensor_map_ring_grad_y, tensor_map_ring_grad_y_sf,
         tensor_map_ring_grad_preact, tensor_map_ring_grad_preact_sf,
         tensor_map_w2_dgrad, tensor_map_w13_dgrad,
