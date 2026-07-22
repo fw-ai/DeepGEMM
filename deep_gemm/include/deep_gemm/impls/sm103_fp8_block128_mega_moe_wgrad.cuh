@@ -18,12 +18,10 @@
 namespace deep_gemm::sm103_block128_wgrad {
 
 // The two CTAs form the same logical 256x256x64 production BF16 tile used by
-// DeepGEMM's grouped large-M kernels. Each dedicated wgrad kernel first converts
-// its FP8 route operands exactly once into private BF16 backing inside this same
-// persistent launch, grid-fences internally, and then runs the native BF16 TMA
-// / UMMA pipeline. Dequantization is therefore part of the dedicated kernel's
-// load prologue rather than repeated for every output tile or composed as a
-// separate kernel.
+// DeepGEMM's grouped large-M kernels.  Its two load warps read canonical E4M3
+// route tiles and FP32 power-of-two scales directly, materialize the exact BF16
+// operands in the native UMMA swizzle, and publish the stage to the MMA warp.
+// No full-route BF16 backing or grid-wide conversion phase exists.
 static constexpr uint32_t kHidden = 6144;
 static constexpr uint32_t kIntermediate = 2048;
 static constexpr uint32_t kGlobalExperts = 256;
@@ -33,9 +31,9 @@ static constexpr uint32_t kBlockN = 256;
 static constexpr uint32_t kBlockK = 64;
 static constexpr uint32_t kLoadBlockN = kBlockN / 2;
 static constexpr uint32_t kStages = 3;
-static constexpr uint32_t kTMAWarp = 0;
+static constexpr uint32_t kLoadAWarp = 0;
 static constexpr uint32_t kMMAWarp = 1;
-static constexpr uint32_t kReadyWarp = 2;
+static constexpr uint32_t kLoadBWarp = 2;
 static constexpr uint32_t kControlWarp = 3;
 static constexpr uint32_t kEpilogueFirstWarp = 4;
 static constexpr uint32_t kEpilogueThreads = 128;
@@ -63,9 +61,8 @@ struct alignas(1024) SharedStorage {
                                       [kStoreBlockM * kStoreBlockN];
     alignas(1024) bf16_t smem_a[kStages][kBlockK * kBlockM];
     alignas(1024) bf16_t smem_b[kStages][kBlockK * kLoadBlockN];
-    Barrier tma_full_barriers[kStages];
-    Barrier tma_empty_barriers[kStages];
-    Barrier mma_full_barriers[kStages];
+    Barrier load_full_barriers[kStages];
+    Barrier load_empty_barriers[kStages];
     Barrier tmem_full_barriers[kNumEpilogueStages];
     Barrier tmem_empty_barriers[kNumEpilogueStages];
     uint32_t tmem_ptr;
@@ -127,94 +124,71 @@ CUTLASS_DEVICE uint32_t convert_fp8x2_power2_to_bf16x2(
     return lo | (hi << 16);
 }
 
-template <
-    uint32_t kShape, uint32_t kLocalExperts,
-    uint32_t kNumSMs, uint32_t kNumThreads,
-    bool kApplyPostScale>
-CUTLASS_DEVICE void dequantize_route_pool_once(
-    const int* expert_counts,
-    const uint32_t max_pool_tokens,
+CUTLASS_DEVICE uint32_t get_bf16_mn_swizzled_pair_offset(
+    const uint32_t mn, const uint32_t k) {
+    const uint32_t row = mn & 7u;
+    const uint32_t col_byte = k * sizeof(bf16_t);
+    return (mn >> 3) * 8u * kSwizzle +
+           row * kSwizzle +
+           ((col_byte >> 4) ^ row) * 16u +
+           (col_byte & 15u);
+}
+
+template <uint32_t kShape>
+CUTLASS_DEVICE void load_dequant_bf16_tile(
     const fp8_t* source,
     const uint32_t* scales,
-    const float* scores,
-    bf16_t* destination) {
-    constexpr uint32_t kValuesPerVector = 8;
-    constexpr uint32_t kVectorsPerRow = kShape / kValuesPerVector;
+    const uint32_t route_base,
+    const uint32_t feature_block,
+    const uint32_t valid_k,
+    bf16_t* destination,
+    const uint32_t lane_idx) {
     constexpr uint32_t kScaleBlocksPerRow = kShape / 128;
     DG_STATIC_ASSERT(kShape % 128 == 0,
                      "wgrad dequant shape must be block128 aligned");
+    DG_STATIC_ASSERT(kBlockM == 128 && kLoadBlockN == 128,
+                     "wgrad tiled dequant requires one block128 feature group");
 
-    const uint64_t global_thread =
-        static_cast<uint64_t>(blockIdx.x) * kNumThreads + threadIdx.x;
-    constexpr uint64_t kGridThreads =
-        static_cast<uint64_t>(kNumSMs) * kNumThreads;
-    uint32_t pool_row = 0;
-
+    auto* destination_bytes = reinterpret_cast<uint8_t*>(destination);
     #pragma unroll 1
-    for (uint32_t expert = 0; expert < kLocalExperts; ++ expert) {
-        const uint32_t count = static_cast<uint32_t>(
-            __ldg(expert_counts + expert));
-        const uint32_t padded_count =
-            math::ceil_div(count, kRouteBlockM) * kRouteBlockM;
-        const uint64_t num_vectors =
-            static_cast<uint64_t>(padded_count) * kVectorsPerRow;
-        for (uint64_t linear = global_thread;
-             linear < num_vectors; linear += kGridThreads) {
-            const uint32_t route = static_cast<uint32_t>(
-                linear / kVectorsPerRow);
-            const uint32_t vector_in_row = static_cast<uint32_t>(
-                linear - static_cast<uint64_t>(route) * kVectorsPerRow);
-            const uint32_t feature =
-                vector_in_row * kValuesPerVector;
-            const uint64_t full_row =
-                static_cast<uint64_t>(pool_row) + route;
-            uint4 packed{};
-            if (route < count) {
-                const uint2 raw = *reinterpret_cast<const uint2*>(
-                    source + full_row * kShape + feature);
-                const uint32_t raw_words[2] = {raw.x, raw.y};
-                const uint32_t scale_exponent = scales[
-                    full_row * kScaleBlocksPerRow + feature / 128] & 0xffu;
-                const float post_scale = kApplyPostScale
-                    ? scores[full_row]
-                    : 1.0f;
-                auto* output_pairs = reinterpret_cast<uint32_t*>(&packed);
-                #pragma unroll
-                for (uint32_t pair = 0; pair < 4; ++ pair) {
-                    const uint16_t fp8x2 = static_cast<uint16_t>(
-                        raw_words[pair / 2] >> ((pair & 1u) * 16));
-                    uint32_t bf16x2 = convert_fp8x2_power2_to_bf16x2(
-                        fp8x2, scale_exponent);
-                    if constexpr (kApplyPostScale) {
-                        const auto dequantized = __bfloat1622float2(
-                            *reinterpret_cast<nv_bfloat162*>(&bf16x2));
-                        const auto scaled = __float22bfloat162_rn(
-                            __fmul2_rn(
-                                dequantized,
-                                {post_scale, post_scale}));
-                        bf16x2 =
-                            *reinterpret_cast<const uint32_t*>(&scaled);
-                    }
-                    output_pairs[pair] = bf16x2;
-                }
-            }
-            *reinterpret_cast<uint4*>(
-                destination + full_row * kShape + feature) = packed;
+    for (uint32_t local_k = 0; local_k < kBlockK; ++local_k) {
+        const bool valid = local_k < valid_k;
+        uint32_t scale_exponent = 0;
+        if (lane_idx == 0 && valid) {
+            scale_exponent = __ldg(
+                scales +
+                static_cast<uint64_t>(route_base + local_k) *
+                    kScaleBlocksPerRow +
+                feature_block) & 0xffu;
         }
-        pool_row += padded_count;
-    }
-    DG_DEVICE_ASSERT(pool_row <= max_pool_tokens);
+        scale_exponent = __shfl_sync(
+            0xffffffffu, scale_exponent, 0);
 
-    // Empty experts consume one permanent all-zero K tile beyond the routed
-    // pool. The host-side private scratch descriptors include these rows.
-    constexpr uint64_t kZeroVectors =
-        static_cast<uint64_t>(kBlockK) * kVectorsPerRow;
-    for (uint64_t linear = global_thread;
-         linear < kZeroVectors; linear += kGridThreads) {
-        *reinterpret_cast<uint4*>(
-            destination +
-            static_cast<uint64_t>(max_pool_tokens) * kShape +
-            linear * kValuesPerVector) = {};
+        #pragma unroll
+        for (uint32_t pair_group = 0; pair_group < 2; ++pair_group) {
+            const uint32_t pair = lane_idx + pair_group * 32u;
+            const uint32_t local_mn = pair * 2u;
+            uint32_t bf16x2 = 0;
+            if (valid) {
+                const uint16_t fp8x2 =
+                    *reinterpret_cast<const uint16_t*>(
+                        source +
+                        static_cast<uint64_t>(route_base + local_k) *
+                            kShape +
+                        feature_block * 128u + local_mn);
+                bf16x2 = convert_fp8x2_power2_to_bf16x2(
+                    fp8x2, scale_exponent);
+            }
+            #pragma unroll
+            for (uint32_t value = 0; value < 2; ++value) {
+                *reinterpret_cast<uint16_t*>(
+                    destination_bytes +
+                    get_bf16_mn_swizzled_pair_offset(
+                        local_mn + value, local_k)) =
+                    static_cast<uint16_t>(
+                        bf16x2 >> (value * 16u));
+            }
+        }
     }
 }
 
@@ -292,41 +266,16 @@ CUTLASS_GLOBAL __launch_bounds__(kThreads, 1) void
 sm103_fp8_block128_mega_moe_wgrad_impl(
     const int* expert_counts,
     const uint32_t max_pool_tokens,
-    const __grid_constant__ layout::Workspace workspace,
     const fp8_t* full_a,
     const fp8_t* full_b,
     const uint32_t* full_a_sf,
     const uint32_t* full_b_sf,
-    const float* full_scores,
-    bf16_t* cached_a,
-    bf16_t* cached_b,
-    const __grid_constant__ cute::TmaDescriptor tensor_map_a,
-    const __grid_constant__ cute::TmaDescriptor tensor_map_b,
     const __grid_constant__ cute::TmaDescriptor tensor_map_output_0,
     const __grid_constant__ cute::TmaDescriptor tensor_map_output_1) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1030
     using Scheduler = WgradTileScheduler<kW2, kNumRanks, kNumSMs>;
     constexpr uint32_t kShapeM = Scheduler::kShapeM;
     constexpr uint32_t kShapeN = Scheduler::kShapeN;
-    constexpr uint32_t kLocalExperts = Scheduler::kLocalExperts;
-
-    // One fused prologue per dedicated wgrad launch. This removes conversion
-    // from the output-tile loop while preserving the exact E4M3 + FP32
-    // power-of-two scale and BF16-rounding semantics.
-    // Reverse dispatch has already formed and power-of-two quantized dz =
-    // BF16(dy * route_score) for W2.  Dequantize it exactly once here; applying
-    // the route score again would square the router derivative.
-    dequantize_route_pool_once<
-        kShapeM, kLocalExperts, kNumSMs, kThreads, false>(
-            expert_counts, max_pool_tokens,
-            full_a, full_a_sf, full_scores, cached_a);
-    dequantize_route_pool_once<
-        kShapeN, kLocalExperts, kNumSMs, kThreads, false>(
-            expert_counts, max_pool_tokens,
-            full_b, full_b_sf, full_scores, cached_b);
-    comm::grid_sync<kNumSMs, kW2 ? 2u : 3u>(
-        workspace, blockIdx.x, threadIdx.x,
-        []() { __syncthreads(); });
 
     extern __shared__ __align__(1024) uint8_t smem_buffer[];
     SharedStorage& storage = *reinterpret_cast<SharedStorage*>(smem_buffer);
@@ -335,9 +284,7 @@ sm103_fp8_block128_mega_moe_wgrad_impl(
     const bool leader_cta = cute::block_rank_in_cluster() == 0;
     const uint32_t cta_rank = cute::block_rank_in_cluster();
 
-    if (warp_idx == kTMAWarp) {
-        cute::prefetch_tma_descriptor(&tensor_map_a);
-        cute::prefetch_tma_descriptor(&tensor_map_b);
+    if (warp_idx == kLoadAWarp) {
         cute::prefetch_tma_descriptor(&tensor_map_output_0);
         cute::prefetch_tma_descriptor(&tensor_map_output_1);
     }
@@ -346,10 +293,10 @@ sm103_fp8_block128_mega_moe_wgrad_impl(
     if (warp_idx == kControlWarp && cute::elect_one_sync()) {
         #pragma unroll
         for (uint32_t i = 0; i < kStages; ++i) {
-            storage.tma_full_barriers[i].init(1);
-            storage.tma_empty_barriers[i].init(1);
-            // Both CTAs publish their direct-BF16 TMA completion to CTA 0.
-            storage.mma_full_barriers[i].init(2);
+            // One A producer and one B producer in each CTA publish directly
+            // to CTA 0, matching upstream's four-arrival 2-CTA load stage.
+            storage.load_full_barriers[i].init(4);
+            storage.load_empty_barriers[i].init(1);
         }
         #pragma unroll
         for (uint32_t i = 0; i < kNumEpilogueStages; ++i) {
@@ -395,9 +342,11 @@ sm103_fp8_block128_mega_moe_wgrad_impl(
         phase ^= stage_idx == 0;
     };
 
-    if (warp_idx == kTMAWarp && cute::elect_one_sync()) {
-        // The production load warp now reads the once-dequantized BF16 backing
-        // directly into the native UMMA swizzle.
+    if (warp_idx == kLoadAWarp || warp_idx == kLoadBWarp) {
+        // Preserve upstream's two producer-warps-per-CTA pipeline. Each
+        // producer loads and dequantizes one canonical FP8 operand directly
+        // into its native BF16 UMMA tile; no route-pool backing is formed.
+        const bool load_a = warp_idx == kLoadAWarp;
         Scheduler scheduler(expert_counts);
         uint32_t expert, count, pool_row, m_block, n_block;
         while (scheduler.get_next(
@@ -407,46 +356,36 @@ sm103_fp8_block128_mega_moe_wgrad_impl(
                 cute::max(1u, math::ceil_div(count, kBlockK));
             for (uint32_t k_block = 0; k_block < num_k_blocks;
                  ++k_block) {
-                storage.tma_empty_barriers[stage_idx].wait(phase ^ 1u);
-                const uint32_t route = count == 0
-                    ? max_pool_tokens
-                    : pool_row + k_block * kBlockK;
-                const uint32_t a_feature = m_block * kBlockM;
-                const uint32_t b_feature =
-                    n_block * kBlockN + cta_rank * kLoadBlockN;
-                tma::copy<kBlockM, kBlockK, kSwizzle, bf16_t>(
-                    &tensor_map_a,
-                    &storage.tma_full_barriers[stage_idx],
-                    storage.smem_a[stage_idx],
-                    a_feature, route);
-                tma::copy<kLoadBlockN, kBlockK, kSwizzle, bf16_t>(
-                    &tensor_map_b,
-                    &storage.tma_full_barriers[stage_idx],
-                    storage.smem_b[stage_idx],
-                    b_feature, route);
-                storage.tma_full_barriers[stage_idx]
-                    .arrive_and_expect_tx(
-                        sizeof(storage.smem_a[0]) +
-                        sizeof(storage.smem_b[0]));
-                advance_pipeline();
-            }
-        }
-    } else if (warp_idx == kReadyWarp && cute::elect_one_sync()) {
-        // Each CTA waits for its local direct-BF16 TMAs, then contributes one
-        // arrival to CTA 0. The leader MMA warp therefore observes both halves
-        // without multicast-copying different GLM feature tiles over each
-        // other.
-        Scheduler scheduler(expert_counts);
-        uint32_t expert, count, pool_row, m_block, n_block;
-        while (scheduler.get_next(
-            expert, count, pool_row, m_block, n_block)) {
-            const uint32_t num_k_blocks =
-                cute::max(1u, math::ceil_div(count, kBlockK));
-            for (uint32_t k_block = 0; k_block < num_k_blocks;
-                 ++k_block) {
-                storage.tma_full_barriers[stage_idx].wait(phase);
+                storage.load_empty_barriers[stage_idx].wait(
+                    phase ^ 1u);
+                const uint32_t valid_k = count == 0
+                    ? 0u
+                    : cute::min(
+                          64u,
+                          count - k_block * kBlockK);
+                if (load_a) {
+                    load_dequant_bf16_tile<kShapeM>(
+                        full_a, full_a_sf,
+                        pool_row + k_block * kBlockK,
+                        m_block,
+                        valid_k,
+                        storage.smem_a[stage_idx],
+                        lane_idx);
+                } else {
+                    const uint32_t b_feature_block =
+                        n_block * (kBlockN / 128u) + cta_rank;
+                    load_dequant_bf16_tile<kShapeN>(
+                        full_b, full_b_sf,
+                        pool_row + k_block * kBlockK,
+                        b_feature_block,
+                        valid_k,
+                        storage.smem_b[stage_idx],
+                        lane_idx);
+                }
                 cutlass::arch::fence_view_async_shared();
-                storage.mma_full_barriers[stage_idx].arrive(0u);
+                __syncwarp();
+                if (cute::elect_one_sync())
+                    storage.load_full_barriers[stage_idx].arrive(0u);
                 advance_pipeline();
             }
         }
@@ -469,7 +408,7 @@ sm103_fp8_block128_mega_moe_wgrad_impl(
                 cute::max(1u, math::ceil_div(count, kBlockK));
             for (uint32_t k_block = 0; k_block < num_k_blocks;
                  ++k_block) {
-                storage.mma_full_barriers[stage_idx].wait(phase);
+                storage.load_full_barriers[stage_idx].wait(phase);
                 ptx::tcgen05_after_thread_sync();
                 const uint32_t a_base =
                     ptx::exchange(a_desc_lo, stage_idx);
@@ -497,7 +436,7 @@ sm103_fp8_block128_mega_moe_wgrad_impl(
                 constexpr uint16_t kCTAMask = 3;
                 cutlass::arch::umma_arrive_multicast_2x1SM(
                     reinterpret_cast<uint64_t*>(
-                        &storage.tma_empty_barriers[stage_idx]),
+                        &storage.load_empty_barriers[stage_idx]),
                     kCTAMask);
                 if (k_block == num_k_blocks - 1) {
                     cutlass::arch::umma_arrive_multicast_2x1SM(

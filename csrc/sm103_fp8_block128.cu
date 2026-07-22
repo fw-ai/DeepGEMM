@@ -193,8 +193,7 @@ struct PersistentWorkspaceLayout {
     deep_gemm::layout::Buffer backward_full_grad_preact_scales;
     deep_gemm::layout::Buffer saved_l1_preact;
     deep_gemm::layout::Buffer saved_down_unweighted;
-    deep_gemm::layout::Buffer backward_wgrad_bf16_narrow;
-    deep_gemm::layout::Buffer backward_wgrad_bf16_wide;
+    deep_gemm::layout::Buffer backward_symmetric_grad_y;
 
     PersistentWorkspaceLayout(
         void* base,
@@ -372,28 +371,20 @@ struct PersistentWorkspaceLayout {
             1,
             workspace.num_max_pool_tokens,
             saved_l1_preact.get_end_ptr()),
-        // The two dedicated wgrad kernels reuse these private operands. W13
-        // maps grad_preact -> narrow and x -> wide; W2 maps grad_y -> wide and
-        // h -> narrow. One extra K tile is a permanent zero source for empty
-        // experts. Capacity remains a once-derived context/CP consequence.
-        backward_wgrad_bf16_narrow(
-            deep_gemm::layout::Data(
-                2 * kPersistentIntermediate * sizeof(__nv_bfloat16)),
-            1,
-            workspace.num_max_pool_tokens +
-                deep_gemm::sm103_block128_wgrad::kBlockK,
-            saved_down_unweighted.get_end_ptr()),
-        backward_wgrad_bf16_wide(
+        // Upstream reverse transport needs an immutable symmetric input plane
+        // distinct from its remote dX combine plane. It is compact-token
+        // storage, not a routed-pool wgrad materialization, so its capacity is
+        // the same context/CP-derived per-rank envelope as the forward input.
+        backward_symmetric_grad_y(
             deep_gemm::layout::Data(
                 kPersistentHidden * sizeof(__nv_bfloat16)),
             1,
-            workspace.num_max_pool_tokens +
-                deep_gemm::sm103_block128_wgrad::kBlockK,
-            backward_wgrad_bf16_narrow.get_end_ptr()) {}
+            capacity,
+            saved_down_unweighted.get_end_ptr()) {}
 
     int64_t num_bytes() const {
         return reinterpret_cast<int64_t>(
-                   backward_wgrad_bf16_wide.get_end_ptr()) -
+                   backward_symmetric_grad_y.get_end_ptr()) -
                reinterpret_cast<int64_t>(workspace.base);
     }
 };
@@ -2277,11 +2268,9 @@ void launch_persistent_backward_activation(
         sym_buffer, layout.workspace,
         reinterpret_cast<const cutlass::bfloat16_t*>(
             grad_output.data_ptr()),
-        // Reverse transport needs the same independent input/output
-        // lifetimes as upstream forward. Reuse the not-yet-live private
-        // wgrad-wide backing as the immutable symmetric grad-y plane; the
-        // normal combine plane remains the remote dX destination.
-        layout.backward_wgrad_bf16_wide
+        // Reverse transport retains upstream's independent immutable input
+        // and remote-combine output lifetimes.
+        layout.backward_symmetric_grad_y
             .get_base_ptr<cutlass::bfloat16_t>(),
         layout.combine_tokens.get_base_ptr<cutlass::bfloat16_t>(),
         layout.backward_ring_grad_y
@@ -2316,57 +2305,23 @@ void launch_persistent_wgrad(
     const PersistentWorkspaceLayout& layout,
     const torch::Tensor& expert_counts
 ) {
-    constexpr int64_t shape_m =
-        kW2 ? kPersistentHidden : 2 * kPersistentIntermediate;
-    constexpr int64_t shape_n =
-        kW2 ? kPersistentIntermediate : kPersistentHidden;
     constexpr int64_t output_rows =
         kW2 ? kPersistentHidden : kPersistentIntermediate;
     constexpr int64_t output_columns =
         kW2 ? kPersistentIntermediate : kPersistentHidden;
     const int64_t local_experts = kPersistentExperts / kNumRanks;
-    const auto bf16_options = torch::TensorOptions()
-        .dtype(torch::kBFloat16)
-        .device(buffer.device());
     void* full_a_base = kW2
         ? layout.backward_full_grad_y.base
         : layout.backward_full_grad_preact.base;
     void* full_b_base = kW2
         ? layout.backward_full_h.base
         : layout.backward_full_x.base;
-    void* cached_a_base = kW2
-        ? layout.backward_wgrad_bf16_wide.base
-        : layout.backward_wgrad_bf16_narrow.base;
-    void* cached_b_base = kW2
-        ? layout.backward_wgrad_bf16_narrow.base
-        : layout.backward_wgrad_bf16_wide.base;
     const uint32_t* full_a_sf = kW2
         ? layout.backward_full_grad_y_scales.get_base_ptr<uint32_t>()
         : layout.backward_full_grad_preact_scales.get_base_ptr<uint32_t>();
     const uint32_t* full_b_sf = kW2
         ? layout.backward_full_h_scales.get_base_ptr<uint32_t>()
         : layout.backward_full_x_scales.get_base_ptr<uint32_t>();
-    const int64_t cached_rows =
-        static_cast<int64_t>(layout.workspace.num_max_pool_tokens) +
-        deep_gemm::sm103_block128_wgrad::kBlockK;
-    auto cached_a = torch::from_blob(
-        cached_a_base, {cached_rows, shape_m}, bf16_options);
-    auto cached_b = torch::from_blob(
-        cached_b_base, {cached_rows, shape_n}, bf16_options);
-    const auto tensor_map_a = deep_gemm::make_tma_2d_desc(
-        cached_a,
-        static_cast<int>(shape_m),
-        static_cast<int>(cached_rows),
-        deep_gemm::sm103_block128_wgrad::kBlockM,
-        deep_gemm::sm103_block128_wgrad::kBlockK,
-        static_cast<int>(shape_m), 128);
-    const auto tensor_map_b = deep_gemm::make_tma_2d_desc(
-        cached_b,
-        static_cast<int>(shape_n),
-        static_cast<int>(cached_rows),
-        deep_gemm::sm103_block128_wgrad::kLoadBlockN,
-        deep_gemm::sm103_block128_wgrad::kBlockK,
-        static_cast<int>(shape_n), 128);
     const auto output_0_flat = output_0.view(
         {local_experts * output_rows, output_columns});
     const auto output_1_flat = output_1.view(
@@ -2413,15 +2368,10 @@ void launch_persistent_wgrad(
         &config, kernel,
         expert_counts.data_ptr<int>(),
         layout.workspace.num_max_pool_tokens,
-        layout.workspace,
         static_cast<const cutlass::float_e4m3_t*>(full_a_base),
         static_cast<const cutlass::float_e4m3_t*>(full_b_base),
         full_a_sf,
         full_b_sf,
-        layout.backward_full_scores.get_base_ptr<float>(),
-        static_cast<cutlass::bfloat16_t*>(cached_a_base),
-        static_cast<cutlass::bfloat16_t*>(cached_b_base),
-        tensor_map_a, tensor_map_b,
         tensor_map_output_0, tensor_map_output_1));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
