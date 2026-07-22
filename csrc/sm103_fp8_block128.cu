@@ -119,10 +119,25 @@ constexpr uint32_t kPersistentEpilogueThreads = 256;
 constexpr uint32_t kPersistentThreads =
     kPersistentDispatchThreads + kPersistentNonEpilogueThreads +
     kPersistentEpilogueThreads;
-constexpr uint32_t kPersistentSMs = 152;
+constexpr uint32_t kPersistentLocalSMs = 148;
+constexpr uint32_t kPersistentProductionSMs = 152;
 constexpr uint32_t kPersistentSmemBytes = 212260;
 constexpr uint32_t kWorkspaceAlignment =
     deep_gemm::layout::kLCMCandidateBlockM;
+
+uint32_t get_persistent_sm_count(const torch::Tensor& tensor) {
+    cudaDeviceProp properties{};
+    C10_CUDA_CHECK(cudaGetDeviceProperties(
+        &properties, tensor.get_device()));
+    TORCH_CHECK(
+        properties.multiProcessorCount == kPersistentLocalSMs ||
+            properties.multiProcessorCount == kPersistentProductionSMs,
+        "persistent GLM MegaMoE supports the 148-SM and 152-SM SM103 "
+        "topologies, got ",
+        properties.multiProcessorCount,
+        " SMs");
+    return static_cast<uint32_t>(properties.multiProcessorCount);
+}
 
 constexpr uint32_t align_workspace_tokens(const uint32_t value) {
     return (value + kWorkspaceAlignment - 1) / kWorkspaceAlignment *
@@ -1671,7 +1686,8 @@ pybind11::dict persistent_workspace_info(
     result["block_m"] = kPersistentBlockM;
     result["block_n"] = kPersistentBlockN;
     result["block_k"] = kPersistentBlockK;
-    result["num_sms"] = kPersistentSMs;
+    result["supported_num_sms"] = pybind11::make_tuple(
+        kPersistentLocalSMs, kPersistentProductionSMs);
     return result;
 }
 
@@ -1732,7 +1748,7 @@ void prepare_persistent_inputs(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-template <uint32_t kNumRanks>
+template <uint32_t kNumRanks, uint32_t kNumSMs>
 void launch_persistent_forward(
     const torch::Tensor& output,
     const torch::Tensor& expert_counts,
@@ -1858,7 +1874,7 @@ void launch_persistent_forward(
         kPersistentDispatchThreads,
         kPersistentNonEpilogueThreads,
         kPersistentEpilogueThreads,
-        kPersistentSMs,
+        kNumSMs,
         kNumRanks,
         0x7f800000u,
         false,
@@ -1881,7 +1897,7 @@ void launch_persistent_forward(
         kPersistentDispatchThreads,
         kPersistentNonEpilogueThreads,
         kPersistentEpilogueThreads,
-        kPersistentSMs,
+        kNumSMs,
         kNumRanks,
         0x7f800000u,
         false,
@@ -1896,7 +1912,7 @@ void launch_persistent_forward(
     attribute.id = cudaLaunchAttributeClusterDimension;
     attribute.val.clusterDim = {2, 1, 1};
     cudaLaunchConfig_t config{};
-    config.gridDim = dim3(kPersistentSMs, 1, 1);
+    config.gridDim = dim3(kNumSMs, 1, 1);
     config.blockDim = dim3(kPersistentThreads, 1, 1);
     config.dynamicSmemBytes = kPersistentSmemBytes;
     config.stream = at::cuda::getCurrentCUDAStream(buffer.get_device());
@@ -1944,12 +1960,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> persistent_forward(
 ) {
     check_sm103_device(buffer);
     c10::cuda::CUDAGuard guard(buffer.device());
-    cudaDeviceProp properties{};
-    C10_CUDA_CHECK(cudaGetDeviceProperties(
-        &properties, buffer.get_device()));
-    TORCH_CHECK(properties.multiProcessorCount == kPersistentSMs,
-                "persistent GLM MegaMoE requires the 152-SM SM103 target, got ",
-                properties.multiProcessorCount);
+    const uint32_t num_sms = get_persistent_sm_count(buffer);
     TORCH_CHECK(buffer_ptrs.size() == 2 || buffer_ptrs.size() == 16,
                 "persistent GLM MegaMoE supports EP2 or EP16 only");
     TORCH_CHECK(rank >= 0 && rank < static_cast<int64_t>(buffer_ptrs.size()),
@@ -2008,21 +2019,35 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> persistent_forward(
     if (num_tokens == 0)
         return {output, expert_counts, token_src_metadata};
 
-    if (buffer_ptrs.size() == 2) {
-        launch_persistent_forward<2>(
-            output, expert_counts, token_src_metadata,
-            buffer, buffer_ptrs, rank, layout,
-            w13_weight, w13_scale, w2_weight, w2_scale, num_tokens);
+    if (num_sms == kPersistentLocalSMs) {
+        if (buffer_ptrs.size() == 2) {
+            launch_persistent_forward<2, kPersistentLocalSMs>(
+                output, expert_counts, token_src_metadata,
+                buffer, buffer_ptrs, rank, layout,
+                w13_weight, w13_scale, w2_weight, w2_scale, num_tokens);
+        } else {
+            launch_persistent_forward<16, kPersistentLocalSMs>(
+                output, expert_counts, token_src_metadata,
+                buffer, buffer_ptrs, rank, layout,
+                w13_weight, w13_scale, w2_weight, w2_scale, num_tokens);
+        }
     } else {
-        launch_persistent_forward<16>(
-            output, expert_counts, token_src_metadata,
-            buffer, buffer_ptrs, rank, layout,
-            w13_weight, w13_scale, w2_weight, w2_scale, num_tokens);
+        if (buffer_ptrs.size() == 2) {
+            launch_persistent_forward<2, kPersistentProductionSMs>(
+                output, expert_counts, token_src_metadata,
+                buffer, buffer_ptrs, rank, layout,
+                w13_weight, w13_scale, w2_weight, w2_scale, num_tokens);
+        } else {
+            launch_persistent_forward<16, kPersistentProductionSMs>(
+                output, expert_counts, token_src_metadata,
+                buffer, buffer_ptrs, rank, layout,
+                w13_weight, w13_scale, w2_weight, w2_scale, num_tokens);
+        }
     }
     return {output, expert_counts, token_src_metadata};
 }
 
-template <uint32_t kNumRanks>
+template <uint32_t kNumRanks, uint32_t kNumSMs>
 void launch_persistent_backward_activation(
     const torch::Tensor& grad_x,
     const torch::Tensor& grad_scores,
@@ -2169,10 +2194,10 @@ void launch_persistent_backward_activation(
 
     using Kernel = decltype(
         &deep_gemm::sm103_block128_backward::
-            sm103_fp8_block128_mega_moe_backward_impl<kNumRanks>);
+            sm103_fp8_block128_mega_moe_backward_impl<kNumRanks, kNumSMs>);
     Kernel kernel =
         &deep_gemm::sm103_block128_backward::
-            sm103_fp8_block128_mega_moe_backward_impl<kNumRanks>;
+            sm103_fp8_block128_mega_moe_backward_impl<kNumRanks, kNumSMs>;
     constexpr uint32_t smem_bytes = sizeof(
         deep_gemm::sm103_block128_backward::SharedStorage);
     C10_CUDA_CHECK(cudaFuncSetAttribute(
@@ -2181,7 +2206,7 @@ void launch_persistent_backward_activation(
     attribute.id = cudaLaunchAttributeClusterDimension;
     attribute.val.clusterDim = {2, 1, 1};
     cudaLaunchConfig_t config{};
-    config.gridDim = dim3(kPersistentSMs, 1, 1);
+    config.gridDim = dim3(kNumSMs, 1, 1);
     config.blockDim = dim3(
         deep_gemm::sm103_block128_backward::kThreads, 1, 1);
     config.dynamicSmemBytes = smem_bytes;
@@ -2243,7 +2268,7 @@ void launch_persistent_backward_activation(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-template <uint32_t kNumRanks, bool kW2>
+template <uint32_t kNumRanks, uint32_t kNumSMs, bool kW2>
 void launch_persistent_wgrad(
     const torch::Tensor& output_0,
     const torch::Tensor& output_1,
@@ -2280,10 +2305,12 @@ void launch_persistent_wgrad(
 
     using Kernel = decltype(
         &deep_gemm::sm103_block128_wgrad::
-            sm103_fp8_block128_mega_moe_wgrad_impl<kW2, kNumRanks>);
+            sm103_fp8_block128_mega_moe_wgrad_impl<
+                kW2, kNumRanks, kNumSMs>);
     Kernel kernel =
         &deep_gemm::sm103_block128_wgrad::
-            sm103_fp8_block128_mega_moe_wgrad_impl<kW2, kNumRanks>;
+            sm103_fp8_block128_mega_moe_wgrad_impl<
+                kW2, kNumRanks, kNumSMs>;
     constexpr uint32_t smem_bytes = sizeof(
         deep_gemm::sm103_block128_wgrad::SharedStorage);
     C10_CUDA_CHECK(cudaFuncSetAttribute(
@@ -2292,7 +2319,7 @@ void launch_persistent_wgrad(
     attribute.id = cudaLaunchAttributeClusterDimension;
     attribute.val.clusterDim = {2, 1, 1};
     cudaLaunchConfig_t config{};
-    config.gridDim = dim3(kPersistentSMs, 1, 1);
+    config.gridDim = dim3(kNumSMs, 1, 1);
     config.blockDim = dim3(
         deep_gemm::sm103_block128_wgrad::kThreads, 1, 1);
     config.dynamicSmemBytes = smem_bytes;
@@ -2362,12 +2389,7 @@ persistent_backward_activation(
                         std::numeric_limits<uint32_t>::max(),
                 "persistent backward context/CP envelope must be positive uint32");
     c10::cuda::CUDAGuard guard(buffer.device());
-    cudaDeviceProp properties{};
-    C10_CUDA_CHECK(cudaGetDeviceProperties(
-        &properties, buffer.get_device()));
-    TORCH_CHECK(properties.multiProcessorCount == kPersistentSMs,
-                "persistent GLM MegaMoE requires the 152-SM SM103 target, got ",
-                properties.multiProcessorCount);
+    const uint32_t num_sms = get_persistent_sm_count(buffer);
     check_bf16_matrix(x, "x");
     check_bf16_matrix(grad_output, "grad_output");
     TORCH_CHECK(x.sizes() == grad_output.sizes() &&
@@ -2441,18 +2463,34 @@ persistent_backward_activation(
     if (x.size(0) == 0) {
         return {grad_x, grad_scores};
     }
-    if (buffer_ptrs.size() == 2) {
-        launch_persistent_backward_activation<2>(
-            grad_x, grad_scores, buffer, buffer_ptrs, rank, layout,
-            x, grad_output, topk_scores, expert_counts,
-            token_src_metadata, w13_weight, w13_scale,
-            w2_weight, w2_scale);
+    if (num_sms == kPersistentLocalSMs) {
+        if (buffer_ptrs.size() == 2) {
+            launch_persistent_backward_activation<2, kPersistentLocalSMs>(
+                grad_x, grad_scores, buffer, buffer_ptrs, rank, layout,
+                x, grad_output, topk_scores, expert_counts,
+                token_src_metadata, w13_weight, w13_scale,
+                w2_weight, w2_scale);
+        } else {
+            launch_persistent_backward_activation<16, kPersistentLocalSMs>(
+                grad_x, grad_scores, buffer, buffer_ptrs, rank, layout,
+                x, grad_output, topk_scores, expert_counts,
+                token_src_metadata, w13_weight, w13_scale,
+                w2_weight, w2_scale);
+        }
     } else {
-        launch_persistent_backward_activation<16>(
-            grad_x, grad_scores, buffer, buffer_ptrs, rank, layout,
-            x, grad_output, topk_scores, expert_counts,
-            token_src_metadata, w13_weight, w13_scale,
-            w2_weight, w2_scale);
+        if (buffer_ptrs.size() == 2) {
+            launch_persistent_backward_activation<2, kPersistentProductionSMs>(
+                grad_x, grad_scores, buffer, buffer_ptrs, rank, layout,
+                x, grad_output, topk_scores, expert_counts,
+                token_src_metadata, w13_weight, w13_scale,
+                w2_weight, w2_scale);
+        } else {
+            launch_persistent_backward_activation<16, kPersistentProductionSMs>(
+                grad_x, grad_scores, buffer, buffer_ptrs, rank, layout,
+                x, grad_output, topk_scores, expert_counts,
+                token_src_metadata, w13_weight, w13_scale,
+                w2_weight, w2_scale);
+        }
     }
     return {grad_x, grad_scores};
 }
@@ -2498,23 +2536,43 @@ persistent_backward(
         return {grad_x, grad_scores, grad_w1, grad_w2, grad_w3};
     }
 
+    const uint32_t num_sms = get_persistent_sm_count(buffer);
+
     const PersistentWorkspaceLayout layout(
         buffer.data_ptr(), static_cast<uint32_t>(buffer_ptrs.size()),
         static_cast<uint32_t>(context_tokens_per_rank));
-    if (buffer_ptrs.size() == 2) {
-        launch_persistent_wgrad<2, true>(
-            grad_w2, grad_w2, buffer, buffer_ptrs, rank, layout,
-            expert_counts, token_src_metadata);
-        launch_persistent_wgrad<2, false>(
-            grad_w1, grad_w3, buffer, buffer_ptrs, rank, layout,
-            expert_counts, token_src_metadata);
+    if (num_sms == kPersistentLocalSMs) {
+        if (buffer_ptrs.size() == 2) {
+            launch_persistent_wgrad<2, kPersistentLocalSMs, true>(
+                grad_w2, grad_w2, buffer, buffer_ptrs, rank, layout,
+                expert_counts, token_src_metadata);
+            launch_persistent_wgrad<2, kPersistentLocalSMs, false>(
+                grad_w1, grad_w3, buffer, buffer_ptrs, rank, layout,
+                expert_counts, token_src_metadata);
+        } else {
+            launch_persistent_wgrad<16, kPersistentLocalSMs, true>(
+                grad_w2, grad_w2, buffer, buffer_ptrs, rank, layout,
+                expert_counts, token_src_metadata);
+            launch_persistent_wgrad<16, kPersistentLocalSMs, false>(
+                grad_w1, grad_w3, buffer, buffer_ptrs, rank, layout,
+                expert_counts, token_src_metadata);
+        }
     } else {
-        launch_persistent_wgrad<16, true>(
-            grad_w2, grad_w2, buffer, buffer_ptrs, rank, layout,
-            expert_counts, token_src_metadata);
-        launch_persistent_wgrad<16, false>(
-            grad_w1, grad_w3, buffer, buffer_ptrs, rank, layout,
-            expert_counts, token_src_metadata);
+        if (buffer_ptrs.size() == 2) {
+            launch_persistent_wgrad<2, kPersistentProductionSMs, true>(
+                grad_w2, grad_w2, buffer, buffer_ptrs, rank, layout,
+                expert_counts, token_src_metadata);
+            launch_persistent_wgrad<2, kPersistentProductionSMs, false>(
+                grad_w1, grad_w3, buffer, buffer_ptrs, rank, layout,
+                expert_counts, token_src_metadata);
+        } else {
+            launch_persistent_wgrad<16, kPersistentProductionSMs, true>(
+                grad_w2, grad_w2, buffer, buffer_ptrs, rank, layout,
+                expert_counts, token_src_metadata);
+            launch_persistent_wgrad<16, kPersistentProductionSMs, false>(
+                grad_w1, grad_w3, buffer, buffer_ptrs, rank, layout,
+                expert_counts, token_src_metadata);
+        }
     }
     return {grad_x, grad_scores, grad_w1, grad_w2, grad_w3};
 }

@@ -5392,7 +5392,6 @@ static constexpr uint32_t kBlockK = 128;
 static constexpr uint32_t kSFBlockM = 256;
 static constexpr uint32_t kSFBlockN = 128;
 static constexpr uint32_t kStages = 6;
-static constexpr uint32_t kNumSMs = 152;
 static constexpr uint32_t kThreads = 512;
 static constexpr uint32_t kStoreBlockM = 32;
 static constexpr uint32_t kEpilogueThreads = 256;
@@ -5511,7 +5510,7 @@ CUTLASS_DEVICE uint32_t phase_shape_k() {
     return kHidden;
 }
 
-template <sched::BackwardBlockPhase kPhase>
+template <sched::BackwardBlockPhase kPhase, uint32_t kNumSMs>
 CUTLASS_DEVICE void run_gemm_phase(
     SharedStorage& storage,
     const uint32_t local_expert_idx,
@@ -5870,7 +5869,7 @@ CUTLASS_DEVICE void run_gemm_phase(
     comm::cluster_sync_with_relaxed_arrive();
 }
 
-template <uint32_t kNumRanks>
+template <uint32_t kNumRanks, uint32_t kNumSMs>
 CUTLASS_GLOBAL __launch_bounds__(kThreads, 1) void
 sm103_fp8_block128_mega_moe_backward_impl(
     const int* expert_counts,
@@ -6063,7 +6062,8 @@ sm103_fp8_block128_mega_moe_backward_impl(
             []() { __syncthreads(); });
 
         if (count != 0) {
-            run_gemm_phase<sched::BackwardBlockPhase::RecomputeW13>(
+            run_gemm_phase<
+                sched::BackwardBlockPhase::RecomputeW13, kNumSMs>(
                 storage, expert, count,
                 tensor_map_ring_x, tensor_map_ring_x_sf,
                 tensor_map_w13_recompute, tensor_map_w2_dgrad,
@@ -6124,7 +6124,8 @@ sm103_fp8_block128_mega_moe_backward_impl(
             []() { __syncthreads(); });
 
         if (count != 0) {
-            run_gemm_phase<sched::BackwardBlockPhase::W2Dgrad>(
+            run_gemm_phase<
+                sched::BackwardBlockPhase::W2Dgrad, kNumSMs>(
                 storage, expert, count,
                 tensor_map_ring_grad_y,
                 tensor_map_ring_grad_y_sf,
@@ -6231,7 +6232,8 @@ sm103_fp8_block128_mega_moe_backward_impl(
             []() { __syncthreads(); });
 
         if (count != 0) {
-            run_gemm_phase<sched::BackwardBlockPhase::W13Dgrad>(
+            run_gemm_phase<
+                sched::BackwardBlockPhase::W13Dgrad, kNumSMs>(
                 storage, expert, count,
                 tensor_map_ring_grad_preact,
                 tensor_map_ring_grad_preact_sf,

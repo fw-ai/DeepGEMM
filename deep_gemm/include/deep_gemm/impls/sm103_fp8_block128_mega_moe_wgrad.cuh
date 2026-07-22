@@ -32,7 +32,6 @@ static constexpr uint32_t kBlockN = 128;
 static constexpr uint32_t kBlockK = 64;
 static constexpr uint32_t kLoadBlockN = kBlockN / 2;
 static constexpr uint32_t kStages = 6;
-static constexpr uint32_t kNumSMs = 152;
 static constexpr uint32_t kThreads = 256;
 static constexpr uint32_t kNumEpilogueStages = 2;
 static constexpr uint32_t kNumTMAStoreStages = 2;
@@ -97,7 +96,7 @@ CUTLASS_DEVICE void store_mn_swizzle128(
         reinterpret_cast<uint8_t*>(base) + byte_offset) = value;
 }
 
-template <bool kW2, uint32_t kNumRanks>
+template <bool kW2, uint32_t kNumRanks, uint32_t kNumSMs>
 CUTLASS_DEVICE void gather_compact_operand(
     const uint32_t count,
     const uint32_t pool_row_offset,
@@ -161,7 +160,7 @@ CUTLASS_DEVICE void gather_compact_operand(
     }
 }
 
-template <bool kW2, uint32_t kNumRanks>
+template <bool kW2, uint32_t kNumRanks, uint32_t kNumSMs>
 CUTLASS_GLOBAL __launch_bounds__(kThreads, 1) void
 sm103_fp8_block128_mega_moe_wgrad_impl(
     const int* expert_counts,
@@ -267,7 +266,7 @@ sm103_fp8_block128_mega_moe_wgrad_impl(
 
         // Each dedicated wgrad kernel transports its one compact operand once
         // per expert.  All output tiles then reuse the local FP8 ring.
-        gather_compact_operand<kW2>(
+        gather_compact_operand<kW2, kNumRanks, kNumSMs>(
             count, pool_row_offset, sf_ring_tokens,
             token_src_metadata, sym_buffer,
             symmetric_x, symmetric_x_sf,
