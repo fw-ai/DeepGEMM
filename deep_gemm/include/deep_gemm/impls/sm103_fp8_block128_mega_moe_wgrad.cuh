@@ -33,9 +33,9 @@ static constexpr uint32_t kStages = 3;
 static constexpr uint32_t kTMAWarp = 0;
 static constexpr uint32_t kMMAWarp = 1;
 static constexpr uint32_t kConvertFirstWarp = 2;
-static constexpr uint32_t kConvertThreads = 128;
-static constexpr uint32_t kControlWarp = 6;
-static constexpr uint32_t kEpilogueFirstWarp = 7;
+static constexpr uint32_t kConvertThreads = 256;
+static constexpr uint32_t kControlWarp = 10;
+static constexpr uint32_t kEpilogueFirstWarp = 11;
 static constexpr uint32_t kEpilogueThreads = 128;
 static constexpr uint32_t kThreads =
     kEpilogueFirstWarp * 32 + kEpilogueThreads;
@@ -72,20 +72,60 @@ struct alignas(1024) SharedStorage {
     uint32_t tmem_ptr;
 };
 
-DG_STATIC_ASSERT(kThreads == 352, "SM103 wgrad role layout changed");
+DG_STATIC_ASSERT(kThreads == 480, "SM103 wgrad role layout changed");
 DG_STATIC_ASSERT(kLoadBlockN == kBlockM,
                  "wgrad A/B prologues must share one tile shape");
 DG_STATIC_ASSERT(kNumTmemCols == 512, "SM103 wgrad TMEM layout changed");
 
-CUTLASS_DEVICE float unpack_power2_scale(const uint32_t packed) {
-    const uint32_t exponent = packed & 0xffu;
-    // UE8M0 code zero denotes 2^-127.  Construct it explicitly because
-    // shifting zero into an IEEE exponent field would produce zero.
-    return exponent == 0u ? 0x1p-127f : __uint_as_float(exponent << 23);
+CUTLASS_DEVICE uint16_t fold_power2_scale_into_bf16(
+    const uint16_t half_bits,
+    const uint32_t scale_exponent) {
+    const uint16_t sign = half_bits & 0x8000u;
+    const uint32_t half_exponent = (half_bits >> 10) & 0x1fu;
+    if (half_exponent == 0u)
+        return sign;
+    if (half_exponent == 0x1fu)
+        return sign | 0x7fc0u;
+
+    const uint32_t mantissa = (half_bits >> 3) & 0x7fu;
+    const int32_t bf16_exponent =
+        static_cast<int32_t>(half_exponent) +
+        static_cast<int32_t>(scale_exponent) - 15;
+    if (bf16_exponent >= 0xff)
+        return sign | 0x7f80u;
+    if (bf16_exponent > 0)
+        return sign |
+               static_cast<uint16_t>(bf16_exponent << 7) |
+               static_cast<uint16_t>(mantissa);
+
+    // The E4M3 significand has only four bits, so folding a power-of-two scale
+    // into BF16 is exact except when the result reaches BF16's subnormal range.
+    // Reproduce round-to-nearest-even there without materializing FP32.
+    const uint32_t significand = 0x80u | mantissa;
+    const uint32_t shift = static_cast<uint32_t>(1 - bf16_exponent);
+    if (shift > 8u)
+        return sign;
+    const uint32_t truncated = significand >> shift;
+    const uint32_t remainder =
+        significand & ((1u << shift) - 1u);
+    const uint32_t halfway = 1u << (shift - 1u);
+    const uint32_t rounded = truncated +
+        (remainder > halfway ||
+         (remainder == halfway && (truncated & 1u)));
+    return sign | static_cast<uint16_t>(rounded);
 }
 
-CUTLASS_DEVICE float round_score_to_bf16(const float score) {
-    return static_cast<float>(bf16_t(score));
+CUTLASS_DEVICE uint32_t convert_fp8x2_power2_to_bf16x2(
+    const uint16_t fp8x2,
+    const uint32_t scale_exponent) {
+    uint32_t half2;
+    asm("cvt.rn.f16x2.e4m3x2 %0, %1;\n"
+        : "=r"(half2) : "h"(fp8x2));
+    const uint32_t lo = fold_power2_scale_into_bf16(
+        static_cast<uint16_t>(half2), scale_exponent);
+    const uint32_t hi = fold_power2_scale_into_bf16(
+        static_cast<uint16_t>(half2 >> 16), scale_exponent);
+    return lo | (hi << 16);
 }
 
 // Address one 16-byte bank group in the TMA swizzle-128 layout for an
@@ -115,28 +155,34 @@ CUTLASS_DEVICE uint8_t* get_bf16_mn_bank_group(
     return reinterpret_cast<uint8_t*>(base) + byte_offset;
 }
 
-template <uint32_t kInnerMN, uint32_t kOuterK>
+template <uint32_t kInnerMN, uint32_t kOuterK, bool kApplyPostScale>
 CUTLASS_DEVICE void convert_and_store_eight(
     const fp8_t* source,
     bf16_t* destination,
     const uint32_t inner_mn,
     const uint32_t outer_k,
-    const float dequant_scale,
+    const uint32_t scale_exponent,
     const float post_scale,
     const bool valid) {
     uint4 packed{};
-    auto* values = reinterpret_cast<bf16_t*>(&packed);
-    #pragma unroll
-    for (uint32_t i = 0; i < 8; ++i) {
-        if (valid) {
-            // "BF16-semantics" means the FP8+power-of-two value first becomes
-            // the BF16 operand represented by the private pool.  W2 then
-            // applies the BF16-rounded route score and rounds to BF16 again.
-            const float dequantized = static_cast<float>(
-                bf16_t(static_cast<float>(source[i]) * dequant_scale));
-            values[i] = bf16_t(dequantized * post_scale);
-        } else {
-            values[i] = bf16_t(0.0f);
+    if (valid) {
+        const uint2 raw = *reinterpret_cast<const uint2*>(source);
+        const uint32_t raw_words[2] = {raw.x, raw.y};
+        auto* output_pairs = reinterpret_cast<uint32_t*>(&packed);
+        #pragma unroll
+        for (uint32_t pair = 0; pair < 4; ++pair) {
+            const uint16_t fp8x2 = static_cast<uint16_t>(
+                raw_words[pair / 2] >> ((pair & 1u) * 16));
+            uint32_t bf16x2 = convert_fp8x2_power2_to_bf16x2(
+                fp8x2, scale_exponent);
+            if constexpr (kApplyPostScale) {
+                const auto dequantized = __bfloat1622float2(
+                    *reinterpret_cast<nv_bfloat162*>(&bf16x2));
+                const auto scaled = __float22bfloat162_rn(__fmul2_rn(
+                    dequantized, {post_scale, post_scale}));
+                bf16x2 = *reinterpret_cast<const uint32_t*>(&scaled);
+            }
+            output_pairs[pair] = bf16x2;
         }
     }
     *reinterpret_cast<uint4*>(
@@ -338,14 +384,15 @@ sm103_fp8_block128_mega_moe_wgrad_impl(
     } else if (
         warp_idx >= kConvertFirstWarp &&
         warp_idx < kConvertFirstWarp + kConvertThreads / 32) {
-        // Two converter threads own each route.  Each thread loads four aligned
-        // FP8x16 vectors per operand, reuses one row scale, and emits eight
-        // aligned BF16x8 bank groups directly into the UMMA swizzle.
+        // Four converter threads own each route.  Each thread loads two aligned
+        // FP8x16 vectors per operand, converts packed E4M3x2 values, folds the
+        // power-of-two exponent directly into BF16, and emits four aligned
+        // BF16x8 bank groups per operand into the UMMA swizzle.
         Scheduler scheduler(expert_counts);
         const uint32_t convert_thread =
             threadIdx.x - kConvertFirstWarp * 32;
-        const uint32_t route_in_k = convert_thread / 2;
-        const uint32_t half = convert_thread & 1u;
+        const uint32_t route_in_k = convert_thread / 4;
+        const uint32_t quarter = convert_thread & 3u;
         uint32_t expert, count, pool_row, m_block, n_block;
         while (scheduler.get_next(
             expert, count, pool_row, m_block, n_block)) {
@@ -359,44 +406,43 @@ sm103_fp8_block128_mega_moe_wgrad_impl(
                 const uint32_t route = k_block * kBlockK + route_in_k;
                 const bool valid = route < count;
                 const uint64_t full_row = pool_row + route;
-                float a_scale = 0.0f;
-                float b_scale = 0.0f;
+                uint32_t a_scale_exponent = 0u;
+                uint32_t b_scale_exponent = 0u;
                 float a_post_scale = 1.0f;
                 if (valid) {
-                    a_scale = unpack_power2_scale(full_a_sf[
-                        full_row * kFullABlocks + m_block]);
-                    b_scale = unpack_power2_scale(full_b_sf[
+                    a_scale_exponent = full_a_sf[
+                        full_row * kFullABlocks + m_block] & 0xffu;
+                    b_scale_exponent = full_b_sf[
                         full_row * kFullBBlocks +
-                        n_block * (kBlockN / 128) + cta_rank]);
+                        n_block * (kBlockN / 128) + cta_rank] & 0xffu;
                     if constexpr (kW2)
-                        a_post_scale = round_score_to_bf16(
-                            full_scores[full_row]);
+                        a_post_scale = full_scores[full_row];
                 }
                 #pragma unroll
-                for (uint32_t chunk = 0; chunk < 4; ++chunk) {
-                    const uint32_t inner = (half * 4 + chunk) * 16;
+                for (uint32_t chunk = 0; chunk < 2; ++chunk) {
+                    const uint32_t inner = (quarter * 2 + chunk) * 16;
                     const auto* raw_a = storage.raw_a[stage_idx] +
                         route_in_k * kBlockM + inner;
                     const auto* raw_b = storage.raw_b[stage_idx] +
                         route_in_k * kLoadBlockN + inner;
-                    convert_and_store_eight<kBlockM, kBlockK>(
+                    convert_and_store_eight<kBlockM, kBlockK, kW2>(
                         raw_a, storage.smem_a[stage_idx],
                         inner, route_in_k,
-                        a_scale, a_post_scale, valid);
-                    convert_and_store_eight<kBlockM, kBlockK>(
+                        a_scale_exponent, a_post_scale, valid);
+                    convert_and_store_eight<kBlockM, kBlockK, kW2>(
                         raw_a + 8, storage.smem_a[stage_idx],
                         inner + 8, route_in_k,
-                        a_scale, a_post_scale, valid);
-                    convert_and_store_eight<kLoadBlockN, kBlockK>(
+                        a_scale_exponent, a_post_scale, valid);
+                    convert_and_store_eight<kLoadBlockN, kBlockK, false>(
                         raw_b, storage.smem_b[stage_idx],
                         inner, route_in_k,
-                        b_scale, 1.0f, valid);
-                    convert_and_store_eight<kLoadBlockN, kBlockK>(
+                        b_scale_exponent, 1.0f, valid);
+                    convert_and_store_eight<kLoadBlockN, kBlockK, false>(
                         raw_b + 8, storage.smem_b[stage_idx],
                         inner + 8, route_in_k,
-                        b_scale, 1.0f, valid);
+                        b_scale_exponent, 1.0f, valid);
                 }
-                ptx::sync_aligned(128, 1);
+                ptx::sync_aligned(256, 1);
                 cutlass::arch::fence_view_async_shared();
                 if (convert_thread == 0) {
                     storage.tma_empty_barriers[stage_idx].arrive();

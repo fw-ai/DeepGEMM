@@ -1450,19 +1450,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         if constexpr (kFP8Block128Weights) {
                             // Match GLM's frozen post-down semantics exactly:
                             // W2's FP32 accumulator was rounded to BF16 when
-                            // written to shared memory above.  The retained GLM
-                            // path also casts the route score to the output
-                            // dtype before the multiply, so round the score to
-                            // BF16, convert both operands back to FP32 for the
-                            // multiply, and round once more to BF16 before
-                            // remote combine.  Moving this multiply into L1 is
-                            // not equivalent because it changes the E4M3
-                            // requantization scale and rounding before W2.
-                            const float route_weight_fp32 = *l1_topk_weights_buffer
+                            // written to shared memory above, then converted
+                            // back to FP32 and multiplied by the FP32 route
+                            // score before the final BF16 rounding.  Moving
+                            // this multiply into L1 is not equivalent because
+                            // it changes E4M3 requantization before W2.
+                            const float route_weight = *l1_topk_weights_buffer
                                 .get_data_buffer(ring_m_idx + m_idx_in_block)
                                 .template get_base_ptr<float>();
-                            const float route_weight = __bfloat162float(
-                                __float2bfloat16_rn(route_weight_fp32));
                             auto* packed_bf16 =
                                 reinterpret_cast<nv_bfloat162*>(&packed);
                             #pragma unroll
