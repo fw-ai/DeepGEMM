@@ -20,6 +20,20 @@
 
 namespace deep_gemm {
 
+// Store one reduction value into the same shared-memory address on the peer
+// CTA.  The FP8-block128 L1 epilogue uses this only to finish the activation
+// amax reduction across the two 64-feature halves already owned by the
+// upstream 2-CTA task.
+CUTLASS_DEVICE void store_cluster_float2(
+    float2* ptr, const uint32_t& cta_rank, const float2& value) {
+    const uint32_t remote_addr = cute::set_block_rank(
+        cute::cast_smem_ptr_to_uint(ptr), cta_rank);
+    asm volatile(
+        "st.shared::cluster.v2.f32 [%0], {%1, %2};\n"
+        :: "r"(remote_addr), "f"(value.x), "f"(value.y)
+        : "memory");
+}
+
 template <
     uint32_t kHidden, uint32_t kIntermediateHidden,
     uint32_t kNumExperts, uint32_t kNumTopk,
@@ -227,6 +241,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         uint32_t smem_sfa[kNumStages][SF_BLOCK_M * (BLOCK_K / 128)];
         uint32_t smem_sfb[kNumStages][SF_BLOCK_N * (BLOCK_K / 128)];
         float2 amax_reduction[kNumEpilogueWarps][AMAX_REDUCTION_WARP_BUFFER_SIZE];
+        // GLM quantizes one contiguous 128-value activation group.  Each
+        // physical CTA owns 64 values, so its peer writes the other half's
+        // reduced amax here before both CTAs derive one shared exponent.
+        float2 l1_peer_amax
+            [kFP8Block128Weights ? kNumEpilogueWarpgroups : 1]
+            [kFP8Block128Weights ? AMAX_REDUCTION_WARP_BUFFER_SIZE : 1];
         // Canonical GLM W13 is loaded as contiguous [up; gate] 64-row
         // planes.  Corresponding accumulator rows therefore land in warp
         // pairs (0, 2) and (1, 3).  Exchange only the BF16 half each partner
@@ -241,6 +261,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         Barrier tmem_full_barriers[kNumEpilogueStages];
         Barrier tmem_empty_barriers[kNumEpilogueStages];
         Barrier combine_barriers[kNumEpilogueWarps * 2];
+        Barrier l1_scale_barriers
+            [kFP8Block128Weights ? kNumEpilogueWarpgroups : 1];
         uint32_t tmem_ptr_in_smem;
     };
     constexpr uint32_t kNumReusableSmemBytes = offsetof(SharedStorage, dispatch_barriers);
@@ -299,6 +321,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             #pragma unroll
             for (uint32_t i = 0; i < kNumEpilogueWarps * 2; ++ i)
                 shared_storage.combine_barriers[i].init(1);
+            if constexpr (kFP8Block128Weights) {
+                #pragma unroll
+                for (uint32_t i = 0; i < kNumEpilogueWarpgroups; ++ i)
+                    shared_storage.l1_scale_barriers[i].init(1);
+            }
         }
         cutlass::arch::fence_barrier_init();
     } else if (warp_idx == 3) {
@@ -1029,6 +1056,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         // Persistently schedule over blocks
         uint32_t current_iter_idx = 0;
+        uint32_t l1_scale_phase = 0;
         scheduler.for_each_block([&](const sched::BlockPhase& block_phase,
                                      const uint32_t& local_expert_idx,
                                      const uint32_t& num_k_blocks,
@@ -1255,16 +1283,85 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     ptx::tma_store_wait<kNumTMAStoreStages - 1>();
                     ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
 
+                    // The upstream task already pairs adjacent N blocks in one
+                    // cluster.  For GLM, those CTAs contain adjacent 64-value
+                    // halves of a single block128 activation group.  Reduce the
+                    // four local warp fragments, exchange one value per token
+                    // pair with the peer CTA, and derive exactly one UE8M0
+                    // exponent for all 128 values.  This remains inside the
+                    // fused persistent epilogue; no preprocessing/composed EP
+                    // stage is introduced.
+                    if constexpr (kFP8Block128Weights) {
+                        float2 local_amax[kNumAtomsPerStore];
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kNumAtomsPerStore; ++ i) {
+                            local_amax[i] = {0.0f, 0.0f};
+                            #pragma unroll
+                            for (uint32_t local_warp = 0;
+                                 local_warp < 4; ++ local_warp) {
+                                const float2 value =
+                                    shared_storage.amax_reduction
+                                        [epilogue_wg_idx * 4 + local_warp]
+                                        [i * (ATOM_M / 2) + lane_idx % 4];
+                                local_amax[i].x = cute::max(
+                                    local_amax[i].x, value.x);
+                                local_amax[i].y = cute::max(
+                                    local_amax[i].y, value.y);
+                            }
+                        }
+
+                        if (warp_idx_in_wg == 0 && lane_idx < 4) {
+                            #pragma unroll
+                            for (uint32_t i = 0;
+                                 i < kNumAtomsPerStore; ++ i) {
+                                store_cluster_float2(
+                                    &shared_storage.l1_peer_amax
+                                        [epilogue_wg_idx]
+                                        [i * (ATOM_M / 2) + lane_idx],
+                                    cute::block_rank_in_cluster() ^ 1u,
+                                    local_amax[i]);
+                            }
+                        }
+                        __syncwarp();
+                        if (warp_idx_in_wg == 0 && cute::elect_one_sync()) {
+                            shared_storage.l1_scale_barriers
+                                [epilogue_wg_idx].arrive(
+                                    cute::block_rank_in_cluster() ^ 1u);
+                        }
+                        shared_storage.l1_scale_barriers
+                            [epilogue_wg_idx].wait(l1_scale_phase);
+
+                        #pragma unroll
+                        for (uint32_t i = 0;
+                             i < kNumAtomsPerStore; ++ i) {
+                            const float2 peer_amax = ptx::ld_shared(
+                                &shared_storage.l1_peer_amax
+                                    [epilogue_wg_idx]
+                                    [i * (ATOM_M / 2) + lane_idx % 4]);
+                            amax_values[i].x = cute::max(
+                                local_amax[i].x, peer_amax.x);
+                            amax_values[i].y = cute::max(
+                                local_amax[i].y, peer_amax.y);
+                        }
+                        l1_scale_phase ^= 1u;
+                    }
+
                     // Cast to FP8 E4M3 and store into shared memory
                     #pragma unroll
                     for (uint32_t i = 0; i < kNumAtomsPerStore; ++ i) {
                         // Reduce amax (warp-pair-level)
-                        const uint32_t amax_partner = epilogue_warp_idx ^
-                            (kFP8Block128Weights ? 2u : 1u);
-                        const float2 wp_amax =
-                            shared_storage.amax_reduction[amax_partner][i * (ATOM_M / 2) + lane_idx % 4];
-                        amax_values[i].x = cute::max(amax_values[i].x, wp_amax.x);
-                        amax_values[i].y = cute::max(amax_values[i].y, wp_amax.y);
+                        if constexpr (!kFP8Block128Weights) {
+                            const uint32_t amax_partner =
+                                epilogue_warp_idx ^ 1u;
+                            const float2 wp_amax =
+                                shared_storage.amax_reduction
+                                    [amax_partner]
+                                    [i * (ATOM_M / 2) + lane_idx % 4];
+                            amax_values[i].x = cute::max(
+                                amax_values[i].x, wp_amax.x);
+                            amax_values[i].y = cute::max(
+                                amax_values[i].y, wp_amax.y);
+                        }
 
                         // Calculate SF
                         float2 sf, sf_inv;

@@ -18,9 +18,12 @@
 namespace deep_gemm::sm103_block128_wgrad {
 
 // The two CTAs form the same logical 256x256x64 production BF16 tile used by
-// DeepGEMM's grouped large-M kernels.  Each CTA owns 128 M rows and 128 N
-// columns.  FP8 route pools are TMA-staged, then converted in the load prologue
-// into the exact MN-major BF16 shared-memory layout consumed by native UMMA.
+// DeepGEMM's grouped large-M kernels. Each dedicated wgrad kernel first converts
+// its FP8 route operands exactly once into private BF16 backing inside this same
+// persistent launch, grid-fences internally, and then runs the native BF16 TMA
+// / UMMA pipeline. Dequantization is therefore part of the dedicated kernel's
+// load prologue rather than repeated for every output tile or composed as a
+// separate kernel.
 static constexpr uint32_t kHidden = 6144;
 static constexpr uint32_t kIntermediate = 2048;
 static constexpr uint32_t kGlobalExperts = 256;
@@ -32,10 +35,9 @@ static constexpr uint32_t kLoadBlockN = kBlockN / 2;
 static constexpr uint32_t kStages = 3;
 static constexpr uint32_t kTMAWarp = 0;
 static constexpr uint32_t kMMAWarp = 1;
-static constexpr uint32_t kConvertFirstWarp = 2;
-static constexpr uint32_t kConvertThreads = 256;
-static constexpr uint32_t kControlWarp = 10;
-static constexpr uint32_t kEpilogueFirstWarp = 11;
+static constexpr uint32_t kReadyWarp = 2;
+static constexpr uint32_t kControlWarp = 3;
+static constexpr uint32_t kEpilogueFirstWarp = 4;
 static constexpr uint32_t kEpilogueThreads = 128;
 static constexpr uint32_t kThreads =
     kEpilogueFirstWarp * 32 + kEpilogueThreads;
@@ -59,20 +61,17 @@ using Barrier = cutlass::arch::ClusterTransactionBarrier;
 struct alignas(1024) SharedStorage {
     alignas(1024) bf16_t smem_cd[kNumTMAStoreStages]
                                       [kStoreBlockM * kStoreBlockN];
-    alignas(1024) fp8_t raw_a[kStages][kBlockK * kBlockM];
-    alignas(1024) fp8_t raw_b[kStages][kBlockK * kLoadBlockN];
     alignas(1024) bf16_t smem_a[kStages][kBlockK * kBlockM];
     alignas(1024) bf16_t smem_b[kStages][kBlockK * kLoadBlockN];
     Barrier tma_full_barriers[kStages];
     Barrier tma_empty_barriers[kStages];
     Barrier mma_full_barriers[kStages];
-    Barrier mma_empty_barriers[kStages];
     Barrier tmem_full_barriers[kNumEpilogueStages];
     Barrier tmem_empty_barriers[kNumEpilogueStages];
     uint32_t tmem_ptr;
 };
 
-DG_STATIC_ASSERT(kThreads == 480, "SM103 wgrad role layout changed");
+DG_STATIC_ASSERT(kThreads == 256, "SM103 wgrad role layout changed");
 DG_STATIC_ASSERT(kLoadBlockN == kBlockM,
                  "wgrad A/B prologues must share one tile shape");
 DG_STATIC_ASSERT(kNumTmemCols == 512, "SM103 wgrad TMEM layout changed");
@@ -128,66 +127,95 @@ CUTLASS_DEVICE uint32_t convert_fp8x2_power2_to_bf16x2(
     return lo | (hi << 16);
 }
 
-// Address one 16-byte bank group in the TMA swizzle-128 layout for an
-// MN-major [inner-MN, outer-K] tile.  TMA splits an inner dimension wider than
-// 64 BF16 values into consecutive 64-value atoms.
-template <uint32_t kInnerMN, uint32_t kOuterK>
-CUTLASS_DEVICE uint8_t* get_bf16_mn_bank_group(
-    bf16_t* base,
-    const uint32_t inner_mn,
-    const uint32_t outer_k) {
-    constexpr uint32_t kBankGroupBytes = 16;
-    constexpr uint32_t kInnerPerAtom = kSwizzle / sizeof(bf16_t);
-    DG_STATIC_ASSERT(kInnerMN % kInnerPerAtom == 0,
-                     "MN dimension must contain whole swizzle atoms");
-    DG_STATIC_ASSERT(kOuterK % 8 == 0,
-                     "K dimension must contain whole swizzle rows");
-    const uint32_t atom = inner_mn / kInnerPerAtom;
-    const uint32_t inner_in_atom = inner_mn % kInnerPerAtom;
-    const uint32_t row = outer_k & 7u;
-    const uint32_t inner_byte = inner_in_atom * sizeof(bf16_t);
-    const uint32_t byte_offset =
-        atom * kOuterK * kSwizzle +
-        (outer_k >> 3) * 8u * kSwizzle +
-        row * kSwizzle +
-        ((inner_byte >> 4) ^ row) * kBankGroupBytes +
-        (inner_byte & (kBankGroupBytes - 1));
-    return reinterpret_cast<uint8_t*>(base) + byte_offset;
-}
-
-template <uint32_t kInnerMN, uint32_t kOuterK, bool kApplyPostScale>
-CUTLASS_DEVICE void convert_and_store_eight(
+template <
+    uint32_t kShape, uint32_t kLocalExperts,
+    uint32_t kNumSMs, uint32_t kNumThreads,
+    bool kApplyPostScale>
+CUTLASS_DEVICE void dequantize_route_pool_once(
+    const int* expert_counts,
+    const uint32_t max_pool_tokens,
     const fp8_t* source,
-    bf16_t* destination,
-    const uint32_t inner_mn,
-    const uint32_t outer_k,
-    const uint32_t scale_exponent,
-    const float post_scale,
-    const bool valid) {
-    uint4 packed{};
-    if (valid) {
-        const uint2 raw = *reinterpret_cast<const uint2*>(source);
-        const uint32_t raw_words[2] = {raw.x, raw.y};
-        auto* output_pairs = reinterpret_cast<uint32_t*>(&packed);
-        #pragma unroll
-        for (uint32_t pair = 0; pair < 4; ++pair) {
-            const uint16_t fp8x2 = static_cast<uint16_t>(
-                raw_words[pair / 2] >> ((pair & 1u) * 16));
-            uint32_t bf16x2 = convert_fp8x2_power2_to_bf16x2(
-                fp8x2, scale_exponent);
-            if constexpr (kApplyPostScale) {
-                const auto dequantized = __bfloat1622float2(
-                    *reinterpret_cast<nv_bfloat162*>(&bf16x2));
-                const auto scaled = __float22bfloat162_rn(__fmul2_rn(
-                    dequantized, {post_scale, post_scale}));
-                bf16x2 = *reinterpret_cast<const uint32_t*>(&scaled);
+    const uint32_t* scales,
+    const float* scores,
+    bf16_t* destination) {
+    constexpr uint32_t kValuesPerVector = 8;
+    constexpr uint32_t kVectorsPerRow = kShape / kValuesPerVector;
+    constexpr uint32_t kScaleBlocksPerRow = kShape / 128;
+    DG_STATIC_ASSERT(kShape % 128 == 0,
+                     "wgrad dequant shape must be block128 aligned");
+
+    const uint64_t global_thread =
+        static_cast<uint64_t>(blockIdx.x) * kNumThreads + threadIdx.x;
+    constexpr uint64_t kGridThreads =
+        static_cast<uint64_t>(kNumSMs) * kNumThreads;
+    uint32_t pool_row = 0;
+
+    #pragma unroll 1
+    for (uint32_t expert = 0; expert < kLocalExperts; ++ expert) {
+        const uint32_t count = static_cast<uint32_t>(
+            __ldg(expert_counts + expert));
+        const uint32_t padded_count =
+            math::ceil_div(count, kRouteBlockM) * kRouteBlockM;
+        const uint64_t num_vectors =
+            static_cast<uint64_t>(padded_count) * kVectorsPerRow;
+        for (uint64_t linear = global_thread;
+             linear < num_vectors; linear += kGridThreads) {
+            const uint32_t route = static_cast<uint32_t>(
+                linear / kVectorsPerRow);
+            const uint32_t vector_in_row = static_cast<uint32_t>(
+                linear - static_cast<uint64_t>(route) * kVectorsPerRow);
+            const uint32_t feature =
+                vector_in_row * kValuesPerVector;
+            const uint64_t full_row =
+                static_cast<uint64_t>(pool_row) + route;
+            uint4 packed{};
+            if (route < count) {
+                const uint2 raw = *reinterpret_cast<const uint2*>(
+                    source + full_row * kShape + feature);
+                const uint32_t raw_words[2] = {raw.x, raw.y};
+                const uint32_t scale_exponent = scales[
+                    full_row * kScaleBlocksPerRow + feature / 128] & 0xffu;
+                const float post_scale = kApplyPostScale
+                    ? scores[full_row]
+                    : 1.0f;
+                auto* output_pairs = reinterpret_cast<uint32_t*>(&packed);
+                #pragma unroll
+                for (uint32_t pair = 0; pair < 4; ++ pair) {
+                    const uint16_t fp8x2 = static_cast<uint16_t>(
+                        raw_words[pair / 2] >> ((pair & 1u) * 16));
+                    uint32_t bf16x2 = convert_fp8x2_power2_to_bf16x2(
+                        fp8x2, scale_exponent);
+                    if constexpr (kApplyPostScale) {
+                        const auto dequantized = __bfloat1622float2(
+                            *reinterpret_cast<nv_bfloat162*>(&bf16x2));
+                        const auto scaled = __float22bfloat162_rn(
+                            __fmul2_rn(
+                                dequantized,
+                                {post_scale, post_scale}));
+                        bf16x2 =
+                            *reinterpret_cast<const uint32_t*>(&scaled);
+                    }
+                    output_pairs[pair] = bf16x2;
+                }
             }
-            output_pairs[pair] = bf16x2;
+            *reinterpret_cast<uint4*>(
+                destination + full_row * kShape + feature) = packed;
         }
+        pool_row += padded_count;
     }
-    *reinterpret_cast<uint4*>(
-        get_bf16_mn_bank_group<kInnerMN, kOuterK>(
-            destination, inner_mn, outer_k)) = packed;
+    DG_DEVICE_ASSERT(pool_row <= max_pool_tokens);
+
+    // Empty experts consume one permanent all-zero K tile beyond the routed
+    // pool. The host-side private scratch descriptors include these rows.
+    constexpr uint64_t kZeroVectors =
+        static_cast<uint64_t>(kBlockK) * kVectorsPerRow;
+    for (uint64_t linear = global_thread;
+         linear < kZeroVectors; linear += kGridThreads) {
+        *reinterpret_cast<uint4*>(
+            destination +
+            static_cast<uint64_t>(max_pool_tokens) * kShape +
+            linear * kValuesPerVector) = {};
+    }
 }
 
 // This is the production grouped-GEMM L2 swizzle specialized to the fixed GLM
@@ -264,9 +292,14 @@ CUTLASS_GLOBAL __launch_bounds__(kThreads, 1) void
 sm103_fp8_block128_mega_moe_wgrad_impl(
     const int* expert_counts,
     const uint32_t max_pool_tokens,
+    const __grid_constant__ layout::Workspace workspace,
+    const fp8_t* full_a,
+    const fp8_t* full_b,
     const uint32_t* full_a_sf,
     const uint32_t* full_b_sf,
     const float* full_scores,
+    bf16_t* cached_a,
+    bf16_t* cached_b,
     const __grid_constant__ cute::TmaDescriptor tensor_map_a,
     const __grid_constant__ cute::TmaDescriptor tensor_map_b,
     const __grid_constant__ cute::TmaDescriptor tensor_map_output_0,
@@ -275,11 +308,22 @@ sm103_fp8_block128_mega_moe_wgrad_impl(
     using Scheduler = WgradTileScheduler<kW2, kNumRanks, kNumSMs>;
     constexpr uint32_t kShapeM = Scheduler::kShapeM;
     constexpr uint32_t kShapeN = Scheduler::kShapeN;
-    constexpr uint32_t kFullABlocks = kShapeM / 128;
-    constexpr uint32_t kFullBBlocks = kShapeN / 128;
-    constexpr uint32_t kRawABytes = kBlockK * kBlockM * sizeof(fp8_t);
-    constexpr uint32_t kRawBBytes =
-        kBlockK * kLoadBlockN * sizeof(fp8_t);
+    constexpr uint32_t kLocalExperts = Scheduler::kLocalExperts;
+
+    // One fused prologue per dedicated wgrad launch. This removes conversion
+    // from the output-tile loop while preserving the exact E4M3 + FP32
+    // power-of-two scale and BF16-rounding semantics.
+    dequantize_route_pool_once<
+        kShapeM, kLocalExperts, kNumSMs, kThreads, kW2>(
+            expert_counts, max_pool_tokens,
+            full_a, full_a_sf, full_scores, cached_a);
+    dequantize_route_pool_once<
+        kShapeN, kLocalExperts, kNumSMs, kThreads, false>(
+            expert_counts, max_pool_tokens,
+            full_b, full_b_sf, full_scores, cached_b);
+    comm::grid_sync<kNumSMs, kW2 ? 2u : 3u>(
+        workspace, blockIdx.x, threadIdx.x,
+        []() { __syncthreads(); });
 
     extern __shared__ __align__(1024) uint8_t smem_buffer[];
     SharedStorage& storage = *reinterpret_cast<SharedStorage*>(smem_buffer);
@@ -301,9 +345,8 @@ sm103_fp8_block128_mega_moe_wgrad_impl(
         for (uint32_t i = 0; i < kStages; ++i) {
             storage.tma_full_barriers[i].init(1);
             storage.tma_empty_barriers[i].init(1);
-            // Both CTAs publish their converted halves to CTA 0.
+            // Both CTAs publish their direct-BF16 TMA completion to CTA 0.
             storage.mma_full_barriers[i].init(2);
-            storage.mma_empty_barriers[i].init(1);
         }
         #pragma unroll
         for (uint32_t i = 0; i < kNumEpilogueStages; ++i) {
@@ -350,8 +393,8 @@ sm103_fp8_block128_mega_moe_wgrad_impl(
     };
 
     if (warp_idx == kTMAWarp && cute::elect_one_sync()) {
-        // The production load warp issues two rectangular TMA transactions per
-        // K stage.  Raw tiles are row-major [route-K, feature-MN].
+        // The production load warp now reads the once-dequantized BF16 backing
+        // directly into the native UMMA swizzle.
         Scheduler scheduler(expert_counts);
         uint32_t expert, count, pool_row, m_block, n_block;
         while (scheduler.get_next(
@@ -362,92 +405,45 @@ sm103_fp8_block128_mega_moe_wgrad_impl(
             for (uint32_t k_block = 0; k_block < num_k_blocks;
                  ++k_block) {
                 storage.tma_empty_barriers[stage_idx].wait(phase ^ 1u);
-                const uint32_t route = pool_row + k_block * kBlockK;
+                const uint32_t route = count == 0
+                    ? max_pool_tokens
+                    : pool_row + k_block * kBlockK;
                 const uint32_t a_feature = m_block * kBlockM;
                 const uint32_t b_feature =
                     n_block * kBlockN + cta_rank * kLoadBlockN;
-                tma::copy<kBlockM, kBlockK, 0, fp8_t>(
+                tma::copy<kBlockM, kBlockK, kSwizzle, bf16_t>(
                     &tensor_map_a,
                     &storage.tma_full_barriers[stage_idx],
-                    storage.raw_a[stage_idx],
+                    storage.smem_a[stage_idx],
                     a_feature, route);
-                tma::copy<kLoadBlockN, kBlockK, 0, fp8_t>(
+                tma::copy<kLoadBlockN, kBlockK, kSwizzle, bf16_t>(
                     &tensor_map_b,
                     &storage.tma_full_barriers[stage_idx],
-                    storage.raw_b[stage_idx],
+                    storage.smem_b[stage_idx],
                     b_feature, route);
                 storage.tma_full_barriers[stage_idx]
-                    .arrive_and_expect_tx(kRawABytes + kRawBBytes);
+                    .arrive_and_expect_tx(
+                        sizeof(storage.smem_a[0]) +
+                        sizeof(storage.smem_b[0]));
                 advance_pipeline();
             }
         }
-    } else if (
-        warp_idx >= kConvertFirstWarp &&
-        warp_idx < kConvertFirstWarp + kConvertThreads / 32) {
-        // Four converter threads own each route.  Each thread loads two aligned
-        // FP8x16 vectors per operand, converts packed E4M3x2 values, folds the
-        // power-of-two exponent directly into BF16, and emits four aligned
-        // BF16x8 bank groups per operand into the UMMA swizzle.
+    } else if (warp_idx == kReadyWarp && cute::elect_one_sync()) {
+        // Each CTA waits for its local direct-BF16 TMAs, then contributes one
+        // arrival to CTA 0. The leader MMA warp therefore observes both halves
+        // without multicast-copying different GLM feature tiles over each
+        // other.
         Scheduler scheduler(expert_counts);
-        const uint32_t convert_thread =
-            threadIdx.x - kConvertFirstWarp * 32;
-        const uint32_t route_in_k = convert_thread / 4;
-        const uint32_t quarter = convert_thread & 3u;
         uint32_t expert, count, pool_row, m_block, n_block;
         while (scheduler.get_next(
             expert, count, pool_row, m_block, n_block)) {
-            DG_DEVICE_ASSERT(pool_row + count <= max_pool_tokens);
             const uint32_t num_k_blocks =
                 cute::max(1u, math::ceil_div(count, kBlockK));
             for (uint32_t k_block = 0; k_block < num_k_blocks;
                  ++k_block) {
                 storage.tma_full_barriers[stage_idx].wait(phase);
-                storage.mma_empty_barriers[stage_idx].wait(phase ^ 1u);
-                const uint32_t route = k_block * kBlockK + route_in_k;
-                const bool valid = route < count;
-                const uint64_t full_row = pool_row + route;
-                uint32_t a_scale_exponent = 0u;
-                uint32_t b_scale_exponent = 0u;
-                float a_post_scale = 1.0f;
-                if (valid) {
-                    a_scale_exponent = full_a_sf[
-                        full_row * kFullABlocks + m_block] & 0xffu;
-                    b_scale_exponent = full_b_sf[
-                        full_row * kFullBBlocks +
-                        n_block * (kBlockN / 128) + cta_rank] & 0xffu;
-                    if constexpr (kW2)
-                        a_post_scale = full_scores[full_row];
-                }
-                #pragma unroll
-                for (uint32_t chunk = 0; chunk < 2; ++chunk) {
-                    const uint32_t inner = (quarter * 2 + chunk) * 16;
-                    const auto* raw_a = storage.raw_a[stage_idx] +
-                        route_in_k * kBlockM + inner;
-                    const auto* raw_b = storage.raw_b[stage_idx] +
-                        route_in_k * kLoadBlockN + inner;
-                    convert_and_store_eight<kBlockM, kBlockK, kW2>(
-                        raw_a, storage.smem_a[stage_idx],
-                        inner, route_in_k,
-                        a_scale_exponent, a_post_scale, valid);
-                    convert_and_store_eight<kBlockM, kBlockK, kW2>(
-                        raw_a + 8, storage.smem_a[stage_idx],
-                        inner + 8, route_in_k,
-                        a_scale_exponent, a_post_scale, valid);
-                    convert_and_store_eight<kLoadBlockN, kBlockK, false>(
-                        raw_b, storage.smem_b[stage_idx],
-                        inner, route_in_k,
-                        b_scale_exponent, 1.0f, valid);
-                    convert_and_store_eight<kLoadBlockN, kBlockK, false>(
-                        raw_b + 8, storage.smem_b[stage_idx],
-                        inner + 8, route_in_k,
-                        b_scale_exponent, 1.0f, valid);
-                }
-                ptx::sync_aligned(256, 1);
                 cutlass::arch::fence_view_async_shared();
-                if (convert_thread == 0) {
-                    storage.tma_empty_barriers[stage_idx].arrive();
-                    storage.mma_full_barriers[stage_idx].arrive(0u);
-                }
+                storage.mma_full_barriers[stage_idx].arrive(0u);
                 advance_pipeline();
             }
         }
@@ -498,7 +494,7 @@ sm103_fp8_block128_mega_moe_wgrad_impl(
                 constexpr uint16_t kCTAMask = 3;
                 cutlass::arch::umma_arrive_multicast_2x1SM(
                     reinterpret_cast<uint64_t*>(
-                        &storage.mma_empty_barriers[stage_idx]),
+                        &storage.tma_empty_barriers[stage_idx]),
                     kCTAMask);
                 if (k_block == num_k_blocks - 1) {
                     cutlass::arch::umma_arrive_multicast_2x1SM(
