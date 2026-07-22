@@ -6361,6 +6361,785 @@ sm103_fp8_block128_mega_moe_backward_impl(
 #endif
 }
 
+// Reference-shaped GLM reverse. The role layout, two-CTA MMA pipeline,
+// wave scheduler, ring counters, and remote publication mirror the upstream
+// forward kernel. Only the operands and fused epilogue differ: reverse
+// dispatch forms score-scaled dz, W2 dgrad emits quantized dpreact, and W13
+// dgrad publishes dX. Forward-saved BF16 preactivation and unweighted down
+// output remove the recompute/standalone score phases entirely.
+template <uint32_t kNumRanks, uint32_t kNumSMs>
+CUTLASS_GLOBAL __launch_bounds__(kThreads, 1) void
+sm103_fp8_block128_mega_moe_backward_persistent_impl(
+    const int* expert_counts,
+    const layout::TokenSrcMetadata* token_src_metadata,
+    const uint32_t num_tokens,
+    const uint32_t capacity,
+    const uint32_t ring_tokens,
+    const uint32_t sf_ring_tokens,
+    const uint32_t max_pool_tokens,
+    const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
+    const __grid_constant__ layout::Workspace workspace,
+    const bf16_t* compact_grad_y,
+    bf16_t* symmetric_bf16,
+    fp8_t* ring_grad_y,
+    uint32_t* ring_grad_y_sf,
+    fp8_t* ring_grad_preact,
+    uint32_t* ring_grad_preact_sf,
+    bf16_t* ring_bf16,
+    fp8_t* full_grad_y,
+    uint32_t* full_grad_y_sf,
+    const float* full_scores,
+    const bf16_t* saved_l1_preact,
+    const bf16_t* saved_down_unweighted,
+    fp8_t* full_grad_preact,
+    uint32_t* full_grad_preact_sf,
+    bf16_t* grad_x,
+    float* symmetric_grad_scores,
+    float* grad_scores,
+    uint32_t* dispatch_done,
+    const __grid_constant__ cute::TmaDescriptor tensor_map_ring_grad_y,
+    const __grid_constant__ cute::TmaDescriptor tensor_map_ring_grad_y_sf,
+    const __grid_constant__ cute::TmaDescriptor tensor_map_ring_grad_preact,
+    const __grid_constant__ cute::TmaDescriptor tensor_map_ring_grad_preact_sf,
+    const __grid_constant__ cute::TmaDescriptor tensor_map_w2_dgrad,
+    const __grid_constant__ cute::TmaDescriptor tensor_map_w13_dgrad,
+    const __grid_constant__ cute::TmaDescriptor tensor_map_grad_h,
+    const __grid_constant__ cute::TmaDescriptor tensor_map_grad_x,
+    const float* w13_scales,
+    const float* w2_scales) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1030
+    constexpr uint32_t kLocalExperts = kGlobalExperts / kNumRanks;
+    constexpr uint32_t kW2BlockNs = kIntermediate / kBlockN;
+    constexpr uint32_t kW13BlockNs = kHidden / kBlockN;
+    constexpr uint32_t kHiddenScaleBlocks = kHidden / 128;
+    constexpr uint32_t kGradPreactScaleBlocks =
+        (2 * kIntermediate) / 128;
+    constexpr uint32_t kDispatchWarps = 4;
+    constexpr uint32_t kDispatchThreads = kDispatchWarps * 32;
+    constexpr uint32_t kEpilogueBarrier = 9;
+    using Scheduler = sched::MegaMoEBackwardScheduler<
+        kBlockM, kBlockN, kBlockK,
+        kHidden, kIntermediate,
+        kLocalExperts, 1, kNumSMs>;
+
+    const uint32_t warp_idx = cutlass::canonical_warp_idx_sync();
+    const uint32_t lane_idx = ptx::get_lane_idx();
+    const uint32_t global_thread =
+        blockIdx.x * kThreads + threadIdx.x;
+    const uint32_t global_stride = kNumSMs * kThreads;
+    const bool leader_cta = cute::block_rank_in_cluster() == 0;
+    const uint32_t num_ring_blocks = ring_tokens / kBlockM;
+    extern __shared__ __align__(1024) uint8_t smem_buffer[];
+    SharedStorage& storage =
+        *reinterpret_cast<SharedStorage*>(smem_buffer);
+
+    if (warp_idx == 0) {
+        cute::prefetch_tma_descriptor(&tensor_map_ring_grad_y);
+        cute::prefetch_tma_descriptor(&tensor_map_ring_grad_y_sf);
+        cute::prefetch_tma_descriptor(&tensor_map_ring_grad_preact);
+        cute::prefetch_tma_descriptor(&tensor_map_ring_grad_preact_sf);
+        cute::prefetch_tma_descriptor(&tensor_map_w2_dgrad);
+        cute::prefetch_tma_descriptor(&tensor_map_w13_dgrad);
+        cute::prefetch_tma_descriptor(&tensor_map_grad_h);
+        cute::prefetch_tma_descriptor(&tensor_map_grad_x);
+    }
+
+    // The forward combine plane is dead on entry. Reuse slot zero as the
+    // symmetric BF16 grad-y source until every reverse dispatch warp has
+    // completed its remote reads.
+    for (uint64_t linear = global_thread;
+         linear < static_cast<uint64_t>(num_tokens) * kHidden;
+         linear += global_stride) {
+        symmetric_bf16[linear] = compact_grad_y[linear];
+    }
+    if (global_thread == 0)
+        *dispatch_done = 0u;
+    comm::nvlink_barrier<kNumRanks, kNumSMs, kThreads, 0, 91>(
+        workspace, sym_buffer, blockIdx.x, threadIdx.x,
+        []() { __syncthreads(); });
+
+    comm::cluster_sync_with_relaxed_arrive();
+    if (warp_idx == 7 && cute::elect_one_sync()) {
+        #pragma unroll
+        for (uint32_t i = 0; i < kStages; ++i) {
+            storage.full_barriers[i].init(4);
+            storage.empty_barriers[i].init(1);
+        }
+        #pragma unroll
+        for (uint32_t i = 0; i < kNumEpilogueStages; ++i) {
+            storage.tmem_full_barriers[i].init(1);
+            storage.tmem_empty_barriers[i].init(
+                2 * kEpilogueThreads);
+        }
+        cutlass::arch::fence_barrier_init();
+    }
+    if (warp_idx == 7)
+        cute::TMEM::Allocator2Sm().allocate(
+            kNumTmemCols, &storage.tmem_ptr);
+    comm::cluster_sync_with_relaxed_arrive();
+
+    uint32_t stage_idx = 0;
+    uint32_t pipeline_phase = 0;
+    const auto advance_pipeline = [&]() {
+        stage_idx = stage_idx == kStages - 1 ? 0 : stage_idx + 1;
+        pipeline_phase ^= stage_idx == 0;
+    };
+
+    if (warp_idx < kDispatchWarps) {
+        cutlass::arch::warpgroup_reg_dealloc<48>();
+        const uint32_t dispatch_warp = warp_idx;
+        const uint32_t global_warp =
+            blockIdx.x * kDispatchWarps + dispatch_warp;
+        constexpr uint32_t kGlobalWarps = kNumSMs * kDispatchWarps;
+        uint32_t pool_block_offset = 0;
+
+        #pragma unroll 1
+        for (uint32_t expert = 0; expert < kLocalExperts; ++expert) {
+            const uint32_t count = static_cast<uint32_t>(
+                __ldg(expert_counts + expert));
+            for (uint32_t row = global_warp; row < count;
+                 row += kGlobalWarps) {
+                const uint32_t pool_row =
+                    pool_block_offset * kBlockM + row;
+                DG_DEVICE_ASSERT(pool_row < max_pool_tokens);
+                const uint32_t pool_block = pool_row / kBlockM;
+                const uint32_t ring_block =
+                    pool_block % num_ring_blocks;
+                const uint32_t ring_row =
+                    ring_block * kBlockM + row % kBlockM;
+                const uint32_t empty_target =
+                    (pool_block / num_ring_blocks) * kW2BlockNs;
+                if (empty_target != 0) {
+                    while (ptx::ld_acq(
+                               workspace.get_l1_empty_count_ptr(
+                                   ring_block)) < empty_target) {
+                    }
+                }
+
+                const auto metadata = token_src_metadata[pool_row];
+                const auto* remote_grad_y = sym_buffer.map(
+                    symmetric_bf16 +
+                        static_cast<uint64_t>(metadata.token_idx) *
+                            kHidden,
+                    metadata.rank_idx);
+                const float score = full_scores[pool_row];
+                float dscore = 0.0f;
+
+                #pragma unroll 1
+                for (uint32_t block = 0;
+                     block < kHiddenScaleBlocks; ++block) {
+                    float dz_values[4];
+                    float local_amax = 0.0f;
+                    #pragma unroll
+                    for (uint32_t i = 0; i < 4; ++i) {
+                        const uint32_t col =
+                            block * 128 + lane_idx * 4 + i;
+                        const float dy = static_cast<float>(
+                            remote_grad_y[col]);
+                        const float down = static_cast<float>(
+                            saved_down_unweighted[
+                                static_cast<uint64_t>(pool_row) *
+                                    kHidden +
+                                col]);
+                        dscore = __fmaf_rn(dy, down, dscore);
+                        dz_values[i] = static_cast<float>(
+                            bf16_t(__fmul_rn(dy, score)));
+                        local_amax = cute::max(
+                            local_amax, cute::abs(dz_values[i]));
+                    }
+                    local_amax = warp_reduce_max(local_amax);
+                    local_amax = __shfl_sync(
+                        0xffffffff, local_amax, 0);
+                    float scale_inv;
+                    const uint32_t packed_scale =
+                        packed_power2_scale(local_amax, scale_inv);
+                    #pragma unroll
+                    for (uint32_t i = 0; i < 4; ++i) {
+                        const uint32_t col =
+                            block * 128 + lane_idx * 4 + i;
+                        const fp8_t value(dz_values[i] * scale_inv);
+                        ring_grad_y[
+                            static_cast<uint64_t>(ring_row) *
+                                kHidden +
+                            col] = value;
+                        full_grad_y[
+                            static_cast<uint64_t>(pool_row) *
+                                kHidden +
+                            col] = value;
+                    }
+                    if (lane_idx == 0) {
+                        ring_grad_y_sf[
+                            block * sf_ring_tokens +
+                            transform_sf_row(ring_row)] =
+                            packed_scale;
+                        full_grad_y_sf[
+                            static_cast<uint64_t>(pool_row) *
+                                kHiddenScaleBlocks +
+                            block] = packed_scale;
+                    }
+                }
+
+                dscore = warp_reduce_sum(dscore);
+                __syncwarp();
+                if (lane_idx == 0) {
+                    *sym_buffer.map(
+                        symmetric_grad_scores +
+                            static_cast<uint64_t>(
+                                metadata.token_idx) * kTopK +
+                            metadata.topk_idx,
+                        metadata.rank_idx) = dscore;
+                    __threadfence();
+                    const bool is_last = row + 1 == count;
+                    ptx::red_add_rel(
+                        workspace.get_l1_full_count_ptr(ring_block),
+                        is_last
+                            ? kBlockM - (row % kBlockM)
+                            : 1u);
+                }
+                __syncwarp();
+            }
+            pool_block_offset += math::ceil_div(count, kBlockM);
+        }
+
+        constexpr uint32_t kDispatchNamedBarrier = 12;
+        comm::nvlink_barrier<
+            kNumRanks, kNumSMs, kDispatchThreads, 1, 92>(
+                workspace, sym_buffer, blockIdx.x,
+                dispatch_warp * 32 + lane_idx,
+                []() {
+                    ptx::sync_aligned(
+                        kDispatchThreads, kDispatchNamedBarrier);
+                });
+        if (blockIdx.x == 0 && dispatch_warp == 0 && lane_idx == 0) {
+            __threadfence();
+            atomicExch(dispatch_done, 1u);
+        }
+    } else if (warp_idx == 4) {
+        cutlass::arch::warpgroup_reg_dealloc<40>();
+        Scheduler scheduler(expert_counts);
+        scheduler.for_each_block(
+            [&](const sched::BackwardBlockPhase block_phase,
+                const uint32_t&, const uint32_t num_k_blocks,
+                const uint32_t m_block_idx,
+                const uint32_t&) {
+                const uint32_t pool_block =
+                    scheduler.get_current_pool_block_offset() +
+                    m_block_idx;
+                const uint32_t ring_block =
+                    pool_block % num_ring_blocks;
+                const uint32_t generation =
+                    pool_block / num_ring_blocks;
+                const uint32_t full_target =
+                    block_phase == sched::BackwardBlockPhase::W2Dgrad
+                        ? kBlockM * (generation + 1)
+                        : (2 * kW2BlockNs) * (generation + 1);
+                auto* full_ptr =
+                    block_phase == sched::BackwardBlockPhase::W2Dgrad
+                        ? workspace.get_l1_full_count_ptr(ring_block)
+                        : workspace.get_l2_full_count_ptr(ring_block);
+                while (ptx::ld_acq(full_ptr) != full_target) {
+                }
+                const auto* map_a =
+                    block_phase == sched::BackwardBlockPhase::W2Dgrad
+                        ? &tensor_map_ring_grad_y
+                        : &tensor_map_ring_grad_preact;
+                const auto* map_sfa =
+                    block_phase == sched::BackwardBlockPhase::W2Dgrad
+                        ? &tensor_map_ring_grad_y_sf
+                        : &tensor_map_ring_grad_preact_sf;
+                const uint32_t ring_m = ring_block * kBlockM;
+                const uint32_t sf_m = ring_block * kSFBlockM;
+                const uint32_t valid_m =
+                    scheduler.template get_valid_m<false>();
+                for (uint32_t k_block = 0; k_block < num_k_blocks;
+                     ++k_block, advance_pipeline()) {
+                    storage.empty_barriers[stage_idx].wait(
+                        pipeline_phase ^ 1u);
+                    uint32_t m_idx = ring_m;
+                    if (!leader_cta)
+                        m_idx += math::align(valid_m, 16u) / 2;
+                    if (cute::elect_one_sync()) {
+                        tma::copy<
+                            kBlockK, kLoadBlockM, kSwizzle, fp8_t>(
+                                map_a,
+                                &storage.full_barriers[stage_idx],
+                                storage.smem_a[stage_idx],
+                                k_block * kBlockK, m_idx, 2);
+                        tma::copy<kSFBlockM, 1, 0>(
+                            map_sfa,
+                            &storage.full_barriers[stage_idx],
+                            storage.smem_sfa[stage_idx],
+                            sf_m, k_block, 2);
+                        if (leader_cta) {
+                            storage.full_barriers[stage_idx]
+                                .arrive_and_expect_tx(
+                                    sizeof(storage.smem_a[0]) * 2 +
+                                    sizeof(storage.smem_sfa[0]) * 2);
+                        } else {
+                            storage.full_barriers[stage_idx].arrive(0u);
+                        }
+                    }
+                    __syncwarp();
+                }
+            });
+    } else if (warp_idx == 5) {
+        cutlass::arch::warpgroup_reg_dealloc<40>();
+        Scheduler scheduler(expert_counts);
+        scheduler.for_each_block(
+            [&](const sched::BackwardBlockPhase block_phase,
+                const uint32_t expert, const uint32_t num_k_blocks,
+                const uint32_t&, const uint32_t n_block) {
+                const auto* map_b =
+                    block_phase == sched::BackwardBlockPhase::W2Dgrad
+                        ? &tensor_map_w2_dgrad
+                        : &tensor_map_w13_dgrad;
+                for (uint32_t k_block = 0; k_block < num_k_blocks;
+                     ++k_block, advance_pipeline()) {
+                    storage.empty_barriers[stage_idx].wait(
+                        pipeline_phase ^ 1u);
+                    if (cute::elect_one_sync()) {
+                        const uint32_t outer_k =
+                            block_phase ==
+                                    sched::BackwardBlockPhase::W2Dgrad
+                                ? expert * kHidden +
+                                      k_block * kBlockK
+                                : expert * (2 * kIntermediate) +
+                                      k_block * kBlockK;
+                        tma::copy<
+                            kBlockN, kBlockK, kSwizzle, fp8_t>(
+                                map_b,
+                                &storage.full_barriers[stage_idx],
+                                storage.smem_b[stage_idx],
+                                n_block * kBlockN, outer_k, 2);
+                    }
+                    #pragma unroll
+                    for (uint32_t row = lane_idx;
+                         row < kBlockN; row += 32) {
+                        float scale;
+                        if (block_phase ==
+                            sched::BackwardBlockPhase::W2Dgrad) {
+                            scale = __ldg(
+                                w2_scales +
+                                (expert * (kHidden / 128) +
+                                 k_block) *
+                                    (kIntermediate / 128) +
+                                n_block);
+                        } else {
+                            const uint32_t plane =
+                                k_block / (kIntermediate / 128);
+                            const uint32_t row_block =
+                                k_block % (kIntermediate / 128);
+                            scale = __ldg(
+                                w13_scales +
+                                ((expert * 2 + plane) *
+                                     (kIntermediate / 128) +
+                                 row_block) *
+                                    (kHidden / 128) +
+                                n_block);
+                        }
+                        storage.smem_sfb[stage_idx][row] =
+                            (__float_as_uint(scale) >> 23) *
+                            0x01010101u;
+                    }
+                    __syncwarp();
+                    if (cute::elect_one_sync()) {
+                        if (leader_cta) {
+                            storage.full_barriers[stage_idx]
+                                .arrive_and_expect_tx(
+                                    sizeof(storage.smem_b[0]) * 2);
+                        } else {
+                            storage.full_barriers[stage_idx].arrive(0u);
+                        }
+                    }
+                    __syncwarp();
+                }
+            });
+    } else if (warp_idx == 6) {
+        cutlass::arch::warpgroup_reg_dealloc<40>();
+        if (leader_cta) {
+            auto instr_desc =
+                cute::UMMA::make_instr_desc_block_scaled<
+                    fp8_t, fp8_t, float,
+                    cutlass::float_ue8m0_t,
+                    kUMMAM, kUMMAN,
+                    cute::UMMA::Major::MN,
+                    cute::UMMA::Major::K>();
+            auto sf_desc = mma::sm100::make_sf_desc(nullptr);
+            auto a_desc = mma::sm100::make_umma_desc<
+                cute::UMMA::Major::K, kLoadBlockM,
+                kBlockK, kSwizzle>(storage.smem_a[0], 0, 0);
+            auto b_desc = mma::sm100::make_umma_desc<
+                cute::UMMA::Major::MN, kLoadBlockN,
+                kBlockK, kSwizzle>(storage.smem_b[0], 0, 0);
+            const uint32_t a_desc_lo = lane_idx < kStages
+                ? a_desc.lo +
+                      lane_idx * sizeof(storage.smem_a[0]) / 16
+                : 0u;
+            const uint32_t b_desc_lo = lane_idx < kStages
+                ? b_desc.lo +
+                      lane_idx * sizeof(storage.smem_b[0]) / 16
+                : 0u;
+            uint32_t current_iter = 0;
+            Scheduler scheduler(expert_counts);
+            scheduler.for_each_block(
+                [&](const sched::BackwardBlockPhase,
+                    const uint32_t&, const uint32_t num_k_blocks,
+                    const uint32_t&, const uint32_t&) {
+                    mma::sm100::update_instr_desc_with_umma_n(
+                        instr_desc,
+                        scheduler.template get_valid_m<true>());
+                    const uint32_t accum_stage =
+                        current_iter % kNumEpilogueStages;
+                    const uint32_t accum_phase =
+                        (current_iter++ / kNumEpilogueStages) & 1u;
+                    storage.tmem_empty_barriers[accum_stage].wait(
+                        accum_phase ^ 1u);
+                    ptx::tcgen05_after_thread_sync();
+                    for (uint32_t k_block = 0;
+                         k_block < num_k_blocks;
+                         ++k_block, advance_pipeline()) {
+                        storage.full_barriers[stage_idx].wait(
+                            pipeline_phase);
+                        ptx::tcgen05_after_thread_sync();
+                        const uint32_t a_base =
+                            ptx::exchange(a_desc_lo, stage_idx);
+                        const uint32_t b_base =
+                            ptx::exchange(b_desc_lo, stage_idx);
+                        if (cute::elect_one_sync()) {
+                            using utccp_t =
+                                cute::SM100_UTCCP_4x32dp128bit_2cta;
+                            #pragma unroll
+                            for (uint32_t i = 0;
+                                 i < kSFBlockM /
+                                         kUTCCPAlignedElements;
+                                 ++i) {
+                                mma::sm100::replace_smem_desc_addr(
+                                    sf_desc,
+                                    storage.smem_sfa[stage_idx] +
+                                        i * kUTCCPAlignedElements);
+                                utccp_t::copy(
+                                    sf_desc, kTmemSFAStart + i * 4);
+                            }
+                            mma::sm100::replace_smem_desc_addr(
+                                sf_desc,
+                                storage.smem_sfb[stage_idx]);
+                            // Keep these device-lambda constants literal.  NVCC
+                            // otherwise ODR-uses the namespace-scope constexpr
+                            // and looks for a device symbol during template
+                            // instantiation.
+                            utccp_t::copy(sf_desc, 392u);
+                            #pragma unroll
+                            for (uint32_t k = 0;
+                                 k < kBlockK / kUMMAK; ++k) {
+                                const auto runtime_desc =
+                                    mma::sm100::
+                                        make_runtime_instr_desc_with_sf_id(
+                                            instr_desc, k, k);
+                                a_desc.lo =
+                                    mma::sm100::advance_umma_desc_lo<
+                                        cute::UMMA::Major::K,
+                                        kLoadBlockM, kSwizzle, fp8_t>(
+                                            a_base, 0, k * kUMMAK);
+                                b_desc.lo =
+                                    mma::sm100::advance_umma_desc_lo<
+                                        cute::UMMA::Major::MN,
+                                        kLoadBlockN, kSwizzle, fp8_t>(
+                                            b_base, 0, k * kUMMAK);
+                                ptx::SM100_MMA_MXF8F6F4_2x1SM_SS::fma(
+                                    b_desc, a_desc,
+                                    accum_stage * kUMMAN,
+                                    k_block > 0 || k > 0,
+                                    runtime_desc, 392u, 384u);
+                            }
+                        }
+                        __syncwarp();
+                        constexpr uint16_t kCTAMask = 3;
+                        cutlass::arch::umma_arrive_multicast_2x1SM(
+                            reinterpret_cast<uint64_t*>(
+                                &storage.empty_barriers[stage_idx]),
+                            kCTAMask);
+                        if (k_block + 1 == num_k_blocks) {
+                            cutlass::arch::umma_arrive_multicast_2x1SM(
+                                reinterpret_cast<uint64_t*>(
+                                    &storage.tmem_full_barriers[
+                                        accum_stage]),
+                                kCTAMask);
+                        }
+                        __syncwarp();
+                    }
+                });
+            if (current_iter != 0) {
+                const uint32_t last = current_iter - 1;
+                storage.tmem_empty_barriers[
+                    last % kNumEpilogueStages]
+                    .wait((last / kNumEpilogueStages) & 1u);
+            }
+        }
+    } else if (warp_idx >= 8 && warp_idx < 12) {
+        cutlass::arch::warpgroup_reg_alloc<208>();
+        const uint32_t epilogue_warp = warp_idx - 8;
+        const uint32_t epilogue_thread =
+            epilogue_warp * 32 + lane_idx;
+        uint32_t current_iter = 0;
+        uint32_t tma_stage = 0;
+        auto smem_cd = utils::PatternVisitor([&](const uint32_t& i) {
+            return storage.smem_cd[i];
+        });
+        Scheduler scheduler(expert_counts);
+        scheduler.for_each_block(
+            [&](const sched::BackwardBlockPhase block_phase,
+                const uint32_t&, const uint32_t,
+                const uint32_t m_block, const uint32_t n_block) {
+                const uint32_t accum_stage =
+                    current_iter % kNumEpilogueStages;
+                const uint32_t accum_phase =
+                    (current_iter++ / kNumEpilogueStages) & 1u;
+                storage.tmem_full_barriers[accum_stage].wait(
+                    accum_phase);
+                ptx::tcgen05_after_thread_sync();
+
+                const uint32_t pool_block =
+                    scheduler.get_current_pool_block_offset() +
+                    m_block;
+                const uint32_t ring_block =
+                    pool_block % num_ring_blocks;
+                const uint32_t generation =
+                    pool_block / num_ring_blocks;
+                const uint32_t ring_m = ring_block * kBlockM;
+                const uint32_t pool_m = pool_block * kBlockM;
+                const uint32_t valid_m =
+                    scheduler.template get_valid_m<false>();
+                const auto* output_map =
+                    block_phase == sched::BackwardBlockPhase::W2Dgrad
+                        ? &tensor_map_grad_h
+                        : &tensor_map_grad_x;
+
+                if (block_phase ==
+                    sched::BackwardBlockPhase::W2Dgrad) {
+                    const uint32_t empty_target =
+                        kW13BlockNs * generation;
+                    while (ptx::ld_acq(
+                               workspace.get_l2_empty_count_ptr(
+                                   ring_block)) != empty_target) {
+                    }
+                }
+
+                epilogue::sm100_store_cd_swap_ab<
+                    kBlockM, kBlockN, kStoreBlockM, kBlockN,
+                    kSwizzle, kNumTMAStoreStages,
+                    128u, GemmType::Normal, false,
+                    bf16_t,
+                    epilogue::transform::EpilogueIdentity>(
+                        smem_cd, tma_stage,
+                        accum_stage * kUMMAN,
+                        ring_m, n_block * kBlockN, 0,
+                        math::align(valid_m, 16u),
+                        epilogue_warp, lane_idx,
+                        &storage.tmem_empty_barriers[accum_stage],
+                        *output_map);
+                if (epilogue_warp == 0)
+                    cute::tma_store_wait<0>();
+                ptx::sync_aligned(
+                    128u, kEpilogueBarrier);
+
+                if (block_phase ==
+                    sched::BackwardBlockPhase::W2Dgrad) {
+                    const uint32_t hidden_col =
+                        n_block * kBlockN + epilogue_thread;
+                    #pragma unroll 1
+                    for (uint32_t row = 0; row < valid_m; ++row) {
+                        const uint32_t ring_row = ring_m + row;
+                        const uint32_t pool_row = pool_m + row;
+                        const float dh = static_cast<float>(
+                            ring_bf16[
+                                static_cast<uint64_t>(ring_row) *
+                                    kHidden +
+                                hidden_col]);
+                        const float gate = static_cast<float>(
+                            saved_l1_preact[
+                                static_cast<uint64_t>(pool_row) *
+                                    (2 * kIntermediate) +
+                                hidden_col]);
+                        const float up = static_cast<float>(
+                            saved_l1_preact[
+                                static_cast<uint64_t>(pool_row) *
+                                    (2 * kIntermediate) +
+                                kIntermediate + hidden_col]);
+                        const float sigmoid =
+                            math::fast_rcp(1.0f + __expf(-gate));
+                        const float dgate =
+                            dh * up * sigmoid *
+                            (1.0f + gate * (1.0f - sigmoid));
+                        const float dup = dh * gate * sigmoid;
+                        const float gate_amax =
+                            reduce_group_128<true>(
+                                cute::abs(dgate), storage, 2);
+                        const float up_amax =
+                            reduce_group_128<true>(
+                                cute::abs(dup), storage, 2);
+                        float gate_inv, up_inv;
+                        const uint32_t gate_scale =
+                            packed_power2_scale(
+                                gate_amax, gate_inv);
+                        const uint32_t up_scale =
+                            packed_power2_scale(up_amax, up_inv);
+                        const uint32_t gate_col = hidden_col;
+                        const uint32_t up_col =
+                            kIntermediate + hidden_col;
+                        ring_grad_preact[
+                            static_cast<uint64_t>(ring_row) *
+                                (2 * kIntermediate) +
+                            gate_col] = fp8_t(dgate * gate_inv);
+                        ring_grad_preact[
+                            static_cast<uint64_t>(ring_row) *
+                                (2 * kIntermediate) +
+                            up_col] = fp8_t(dup * up_inv);
+                        full_grad_preact[
+                            static_cast<uint64_t>(pool_row) *
+                                (2 * kIntermediate) +
+                            gate_col] = fp8_t(dgate * gate_inv);
+                        full_grad_preact[
+                            static_cast<uint64_t>(pool_row) *
+                                (2 * kIntermediate) +
+                            up_col] = fp8_t(dup * up_inv);
+                        if (epilogue_thread == 0) {
+                            const uint32_t sf_row =
+                                transform_sf_row(ring_row);
+                            ring_grad_preact_sf[
+                                n_block * sf_ring_tokens +
+                                sf_row] = gate_scale;
+                            ring_grad_preact_sf[
+                                (kW2BlockNs + n_block) *
+                                    sf_ring_tokens +
+                                sf_row] = up_scale;
+                            full_grad_preact_sf[
+                                static_cast<uint64_t>(pool_row) *
+                                    kGradPreactScaleBlocks +
+                                n_block] = gate_scale;
+                            full_grad_preact_sf[
+                                static_cast<uint64_t>(pool_row) *
+                                    kGradPreactScaleBlocks +
+                                kW2BlockNs + n_block] = up_scale;
+                        }
+                    }
+                    ptx::sync_aligned(
+                        128u, kEpilogueBarrier);
+                    if (epilogue_warp == 0 &&
+                        cute::elect_one_sync()) {
+                        __threadfence();
+                        ptx::red_add_rel(
+                            workspace.get_l2_full_count_ptr(
+                                ring_block),
+                            2u);
+                        ptx::red_add(
+                            workspace.get_l1_empty_count_ptr(
+                                ring_block),
+                            1u);
+                    }
+                    __syncwarp();
+                } else {
+                    while (ptx::ld_acq(dispatch_done) != 1u) {
+                    }
+                    constexpr uint32_t kVecElements =
+                        sizeof(uint4) / sizeof(bf16_t);
+                    constexpr uint32_t kVecsPerNBlock =
+                        kBlockN / kVecElements;
+                    for (uint32_t linear = epilogue_thread;
+                         linear < valid_m * kVecsPerNBlock;
+                         linear += 128u) {
+                        const uint32_t row =
+                            linear / kVecsPerNBlock;
+                        const uint32_t vec =
+                            linear - row * kVecsPerNBlock;
+                        const uint32_t pool_row = pool_m + row;
+                        const uint32_t ring_row = ring_m + row;
+                        const auto metadata =
+                            token_src_metadata[pool_row];
+                        const uint32_t source_vec =
+                            n_block * kVecsPerNBlock + vec;
+                        const uint4 value =
+                            reinterpret_cast<const uint4*>(
+                                ring_bf16 +
+                                static_cast<uint64_t>(ring_row) *
+                                    kHidden)[source_vec];
+                        auto* remote = sym_buffer.map(
+                            reinterpret_cast<uint4*>(
+                                symmetric_bf16 +
+                                (static_cast<uint64_t>(
+                                     metadata.topk_idx) *
+                                     capacity +
+                                 metadata.token_idx) *
+                                    kHidden) +
+                                source_vec,
+                            metadata.rank_idx);
+                        *remote = value;
+                    }
+                    ptx::sync_aligned(
+                        128u, kEpilogueBarrier);
+                    if (epilogue_warp == 0 &&
+                        cute::elect_one_sync()) {
+                        __threadfence_system();
+                        ptx::red_add_rel(
+                            workspace.get_l2_empty_count_ptr(
+                                ring_block),
+                            1u);
+                    }
+                    __syncwarp();
+                }
+            });
+    } else {
+        cutlass::arch::warpgroup_reg_dealloc<40>();
+    }
+
+    comm::cluster_sync_with_relaxed_arrive();
+    if (warp_idx == 7)
+        cute::TMEM::Allocator2Sm().free(0, kNumTmemCols);
+
+    comm::nvlink_barrier<kNumRanks, kNumSMs, kThreads, 2, 93>(
+        workspace, sym_buffer, blockIdx.x, threadIdx.x,
+        []() { __syncthreads(); });
+
+    for (uint64_t linear = global_thread;
+         linear < static_cast<uint64_t>(num_tokens) * kHidden;
+         linear += global_stride) {
+        const uint32_t token = linear / kHidden;
+        const uint32_t col = linear -
+            static_cast<uint64_t>(token) * kHidden;
+        float value = 0.0f;
+        #pragma unroll
+        for (uint32_t slot = 0; slot < kTopK; ++slot) {
+            value = __fadd_rn(
+                value,
+                static_cast<float>(
+                    symmetric_bf16[
+                        (static_cast<uint64_t>(slot) * capacity +
+                         token) *
+                            kHidden +
+                        col]));
+        }
+        grad_x[linear] = bf16_t(value);
+    }
+    for (uint64_t route = global_thread;
+         route < static_cast<uint64_t>(num_tokens) * kTopK;
+         route += global_stride) {
+        grad_scores[route] = symmetric_grad_scores[route];
+    }
+
+    for (uint32_t block = global_thread;
+         block < num_ring_blocks; block += global_stride) {
+        *workspace.get_l1_full_count_ptr(block) = 0u;
+        *workspace.get_l1_empty_count_ptr(block) = 0u;
+        *workspace.get_l2_full_count_ptr(block) = 0u;
+        *workspace.get_l2_empty_count_ptr(block) = 0u;
+    }
+    if (global_thread == 0)
+        *dispatch_done = 0u;
+    comm::grid_sync<kNumSMs, 3>(
+        workspace, blockIdx.x, threadIdx.x,
+        []() { __syncthreads(); });
+#endif
+}
+
 }  // namespace sm103_block128_backward
 
 }  // namespace deep_gemm

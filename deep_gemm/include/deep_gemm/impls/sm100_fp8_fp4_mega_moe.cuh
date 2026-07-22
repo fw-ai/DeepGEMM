@@ -76,12 +76,21 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l1_weights,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l1_weights_sf,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l1_output,
+                            const __grid_constant__ cute::TmaDescriptor tensor_map_l1_saved_output,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts_sf,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights_sf,
+                            const __grid_constant__ cute::TmaDescriptor tensor_map_l2_saved_output,
                             const float* l1_block128_scales = nullptr,
-                            const float* l2_block128_scales = nullptr) {
+                            const float* l2_block128_scales = nullptr,
+                            cutlass::float_e4m3_t* saved_l1_acts = nullptr,
+                            uint32_t* saved_l1_acts_sf = nullptr,
+                            float* saved_route_weights = nullptr,
+                            nv_bfloat16* saved_l1_preact = nullptr,
+                            cutlass::float_e4m3_t* saved_l2_acts = nullptr,
+                            uint32_t* saved_l2_acts_sf = nullptr,
+                            nv_bfloat16* saved_down_unweighted = nullptr) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::TMEM::Allocator2Sm;
@@ -115,10 +124,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         cute::prefetch_tma_descriptor(&tensor_map_l1_weights);
         cute::prefetch_tma_descriptor(&tensor_map_l1_weights_sf);
         cute::prefetch_tma_descriptor(&tensor_map_l1_output);
+        cute::prefetch_tma_descriptor(&tensor_map_l1_saved_output);
         cute::prefetch_tma_descriptor(&tensor_map_l2_acts);
         cute::prefetch_tma_descriptor(&tensor_map_l2_acts_sf);
         cute::prefetch_tma_descriptor(&tensor_map_l2_weights);
         cute::prefetch_tma_descriptor(&tensor_map_l2_weights_sf);
+        cute::prefetch_tma_descriptor(&tensor_map_l2_saved_output);
     }
 
     // Workspaces
@@ -589,6 +600,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const auto src_base_ptr = sym_buffer.map(
                 input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(), current_rank_in_expert_idx);
             const auto dst_base_ptr = l1_token_buffer.get_data_buffer(pool_token_idx % num_ring_tokens).get_base_ptr();
+            const auto saved_dst_base_ptr = saved_l1_acts != nullptr
+                ? saved_l1_acts + static_cast<uint64_t>(pool_token_idx) * kHidden
+                : nullptr;
             const auto issue_and_wait_pull_store = [&](const uint32_t& i) {
                 ptx::mbarrier_wait_and_flip_phase(pull_mbarrier, pull_mbarrier_phase);
                 ptx::tma_store_1d(
@@ -596,6 +610,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     pull_buffer.get_base_ptr(), kNumBytesPerPull
                 );
                 cute::tma_store_arrive();
+                if (saved_dst_base_ptr != nullptr) {
+                    ptx::tma_store_1d(
+                        math::advance_ptr(
+                            saved_dst_base_ptr, i * kNumBytesPerPull),
+                        pull_buffer.get_base_ptr(), kNumBytesPerPull);
+                    cute::tma_store_arrive();
+                }
                 ptx::tma_store_wait<0>();
             };
             if (cute::elect_one_sync()) {
@@ -626,8 +647,17 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             #pragma unroll
             for (uint32_t i = 0; i < math::constexpr_ceil_div(kNumSFUint32, 32u); ++ i) {
                 const uint32_t j = i * 32 + lane_idx;
-                if (j < kNumSFUint32)
-                    local_sf_ptr[j * num_sf_ring_tokens + sf_ring_token_idx] = remote_sf_ptr[j];
+                if (j < kNumSFUint32) {
+                    const uint32_t packed_sf = remote_sf_ptr[j];
+                    local_sf_ptr[j * num_sf_ring_tokens + sf_ring_token_idx] =
+                        packed_sf;
+                    if (saved_l1_acts_sf != nullptr) {
+                        saved_l1_acts_sf[
+                            static_cast<uint64_t>(pool_token_idx) *
+                                kNumSFUint32 +
+                            j] = packed_sf;
+                    }
+                }
             }
             __syncwarp();
 
@@ -640,6 +670,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 *l1_topk_weights_buffer.get_data_buffer(pool_token_idx % num_ring_tokens).template get_base_ptr<float>() = weight;
                 if constexpr (kFP8Block128Weights)
                     *workspace.get_route_weight_ptr(pool_token_idx) = weight;
+                if (saved_route_weights != nullptr)
+                    saved_route_weights[pool_token_idx] = weight;
 
                 // Write source metadata for combine write-back (logical pool token)
                 *(saved_token_src_metadata != nullptr
@@ -1211,6 +1243,55 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             auto bf16_gate = bf16_gate_values[k];
                             auto bf16_up = bf16_up_values[k];
 
+                            if constexpr (kFP8Block128Weights) {
+                                if (saved_l1_preact != nullptr) {
+                                    // Preserve upstream's training lifetime:
+                                    // save the exact BF16 accumulator rounding
+                                    // before clamp/activation. Canonical W13 is
+                                    // loaded as [up64; gate64], while the fused
+                                    // output chunk order is 0,2,1,3 across the
+                                    // four epilogue warps.
+                                    const uint32_t logical_chunk =
+                                        (warp_idx_in_wg % 2) * 2 +
+                                        warp_idx_in_wg / 2;
+                                    const uint32_t hidden_col =
+                                        n_block_idx * (BLOCK_N / 2) +
+                                        logical_chunk * 16 +
+                                        (lane_idx / 4) * 2 + k;
+                                    const uint32_t row_base =
+                                        pool_m_idx +
+                                        epilogue_wg_idx * WG_BLOCK_M +
+                                        s * STORE_BLOCK_M +
+                                        i * ATOM_M +
+                                        (lane_idx % 4) * 2;
+                                    const uint32_t gate_bits =
+                                        *reinterpret_cast<const uint32_t*>(
+                                            &bf16_gate);
+                                    const uint32_t up_bits =
+                                        *reinterpret_cast<const uint32_t*>(
+                                            &bf16_up);
+                                    #pragma unroll
+                                    for (uint32_t r = 0; r < 2; ++r) {
+                                        const uint32_t pool_row = row_base + r;
+                                        if (pool_row < pool_m_idx + valid_m) {
+                                            auto* saved_bits =
+                                                reinterpret_cast<uint16_t*>(
+                                                    saved_l1_preact +
+                                                    static_cast<uint64_t>(
+                                                        pool_row) *
+                                                        (2 * kIntermediateHidden));
+                                            saved_bits[hidden_col] =
+                                                static_cast<uint16_t>(
+                                                    gate_bits >> (r * 16));
+                                            saved_bits[
+                                                kIntermediateHidden + hidden_col] =
+                                                static_cast<uint16_t>(
+                                                    up_bits >> (r * 16));
+                                        }
+                                    }
+                                }
+                            }
+
                             // Clamp
                             if constexpr (kActivationClampBits != 0x7f800000u) {
                                 const float activation_clamp = __uint_as_float(kActivationClampBits);
@@ -1427,6 +1508,43 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                 (*reinterpret_cast<const uint32_t*>(&sf.x) >> 23);
                             sf_base_ptr[sf_addr + 4 * static_cast<uint32_t>(sizeof(uint32_t))] =
                                 (*reinterpret_cast<const uint32_t*>(&sf.y) >> 23);
+
+                            if constexpr (kFP8Block128Weights) {
+                                if (saved_l2_acts_sf != nullptr &&
+                                    (n_block_idx & 1u) == 0u &&
+                                    warp_idx_in_wg == 0) {
+                                    const uint32_t token_base_idx =
+                                        epilogue_wg_idx * WG_BLOCK_M +
+                                        s * STORE_BLOCK_M +
+                                        i * ATOM_M;
+                                    const uint32_t row0 =
+                                        pool_m_idx + token_base_idx +
+                                        lane_idx * 2;
+                                    const uint32_t row1 = row0 + 1;
+                                    const uint32_t scale_block =
+                                        n_block_idx / 2;
+                                    const uint32_t num_scale_blocks =
+                                        kIntermediateHidden / 128;
+                                    const uint32_t packed0 =
+                                        (*reinterpret_cast<const uint32_t*>(
+                                            &sf.x) >> 23) * 0x01010101u;
+                                    const uint32_t packed1 =
+                                        (*reinterpret_cast<const uint32_t*>(
+                                            &sf.y) >> 23) * 0x01010101u;
+                                    if (row0 < pool_m_idx + valid_m) {
+                                        saved_l2_acts_sf[
+                                            static_cast<uint64_t>(row0) *
+                                                num_scale_blocks +
+                                            scale_block] = packed0;
+                                    }
+                                    if (row1 < pool_m_idx + valid_m) {
+                                        saved_l2_acts_sf[
+                                            static_cast<uint64_t>(row1) *
+                                                num_scale_blocks +
+                                            scale_block] = packed1;
+                                    }
+                                }
+                            }
                         }
                         __syncwarp();
                     }
@@ -1442,6 +1560,17 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             out_n_idx,
                             ring_m_idx + epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M);
                         cute::tma_store_arrive();
+                        if (saved_l2_acts != nullptr) {
+                            cute::SM90_TMA_STORE_2D::copy(
+                                &tensor_map_l1_saved_output,
+                                shared_storage.smem_d
+                                    .l1[epilogue_wg_idx][tma_stage_idx],
+                                out_n_idx,
+                                pool_m_idx +
+                                    epilogue_wg_idx * WG_BLOCK_M +
+                                    s * STORE_BLOCK_M);
+                            cute::tma_store_arrive();
+                        }
                     }
                     __syncwarp();
                 }
@@ -1524,6 +1653,42 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
                     // Wait shared memory ready
                     ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
+
+                    if constexpr (kFP8Block128Weights) {
+                        if (saved_down_unweighted != nullptr) {
+                            const uint32_t saved_store_row =
+                                pool_m_idx +
+                                epilogue_wg_idx * WG_BLOCK_M +
+                                s * STORE_BLOCK_M;
+                            if (warp_idx_in_wg == 0 &&
+                                cute::elect_one_sync()) {
+                                cute::tma_store_fence();
+                                #pragma unroll
+                                for (uint32_t atom = 0;
+                                     atom <
+                                         BLOCK_N * sizeof(nv_bfloat16) /
+                                             kSwizzleCDMode;
+                                     ++atom) {
+                                    cute::SM90_TMA_STORE_2D::copy(
+                                        &tensor_map_l2_saved_output,
+                                        shared_storage.smem_d
+                                                .l2[epilogue_wg_idx] +
+                                            atom * STORE_BLOCK_M *
+                                                (kSwizzleCDMode /
+                                                 sizeof(nv_bfloat16)),
+                                        n_idx +
+                                            atom *
+                                                (kSwizzleCDMode /
+                                                 sizeof(nv_bfloat16)),
+                                        saved_store_row);
+                                    cute::tma_store_arrive();
+                                }
+                            }
+                            if (warp_idx_in_wg == 0)
+                                cute::tma_store_wait<0>();
+                            __syncwarp();
+                        }
+                    }
 
                     // Write into remote buffers
                     // Each warp writes 2 rows (lane_idx/16 splits the warp into two halves, one per row)

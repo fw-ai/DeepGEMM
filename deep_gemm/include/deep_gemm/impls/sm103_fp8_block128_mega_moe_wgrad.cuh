@@ -313,8 +313,11 @@ sm103_fp8_block128_mega_moe_wgrad_impl(
     // One fused prologue per dedicated wgrad launch. This removes conversion
     // from the output-tile loop while preserving the exact E4M3 + FP32
     // power-of-two scale and BF16-rounding semantics.
+    // Reverse dispatch has already formed and power-of-two quantized dz =
+    // BF16(dy * route_score) for W2.  Dequantize it exactly once here; applying
+    // the route score again would square the router derivative.
     dequantize_route_pool_once<
-        kShapeM, kLocalExperts, kNumSMs, kThreads, kW2>(
+        kShapeM, kLocalExperts, kNumSMs, kThreads, false>(
             expert_counts, max_pool_tokens,
             full_a, full_a_sf, full_scores, cached_a);
     dequantize_route_pool_once<

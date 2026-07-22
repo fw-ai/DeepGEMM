@@ -177,6 +177,7 @@ struct PersistentWorkspaceLayout {
     deep_gemm::layout::Buffer backward_grad_y_tokens;
     deep_gemm::layout::Buffer backward_grad_y_scales;
     deep_gemm::layout::Buffer backward_grad_scores;
+    deep_gemm::layout::Buffer backward_dispatch_done;
     deep_gemm::layout::Buffer backward_ring_grad_y;
     deep_gemm::layout::Buffer backward_ring_grad_y_scales;
     deep_gemm::layout::Buffer backward_ring_grad_preact;
@@ -192,6 +193,8 @@ struct PersistentWorkspaceLayout {
     deep_gemm::layout::Buffer backward_full_h_scales;
     deep_gemm::layout::Buffer backward_full_grad_preact;
     deep_gemm::layout::Buffer backward_full_grad_preact_scales;
+    deep_gemm::layout::Buffer saved_l1_preact;
+    deep_gemm::layout::Buffer saved_down_unweighted;
     deep_gemm::layout::Buffer backward_wgrad_bf16_narrow;
     deep_gemm::layout::Buffer backward_wgrad_bf16_wide;
 
@@ -280,11 +283,16 @@ struct PersistentWorkspaceLayout {
             1,
             capacity,
             backward_grad_y_scales.get_end_ptr()),
+        backward_dispatch_done(
+            deep_gemm::layout::Data(sizeof(uint32_t), false),
+            1,
+            1,
+            backward_grad_scores.get_end_ptr()),
         backward_ring_grad_y(
             deep_gemm::layout::Data(kPersistentHidden),
             1,
             ring_tokens,
-            backward_grad_scores.get_end_ptr()),
+            backward_dispatch_done.get_end_ptr()),
         backward_ring_grad_y_scales(
             deep_gemm::layout::Data(kPersistentHidden / 32),
             1,
@@ -358,6 +366,19 @@ struct PersistentWorkspaceLayout {
             1,
             workspace.num_max_pool_tokens,
             backward_full_grad_preact.get_end_ptr()),
+        saved_l1_preact(
+            deep_gemm::layout::Data(
+                2 * kPersistentIntermediate *
+                sizeof(__nv_bfloat16)),
+            1,
+            workspace.num_max_pool_tokens,
+            backward_full_grad_preact_scales.get_end_ptr()),
+        saved_down_unweighted(
+            deep_gemm::layout::Data(
+                kPersistentHidden * sizeof(__nv_bfloat16)),
+            1,
+            workspace.num_max_pool_tokens,
+            saved_l1_preact.get_end_ptr()),
         // The two dedicated wgrad kernels reuse these private operands. W13
         // maps grad_preact -> narrow and x -> wide; W2 maps grad_y -> wide and
         // h -> narrow. One extra K tile is a permanent zero source for empty
@@ -368,7 +389,7 @@ struct PersistentWorkspaceLayout {
             1,
             workspace.num_max_pool_tokens +
                 deep_gemm::sm103_block128_wgrad::kBlockK,
-            backward_full_grad_preact_scales.get_end_ptr()),
+            saved_down_unweighted.get_end_ptr()),
         backward_wgrad_bf16_wide(
             deep_gemm::layout::Data(
                 kPersistentHidden * sizeof(__nv_bfloat16)),
@@ -1834,6 +1855,9 @@ void launch_persistent_forward(
     const auto int_options = torch::TensorOptions()
         .dtype(torch::kInt)
         .device(device);
+    const auto bf16_options = torch::TensorOptions()
+        .dtype(torch::kBFloat16)
+        .device(device);
 
     auto l1_acts = torch::from_blob(
         layout.l1_tokens.base,
@@ -1853,6 +1877,16 @@ void launch_persistent_forward(
         {layout.sf_ring_tokens, kPersistentIntermediate / 128},
         {1, static_cast<int64_t>(layout.sf_ring_tokens)},
         int_options);
+    auto saved_l2_acts = torch::from_blob(
+        layout.backward_full_h.base,
+        {static_cast<int64_t>(layout.workspace.num_max_pool_tokens),
+         kPersistentIntermediate},
+        fp8_options);
+    auto saved_down_unweighted = torch::from_blob(
+        layout.saved_down_unweighted.base,
+        {static_cast<int64_t>(layout.workspace.num_max_pool_tokens),
+         kPersistentHidden},
+        bf16_options);
 
     const auto tensor_map_l1_acts = deep_gemm::make_tma_2d_desc(
         l1_acts,
@@ -1892,6 +1926,15 @@ void launch_persistent_forward(
         kPersistentStoreBlockM,
         static_cast<int>(l2_acts.stride(-2)),
         64);
+    const auto tensor_map_l1_saved_output =
+        deep_gemm::make_tma_2d_desc(
+            saved_l2_acts,
+            kPersistentIntermediate,
+            static_cast<int>(layout.workspace.num_max_pool_tokens),
+            kPersistentBlockN / 2,
+            kPersistentStoreBlockM,
+            kPersistentIntermediate,
+            64);
     const auto tensor_map_l2_acts = deep_gemm::make_tma_2d_desc(
         l2_acts,
         kPersistentIntermediate,
@@ -1920,6 +1963,15 @@ void launch_persistent_forward(
         kPersistentBlockN,
         static_cast<int>(w2_weight.stride(-2)),
         128);
+    const auto tensor_map_l2_saved_output =
+        deep_gemm::make_tma_2d_desc(
+            saved_down_unweighted,
+            kPersistentHidden,
+            static_cast<int>(layout.workspace.num_max_pool_tokens),
+            kPersistentBlockN,
+            kPersistentStoreBlockM,
+            kPersistentHidden,
+            128);
 
     using Kernel = decltype(&deep_gemm::sm100_fp8_fp4_mega_moe_impl<
         kPersistentHidden,
@@ -2002,12 +2054,23 @@ void launch_persistent_forward(
         tensor_map_l1_weights,
         tensor_map_l1_acts_sf,
         tensor_map_l1_output,
+        tensor_map_l1_saved_output,
         tensor_map_l2_acts,
         tensor_map_l2_acts_sf,
         tensor_map_l2_weights,
         tensor_map_l2_acts_sf,
+        tensor_map_l2_saved_output,
         w13_scale.data_ptr<float>(),
-        w2_scale.data_ptr<float>()));
+        w2_scale.data_ptr<float>(),
+        layout.backward_full_x
+            .get_base_ptr<cutlass::float_e4m3_t>(),
+        layout.backward_full_x_scales.get_base_ptr<uint32_t>(),
+        layout.backward_full_scores.get_base_ptr<float>(),
+        layout.saved_l1_preact.get_base_ptr<__nv_bfloat16>(),
+        layout.backward_full_h
+            .get_base_ptr<cutlass::float_e4m3_t>(),
+        layout.backward_full_h_scales.get_base_ptr<uint32_t>(),
+        layout.saved_down_unweighted.get_base_ptr<__nv_bfloat16>()));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -2179,8 +2242,7 @@ void launch_persistent_backward_activation(
         {static_cast<int64_t>(kPersistentHidden), 1},
         bf16_options);
     auto grad_h = torch::from_blob(
-        layout.backward_ring_bf16.get_base_ptr<__nv_bfloat16>() +
-            2 * kPersistentIntermediate,
+        layout.backward_ring_bf16.base,
         {layout.ring_tokens, kPersistentIntermediate},
         {static_cast<int64_t>(kPersistentHidden), 1},
         bf16_options);
@@ -2258,10 +2320,12 @@ void launch_persistent_backward_activation(
 
     using Kernel = decltype(
         &deep_gemm::sm103_block128_backward::
-            sm103_fp8_block128_mega_moe_backward_impl<kNumRanks, kNumSMs>);
+            sm103_fp8_block128_mega_moe_backward_persistent_impl<
+                kNumRanks, kNumSMs>);
     Kernel kernel =
         &deep_gemm::sm103_block128_backward::
-            sm103_fp8_block128_mega_moe_backward_impl<kNumRanks, kNumSMs>;
+            sm103_fp8_block128_mega_moe_backward_persistent_impl<
+                kNumRanks, kNumSMs>;
     constexpr uint32_t smem_bytes = sizeof(
         deep_gemm::sm103_block128_backward::SharedStorage);
     C10_CUDA_CHECK(cudaFuncSetAttribute(
@@ -2289,49 +2353,31 @@ void launch_persistent_backward_activation(
         layout.ring_tokens, layout.sf_ring_tokens,
         layout.workspace.num_max_pool_tokens,
         sym_buffer, layout.workspace,
-        reinterpret_cast<const cutlass::bfloat16_t*>(x.data_ptr()),
         reinterpret_cast<const cutlass::bfloat16_t*>(
             grad_output.data_ptr()),
-        topk_scores.data_ptr<float>(),
-        layout.input_tokens.get_base_ptr<cutlass::float_e4m3_t>(),
-        layout.input_scales.get_base_ptr<uint32_t>(),
-        layout.backward_grad_y_tokens
-            .get_base_ptr<cutlass::float_e4m3_t>(),
-        layout.backward_grad_y_scales.get_base_ptr<uint32_t>(),
-        layout.input_topk_scores.get_base_ptr<float>(),
-        layout.backward_grad_scores.get_base_ptr<float>(),
         layout.combine_tokens.get_base_ptr<cutlass::bfloat16_t>(),
-        layout.l1_tokens.get_base_ptr<cutlass::float_e4m3_t>(),
-        layout.l1_scales.get_base_ptr<uint32_t>(),
         layout.backward_ring_grad_y
             .get_base_ptr<cutlass::float_e4m3_t>(),
         layout.backward_ring_grad_y_scales.get_base_ptr<uint32_t>(),
-        layout.l1_scores.get_base_ptr<float>(),
-        layout.l2_tokens.get_base_ptr<cutlass::float_e4m3_t>(),
-        layout.l2_scales.get_base_ptr<uint32_t>(),
         layout.backward_ring_grad_preact
             .get_base_ptr<cutlass::float_e4m3_t>(),
         layout.backward_ring_grad_preact_scales.get_base_ptr<uint32_t>(),
         layout.backward_ring_bf16.get_base_ptr<cutlass::bfloat16_t>(),
-        layout.backward_ring_dscore.get_base_ptr<float>(),
-        layout.backward_full_x.get_base_ptr<cutlass::float_e4m3_t>(),
-        layout.backward_full_x_scales.get_base_ptr<uint32_t>(),
         layout.backward_full_grad_y.get_base_ptr<cutlass::float_e4m3_t>(),
         layout.backward_full_grad_y_scales.get_base_ptr<uint32_t>(),
         layout.backward_full_scores.get_base_ptr<float>(),
-        layout.backward_full_h.get_base_ptr<cutlass::float_e4m3_t>(),
-        layout.backward_full_h_scales.get_base_ptr<uint32_t>(),
+        layout.saved_l1_preact.get_base_ptr<cutlass::bfloat16_t>(),
+        layout.saved_down_unweighted.get_base_ptr<cutlass::bfloat16_t>(),
         layout.backward_full_grad_preact
             .get_base_ptr<cutlass::float_e4m3_t>(),
         layout.backward_full_grad_preact_scales.get_base_ptr<uint32_t>(),
         reinterpret_cast<cutlass::bfloat16_t*>(grad_x.data_ptr()),
+        layout.backward_grad_scores.get_base_ptr<float>(),
         grad_scores.data_ptr<float>(),
-        tensor_map_ring_x, tensor_map_ring_x_sf,
+        layout.backward_dispatch_done.get_base_ptr<uint32_t>(),
         tensor_map_ring_grad_y, tensor_map_ring_grad_y_sf,
-        tensor_map_ring_h, tensor_map_ring_h_sf,
         tensor_map_ring_grad_preact, tensor_map_ring_grad_preact_sf,
-        tensor_map_w13_recompute, tensor_map_w2_dgrad,
-        tensor_map_w13_dgrad, tensor_map_gate_up,
+        tensor_map_w2_dgrad, tensor_map_w13_dgrad,
         tensor_map_grad_h, tensor_map_grad_x,
         w13_scale.data_ptr<float>(), w2_scale.data_ptr<float>()));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
