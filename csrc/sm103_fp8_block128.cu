@@ -284,7 +284,11 @@ struct PersistentWorkspaceLayout {
             capacity,
             backward_grad_y_scales.get_end_ptr()),
         backward_dispatch_done(
-            deep_gemm::layout::Data(sizeof(uint32_t), false),
+            // The control word itself is four bytes, but every following
+            // reverse-pipeline operand is TMA-addressed and therefore needs
+            // a 16-byte-aligned base.  Reserve one complete TMA alignment
+            // unit here instead of shifting the entire suffix by four bytes.
+            deep_gemm::layout::Data(16, false),
             1,
             1,
             backward_grad_scores.get_end_ptr()),
