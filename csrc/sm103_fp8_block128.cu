@@ -121,7 +121,16 @@ constexpr uint32_t kPersistentThreads =
     kPersistentEpilogueThreads;
 constexpr uint32_t kPersistentLocalSMs = 148;
 constexpr uint32_t kPersistentProductionSMs = 152;
-constexpr uint32_t kPersistentSmemBytes = 212260;
+// Upstream's persistent tile occupies 212,260 bytes through its last shared
+// control word.  Canonical FP8 W13 adds one BF16 warp-pair exchange slot per
+// epilogue warpgroup: 2 warpgroups * 4 warps * 32 lanes * sizeof(uint2).
+// Keep the launch extent derived from that private implementation detail; this
+// is not a caller capacity or tuning option.
+constexpr uint32_t kPersistentUpstreamSmemBytes = 212260;
+constexpr uint32_t kPersistentW13PairExchangeBytes =
+    2 * 4 * 32 * sizeof(uint2);
+constexpr uint32_t kPersistentSmemBytes =
+    kPersistentUpstreamSmemBytes + kPersistentW13PairExchangeBytes;
 constexpr uint32_t kWorkspaceAlignment =
     deep_gemm::layout::kLCMCandidateBlockM;
 
