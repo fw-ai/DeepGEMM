@@ -851,8 +851,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     __syncwarp();
                     if (cute::elect_one_sync()) {
                         if (is_leader_cta)
+                            // Both CTAs issue the 2-SM FP8 TMA load and their
+                            // transaction bytes accumulate on CTA 0's
+                            // multicast barrier.  Unlike packed FP4, one CTA's
+                            // FP8 contribution already occupies the complete
+                            // shared-memory tile, so account for both CTAs.
                             shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(
-                                sizeof(SharedStorage::smem_b[0]));
+                                sizeof(SharedStorage::smem_b[0]) * 2);
                         else
                             shared_storage.full_barriers[stage_idx].arrive(0u);
                     }
