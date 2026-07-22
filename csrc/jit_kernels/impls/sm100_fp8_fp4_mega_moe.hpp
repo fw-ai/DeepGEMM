@@ -13,7 +13,17 @@
 
 #include "../heuristics/mega_moe.hpp"
 
+#include <cstdint>
+#include <cstring>
+
 namespace deep_gemm {
+
+static uint32_t get_fp32_bits(const float value) {
+    uint32_t bits;
+    static_assert(sizeof(bits) == sizeof(value));
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
 
 // Map an activation name to its `deep_gemm::ActivationType` enumerator token
 // (resolved inside the JIT-generated translation unit via `using namespace deep_gemm`).
@@ -41,6 +51,7 @@ public:
         // Runtime arguments
         void* y;
         int* cumulative_local_expert_recv_stats;
+        deep_gemm::layout::TokenSrcMetadata* saved_token_src_metadata;
         int num_tokens;
         layout::SymBuffer<> sym_buffer_ptrs;
 
@@ -67,15 +78,12 @@ using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&sm100_fp8_fp4_mega_moe_impl<
-        {},
         {}, {},
         {}, {},
         {},
         {}, {}, {},
         {},
         {}, {},
-        {},
-        {},
         {},
         {},
         {}, {}, {},
@@ -85,20 +93,17 @@ static void __instantiate_kernel() {{
         {}
     >);
 }};
-)", args.num_max_tokens_per_rank,
-    args.hidden, args.intermediate_hidden,
+)", args.hidden, args.intermediate_hidden,
     args.num_experts, args.num_topk,
     args.config.num_experts_per_wave,
     args.config.block_m, args.config.block_n, args.config.block_k,
     args.config.store_block_m,
     args.config.sf_block_m, args.config.sf_block_n,
-    args.config.num_ring_tokens,
-    args.config.num_sf_ring_tokens,
     args.config.num_stages,
     args.config.num_bytes_per_pull,
     args.config.num_dispatch_threads, args.config.num_non_epilogue_threads, args.config.num_epilogue_threads,
     args.launch_args.grid_dim.first, args.num_ranks,
-    to_string(args.activation_clamp),
+    fmt::format("{}u", get_fp32_bits(args.activation_clamp)),
     args.fast_math ? "true" : "false",
     get_activation_type_name(args.activation));
     }
@@ -108,17 +113,32 @@ static void __instantiate_kernel() {{
         DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
             args.y,
             args.cumulative_local_expert_recv_stats,
+            args.saved_token_src_metadata,
             args.num_tokens,
+            args.num_max_tokens_per_rank,
+            args.config.num_ring_tokens,
+            args.config.num_sf_ring_tokens,
             args.sym_buffer_ptrs,
             args.tensor_map_l1_acts,
             args.tensor_map_l1_acts_sf,
             args.tensor_map_l1_weights,
             args.tensor_map_l1_weights_sf,
             args.tensor_map_l1_output,
+            args.tensor_map_l1_output,
             args.tensor_map_l2_acts,
             args.tensor_map_l2_acts_sf,
             args.tensor_map_l2_weights,
-            args.tensor_map_l2_weights_sf
+            args.tensor_map_l2_weights_sf,
+            args.tensor_map_l1_output,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr
         ));
     }
 };
@@ -221,6 +241,7 @@ static void sm100_fp8_fp4_mega_moe(
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,
+        .saved_token_src_metadata = nullptr,
         .num_tokens = num_tokens,
         .sym_buffer_ptrs = layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
         .tensor_map_l1_acts = tensor_map_l1_acts,

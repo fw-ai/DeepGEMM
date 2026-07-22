@@ -13,6 +13,13 @@ except Exception as exception:
     print(f'Failed to load mega kernels, please check your PyTorch version: {exception}')
 
 from .. import _C
+from .fp8_block128 import (
+    REQUIRED_NATIVE_SYMBOLS as FP8_BLOCK128_MEGAMOE_REQUIRED_NATIVE_SYMBOLS,
+    REQUIRED_PYTHON_SYMBOLS as FP8_BLOCK128_MEGAMOE_REQUIRED_PYTHON_SYMBOLS,
+    fp8_block128_mega_moe,
+    get_fp8_block128_mega_moe_capabilities,
+    transform_glm_w13_for_fp8_block128_mega_moe,
+)
 
 
 class SymmBuffer:

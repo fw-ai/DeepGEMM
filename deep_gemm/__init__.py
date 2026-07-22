@@ -14,6 +14,10 @@ except ImportError:
 
 # Configs
 from . import _C
+
+# Full, build-time source identity.  Unlike the local version suffix this is
+# never shortened and remains available after the source checkout is absent.
+__git_commit__ = _C.__git_commit__
 from ._C import (
     set_num_sms,
     get_num_sms,
@@ -87,6 +91,9 @@ from .mega import (
     transform_weights_for_mega_moe,
     fp8_fp4_mega_moe,
     bf16_mega_moe,
+    fp8_block128_mega_moe,
+    get_fp8_block128_mega_moe_capabilities,
+    transform_glm_w13_for_fp8_block128_mega_moe,
 )
 
 # Some utils

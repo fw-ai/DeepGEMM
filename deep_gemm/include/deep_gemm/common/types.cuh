@@ -56,4 +56,15 @@ enum class ActivationType {
     GeGLU  = 1,
 };
 
+enum class RouteWeightMode {
+    PreDown = 0,
+    PostDown = 1,
+};
+
+enum class CombineOrderMode {
+    FixedTopK = 0,
+    DeepEP = 1,
+    DeepEPV1 = 2,
+};
+
 } // namespace deep_gemm

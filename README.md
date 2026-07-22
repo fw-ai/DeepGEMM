@@ -26,7 +26,7 @@ Despite its lightweight design, DeepGEMM's performance matches or exceeds expert
 
 ### Requirements
 
-- NVIDIA SM90 or SM100 architecture GPU
+- NVIDIA SM90, SM100, or SM103 architecture GPU
 - Python 3.8 or higher
 - Compilers with C++20 support
 - CUDA Toolkit:
@@ -138,6 +138,38 @@ deep_gemm.fp8_fp4_mega_moe(y, transformed_l1, transformed_l2, buffer)
 ```
 
 For the full example with multi-process setup and benchmarking, please refer to `tests/test_mega_moe.py`.
+
+#### SM103 FP8-block128 Mega MoE training
+
+`fp8_block128_mega_moe` is a separate SM103-only training backend. It accepts
+compact BF16 source tokens, global top-k expert IDs and FP32 route scores, and
+GLM-style E4M3 expert weights with FP32 inverse scales on exact 128 x 128
+blocks in canonical interleaved `[gate, up]` storage. The W13 launch presents
+`[up; gate]` to fused SwiGLU without copying those weights, and accepts the
+existing BF16 gate/down/up masters as three separate tensors. The operation
+owns activation quantization, expert-parallel transport, W13/SwiGLU/W2,
+post-down route scaling and combine, and the complete routed backward. It
+returns BF16 input and master-weight gradients and FP32 route-score gradients
+through autograd.
+
+Multi-rank execution uses one internally owned expanded
+`deep_ep.ElasticBuffer` route. Expert segments are aligned to 128 rows while
+the device PSUM retains each expert's real end. The SM103 companion zeros only
+undefined padding before grouped BF16-master reduction, explicitly zeros empty
+expert gradients, and uses deterministic routing with one combine reduction
+for bitwise activation-checkpoint replay. There is no outer dispatch/combine,
+dynamic `torch.distributed` split exchange, expert-weight dequantization,
+UE8M0 requantization, or MXFP4 transcode. The single-rank specialization is
+only for focused kernel validation and is not a distributed transport
+fallback.
+
+The backend requires CUDA compute capability exactly 10.3. It has no SM100,
+SM90, generic, or compatibility fallback. Use
+`get_fp8_block128_mega_moe_capabilities()` for a non-launching capability
+manifest and `deep_gemm.__git_commit__` for the full source OID embedded in the
+native extension. Reference, adversarial, distributed, and performance
+examples live in `tests/test_fp8_block128_*` and
+`tests/benchmark_fp8_block128_mega_moe.py`.
 
 #### Utilities
 
