@@ -2174,7 +2174,7 @@ void launch_persistent_backward_activation(
     const auto tensor_map_w13_recompute = deep_gemm::make_tma_2d_desc(
         w13_weight, kPersistentHidden,
         static_cast<int>(w13_weight.size(0) * w13_weight.size(1)),
-        kPersistentBlockK, 8,
+        kPersistentBlockK, kPersistentBlockN / 2,
         static_cast<int>(w13_weight.stride(-2)), 128);
     const auto tensor_map_w2_dgrad = deep_gemm::make_tma_b_desc(
         cute::UMMA::Major::MN, w2_weight,

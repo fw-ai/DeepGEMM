@@ -5617,32 +5617,26 @@ CUTLASS_DEVICE void run_gemm_phase(
                 if constexpr (
                     kPhase == sched::BackwardBlockPhase::RecomputeW13) {
                     if (cute::elect_one_sync()) {
-                        constexpr uint32_t gran = 8;
                         constexpr uint32_t logical_rows = kBlockN / 2;
-                        #pragma unroll
-                        for (uint32_t group = 0;
-                             group < logical_rows / gran; ++group) {
-                            const uint32_t logical_row =
-                                n_block_idx * logical_rows + group * gran;
-                            const uint32_t up_row =
-                                (local_expert_idx * 2 + 1) * kIntermediate +
-                                logical_row;
-                            const uint32_t gate_row =
-                                (local_expert_idx * 2) * kIntermediate +
-                                logical_row;
-                            tma::copy<kBlockK, gran, kSwizzle, fp8_t>(
-                                &tensor_map_w13_recompute,
-                                &storage.full_barriers[stage_idx],
-                                storage.smem_b[stage_idx] +
-                                    (group * 2) * gran * kBlockK,
-                                k_block_idx * kBlockK, up_row, 2);
-                            tma::copy<kBlockK, gran, kSwizzle, fp8_t>(
-                                &tensor_map_w13_recompute,
-                                &storage.full_barriers[stage_idx],
-                                storage.smem_b[stage_idx] +
-                                    (group * 2 + 1) * gran * kBlockK,
-                                k_block_idx * kBlockK, gate_row, 2);
-                        }
+                        const uint32_t logical_row =
+                            n_block_idx * logical_rows;
+                        const uint32_t up_row =
+                            (local_expert_idx * 2 + 1) * kIntermediate +
+                            logical_row;
+                        const uint32_t gate_row =
+                            (local_expert_idx * 2) * kIntermediate +
+                            logical_row;
+                        tma::copy<kBlockK, logical_rows, kSwizzle, fp8_t>(
+                            &tensor_map_w13_recompute,
+                            &storage.full_barriers[stage_idx],
+                            storage.smem_b[stage_idx],
+                            k_block_idx * kBlockK, up_row, 2);
+                        tma::copy<kBlockK, logical_rows, kSwizzle, fp8_t>(
+                            &tensor_map_w13_recompute,
+                            &storage.full_barriers[stage_idx],
+                            storage.smem_b[stage_idx] +
+                                logical_rows * kBlockK,
+                            k_block_idx * kBlockK, gate_row, 2);
                     }
                 } else {
                     const auto* map =
@@ -5668,15 +5662,13 @@ CUTLASS_DEVICE void run_gemm_phase(
                     float scale;
                     if constexpr (
                         kPhase == sched::BackwardBlockPhase::RecomputeW13) {
-                        constexpr uint32_t gran = 8;
                         constexpr uint32_t logical_rows = kBlockN / 2;
-                        const uint32_t segment = row / gran;
                         const uint32_t logical_row =
                             n_block_idx * logical_rows +
-                            (segment / 2) * gran;
+                            row % logical_rows;
                         const uint32_t canonical_expert =
                             local_expert_idx * 2 +
-                            ((segment & 1u) ? 0u : 1u);
+                            (row < logical_rows ? 1u : 0u);
                         scale = __ldg(
                             w13_scales +
                             (canonical_expert * (kIntermediate / 128) +
@@ -5714,7 +5706,7 @@ CUTLASS_DEVICE void run_gemm_phase(
                     if (leader_cta) {
                         storage.full_barriers[stage_idx]
                             .arrive_and_expect_tx(
-                                sizeof(storage.smem_b[0]));
+                                sizeof(storage.smem_b[0]) * 2);
                     } else {
                         storage.full_barriers[stage_idx].arrive(0u);
                     }
@@ -6074,8 +6066,8 @@ sm103_fp8_block128_mega_moe_backward_impl(
             workspace, blockIdx.x, threadIdx.x,
             []() { __syncthreads(); });
 
-        // [up8,gate8] physical W13 output -> logical h, quantized per 128
-        // columns with the same power-of-two recipe as compact x.
+        // Contiguous [up64; gate64] W13 output -> logical h, quantized per
+        // 128 columns with the same power-of-two recipe as compact x.
         constexpr uint32_t h_blocks = kIntermediate / 128;
         for (uint64_t work = group_global;
              work < static_cast<uint64_t>(count) * h_blocks;
@@ -6087,8 +6079,8 @@ sm103_fp8_block128_mega_moe_backward_impl(
             const uint32_t w13_block = h_col / 64;
             const uint32_t in_block = h_col % 64;
             const uint32_t physical_up =
-                w13_block * 128 + (in_block / 8) * 16 + in_block % 8;
-            const uint32_t physical_gate = physical_up + 8;
+                w13_block * 128 + in_block;
+            const uint32_t physical_gate = physical_up + 64;
             const float up = static_cast<float>(
                 ring_bf16[static_cast<uint64_t>(row) * kHidden +
                             physical_up]);
