@@ -1322,6 +1322,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                     local_amax[i]);
                             }
                         }
+                        // Four lanes issue the peer DSM stores, whereas one
+                        // elected lane publishes the remote mbarrier arrival.
+                        // Give every writer cluster-scope release semantics
+                        // before that arrival; a warp execution barrier alone
+                        // does not order another lane's remote shared writes.
+                        if (warp_idx_in_wg == 0)
+                            __threadfence_cluster();
                         __syncwarp();
                         if (warp_idx_in_wg == 0 && cute::elect_one_sync()) {
                             shared_storage.l1_scale_barriers
