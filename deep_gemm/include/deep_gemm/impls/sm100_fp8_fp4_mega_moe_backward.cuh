@@ -5393,6 +5393,16 @@ static constexpr uint32_t kSFBlockM = 256;
 static constexpr uint32_t kSFBlockN = 128;
 static constexpr uint32_t kStages = 6;
 static constexpr uint32_t kThreads = 512;
+static constexpr uint32_t kNumDispatchWarps = 4;
+// Match the upstream persistent dispatch granularity.  Reverse pulls BF16
+// grad-y, so four 3-KiB transactions cover one 6,144-value token.  Two shared
+// stages let the next remote TMA overlap score/dz work on the current chunk.
+static constexpr uint32_t kDispatchPullBytes = 3072;
+static constexpr uint32_t kDispatchPullStages = 2;
+static constexpr uint32_t kDispatchPullElements =
+    kDispatchPullBytes / sizeof(cutlass::bfloat16_t);
+static constexpr uint32_t kDispatchPullChunks =
+    kHidden * sizeof(cutlass::bfloat16_t) / kDispatchPullBytes;
 // sm100_store_cd_swap_ab maps one 128-thread warpgroup over the two 64-column
 // BF16 atoms of BLOCK_N.  STORE_BLOCK_M=16 is also required so every valid
 // UMMA-N extent (which is 16-row aligned) emits at least one store and returns
@@ -5428,6 +5438,9 @@ using bf16_t = cutlass::bfloat16_t;
 using Barrier = cutlass::arch::ClusterTransactionBarrier;
 
 struct alignas(1024) SharedStorage {
+    alignas(1024) bf16_t dispatch_pull[kNumDispatchWarps]
+                                            [kDispatchPullStages]
+                                            [kDispatchPullElements];
     alignas(1024) bf16_t smem_cd[kNumTMAStoreStages]
                                       [kStoreBlockM * kBlockN];
     alignas(1024) fp8_t smem_a[kStages][kLoadBlockM * kBlockK];
@@ -5439,6 +5452,8 @@ struct alignas(1024) SharedStorage {
     Barrier empty_barriers[kStages];
     Barrier tmem_full_barriers[kNumEpilogueStages];
     Barrier tmem_empty_barriers[kNumEpilogueStages];
+    Barrier dispatch_barriers[kNumDispatchWarps]
+                              [kDispatchPullStages];
     uint32_t tmem_ptr;
 };
 
@@ -5446,6 +5461,10 @@ DG_STATIC_ASSERT(kNumTmemCols <= 512, "SM103 backward exceeds TMEM");
 DG_STATIC_ASSERT(
     kEpilogueThreads == 128 && kStoreBlockM == 16,
     "SM103 swap-AB epilogue requires one warpgroup and 16-row stores");
+DG_STATIC_ASSERT(
+    kDispatchPullChunks * kDispatchPullBytes ==
+        kHidden * sizeof(bf16_t),
+    "reverse dispatch pull must cover one complete hidden row");
 
 CUTLASS_DEVICE float warp_reduce_max(float value) {
     #pragma unroll
@@ -6414,8 +6433,7 @@ sm103_fp8_block128_mega_moe_backward_persistent_impl(
     constexpr uint32_t kHiddenScaleBlocks = kHidden / 128;
     constexpr uint32_t kGradPreactScaleBlocks =
         (2 * kIntermediate) / 128;
-    constexpr uint32_t kDispatchWarps = 4;
-    constexpr uint32_t kDispatchThreads = kDispatchWarps * 32;
+    constexpr uint32_t kDispatchThreads = kNumDispatchWarps * 32;
     constexpr uint32_t kEpilogueBarrier = 9;
     using Scheduler = sched::MegaMoEBackwardScheduler<
         kBlockM, kBlockN, kBlockK,
@@ -6470,6 +6488,14 @@ sm103_fp8_block128_mega_moe_backward_persistent_impl(
             storage.tmem_empty_barriers[i].init(
                 2 * kEpilogueThreads);
         }
+        #pragma unroll
+        for (uint32_t warp = 0; warp < kNumDispatchWarps; ++warp) {
+            #pragma unroll
+            for (uint32_t stage = 0;
+                 stage < kDispatchPullStages; ++stage) {
+                storage.dispatch_barriers[warp][stage].init(1);
+            }
+        }
         cutlass::arch::fence_barrier_init();
     }
     if (warp_idx == 7)
@@ -6484,12 +6510,14 @@ sm103_fp8_block128_mega_moe_backward_persistent_impl(
         pipeline_phase ^= stage_idx == 0;
     };
 
-    if (warp_idx < kDispatchWarps) {
+    if (warp_idx < kNumDispatchWarps) {
         cutlass::arch::warpgroup_reg_dealloc<48>();
         const uint32_t dispatch_warp = warp_idx;
         const uint32_t global_warp =
-            blockIdx.x * kDispatchWarps + dispatch_warp;
-        constexpr uint32_t kGlobalWarps = kNumSMs * kDispatchWarps;
+            blockIdx.x * kNumDispatchWarps + dispatch_warp;
+        constexpr uint32_t kGlobalWarps =
+            kNumSMs * kNumDispatchWarps;
+        uint32_t pull_phase[kDispatchPullStages] = {};
         uint32_t pool_block_offset = 0;
 
         #pragma unroll 1
@@ -6524,58 +6552,131 @@ sm103_fp8_block128_mega_moe_backward_persistent_impl(
                 const float score = full_scores[pool_row];
                 float dscore = 0.0f;
 
+                // Follow the upstream persistent dispatch transport: one
+                // elected lane issues a chunked remote TMA into a private
+                // warp pull buffer while all lanes transform the preceding
+                // chunk.  Only the precision-side work differs here: BF16
+                // dy is score-scaled, reduced for dscore, and quantized to
+                // the existing E4M3/UE8M0 block128 ring representation.
+                const auto issue_pull = [&](const uint32_t chunk) {
+                    const uint32_t pull_bytes = kDispatchPullBytes;
+                    const uint32_t pull_stage =
+                        chunk % kDispatchPullStages;
+                    auto* pull_barrier =
+                        &storage.dispatch_barriers[dispatch_warp]
+                                                  [pull_stage];
+                    ptx::tma_load_1d(
+                        storage.dispatch_pull[dispatch_warp]
+                                             [pull_stage],
+                        remote_grad_y +
+                            static_cast<uint64_t>(chunk) *
+                                kDispatchPullElements,
+                        pull_barrier, pull_bytes);
+                    ptx::mbarrier_arrive_and_set_tx(
+                        pull_barrier, pull_bytes);
+                };
+                const auto wait_pull = [&](const uint32_t chunk) {
+                    const uint32_t pull_stage =
+                        chunk % kDispatchPullStages;
+                    ptx::mbarrier_wait_and_flip_phase(
+                        &storage.dispatch_barriers[dispatch_warp]
+                                                  [pull_stage],
+                        pull_phase[pull_stage]);
+                };
+
+                if (cute::elect_one_sync()) {
+                    issue_pull(0);
+                    wait_pull(0);
+                }
+                __syncwarp();
+
+                constexpr uint32_t kScaleBlocksPerPull =
+                    kDispatchPullElements / 128;
+                DG_STATIC_ASSERT(
+                    kScaleBlocksPerPull * kDispatchPullChunks ==
+                        kHiddenScaleBlocks,
+                    "reverse pull chunks must preserve block128 groups");
                 #pragma unroll 1
-                for (uint32_t block = 0;
-                     block < kHiddenScaleBlocks; ++block) {
-                    float dz_values[4];
-                    float local_amax = 0.0f;
-                    #pragma unroll
-                    for (uint32_t i = 0; i < 4; ++i) {
-                        const uint32_t col =
-                            block * 128 + lane_idx * 4 + i;
-                        const float dy = static_cast<float>(
-                            remote_grad_y[col]);
-                        const float down = static_cast<float>(
-                            saved_down_unweighted[
+                for (uint32_t chunk = 0;
+                     chunk < kDispatchPullChunks; ++chunk) {
+                    const uint32_t pull_stage =
+                        chunk % kDispatchPullStages;
+                    if (chunk + 1 < kDispatchPullChunks &&
+                        cute::elect_one_sync()) {
+                        issue_pull(chunk + 1);
+                    }
+
+                    #pragma unroll 1
+                    for (uint32_t chunk_block = 0;
+                         chunk_block < kScaleBlocksPerPull;
+                         ++chunk_block) {
+                        const uint32_t block =
+                            chunk * kScaleBlocksPerPull +
+                            chunk_block;
+                        float dz_values[4];
+                        float local_amax = 0.0f;
+                        #pragma unroll
+                        for (uint32_t i = 0; i < 4; ++i) {
+                            const uint32_t col_in_chunk =
+                                chunk_block * 128 + lane_idx * 4 + i;
+                            const uint32_t col =
+                                chunk * kDispatchPullElements +
+                                col_in_chunk;
+                            const float dy = static_cast<float>(
+                                storage.dispatch_pull[dispatch_warp]
+                                                     [pull_stage]
+                                                     [col_in_chunk]);
+                            const float down = static_cast<float>(
+                                saved_down_unweighted[
+                                    static_cast<uint64_t>(pool_row) *
+                                        kHidden +
+                                    col]);
+                            dscore = __fmaf_rn(dy, down, dscore);
+                            dz_values[i] = static_cast<float>(
+                                bf16_t(__fmul_rn(dy, score)));
+                            local_amax = cute::max(
+                                local_amax,
+                                cute::abs(dz_values[i]));
+                        }
+                        local_amax = warp_reduce_max(local_amax);
+                        local_amax = __shfl_sync(
+                            0xffffffff, local_amax, 0);
+                        float scale_inv;
+                        const uint32_t packed_scale =
+                            packed_power2_scale(
+                                local_amax, scale_inv);
+                        #pragma unroll
+                        for (uint32_t i = 0; i < 4; ++i) {
+                            const uint32_t col =
+                                block * 128 + lane_idx * 4 + i;
+                            const fp8_t value(
+                                dz_values[i] * scale_inv);
+                            ring_grad_y[
+                                static_cast<uint64_t>(ring_row) *
+                                    kHidden +
+                                col] = value;
+                            full_grad_y[
                                 static_cast<uint64_t>(pool_row) *
                                     kHidden +
-                                col]);
-                        dscore = __fmaf_rn(dy, down, dscore);
-                        dz_values[i] = static_cast<float>(
-                            bf16_t(__fmul_rn(dy, score)));
-                        local_amax = cute::max(
-                            local_amax, cute::abs(dz_values[i]));
+                                col] = value;
+                        }
+                        if (lane_idx == 0) {
+                            ring_grad_y_sf[
+                                block * sf_ring_tokens +
+                                transform_sf_row(ring_row)] =
+                                packed_scale;
+                            full_grad_y_sf[
+                                static_cast<uint64_t>(pool_row) *
+                                    kHiddenScaleBlocks +
+                                block] = packed_scale;
+                        }
                     }
-                    local_amax = warp_reduce_max(local_amax);
-                    local_amax = __shfl_sync(
-                        0xffffffff, local_amax, 0);
-                    float scale_inv;
-                    const uint32_t packed_scale =
-                        packed_power2_scale(local_amax, scale_inv);
-                    #pragma unroll
-                    for (uint32_t i = 0; i < 4; ++i) {
-                        const uint32_t col =
-                            block * 128 + lane_idx * 4 + i;
-                        const fp8_t value(dz_values[i] * scale_inv);
-                        ring_grad_y[
-                            static_cast<uint64_t>(ring_row) *
-                                kHidden +
-                            col] = value;
-                        full_grad_y[
-                            static_cast<uint64_t>(pool_row) *
-                                kHidden +
-                            col] = value;
+
+                    if (chunk + 1 < kDispatchPullChunks &&
+                        cute::elect_one_sync()) {
+                        wait_pull(chunk + 1);
                     }
-                    if (lane_idx == 0) {
-                        ring_grad_y_sf[
-                            block * sf_ring_tokens +
-                            transform_sf_row(ring_row)] =
-                            packed_scale;
-                        full_grad_y_sf[
-                            static_cast<uint64_t>(pool_row) *
-                                kHiddenScaleBlocks +
-                            block] = packed_scale;
-                    }
+                    __syncwarp();
                 }
 
                 dscore = warp_reduce_sum(dscore);
