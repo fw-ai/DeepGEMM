@@ -1811,13 +1811,13 @@ void launch_persistent_forward(
         false,
         1);
     // Canonical [2E,H,D] is addressed as a 2-D [2E*H,D] plane.  The
-    // persistent kernel issues separate 8-row TMA offsets for up and gate.
+    // persistent kernel issues separate 64-row TMA offsets for up and gate.
     const auto tensor_map_l1_weights = deep_gemm::make_tma_2d_desc(
         w13_weight,
         kPersistentHidden,
         static_cast<int>(w13_weight.size(0) * w13_weight.size(1)),
         kPersistentBlockK,
-        8,
+        kPersistentBlockN / 2,
         static_cast<int>(w13_weight.stride(-2)),
         128);
     const auto tensor_map_l1_output = deep_gemm::make_tma_2d_desc(

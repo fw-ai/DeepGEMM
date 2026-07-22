@@ -227,6 +227,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         uint32_t smem_sfa[kNumStages][SF_BLOCK_M * (BLOCK_K / 128)];
         uint32_t smem_sfb[kNumStages][SF_BLOCK_N * (BLOCK_K / 128)];
         float2 amax_reduction[kNumEpilogueWarps][AMAX_REDUCTION_WARP_BUFFER_SIZE];
+        // Canonical GLM W13 is loaded as contiguous [up; gate] 64-row
+        // planes.  Corresponding accumulator rows therefore land in warp
+        // pairs (0, 2) and (1, 3).  Exchange only the BF16 half each partner
+        // consumes; this preserves the fused epilogue without repacking W13.
+        uint2 l1_pair_exchange
+            [kFP8Block128Weights ? kNumEpilogueWarpgroups : 1]
+            [kFP8Block128Weights ? 4 : 1]
+            [kFP8Block128Weights ? 32 : 1];
         Barrier dispatch_barriers[kNumDispatchWarps];
         Barrier full_barriers[kNumStages];
         Barrier empty_barriers[kNumStages];
@@ -770,41 +778,35 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
                 // TMA copy weights with SF
                 if constexpr (kFP8Block128Weights) {
-                    // GLM stores canonical [gate, up] as [2E, H, D].  The L1
-                    // epilogue consumes 8-row [up, gate] pairs, so issue TMA
-                    // loads from the two canonical expert planes directly into
-                    // the logical interleave in shared memory.  Only the 16-KiB
-                    // shared tile is materialized; the multi-GiB weight tensor
-                    // is never copied or repacked.
+                    // GLM stores canonical [gate, up] as [2E, H, D].  Load the
+                    // two 64-row canonical planes directly into contiguous
+                    // [up; gate] shared-memory halves.  Two TMA transactions
+                    // replace the invalid 16-way 8-row fan-out; only the
+                    // 16-KiB tile is materialized and W13 is never repacked.
                     if (cute::elect_one_sync()) {
                         if (block_phase == sched::BlockPhase::Linear1) {
-                            constexpr uint32_t kPairGranularity = 8;
                             constexpr uint32_t kLogicalRowsPerBlock = BLOCK_N / 2;
-                            #pragma unroll
-                            for (uint32_t group = 0; group < kLogicalRowsPerBlock / kPairGranularity; ++group) {
-                                const uint32_t logical_row =
-                                    n_block_idx * kLogicalRowsPerBlock + group * kPairGranularity;
-                                const uint32_t up_row =
-                                    (local_expert_idx * 2 + 1) * kIntermediateHidden + logical_row;
-                                const uint32_t gate_row =
-                                    (local_expert_idx * 2) * kIntermediateHidden + logical_row;
-                                tma::copy<BLOCK_K, kPairGranularity, kSwizzleBMode, b_dtype_t>(
-                                    tensor_map_b_ptr,
-                                    &shared_storage.full_barriers[stage_idx],
-                                    shared_storage.smem_b[stage_idx] +
-                                        (group * 2) * kPairGranularity * BLOCK_K,
-                                    k_idx,
-                                    up_row,
-                                    2);
-                                tma::copy<BLOCK_K, kPairGranularity, kSwizzleBMode, b_dtype_t>(
-                                    tensor_map_b_ptr,
-                                    &shared_storage.full_barriers[stage_idx],
-                                    shared_storage.smem_b[stage_idx] +
-                                        (group * 2 + 1) * kPairGranularity * BLOCK_K,
-                                    k_idx,
-                                    gate_row,
-                                    2);
-                            }
+                            const uint32_t logical_row =
+                                n_block_idx * kLogicalRowsPerBlock;
+                            const uint32_t up_row =
+                                (local_expert_idx * 2 + 1) * kIntermediateHidden + logical_row;
+                            const uint32_t gate_row =
+                                (local_expert_idx * 2) * kIntermediateHidden + logical_row;
+                            tma::copy<BLOCK_K, kLogicalRowsPerBlock, kSwizzleBMode, b_dtype_t>(
+                                tensor_map_b_ptr,
+                                &shared_storage.full_barriers[stage_idx],
+                                shared_storage.smem_b[stage_idx],
+                                k_idx,
+                                up_row,
+                                2);
+                            tma::copy<BLOCK_K, kLogicalRowsPerBlock, kSwizzleBMode, b_dtype_t>(
+                                tensor_map_b_ptr,
+                                &shared_storage.full_barriers[stage_idx],
+                                shared_storage.smem_b[stage_idx] +
+                                    kLogicalRowsPerBlock * BLOCK_K,
+                                k_idx,
+                                gate_row,
+                                2);
                         } else {
                             tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t>(
                                 tensor_map_b_ptr,
@@ -825,14 +827,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     for (uint32_t row = lane_idx; row < BLOCK_N; row += 32) {
                         float scale;
                         if (block_phase == sched::BlockPhase::Linear1) {
-                            constexpr uint32_t kPairGranularity = 8;
                             constexpr uint32_t kLogicalRowsPerBlock = BLOCK_N / 2;
-                            const uint32_t segment = row / kPairGranularity;
                             const uint32_t logical_row =
                                 n_block_idx * kLogicalRowsPerBlock +
-                                (segment / 2) * kPairGranularity;
+                                row % kLogicalRowsPerBlock;
                             const uint32_t canonical_expert =
-                                local_expert_idx * 2 + ((segment & 1u) ? 0u : 1u);
+                                local_expert_idx * 2 + (row < kLogicalRowsPerBlock ? 1u : 0u);
                             const uint32_t scale_idx =
                                 (canonical_expert * (kIntermediateHidden / 128) + logical_row / 128) *
                                     (kHidden / 128) +
@@ -1049,9 +1049,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const auto num_expected_blocks = (L2_SHAPE_N / BLOCK_N) * (pool_block_idx / num_ring_blocks);
                 while (ptx::ld_acq(l2_empty_ptr) != num_expected_blocks);
 
-                // Unified L1 epilogue: gated activation (SwiGLU/GeGLU) in-place using
-                // granularity 8 interleaved weights.
-                // With `SM100_TMEM_LOAD_16dp256b1x`, gate/up pairs are:
+                // Unified L1 epilogue: gated activation (SwiGLU/GeGLU).
+                // The FP8-block128 path keeps canonical W13 in contiguous
+                // [up; gate] halves.  Accumulator warp pairs exchange the
+                // BF16 half needed to form each logical feature in place.
                 float stored_cached_weight = 0;
 
                 #pragma unroll
@@ -1099,17 +1100,70 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             shared_storage.tmem_empty_barriers[accum_stage_idx].arrive(0u);
                         }
 
-                        // Apply gated activation: act(gate) * up (SwiGLU or GeGLU)
+                        // Materialize logical gate/up pairs.  The upstream FP4
+                        // layout is already interleaved at granularity 8.  The
+                        // canonical FP8 layout is contiguous [up64; gate64],
+                        // so warp pairs (0, 2) and (1, 3) exchange only the
+                        // BF16 half their partner consumes.
                         auto fp32_values = reinterpret_cast<float2*>(raw_values);
+                        nv_bfloat162 bf16_gate_values[2];
+                        nv_bfloat162 bf16_up_values[2];
+                        if constexpr (kFP8Block128Weights) {
+                            const bool owns_up = warp_idx_in_wg < 2;
+                            const uint32_t own_base = owns_up ? 0u : 2u;
+                            const uint32_t outbound_base = owns_up ? 2u : 0u;
+                            const auto outbound_0 = __float22bfloat162_rn(
+                                fp32_values[outbound_base]);
+                            const auto outbound_1 = __float22bfloat162_rn(
+                                fp32_values[outbound_base + 1]);
+                            const uint2 outbound = {
+                                *reinterpret_cast<const uint32_t*>(&outbound_0),
+                                *reinterpret_cast<const uint32_t*>(&outbound_1)
+                            };
+                            auto outbound_ptr = reinterpret_cast<uint32_t*>(
+                                &shared_storage.l1_pair_exchange
+                                    [epilogue_wg_idx][warp_idx_in_wg][lane_idx]);
+                            ptx::st_shared(outbound_ptr, outbound.x);
+                            ptx::st_shared(outbound_ptr + 1, outbound.y);
+                            ptx::sync_aligned(
+                                128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
+
+                            auto inbound_ptr = reinterpret_cast<const uint32_t*>(
+                                &shared_storage.l1_pair_exchange
+                                    [epilogue_wg_idx][warp_idx_in_wg ^ 2u][lane_idx]);
+                            const uint2 inbound = {
+                                ptx::ld_shared(inbound_ptr),
+                                ptx::ld_shared(inbound_ptr + 1)
+                            };
+                            // No warp may overwrite the single exchange stage
+                            // for the next atom until every partner has read it.
+                            ptx::sync_aligned(
+                                128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
+                            const auto inbound_bf16 =
+                                reinterpret_cast<const nv_bfloat162*>(&inbound);
+
+                            #pragma unroll
+                            for (uint32_t k = 0; k < 2; ++ k) {
+                                const auto own = __float22bfloat162_rn(
+                                    fp32_values[own_base + k]);
+                                bf16_gate_values[k] = owns_up ? inbound_bf16[k] : own;
+                                bf16_up_values[k] = owns_up ? own : inbound_bf16[k];
+                            }
+                        } else {
+                            #pragma unroll
+                            for (uint32_t k = 0; k < 2; ++ k) {
+                                bf16_gate_values[k] = __float22bfloat162_rn(
+                                    fp32_values[k * 2]);
+                                bf16_up_values[k] = __float22bfloat162_rn(
+                                    fp32_values[k * 2 + 1]);
+                            }
+                        }
+
+                        // Apply gated activation: act(gate) * up (SwiGLU or GeGLU)
                         #pragma unroll
                         for (uint32_t k = 0; k < 2; ++ k) {
-                            // The upstream transformed FP4 tensor is
-                            // [gate, up].  Canonical GLM is loaded logically as
-                            // [up, gate] from its two expert planes.
-                            auto bf16_gate = __float22bfloat162_rn(
-                                fp32_values[k * 2 + (kFP8Block128Weights ? 1 : 0)]);
-                            auto bf16_up = __float22bfloat162_rn(
-                                fp32_values[k * 2 + (kFP8Block128Weights ? 0 : 1)]);
+                            auto bf16_gate = bf16_gate_values[k];
+                            auto bf16_up = bf16_up_values[k];
 
                             // Clamp
                             if constexpr (kActivationClampBits != 0x7f800000u) {
@@ -1184,8 +1238,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     #pragma unroll
                     for (uint32_t i = 0; i < kNumAtomsPerStore; ++ i) {
                         // Reduce amax (warp-pair-level)
+                        const uint32_t amax_partner = epilogue_warp_idx ^
+                            (kFP8Block128Weights ? 2u : 1u);
                         const float2 wp_amax =
-                            shared_storage.amax_reduction[epilogue_warp_idx ^ 1][i * (ATOM_M / 2) + lane_idx % 4];
+                            shared_storage.amax_reduction[amax_partner][i * (ATOM_M / 2) + lane_idx % 4];
                         amax_values[i].x = cute::max(amax_values[i].x, wp_amax.x);
                         amax_values[i].y = cute::max(amax_values[i].y, wp_amax.y);
 
@@ -1200,7 +1256,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
                         // STSM
                         uint32_t row = lane_idx;
-                        uint32_t col = warp_idx_in_wg;
+                        // Contiguous [up; gate] maps logical 16-feature output
+                        // chunks as warp 0, 2, 1, 3.  The FP4 path retains its
+                        // original interleaved warp order.
+                        uint32_t col = kFP8Block128Weights
+                            ? (warp_idx_in_wg % 2) * 2 + warp_idx_in_wg / 2
+                            : warp_idx_in_wg;
                         const auto smem_ptr = reinterpret_cast<uint8_t*>(shared_storage.smem_d.l1[epilogue_wg_idx][tma_stage_idx])
                             + i * ATOM_M * L1_OUT_BLOCK_N
                             + row * L1_OUT_BLOCK_N
@@ -1211,8 +1272,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         // Store SF to `l2_sf_buffer` as UE8M0 (MN-major layout)
                         // Only one warp per pair writes (both hold the same SF after cross-warp reduce)
                         // Each lane < 4 holds SF for 2 rows (sf.x and sf.y)
-                        if (warp_idx_in_wg % 2 == 0 and lane_idx < 4) {
-                            const uint32_t k_idx = n_block_idx * 2 + warp_idx_in_wg / 2;
+                        const bool writes_sf = kFP8Block128Weights
+                            ? warp_idx_in_wg < 2
+                            : warp_idx_in_wg % 2 == 0;
+                        if (writes_sf and lane_idx < 4) {
+                            const uint32_t sf_group = kFP8Block128Weights
+                                ? warp_idx_in_wg
+                                : warp_idx_in_wg / 2;
+                            const uint32_t k_idx = n_block_idx * 2 + sf_group;
                             const uint32_t k_uint_idx = k_idx / 4, byte_idx = k_idx % 4;
                             const uint32_t mn_stride = num_sf_ring_tokens * sizeof(uint32_t);
                             const auto sf_base_ptr = l2_sf_buffer.get_base_ptr<uint8_t>();
