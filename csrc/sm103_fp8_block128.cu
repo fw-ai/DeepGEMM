@@ -35,8 +35,8 @@
 // translation unit itself contains only sm_103a code and every host entry point
 // checks compute capability 10.3 exactly.
 namespace cutlass::gemm {
-struct KernelPtrArrayTmaWarpSpecializedBlockwise1SmSm103 final
-    : KernelSchedule1Sm, KernelScheduleSm100PtrArrayBlockwise {};
+struct KernelPtrArrayTmaWarpSpecializedBlockwise2SmSm103 final
+    : KernelSchedule2Sm, KernelScheduleSm100PtrArrayBlockwise {};
 }  // namespace cutlass::gemm
 
 namespace cutlass::gemm::collective {
@@ -699,8 +699,8 @@ struct SM103GroupedBlockwiseGemm {
     static constexpr int AlignmentB = 16;
     static constexpr int AlignmentC = 8;
     static constexpr int AlignmentD = 8;
-    using MmaTileShape = cute::Shape<cute::_128, cute::_128, cute::_128>;
-    using ClusterShape = cute::Shape<cute::_1, cute::_1, cute::_1>;
+    using MmaTileShape = cute::Shape<cute::_256, cute::_128, cute::_128>;
+    using ClusterShape = cute::Shape<cute::_2, cute::_1, cute::_1>;
 
     // A scales are native row-major [M, K/128].  For the ordinary NT path,
     // B scales are [N/128, K/128]; for the transposed-weight path the original
@@ -728,7 +728,7 @@ struct SM103GroupedBlockwiseGemm {
         ElementD,
         LayoutD*,
         AlignmentD,
-        cutlass::epilogue::PtrArrayTmaWarpSpecialized1Sm>::CollectiveOp;
+        cutlass::epilogue::PtrArrayTmaWarpSpecialized2Sm>::CollectiveOp;
 
     using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
         cutlass::arch::Sm103,
@@ -744,7 +744,7 @@ struct SM103GroupedBlockwiseGemm {
         ClusterShape,
         cutlass::gemm::collective::StageCountAutoCarveout<
             static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
-        cutlass::gemm::KernelPtrArrayTmaWarpSpecializedBlockwise1SmSm103>::CollectiveOp;
+        cutlass::gemm::KernelPtrArrayTmaWarpSpecializedBlockwise2SmSm103>::CollectiveOp;
 
     using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
         ProblemShape,
