@@ -102,6 +102,11 @@ struct Workspace {
         // Combine push source indices (full)
         num_bytes += num_max_pool_tokens * sizeof(TokenSrcMetadata);
 
+        // POST_DOWN route weights (full).  The reusable L1 ring is released
+        // before L2 remote combine, so route weights needed by that epilogue
+        // must follow the logical pool-token lifetime instead of the ring.
+        num_bytes += num_max_pool_tokens * sizeof(float);
+
         // Align to TMA descriptor requirements
         num_bytes = math::align<uint64_t>(num_bytes, 16);
         return num_bytes;
@@ -190,6 +195,15 @@ struct Workspace {
     CUTLASS_DEVICE
     TokenSrcMetadata* get_token_src_metadata_ptr(const uint32_t& pool_token_idx = 0) const {
         const auto base = reinterpret_cast<TokenSrcMetadata*>(get_src_token_topk_idx_ptr(num_experts_per_rank));
+        return base + pool_token_idx;
+    }
+
+    // Full-pool POST_DOWN state, matching upstream persistent MegaMoE.  This
+    // is private symmetric-workspace storage derived from context/CP capacity.
+    CUTLASS_DEVICE
+    float* get_route_weight_ptr(const uint32_t& pool_token_idx = 0) const {
+        const auto base = reinterpret_cast<float*>(
+            get_token_src_metadata_ptr(num_max_pool_tokens));
         return base + pool_token_idx;
     }
 };

@@ -638,6 +638,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
                     current_rank_in_expert_idx);
                 *l1_topk_weights_buffer.get_data_buffer(pool_token_idx % num_ring_tokens).template get_base_ptr<float>() = weight;
+                if constexpr (kFP8Block128Weights)
+                    *workspace.get_route_weight_ptr(pool_token_idx) = weight;
 
                 // Write source metadata for combine write-back (logical pool token)
                 *(saved_token_src_metadata != nullptr
@@ -1559,9 +1561,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             // score before the final BF16 rounding.  Moving
                             // this multiply into L1 is not equivalent because
                             // it changes E4M3 requantization before W2.
-                            const float route_weight = *l1_topk_weights_buffer
-                                .get_data_buffer(ring_m_idx + m_idx_in_block)
-                                .template get_base_ptr<float>();
+                            // Follow upstream persistent POST_DOWN lifetime:
+                            // L1 ring slots may already be reused by a later
+                            // wave, whereas this full-pool entry remains owned
+                            // by the logical route until remote combine.
+                            const float route_weight =
+                                *workspace.get_route_weight_ptr(
+                                    pool_m_idx + m_idx_in_block);
                             auto* packed_bf16 =
                                 reinterpret_cast<nv_bfloat162*>(&packed);
                             #pragma unroll
