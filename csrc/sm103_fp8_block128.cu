@@ -19,6 +19,15 @@
 #include <cutlass/layout/matrix.h>
 #include <cutlass/util/packed_stride.hpp>
 
+#include <deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh>
+#include <deep_gemm/impls/sm100_fp8_fp4_mega_moe_backward.cuh>
+#include <deep_gemm/impls/sm103_fp8_block128_mega_moe_wgrad.cuh>
+#include <deep_gemm/layout/mega_moe.cuh>
+#include <deep_gemm/layout/sym_buffer.cuh>
+
+#include "utils/system.hpp"
+#include "jit_kernels/impls/runtime_utils.hpp"
+
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -91,6 +100,210 @@ constexpr int kRequiredMajor = 10;
 constexpr int kRequiredMinor = 3;
 constexpr int kBlockK = 128;
 constexpr float kE4M3Max = 448.0f;
+
+constexpr uint32_t kPersistentHidden = 6144;
+constexpr uint32_t kPersistentIntermediate = 2048;
+constexpr uint32_t kPersistentExperts = 256;
+constexpr uint32_t kPersistentTopK = 8;
+constexpr uint32_t kPersistentBlockM = 192;
+constexpr uint32_t kPersistentBlockN = 128;
+constexpr uint32_t kPersistentBlockK = 128;
+constexpr uint32_t kPersistentStoreBlockM = 32;
+constexpr uint32_t kPersistentSFBlockM = 256;
+constexpr uint32_t kPersistentSFBlockN = 128;
+constexpr uint32_t kPersistentStages = 6;
+constexpr uint32_t kPersistentPullBytes = 3072;
+constexpr uint32_t kPersistentDispatchThreads = 128;
+constexpr uint32_t kPersistentNonEpilogueThreads = 128;
+constexpr uint32_t kPersistentEpilogueThreads = 256;
+constexpr uint32_t kPersistentThreads =
+    kPersistentDispatchThreads + kPersistentNonEpilogueThreads +
+    kPersistentEpilogueThreads;
+constexpr uint32_t kPersistentSMs = 152;
+constexpr uint32_t kPersistentSmemBytes = 212260;
+constexpr uint32_t kWorkspaceAlignment =
+    deep_gemm::layout::kLCMCandidateBlockM;
+
+constexpr uint32_t align_workspace_tokens(const uint32_t value) {
+    return (value + kWorkspaceAlignment - 1) / kWorkspaceAlignment *
+           kWorkspaceAlignment;
+}
+
+struct PersistentWorkspaceLayout {
+    uint32_t num_ranks;
+    uint32_t capacity;
+    uint32_t ring_tokens;
+    uint32_t sf_ring_tokens;
+    deep_gemm::layout::Workspace workspace;
+    deep_gemm::layout::Buffer input_tokens;
+    deep_gemm::layout::Buffer input_scales;
+    deep_gemm::layout::Buffer input_topk_ids;
+    deep_gemm::layout::Buffer input_topk_scores;
+    deep_gemm::layout::Buffer l1_tokens;
+    deep_gemm::layout::Buffer l1_scales;
+    deep_gemm::layout::Buffer l1_scores;
+    deep_gemm::layout::Buffer l2_tokens;
+    deep_gemm::layout::Buffer l2_scales;
+    deep_gemm::layout::Buffer combine_tokens;
+    deep_gemm::layout::Buffer backward_grad_y_tokens;
+    deep_gemm::layout::Buffer backward_grad_y_scales;
+    deep_gemm::layout::Buffer backward_grad_scores;
+    deep_gemm::layout::Buffer backward_ring_grad_y;
+    deep_gemm::layout::Buffer backward_ring_grad_y_scales;
+    deep_gemm::layout::Buffer backward_ring_grad_preact;
+    deep_gemm::layout::Buffer backward_ring_grad_preact_scales;
+    deep_gemm::layout::Buffer backward_ring_bf16;
+    deep_gemm::layout::Buffer backward_ring_dscore;
+    deep_gemm::layout::Buffer backward_full_h;
+    deep_gemm::layout::Buffer backward_full_h_scales;
+    deep_gemm::layout::Buffer backward_full_grad_preact;
+    deep_gemm::layout::Buffer backward_full_grad_preact_scales;
+
+    PersistentWorkspaceLayout(
+        void* base,
+        const uint32_t ranks,
+        const uint32_t context_tokens_per_rank
+    ) : num_ranks(ranks),
+        capacity(align_workspace_tokens(context_tokens_per_rank)),
+        ring_tokens(align_workspace_tokens(ranks * capacity)),
+        sf_ring_tokens(deep_gemm::layout::get_num_sf_ring_tokens(
+            ring_tokens, kPersistentBlockM)),
+        workspace(
+            base,
+            ranks,
+            kPersistentExperts,
+            capacity,
+            kPersistentTopK,
+            ring_tokens),
+        input_tokens(
+            deep_gemm::layout::Data(kPersistentHidden),
+            1,
+            capacity,
+            workspace.get_end_ptr()),
+        input_scales(
+            deep_gemm::layout::Data(kPersistentHidden / 32),
+            1,
+            capacity,
+            input_tokens.get_end_ptr()),
+        input_topk_ids(
+            deep_gemm::layout::Data(
+                kPersistentTopK * sizeof(int64_t), false),
+            1,
+            capacity,
+            input_scales.get_end_ptr()),
+        input_topk_scores(
+            deep_gemm::layout::Data(
+                kPersistentTopK * sizeof(float), false),
+            1,
+            capacity,
+            input_topk_ids.get_end_ptr()),
+        l1_tokens(
+            deep_gemm::layout::Data(kPersistentHidden),
+            1,
+            ring_tokens,
+            input_topk_scores.get_end_ptr()),
+        l1_scales(
+            deep_gemm::layout::Data(kPersistentHidden / 32),
+            1,
+            sf_ring_tokens,
+            l1_tokens.get_end_ptr()),
+        l1_scores(
+            deep_gemm::layout::Data(sizeof(float), false),
+            1,
+            ring_tokens,
+            l1_scales.get_end_ptr()),
+        l2_tokens(
+            deep_gemm::layout::Data(kPersistentIntermediate),
+            1,
+            ring_tokens,
+            l1_scores.get_end_ptr()),
+        l2_scales(
+            deep_gemm::layout::Data(kPersistentIntermediate / 32),
+            1,
+            sf_ring_tokens,
+            l2_tokens.get_end_ptr()),
+        combine_tokens(
+            deep_gemm::layout::Data(
+                kPersistentHidden * sizeof(__nv_bfloat16)),
+            kPersistentTopK,
+            capacity,
+            l2_scales.get_end_ptr()),
+        backward_grad_y_tokens(
+            deep_gemm::layout::Data(kPersistentHidden),
+            1,
+            capacity,
+            combine_tokens.get_end_ptr()),
+        backward_grad_y_scales(
+            deep_gemm::layout::Data(kPersistentHidden / 32),
+            1,
+            capacity,
+            backward_grad_y_tokens.get_end_ptr()),
+        backward_grad_scores(
+            deep_gemm::layout::Data(
+                kPersistentTopK * sizeof(float), false),
+            1,
+            capacity,
+            backward_grad_y_scales.get_end_ptr()),
+        backward_ring_grad_y(
+            deep_gemm::layout::Data(kPersistentHidden),
+            1,
+            ring_tokens,
+            backward_grad_scores.get_end_ptr()),
+        backward_ring_grad_y_scales(
+            deep_gemm::layout::Data(kPersistentHidden / 32),
+            1,
+            sf_ring_tokens,
+            backward_ring_grad_y.get_end_ptr()),
+        backward_ring_grad_preact(
+            deep_gemm::layout::Data(2 * kPersistentIntermediate),
+            1,
+            ring_tokens,
+            backward_ring_grad_y_scales.get_end_ptr()),
+        backward_ring_grad_preact_scales(
+            deep_gemm::layout::Data(
+                2 * kPersistentIntermediate / 32),
+            1,
+            sf_ring_tokens,
+            backward_ring_grad_preact.get_end_ptr()),
+        backward_ring_bf16(
+            deep_gemm::layout::Data(
+                kPersistentHidden * sizeof(__nv_bfloat16)),
+            1,
+            ring_tokens,
+            backward_ring_grad_preact_scales.get_end_ptr()),
+        backward_ring_dscore(
+            deep_gemm::layout::Data(sizeof(float), false),
+            1,
+            ring_tokens,
+            backward_ring_bf16.get_end_ptr()),
+        backward_full_h(
+            deep_gemm::layout::Data(kPersistentIntermediate),
+            1,
+            workspace.num_max_pool_tokens,
+            backward_ring_dscore.get_end_ptr()),
+        backward_full_h_scales(
+            deep_gemm::layout::Data(kPersistentIntermediate / 32),
+            1,
+            workspace.num_max_pool_tokens,
+            backward_full_h.get_end_ptr()),
+        backward_full_grad_preact(
+            deep_gemm::layout::Data(2 * kPersistentIntermediate),
+            1,
+            workspace.num_max_pool_tokens,
+            backward_full_h_scales.get_end_ptr()),
+        backward_full_grad_preact_scales(
+            deep_gemm::layout::Data(
+                2 * kPersistentIntermediate / 32),
+            1,
+            workspace.num_max_pool_tokens,
+            backward_full_grad_preact.get_end_ptr()) {}
+
+    int64_t num_bytes() const {
+        return reinterpret_cast<int64_t>(
+                   backward_full_grad_preact_scales.get_end_ptr()) -
+               reinterpret_cast<int64_t>(workspace.base);
+    }
+};
 
 constexpr int64_t align_rows(const int64_t rows) {
     return (rows + kBlockK - 1) / kBlockK * kBlockK;
@@ -189,11 +402,55 @@ __global__ void sm103_quantize_bf16_e4m3_group128_kernel(
     const float value = __bfloat162float(input[offset]);
     __shared__ float warp_values[4];
     const float amax = block_max_128(fabsf(value), warp_values);
-    const float scale = amax == 0.0f ? 1.0f : amax / kE4M3Max;
+    const float raw_scale = fmaxf(amax / kE4M3Max, 0x1p-127f);
+    const float scale = exp2f(ceilf(log2f(raw_scale)));
     if (threadIdx.x == 0) {
         scales[row * num_blocks_k + block_k] = scale;
     }
     output[offset] = __nv_fp8_e4m3(value / scale);
+#endif
+}
+
+__global__ void sm103_prepare_persistent_inputs_kernel(
+    const __nv_bfloat16* input,
+    const int64_t* topk_ids,
+    const float* topk_scores,
+    __nv_fp8_e4m3* output,
+    uint32_t* packed_scales,
+    int64_t* output_topk_ids,
+    float* output_topk_scores,
+    const int64_t rows
+) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1030
+    const int64_t num_blocks_k = kPersistentHidden / kBlockK;
+    const int64_t work_idx = blockIdx.x;
+    const int64_t row = work_idx / num_blocks_k;
+    const int64_t block_k = work_idx - row * num_blocks_k;
+    if (row >= rows)
+        return;
+
+    const int64_t column = block_k * kBlockK + threadIdx.x;
+    const int64_t offset = row * kPersistentHidden + column;
+    const float value = __bfloat162float(input[offset]);
+    __shared__ float warp_values[4];
+    const float amax = block_max_128(fabsf(value), warp_values);
+    const float raw_scale = fmaxf(amax / kE4M3Max, 0x1p-127f);
+    const float scale = exp2f(ceilf(log2f(raw_scale)));
+    if (threadIdx.x == 0) {
+        const uint32_t exponent = __float_as_uint(scale) >> 23;
+        packed_scales[row * num_blocks_k + block_k] =
+            exponent * 0x01010101u;
+    }
+    output[offset] = __nv_fp8_e4m3(value / scale);
+
+    // The first activation block also installs the route metadata into the
+    // registered symmetric input plane.  This keeps preparation to one launch
+    // and leaves dispatch/transport to the persistent kernel.
+    if (block_k == 0 && threadIdx.x < kPersistentTopK) {
+        const int64_t route = row * kPersistentTopK + threadIdx.x;
+        output_topk_ids[route] = topk_ids[route];
+        output_topk_scores[route] = topk_scores[route];
+    }
 #endif
 }
 
@@ -241,7 +498,8 @@ __global__ void sm103_swiglu_quantize_group128_kernel(
     const float value = up * gate * sigmoid_gate;
     __shared__ float warp_values[4];
     const float amax = block_max_128(fabsf(value), warp_values);
-    const float scale = amax == 0.0f ? 1.0f : amax / kE4M3Max;
+    const float raw_scale = fmaxf(amax / kE4M3Max, 0x1p-127f);
+    const float scale = exp2f(ceilf(log2f(raw_scale)));
     if (threadIdx.x == 0) {
         scales[row * num_blocks_k + block_k] = scale;
     }
@@ -1392,6 +1650,875 @@ torch::Tensor grouped_fp8_block128_w13_gemm_nt_canonical_expanded(
         true);
 }
 
+pybind11::dict persistent_workspace_info(
+    const int64_t num_ranks,
+    const int64_t context_tokens_per_rank
+) {
+    TORCH_CHECK(num_ranks == 2 || num_ranks == 16,
+                "GLM MegaMoE supports only the target EP2 and EP16 topologies");
+    TORCH_CHECK(context_tokens_per_rank > 0 &&
+                    context_tokens_per_rank <= std::numeric_limits<uint32_t>::max(),
+                "context_tokens_per_rank must be a positive uint32 value");
+    const PersistentWorkspaceLayout layout(
+        nullptr,
+        static_cast<uint32_t>(num_ranks),
+        static_cast<uint32_t>(context_tokens_per_rank));
+    pybind11::dict result;
+    result["num_bytes"] = layout.num_bytes();
+    result["capacity"] = layout.capacity;
+    result["ring_tokens"] = layout.ring_tokens;
+    result["sf_ring_tokens"] = layout.sf_ring_tokens;
+    result["block_m"] = kPersistentBlockM;
+    result["block_n"] = kPersistentBlockN;
+    result["block_k"] = kPersistentBlockK;
+    result["num_sms"] = kPersistentSMs;
+    return result;
+}
+
+void prepare_persistent_inputs(
+    const torch::Tensor& buffer,
+    const torch::Tensor& input,
+    const torch::Tensor& topk_ids,
+    const torch::Tensor& topk_scores,
+    const int64_t num_ranks,
+    const int64_t context_tokens_per_rank
+) {
+    check_bf16_matrix(input, "input");
+    TORCH_CHECK(input.size(1) == kPersistentHidden,
+                "persistent GLM MegaMoE input width must be 6144");
+    check_sm103_device(buffer);
+    DG_CHECK_CONTIGUOUS(buffer);
+    TORCH_CHECK(buffer.scalar_type() == torch::kInt8 && buffer.dim() == 1,
+                "persistent workspace must be a contiguous int8 vector");
+    TORCH_CHECK(topk_ids.is_cuda() && topk_ids.is_contiguous() &&
+                    topk_ids.scalar_type() == torch::kInt64 &&
+                    topk_ids.sizes() == torch::IntArrayRef({input.size(0), kPersistentTopK}),
+                "persistent topk_ids must be contiguous CUDA int64 [tokens, 8]");
+    TORCH_CHECK(topk_scores.is_cuda() && topk_scores.is_contiguous() &&
+                    topk_scores.scalar_type() == torch::kFloat32 &&
+                    topk_scores.sizes() == torch::IntArrayRef({input.size(0), kPersistentTopK}),
+                "persistent topk_scores must be contiguous CUDA float32 [tokens, 8]");
+    TORCH_CHECK(input.device() == buffer.device() &&
+                    topk_ids.device() == buffer.device() &&
+                    topk_scores.device() == buffer.device(),
+                "persistent inputs and workspace must share a device");
+
+    const PersistentWorkspaceLayout layout(
+        buffer.data_ptr(),
+        static_cast<uint32_t>(num_ranks),
+        static_cast<uint32_t>(context_tokens_per_rank));
+    TORCH_CHECK(buffer.nbytes() >= static_cast<size_t>(layout.num_bytes()),
+                "persistent workspace is smaller than its derived context/CP layout");
+    TORCH_CHECK(input.size(0) <= layout.capacity,
+                "input exceeds the private context/CP workspace capacity");
+
+    if (input.size(0) == 0)
+        return;
+    c10::cuda::CUDAGuard guard(input.device());
+    const auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
+    sm103_prepare_persistent_inputs_kernel<<<
+        input.size(0) * (kPersistentHidden / kBlockK),
+        kBlockK,
+        0,
+        stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
+        topk_ids.data_ptr<int64_t>(),
+        topk_scores.data_ptr<float>(),
+        layout.input_tokens.get_base_ptr<__nv_fp8_e4m3>(),
+        layout.input_scales.get_base_ptr<uint32_t>(),
+        layout.input_topk_ids.get_base_ptr<int64_t>(),
+        layout.input_topk_scores.get_base_ptr<float>(),
+        input.size(0));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+template <uint32_t kNumRanks>
+void launch_persistent_forward(
+    const torch::Tensor& output,
+    const torch::Tensor& expert_counts,
+    const torch::Tensor& token_src_metadata,
+    const torch::Tensor& buffer,
+    const std::vector<int64_t>& buffer_ptrs,
+    const int64_t rank,
+    const PersistentWorkspaceLayout& layout,
+    const torch::Tensor& w13_weight,
+    const torch::Tensor& w13_scale,
+    const torch::Tensor& w2_weight,
+    const torch::Tensor& w2_scale,
+    const int64_t num_tokens
+) {
+    const auto device = buffer.device();
+    const auto fp8_options = torch::TensorOptions()
+        .dtype(torch::kFloat8_e4m3fn)
+        .device(device);
+    const auto int_options = torch::TensorOptions()
+        .dtype(torch::kInt)
+        .device(device);
+
+    auto l1_acts = torch::from_blob(
+        layout.l1_tokens.base,
+        {layout.ring_tokens, kPersistentHidden},
+        fp8_options);
+    auto l1_acts_sf = torch::from_blob(
+        layout.l1_scales.base,
+        {layout.sf_ring_tokens, kPersistentHidden / 128},
+        {1, static_cast<int64_t>(layout.sf_ring_tokens)},
+        int_options);
+    auto l2_acts = torch::from_blob(
+        layout.l2_tokens.base,
+        {layout.ring_tokens, kPersistentIntermediate},
+        fp8_options);
+    auto l2_acts_sf = torch::from_blob(
+        layout.l2_scales.base,
+        {layout.sf_ring_tokens, kPersistentIntermediate / 128},
+        {1, static_cast<int64_t>(layout.sf_ring_tokens)},
+        int_options);
+
+    const auto tensor_map_l1_acts = deep_gemm::make_tma_2d_desc(
+        l1_acts,
+        kPersistentHidden,
+        layout.ring_tokens,
+        kPersistentBlockK,
+        kPersistentBlockM / 2,
+        static_cast<int>(l1_acts.stride(-2)),
+        128);
+    const auto tensor_map_l1_acts_sf = deep_gemm::make_tma_sf_desc(
+        cute::UMMA::Major::MN,
+        l1_acts_sf,
+        layout.sf_ring_tokens,
+        kPersistentHidden,
+        kPersistentSFBlockM,
+        32,
+        1,
+        0,
+        0,
+        false,
+        1);
+    // Canonical [2E,H,D] is addressed as a 2-D [2E*H,D] plane.  The
+    // persistent kernel issues separate 8-row TMA offsets for up and gate.
+    const auto tensor_map_l1_weights = deep_gemm::make_tma_2d_desc(
+        w13_weight,
+        kPersistentHidden,
+        static_cast<int>(w13_weight.size(0) * w13_weight.size(1)),
+        kPersistentBlockK,
+        8,
+        static_cast<int>(w13_weight.stride(-2)),
+        128);
+    const auto tensor_map_l1_output = deep_gemm::make_tma_2d_desc(
+        l2_acts,
+        kPersistentIntermediate,
+        layout.ring_tokens,
+        kPersistentBlockN / 2,
+        kPersistentStoreBlockM,
+        static_cast<int>(l2_acts.stride(-2)),
+        64);
+    const auto tensor_map_l2_acts = deep_gemm::make_tma_2d_desc(
+        l2_acts,
+        kPersistentIntermediate,
+        layout.ring_tokens,
+        kPersistentBlockK,
+        kPersistentBlockM / 2,
+        static_cast<int>(l2_acts.stride(-2)),
+        128);
+    const auto tensor_map_l2_acts_sf = deep_gemm::make_tma_sf_desc(
+        cute::UMMA::Major::MN,
+        l2_acts_sf,
+        layout.sf_ring_tokens,
+        kPersistentIntermediate,
+        kPersistentSFBlockM,
+        32,
+        1,
+        0,
+        0,
+        false,
+        1);
+    const auto tensor_map_l2_weights = deep_gemm::make_tma_2d_desc(
+        w2_weight,
+        kPersistentIntermediate,
+        static_cast<int>(w2_weight.size(0) * w2_weight.size(1)),
+        kPersistentBlockK,
+        kPersistentBlockN,
+        static_cast<int>(w2_weight.stride(-2)),
+        128);
+
+    using Kernel = decltype(&deep_gemm::sm100_fp8_fp4_mega_moe_impl<
+        kPersistentHidden,
+        kPersistentIntermediate,
+        kPersistentExperts,
+        kPersistentTopK,
+        1,
+        kPersistentBlockM,
+        kPersistentBlockN,
+        kPersistentBlockK,
+        kPersistentStoreBlockM,
+        kPersistentSFBlockM,
+        kPersistentSFBlockN,
+        kPersistentStages,
+        kPersistentPullBytes,
+        kPersistentDispatchThreads,
+        kPersistentNonEpilogueThreads,
+        kPersistentEpilogueThreads,
+        kPersistentSMs,
+        kNumRanks,
+        0x7f800000u,
+        false,
+        deep_gemm::ActivationType::SwiGLU,
+        true>);
+    Kernel kernel = &deep_gemm::sm100_fp8_fp4_mega_moe_impl<
+        kPersistentHidden,
+        kPersistentIntermediate,
+        kPersistentExperts,
+        kPersistentTopK,
+        1,
+        kPersistentBlockM,
+        kPersistentBlockN,
+        kPersistentBlockK,
+        kPersistentStoreBlockM,
+        kPersistentSFBlockM,
+        kPersistentSFBlockN,
+        kPersistentStages,
+        kPersistentPullBytes,
+        kPersistentDispatchThreads,
+        kPersistentNonEpilogueThreads,
+        kPersistentEpilogueThreads,
+        kPersistentSMs,
+        kNumRanks,
+        0x7f800000u,
+        false,
+        deep_gemm::ActivationType::SwiGLU,
+        true>;
+
+    C10_CUDA_CHECK(cudaFuncSetAttribute(
+        kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        kPersistentSmemBytes));
+    cudaLaunchAttribute attribute{};
+    attribute.id = cudaLaunchAttributeClusterDimension;
+    attribute.val.clusterDim = {2, 1, 1};
+    cudaLaunchConfig_t config{};
+    config.gridDim = dim3(kPersistentSMs, 1, 1);
+    config.blockDim = dim3(kPersistentThreads, 1, 1);
+    config.dynamicSmemBytes = kPersistentSmemBytes;
+    config.stream = at::cuda::getCurrentCUDAStream(buffer.get_device());
+    config.attrs = &attribute;
+    config.numAttrs = 1;
+
+    const auto sym_buffer = deep_gemm::layout::SymBuffer<kNumRanks>(
+        buffer_ptrs, static_cast<uint32_t>(rank));
+    C10_CUDA_CHECK(cudaLaunchKernelEx(
+        &config,
+        kernel,
+        output.data_ptr(),
+        expert_counts.data_ptr<int>(),
+        reinterpret_cast<deep_gemm::layout::TokenSrcMetadata*>(
+            token_src_metadata.data_ptr<int>()),
+        static_cast<uint32_t>(num_tokens),
+        layout.capacity,
+        layout.ring_tokens,
+        layout.sf_ring_tokens,
+        sym_buffer,
+        tensor_map_l1_acts,
+        tensor_map_l1_acts_sf,
+        tensor_map_l1_weights,
+        tensor_map_l1_acts_sf,
+        tensor_map_l1_output,
+        tensor_map_l2_acts,
+        tensor_map_l2_acts_sf,
+        tensor_map_l2_weights,
+        tensor_map_l2_acts_sf,
+        w13_scale.data_ptr<float>(),
+        w2_scale.data_ptr<float>()));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> persistent_forward(
+    const torch::Tensor& buffer,
+    const std::vector<int64_t>& buffer_ptrs,
+    const int64_t rank,
+    const int64_t context_tokens_per_rank,
+    const int64_t num_tokens,
+    const torch::Tensor& w13_weight,
+    const torch::Tensor& w13_scale,
+    const torch::Tensor& w2_weight,
+    const torch::Tensor& w2_scale
+) {
+    check_sm103_device(buffer);
+    c10::cuda::CUDAGuard guard(buffer.device());
+    cudaDeviceProp properties{};
+    C10_CUDA_CHECK(cudaGetDeviceProperties(
+        &properties, buffer.get_device()));
+    TORCH_CHECK(properties.multiProcessorCount == kPersistentSMs,
+                "persistent GLM MegaMoE requires the 152-SM SM103 target, got ",
+                properties.multiProcessorCount);
+    TORCH_CHECK(buffer_ptrs.size() == 2 || buffer_ptrs.size() == 16,
+                "persistent GLM MegaMoE supports EP2 or EP16 only");
+    TORCH_CHECK(rank >= 0 && rank < static_cast<int64_t>(buffer_ptrs.size()),
+                "persistent workspace rank is out of range");
+    TORCH_CHECK(num_tokens >= 0,
+                "persistent num_tokens must be nonnegative");
+
+    const auto local_experts = kPersistentExperts / buffer_ptrs.size();
+    TORCH_CHECK(w13_weight.is_cuda() && w13_weight.is_contiguous() &&
+                    w13_weight.scalar_type() == torch::kFloat8_e4m3fn &&
+                    w13_weight.sizes() == torch::IntArrayRef(
+                        {static_cast<int64_t>(2 * local_experts),
+                         kPersistentIntermediate,
+                         kPersistentHidden}),
+                "canonical W13 must be contiguous E4M3 [2E_local,2048,6144]");
+    TORCH_CHECK(w13_scale.is_cuda() && w13_scale.is_contiguous() &&
+                    w13_scale.scalar_type() == torch::kFloat32 &&
+                    w13_scale.sizes() == torch::IntArrayRef(
+                        {static_cast<int64_t>(2 * local_experts), 16, 48}),
+                "canonical W13 scales must be FP32 [2E_local,16,48]");
+    TORCH_CHECK(w2_weight.is_cuda() && w2_weight.is_contiguous() &&
+                    w2_weight.scalar_type() == torch::kFloat8_e4m3fn &&
+                    w2_weight.sizes() == torch::IntArrayRef(
+                        {static_cast<int64_t>(local_experts),
+                         kPersistentHidden,
+                         kPersistentIntermediate}),
+                "W2 must be contiguous E4M3 [E_local,6144,2048]");
+    TORCH_CHECK(w2_scale.is_cuda() && w2_scale.is_contiguous() &&
+                    w2_scale.scalar_type() == torch::kFloat32 &&
+                    w2_scale.sizes() == torch::IntArrayRef(
+                        {static_cast<int64_t>(local_experts), 48, 16}),
+                "W2 scales must be FP32 [E_local,48,16]");
+    TORCH_CHECK(w13_weight.device() == buffer.device() &&
+                    w13_scale.device() == buffer.device() &&
+                    w2_weight.device() == buffer.device() &&
+                    w2_scale.device() == buffer.device(),
+                "persistent weights and workspace must share a device");
+
+    const PersistentWorkspaceLayout layout(
+        buffer.data_ptr(),
+        static_cast<uint32_t>(buffer_ptrs.size()),
+        static_cast<uint32_t>(context_tokens_per_rank));
+    TORCH_CHECK(buffer.nbytes() >= static_cast<size_t>(layout.num_bytes()),
+                "persistent workspace is smaller than its derived layout");
+    TORCH_CHECK(num_tokens <= layout.capacity,
+                "persistent num_tokens exceeds the private context/CP capacity");
+    auto output = torch::empty(
+        {num_tokens, kPersistentHidden},
+        buffer.options().dtype(torch::kBFloat16));
+    auto expert_counts = torch::zeros(
+        {static_cast<int64_t>(local_experts)},
+        buffer.options().dtype(torch::kInt));
+    auto token_src_metadata = torch::empty(
+        {static_cast<int64_t>(layout.workspace.num_max_pool_tokens), 3},
+        buffer.options().dtype(torch::kInt));
+    if (num_tokens == 0)
+        return {output, expert_counts, token_src_metadata};
+
+    if (buffer_ptrs.size() == 2) {
+        launch_persistent_forward<2>(
+            output, expert_counts, token_src_metadata,
+            buffer, buffer_ptrs, rank, layout,
+            w13_weight, w13_scale, w2_weight, w2_scale, num_tokens);
+    } else {
+        launch_persistent_forward<16>(
+            output, expert_counts, token_src_metadata,
+            buffer, buffer_ptrs, rank, layout,
+            w13_weight, w13_scale, w2_weight, w2_scale, num_tokens);
+    }
+    return {output, expert_counts, token_src_metadata};
+}
+
+template <uint32_t kNumRanks>
+void launch_persistent_backward_activation(
+    const torch::Tensor& grad_x,
+    const torch::Tensor& grad_scores,
+    const torch::Tensor& buffer,
+    const std::vector<int64_t>& buffer_ptrs,
+    const int64_t rank,
+    const PersistentWorkspaceLayout& layout,
+    const torch::Tensor& x,
+    const torch::Tensor& grad_output,
+    const torch::Tensor& topk_scores,
+    const torch::Tensor& expert_counts,
+    const torch::Tensor& token_src_metadata,
+    const torch::Tensor& w13_weight,
+    const torch::Tensor& w13_scale,
+    const torch::Tensor& w2_weight,
+    const torch::Tensor& w2_scale
+) {
+    const auto device = buffer.device();
+    const auto fp8_options = torch::TensorOptions()
+        .dtype(torch::kFloat8_e4m3fn)
+        .device(device);
+    const auto int_options = torch::TensorOptions()
+        .dtype(torch::kInt)
+        .device(device);
+    const auto bf16_options = torch::TensorOptions()
+        .dtype(torch::kBFloat16)
+        .device(device);
+
+    auto ring_x = torch::from_blob(
+        layout.l1_tokens.base,
+        {layout.ring_tokens, kPersistentHidden}, fp8_options);
+    auto ring_x_sf = torch::from_blob(
+        layout.l1_scales.base,
+        {layout.sf_ring_tokens, kPersistentHidden / 128},
+        {1, static_cast<int64_t>(layout.sf_ring_tokens)},
+        int_options);
+    auto ring_grad_y = torch::from_blob(
+        layout.backward_ring_grad_y.base,
+        {layout.ring_tokens, kPersistentHidden}, fp8_options);
+    auto ring_grad_y_sf = torch::from_blob(
+        layout.backward_ring_grad_y_scales.base,
+        {layout.sf_ring_tokens, kPersistentHidden / 128},
+        {1, static_cast<int64_t>(layout.sf_ring_tokens)},
+        int_options);
+    auto ring_h = torch::from_blob(
+        layout.l2_tokens.base,
+        {layout.ring_tokens, kPersistentIntermediate}, fp8_options);
+    auto ring_h_sf = torch::from_blob(
+        layout.l2_scales.base,
+        {layout.sf_ring_tokens, kPersistentIntermediate / 128},
+        {1, static_cast<int64_t>(layout.sf_ring_tokens)},
+        int_options);
+    auto ring_grad_preact = torch::from_blob(
+        layout.backward_ring_grad_preact.base,
+        {layout.ring_tokens, 2 * kPersistentIntermediate}, fp8_options);
+    auto ring_grad_preact_sf = torch::from_blob(
+        layout.backward_ring_grad_preact_scales.base,
+        {layout.sf_ring_tokens, 2 * kPersistentIntermediate / 128},
+        {1, static_cast<int64_t>(layout.sf_ring_tokens)},
+        int_options);
+
+    auto gate_up = torch::from_blob(
+        layout.backward_ring_bf16.base,
+        {layout.ring_tokens, 2 * kPersistentIntermediate},
+        {static_cast<int64_t>(kPersistentHidden), 1},
+        bf16_options);
+    auto grad_h = torch::from_blob(
+        layout.backward_ring_bf16.get_base_ptr<__nv_bfloat16>() +
+            2 * kPersistentIntermediate,
+        {layout.ring_tokens, kPersistentIntermediate},
+        {static_cast<int64_t>(kPersistentHidden), 1},
+        bf16_options);
+    auto ring_grad_x = torch::from_blob(
+        layout.backward_ring_bf16.base,
+        {layout.ring_tokens, kPersistentHidden},
+        {static_cast<int64_t>(kPersistentHidden), 1},
+        bf16_options);
+
+    const auto tensor_map_ring_x = deep_gemm::make_tma_2d_desc(
+        ring_x, kPersistentHidden, layout.ring_tokens,
+        kPersistentBlockK, kPersistentBlockM / 2,
+        kPersistentHidden, 128);
+    const auto tensor_map_ring_x_sf = deep_gemm::make_tma_sf_desc(
+        cute::UMMA::Major::MN, ring_x_sf,
+        layout.sf_ring_tokens, kPersistentHidden,
+        kPersistentSFBlockM, 32, 1, 0, 0, false, 1);
+    const auto tensor_map_ring_grad_y = deep_gemm::make_tma_2d_desc(
+        ring_grad_y, kPersistentHidden, layout.ring_tokens,
+        kPersistentBlockK, kPersistentBlockM / 2,
+        kPersistentHidden, 128);
+    const auto tensor_map_ring_grad_y_sf = deep_gemm::make_tma_sf_desc(
+        cute::UMMA::Major::MN, ring_grad_y_sf,
+        layout.sf_ring_tokens, kPersistentHidden,
+        kPersistentSFBlockM, 32, 1, 0, 0, false, 1);
+    const auto tensor_map_ring_h = deep_gemm::make_tma_2d_desc(
+        ring_h, kPersistentIntermediate, layout.ring_tokens,
+        kPersistentBlockK, kPersistentBlockM / 2,
+        kPersistentIntermediate, 128);
+    const auto tensor_map_ring_h_sf = deep_gemm::make_tma_sf_desc(
+        cute::UMMA::Major::MN, ring_h_sf,
+        layout.sf_ring_tokens, kPersistentIntermediate,
+        kPersistentSFBlockM, 32, 1, 0, 0, false, 1);
+    const auto tensor_map_ring_grad_preact =
+        deep_gemm::make_tma_2d_desc(
+            ring_grad_preact, 2 * kPersistentIntermediate,
+            layout.ring_tokens, kPersistentBlockK,
+            kPersistentBlockM / 2,
+            2 * kPersistentIntermediate, 128);
+    const auto tensor_map_ring_grad_preact_sf =
+        deep_gemm::make_tma_sf_desc(
+            cute::UMMA::Major::MN, ring_grad_preact_sf,
+            layout.sf_ring_tokens, 2 * kPersistentIntermediate,
+            kPersistentSFBlockM, 32, 1, 0, 0, false, 1);
+
+    const auto tensor_map_w13_recompute = deep_gemm::make_tma_2d_desc(
+        w13_weight, kPersistentHidden,
+        static_cast<int>(w13_weight.size(0) * w13_weight.size(1)),
+        kPersistentBlockK, 8,
+        static_cast<int>(w13_weight.stride(-2)), 128);
+    const auto tensor_map_w2_dgrad = deep_gemm::make_tma_b_desc(
+        cute::UMMA::Major::MN, w2_weight,
+        kPersistentIntermediate, kPersistentHidden,
+        kPersistentBlockN, kPersistentBlockK,
+        static_cast<int>(w2_weight.stride(-2)),
+        static_cast<int>(w2_weight.size(0)), 128);
+    const auto tensor_map_w13_dgrad = deep_gemm::make_tma_b_desc(
+        cute::UMMA::Major::MN, w13_weight,
+        kPersistentHidden, 2 * kPersistentIntermediate,
+        kPersistentBlockN, kPersistentBlockK,
+        static_cast<int>(w13_weight.stride(-2)),
+        static_cast<int>(w13_weight.size(0) / 2), 128);
+    const auto tensor_map_gate_up = deep_gemm::make_tma_2d_desc(
+        gate_up, 2 * kPersistentIntermediate, layout.ring_tokens,
+        kPersistentBlockN, kPersistentStoreBlockM,
+        kPersistentHidden, 128);
+    const auto tensor_map_grad_h = deep_gemm::make_tma_2d_desc(
+        grad_h, kPersistentIntermediate, layout.ring_tokens,
+        kPersistentBlockN, kPersistentStoreBlockM,
+        kPersistentHidden, 128);
+    const auto tensor_map_grad_x = deep_gemm::make_tma_2d_desc(
+        ring_grad_x, kPersistentHidden, layout.ring_tokens,
+        kPersistentBlockN, kPersistentStoreBlockM,
+        kPersistentHidden, 128);
+
+    using Kernel = decltype(
+        &deep_gemm::sm103_block128_backward::
+            sm103_fp8_block128_mega_moe_backward_impl<kNumRanks>);
+    Kernel kernel =
+        &deep_gemm::sm103_block128_backward::
+            sm103_fp8_block128_mega_moe_backward_impl<kNumRanks>;
+    constexpr uint32_t smem_bytes = sizeof(
+        deep_gemm::sm103_block128_backward::SharedStorage);
+    C10_CUDA_CHECK(cudaFuncSetAttribute(
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
+    cudaLaunchAttribute attribute{};
+    attribute.id = cudaLaunchAttributeClusterDimension;
+    attribute.val.clusterDim = {2, 1, 1};
+    cudaLaunchConfig_t config{};
+    config.gridDim = dim3(kPersistentSMs, 1, 1);
+    config.blockDim = dim3(
+        deep_gemm::sm103_block128_backward::kThreads, 1, 1);
+    config.dynamicSmemBytes = smem_bytes;
+    config.stream = at::cuda::getCurrentCUDAStream(buffer.get_device());
+    config.attrs = &attribute;
+    config.numAttrs = 1;
+    const auto sym_buffer = deep_gemm::layout::SymBuffer<kNumRanks>(
+        buffer_ptrs, static_cast<uint32_t>(rank));
+
+    C10_CUDA_CHECK(cudaLaunchKernelEx(
+        &config, kernel,
+        expert_counts.data_ptr<int>(),
+        reinterpret_cast<const deep_gemm::layout::TokenSrcMetadata*>(
+            token_src_metadata.data_ptr<int>()),
+        static_cast<uint32_t>(x.size(0)), layout.capacity,
+        layout.ring_tokens, layout.sf_ring_tokens,
+        layout.workspace.num_max_pool_tokens,
+        sym_buffer, layout.workspace,
+        reinterpret_cast<const cutlass::bfloat16_t*>(x.data_ptr()),
+        reinterpret_cast<const cutlass::bfloat16_t*>(
+            grad_output.data_ptr()),
+        topk_scores.data_ptr<float>(),
+        layout.input_tokens.get_base_ptr<cutlass::float_e4m3_t>(),
+        layout.input_scales.get_base_ptr<uint32_t>(),
+        layout.backward_grad_y_tokens
+            .get_base_ptr<cutlass::float_e4m3_t>(),
+        layout.backward_grad_y_scales.get_base_ptr<uint32_t>(),
+        layout.input_topk_scores.get_base_ptr<float>(),
+        layout.backward_grad_scores.get_base_ptr<float>(),
+        layout.combine_tokens.get_base_ptr<cutlass::bfloat16_t>(),
+        layout.l1_tokens.get_base_ptr<cutlass::float_e4m3_t>(),
+        layout.l1_scales.get_base_ptr<uint32_t>(),
+        layout.backward_ring_grad_y
+            .get_base_ptr<cutlass::float_e4m3_t>(),
+        layout.backward_ring_grad_y_scales.get_base_ptr<uint32_t>(),
+        layout.l1_scores.get_base_ptr<float>(),
+        layout.l2_tokens.get_base_ptr<cutlass::float_e4m3_t>(),
+        layout.l2_scales.get_base_ptr<uint32_t>(),
+        layout.backward_ring_grad_preact
+            .get_base_ptr<cutlass::float_e4m3_t>(),
+        layout.backward_ring_grad_preact_scales.get_base_ptr<uint32_t>(),
+        layout.backward_ring_bf16.get_base_ptr<cutlass::bfloat16_t>(),
+        layout.backward_ring_dscore.get_base_ptr<float>(),
+        layout.backward_full_h.get_base_ptr<cutlass::float_e4m3_t>(),
+        layout.backward_full_h_scales.get_base_ptr<uint32_t>(),
+        layout.backward_full_grad_preact
+            .get_base_ptr<cutlass::float_e4m3_t>(),
+        layout.backward_full_grad_preact_scales.get_base_ptr<uint32_t>(),
+        reinterpret_cast<cutlass::bfloat16_t*>(grad_x.data_ptr()),
+        grad_scores.data_ptr<float>(),
+        tensor_map_ring_x, tensor_map_ring_x_sf,
+        tensor_map_ring_grad_y, tensor_map_ring_grad_y_sf,
+        tensor_map_ring_h, tensor_map_ring_h_sf,
+        tensor_map_ring_grad_preact, tensor_map_ring_grad_preact_sf,
+        tensor_map_w13_recompute, tensor_map_w2_dgrad,
+        tensor_map_w13_dgrad, tensor_map_gate_up,
+        tensor_map_grad_h, tensor_map_grad_x,
+        w13_scale.data_ptr<float>(), w2_scale.data_ptr<float>()));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+template <uint32_t kNumRanks, bool kW2>
+void launch_persistent_wgrad(
+    const torch::Tensor& output_0,
+    const torch::Tensor& output_1,
+    const torch::Tensor& buffer,
+    const std::vector<int64_t>& buffer_ptrs,
+    const int64_t rank,
+    const PersistentWorkspaceLayout& layout,
+    const torch::Tensor& expert_counts,
+    const torch::Tensor& token_src_metadata
+) {
+    constexpr int64_t output_rows =
+        kW2 ? kPersistentHidden : kPersistentIntermediate;
+    constexpr int64_t output_columns =
+        kW2 ? kPersistentIntermediate : kPersistentHidden;
+    const int64_t local_experts = kPersistentExperts / kNumRanks;
+    const auto output_0_flat = output_0.view(
+        {local_experts * output_rows, output_columns});
+    const auto output_1_flat = output_1.view(
+        {local_experts * output_rows, output_columns});
+    const auto tensor_map_output_0 = deep_gemm::make_tma_cd_desc(
+        output_0_flat,
+        static_cast<int>(local_experts * output_rows),
+        static_cast<int>(output_columns),
+        deep_gemm::sm103_block128_wgrad::kStoreBlockM,
+        deep_gemm::sm103_block128_wgrad::kStoreBlockN,
+        static_cast<int>(output_columns), 1, 128);
+    const auto tensor_map_output_1 = deep_gemm::make_tma_cd_desc(
+        output_1_flat,
+        static_cast<int>(local_experts * output_rows),
+        static_cast<int>(output_columns),
+        deep_gemm::sm103_block128_wgrad::kStoreBlockM,
+        deep_gemm::sm103_block128_wgrad::kStoreBlockN,
+        static_cast<int>(output_columns), 1, 128);
+
+    using Kernel = decltype(
+        &deep_gemm::sm103_block128_wgrad::
+            sm103_fp8_block128_mega_moe_wgrad_impl<kW2, kNumRanks>);
+    Kernel kernel =
+        &deep_gemm::sm103_block128_wgrad::
+            sm103_fp8_block128_mega_moe_wgrad_impl<kW2, kNumRanks>;
+    constexpr uint32_t smem_bytes = sizeof(
+        deep_gemm::sm103_block128_wgrad::SharedStorage);
+    C10_CUDA_CHECK(cudaFuncSetAttribute(
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
+    cudaLaunchAttribute attribute{};
+    attribute.id = cudaLaunchAttributeClusterDimension;
+    attribute.val.clusterDim = {2, 1, 1};
+    cudaLaunchConfig_t config{};
+    config.gridDim = dim3(kPersistentSMs, 1, 1);
+    config.blockDim = dim3(
+        deep_gemm::sm103_block128_wgrad::kThreads, 1, 1);
+    config.dynamicSmemBytes = smem_bytes;
+    config.stream = at::cuda::getCurrentCUDAStream(buffer.get_device());
+    config.attrs = &attribute;
+    config.numAttrs = 1;
+    const auto sym_buffer = deep_gemm::layout::SymBuffer<kNumRanks>(
+        buffer_ptrs, static_cast<uint32_t>(rank));
+
+    auto* ring_operand = kW2
+        ? layout.backward_ring_grad_y
+              .get_base_ptr<cutlass::float_e4m3_t>()
+        : layout.l1_tokens.get_base_ptr<cutlass::float_e4m3_t>();
+    auto* ring_operand_sf = kW2
+        ? layout.backward_ring_grad_y_scales.get_base_ptr<uint32_t>()
+        : layout.l1_scales.get_base_ptr<uint32_t>();
+    C10_CUDA_CHECK(cudaLaunchKernelEx(
+        &config, kernel,
+        expert_counts.data_ptr<int>(),
+        reinterpret_cast<const deep_gemm::layout::TokenSrcMetadata*>(
+            token_src_metadata.data_ptr<int>()),
+        layout.sf_ring_tokens,
+        sym_buffer, layout.workspace,
+        layout.input_tokens.get_base_ptr<cutlass::float_e4m3_t>(),
+        layout.input_scales.get_base_ptr<uint32_t>(),
+        layout.backward_grad_y_tokens
+            .get_base_ptr<cutlass::float_e4m3_t>(),
+        layout.backward_grad_y_scales.get_base_ptr<uint32_t>(),
+        layout.input_topk_scores.get_base_ptr<float>(),
+        ring_operand, ring_operand_sf,
+        layout.l1_scores.get_base_ptr<float>(),
+        layout.backward_full_h.get_base_ptr<cutlass::float_e4m3_t>(),
+        layout.backward_full_h_scales.get_base_ptr<uint32_t>(),
+        layout.backward_full_grad_preact
+            .get_base_ptr<cutlass::float_e4m3_t>(),
+        layout.backward_full_grad_preact_scales.get_base_ptr<uint32_t>(),
+        tensor_map_output_0, tensor_map_output_1));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+std::tuple<torch::Tensor, torch::Tensor>
+persistent_backward_activation(
+    const torch::Tensor& buffer,
+    const std::vector<int64_t>& buffer_ptrs,
+    const int64_t rank,
+    const int64_t context_tokens_per_rank,
+    const torch::Tensor& x,
+    const torch::Tensor& grad_output,
+    const torch::Tensor& topk_scores,
+    const torch::Tensor& expert_counts,
+    const torch::Tensor& token_src_metadata,
+    const torch::Tensor& w13_weight,
+    const torch::Tensor& w13_scale,
+    const torch::Tensor& w2_weight,
+    const torch::Tensor& w2_scale
+) {
+    check_sm103_device(buffer);
+    DG_CHECK_CONTIGUOUS(buffer);
+    TORCH_CHECK(buffer.scalar_type() == torch::kInt8 && buffer.dim() == 1,
+                "persistent workspace must be a contiguous int8 vector");
+    TORCH_CHECK(buffer_ptrs.size() == 2 || buffer_ptrs.size() == 16,
+                "persistent backward supports EP2 or EP16 only");
+    TORCH_CHECK(rank >= 0 && rank < static_cast<int64_t>(buffer_ptrs.size()),
+                "persistent backward workspace rank is out of range");
+    TORCH_CHECK(context_tokens_per_rank > 0 &&
+                    context_tokens_per_rank <=
+                        std::numeric_limits<uint32_t>::max(),
+                "persistent backward context/CP envelope must be positive uint32");
+    c10::cuda::CUDAGuard guard(buffer.device());
+    cudaDeviceProp properties{};
+    C10_CUDA_CHECK(cudaGetDeviceProperties(
+        &properties, buffer.get_device()));
+    TORCH_CHECK(properties.multiProcessorCount == kPersistentSMs,
+                "persistent GLM MegaMoE requires the 152-SM SM103 target, got ",
+                properties.multiProcessorCount);
+    check_bf16_matrix(x, "x");
+    check_bf16_matrix(grad_output, "grad_output");
+    TORCH_CHECK(x.sizes() == grad_output.sizes() &&
+                    x.size(1) == kPersistentHidden,
+                "persistent backward x/grad_output must match [tokens,6144]");
+    TORCH_CHECK(topk_scores.is_cuda() && topk_scores.is_contiguous() &&
+                    topk_scores.scalar_type() == torch::kFloat32 &&
+                    topk_scores.sizes() == torch::IntArrayRef(
+                        {x.size(0), kPersistentTopK}),
+                "persistent backward scores must be float32 [tokens,8]");
+    TORCH_CHECK(x.device() == buffer.device() &&
+                    grad_output.device() == buffer.device() &&
+                    topk_scores.device() == buffer.device(),
+                "persistent backward activations and workspace must share a device");
+    const auto local_experts =
+        kPersistentExperts / buffer_ptrs.size();
+    TORCH_CHECK(expert_counts.is_cuda() && expert_counts.is_contiguous() &&
+                    expert_counts.scalar_type() == torch::kInt &&
+                    expert_counts.numel() ==
+                        static_cast<int64_t>(local_experts),
+                "saved expert counts mismatch");
+    TORCH_CHECK(token_src_metadata.is_cuda() &&
+                    token_src_metadata.is_contiguous() &&
+                    token_src_metadata.scalar_type() == torch::kInt &&
+                    token_src_metadata.dim() == 2 &&
+                    token_src_metadata.size(1) == 3,
+                "saved source metadata must be int32 [pool,3]");
+    TORCH_CHECK(expert_counts.device() == buffer.device() &&
+                    token_src_metadata.device() == buffer.device(),
+                "saved routing state and workspace must share a device");
+    TORCH_CHECK(w13_weight.is_cuda() && w13_weight.is_contiguous() &&
+                    w13_weight.scalar_type() == torch::kFloat8_e4m3fn &&
+                    w13_weight.sizes() == torch::IntArrayRef(
+                        {static_cast<int64_t>(2 * local_experts),
+                         kPersistentIntermediate, kPersistentHidden}),
+                "canonical W13 must be contiguous E4M3 [2E_local,2048,6144]");
+    TORCH_CHECK(w13_scale.is_cuda() && w13_scale.is_contiguous() &&
+                    w13_scale.scalar_type() == torch::kFloat32 &&
+                    w13_scale.sizes() == torch::IntArrayRef(
+                        {static_cast<int64_t>(2 * local_experts), 16, 48}),
+                "canonical W13 scales must be FP32 [2E_local,16,48]");
+    TORCH_CHECK(w2_weight.is_cuda() && w2_weight.is_contiguous() &&
+                    w2_weight.scalar_type() == torch::kFloat8_e4m3fn &&
+                    w2_weight.sizes() == torch::IntArrayRef(
+                        {static_cast<int64_t>(local_experts),
+                         kPersistentHidden, kPersistentIntermediate}),
+                "W2 must be contiguous E4M3 [E_local,6144,2048]");
+    TORCH_CHECK(w2_scale.is_cuda() && w2_scale.is_contiguous() &&
+                    w2_scale.scalar_type() == torch::kFloat32 &&
+                    w2_scale.sizes() == torch::IntArrayRef(
+                        {static_cast<int64_t>(local_experts), 48, 16}),
+                "W2 scales must be FP32 [E_local,48,16]");
+    TORCH_CHECK(w13_weight.device() == buffer.device() &&
+                    w13_scale.device() == buffer.device() &&
+                    w2_weight.device() == buffer.device() &&
+                    w2_scale.device() == buffer.device(),
+                "persistent backward weights and workspace must share a device");
+
+    const PersistentWorkspaceLayout layout(
+        buffer.data_ptr(), static_cast<uint32_t>(buffer_ptrs.size()),
+        static_cast<uint32_t>(context_tokens_per_rank));
+    TORCH_CHECK(buffer.nbytes() >= static_cast<size_t>(layout.num_bytes()),
+                "persistent backward workspace is smaller than its derived layout");
+    TORCH_CHECK(x.size(0) <= layout.capacity,
+                "persistent backward input exceeds context/CP capacity");
+    TORCH_CHECK(token_src_metadata.size(0) >=
+                    static_cast<int64_t>(layout.workspace.num_max_pool_tokens),
+                "saved source metadata does not cover the full route pool");
+    auto grad_x = torch::empty_like(x);
+    auto grad_scores = torch::empty_like(topk_scores);
+    if (x.size(0) == 0) {
+        return {grad_x, grad_scores};
+    }
+    if (buffer_ptrs.size() == 2) {
+        launch_persistent_backward_activation<2>(
+            grad_x, grad_scores, buffer, buffer_ptrs, rank, layout,
+            x, grad_output, topk_scores, expert_counts,
+            token_src_metadata, w13_weight, w13_scale,
+            w2_weight, w2_scale);
+    } else {
+        launch_persistent_backward_activation<16>(
+            grad_x, grad_scores, buffer, buffer_ptrs, rank, layout,
+            x, grad_output, topk_scores, expert_counts,
+            token_src_metadata, w13_weight, w13_scale,
+            w2_weight, w2_scale);
+    }
+    return {grad_x, grad_scores};
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+           torch::Tensor>
+persistent_backward(
+    const torch::Tensor& buffer,
+    const std::vector<int64_t>& buffer_ptrs,
+    const int64_t rank,
+    const int64_t context_tokens_per_rank,
+    const torch::Tensor& x,
+    const torch::Tensor& grad_output,
+    const torch::Tensor& topk_scores,
+    const torch::Tensor& expert_counts,
+    const torch::Tensor& token_src_metadata,
+    const torch::Tensor& w13_weight,
+    const torch::Tensor& w13_scale,
+    const torch::Tensor& w2_weight,
+    const torch::Tensor& w2_scale
+) {
+    auto [grad_x, grad_scores] = persistent_backward_activation(
+        buffer, buffer_ptrs, rank, context_tokens_per_rank,
+        x, grad_output, topk_scores, expert_counts, token_src_metadata,
+        w13_weight, w13_scale, w2_weight, w2_scale);
+
+    const int64_t local_experts =
+        kPersistentExperts / static_cast<int64_t>(buffer_ptrs.size());
+    const auto options = x.options().dtype(torch::kBFloat16);
+    auto grad_w1 = torch::empty(
+        {local_experts, kPersistentIntermediate, kPersistentHidden},
+        options);
+    auto grad_w2 = torch::empty(
+        {local_experts, kPersistentHidden, kPersistentIntermediate},
+        options);
+    auto grad_w3 = torch::empty(
+        {local_experts, kPersistentIntermediate, kPersistentHidden},
+        options);
+    if (x.size(0) == 0) {
+        grad_w1.zero_();
+        grad_w2.zero_();
+        grad_w3.zero_();
+        return {grad_x, grad_scores, grad_w1, grad_w2, grad_w3};
+    }
+
+    const PersistentWorkspaceLayout layout(
+        buffer.data_ptr(), static_cast<uint32_t>(buffer_ptrs.size()),
+        static_cast<uint32_t>(context_tokens_per_rank));
+    if (buffer_ptrs.size() == 2) {
+        launch_persistent_wgrad<2, true>(
+            grad_w2, grad_w2, buffer, buffer_ptrs, rank, layout,
+            expert_counts, token_src_metadata);
+        launch_persistent_wgrad<2, false>(
+            grad_w1, grad_w3, buffer, buffer_ptrs, rank, layout,
+            expert_counts, token_src_metadata);
+    } else {
+        launch_persistent_wgrad<16, true>(
+            grad_w2, grad_w2, buffer, buffer_ptrs, rank, layout,
+            expert_counts, token_src_metadata);
+        launch_persistent_wgrad<16, false>(
+            grad_w1, grad_w3, buffer, buffer_ptrs, rank, layout,
+            expert_counts, token_src_metadata);
+    }
+    return {grad_x, grad_scores, grad_w1, grad_w2, grad_w3};
+}
+
 std::tuple<torch::Tensor, torch::Tensor> quantize_bf16(const torch::Tensor& input) {
     check_bf16_matrix(input, "input");
     c10::cuda::CUDAGuard guard(input.device());
@@ -1822,8 +2949,18 @@ pybind11::dict capabilities() {
     result["weight_block_m"] = kBlockK;
     result["weight_block_k"] = kBlockK;
     result["route_score_placement"] = "post_down";
+    result["execution"] = "persistent_2cta_ring_l1_l2";
+    result["mma"] = "sm103_mxf8f6f4_block_scale_e4m3_e4m3";
+    result["scale_values"] = "fp32_power_of_two";
+    result["tile"] = py::make_tuple(
+        kPersistentBlockM, kPersistentBlockN, kPersistentBlockK);
+    result["workspace_capacity"] = "private_context_over_cp_once";
     result["fallback"] = py::none();
     result["native_symbols"] = py::make_tuple(
+        "sm103_fp8_block128_persistent_workspace_info",
+        "sm103_fp8_block128_prepare_persistent_inputs",
+        "sm103_fp8_block128_persistent_forward",
+        "sm103_fp8_block128_persistent_backward",
         "sm103_fp8_block128_quantize",
         "sm103_fp8_block128_dequantize",
         "sm103_fp8_block128_grouped_gemm_nt",
@@ -1854,6 +2991,44 @@ pybind11::dict capabilities() {
 
 void register_apis(pybind11::module_& m) {
     m.def("get_sm103_fp8_block128_capabilities", &capabilities);
+    m.def("sm103_fp8_block128_persistent_workspace_info",
+          &persistent_workspace_info,
+          pybind11::arg("num_ranks"),
+          pybind11::arg("context_tokens_per_rank"));
+    m.def("sm103_fp8_block128_prepare_persistent_inputs",
+          &prepare_persistent_inputs,
+          pybind11::arg("buffer"),
+          pybind11::arg("input"),
+          pybind11::arg("topk_ids"),
+          pybind11::arg("topk_scores"),
+          pybind11::arg("num_ranks"),
+          pybind11::arg("context_tokens_per_rank"));
+    m.def("sm103_fp8_block128_persistent_forward",
+          &persistent_forward,
+          pybind11::arg("buffer"),
+          pybind11::arg("buffer_ptrs"),
+          pybind11::arg("rank"),
+          pybind11::arg("context_tokens_per_rank"),
+          pybind11::arg("num_tokens"),
+          pybind11::arg("w13_weight"),
+          pybind11::arg("w13_scale"),
+          pybind11::arg("w2_weight"),
+          pybind11::arg("w2_scale"));
+    m.def("sm103_fp8_block128_persistent_backward",
+          &persistent_backward,
+          pybind11::arg("buffer"),
+          pybind11::arg("buffer_ptrs"),
+          pybind11::arg("rank"),
+          pybind11::arg("context_tokens_per_rank"),
+          pybind11::arg("x"),
+          pybind11::arg("grad_output"),
+          pybind11::arg("topk_scores"),
+          pybind11::arg("expert_counts"),
+          pybind11::arg("token_src_metadata"),
+          pybind11::arg("w13_weight"),
+          pybind11::arg("w13_scale"),
+          pybind11::arg("w2_weight"),
+          pybind11::arg("w2_scale"));
     m.def("sm103_fp8_block128_quantize", &quantize_bf16, pybind11::arg("input"));
     m.def("sm103_fp8_block128_dequantize", &dequantize_fp8,
           pybind11::arg("input"), pybind11::arg("scales"));

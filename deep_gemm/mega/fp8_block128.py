@@ -1,16 +1,17 @@
-"""SM103-only distributed FP8-block128 MegaMoE training path.
+"""Exact-SM103 persistent FP8-block128 MegaMoE training path.
 
-The public operation owns routed-token quantization, transport, expert compute,
-POST_DOWN combine, and the complete routed backward.  Weight tensors retain
-GLM's E4M3 + FP32 128x128 block-scale contract; no BF16 weight dequantization,
-MXFP4 transcode, or architecture fallback exists in this path.
+The operation owns route transport, expert compute, POST_DOWN score
+application, remote combine, reverse transport, activation backward, and two
+dedicated BF16-semantics weight-gradient kernels.  GLM's canonical E4M3 +
+FP32 128x128 q/s storage is consumed directly; there is no W13 repack, public
+workspace-size knob, composed DeepEP path, architecture fallback, or JIT
+configuration matrix.
 """
 
 from __future__ import annotations
 
-from copy import copy
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -18,32 +19,18 @@ import torch.distributed as dist
 from .. import _C
 
 _BLOCK = 128
-_PAD_ROWS = 128
+_MODEL_DIM = 6144
+_INTERMEDIATE = 2048
+_GLOBAL_EXPERTS = 256
+_TOPK = 8
+_SUPPORTED_EP = (2, 16)
 
 REQUIRED_NATIVE_SYMBOLS = (
     "get_sm103_fp8_block128_capabilities",
-    "sm103_fp8_block128_quantize",
-    "sm103_fp8_block128_dequantize",
-    "sm103_fp8_block128_grouped_gemm_nt",
-    "sm103_fp8_block128_grouped_gemm_nn",
-    "sm103_fp8_block128_grouped_w13_gemm_nt_canonical",
-    "sm103_fp8_block128_grouped_gemm_nt_expanded",
-    "sm103_fp8_block128_grouped_gemm_nn_expanded",
-    "sm103_fp8_block128_grouped_w13_gemm_nt_canonical_expanded",
-    "sm103_fp8_block128_swiglu_quantize",
-    "sm103_fp8_block128_swiglu_backward",
-    "sm103_fp8_block128_swiglu_backward_canonical",
-    "sm103_fp8_block128_route_scale_quantize",
-    "sm103_fp8_block128_post_down_combine",
-    "sm103_fp8_block128_post_down_score_grad",
-    "sm103_fp8_block128_route_sum",
-    "sm103_fp8_block128_expanded_post_down_scale",
-    "sm103_fp8_block128_expand_compact_routes",
-    "sm103_fp8_block128_collapse_expanded_routes",
-    "sm103_fp8_block128_expanded_post_down_score_grad",
-    "sm103_fp8_block128_expanded_route_scale_quantize",
-    "sm103_fp8_block128_grouped_bf16_wgrad",
-    "sm103_fp8_block128_grouped_bf16_wgrad_expanded",
+    "sm103_fp8_block128_persistent_workspace_info",
+    "sm103_fp8_block128_prepare_persistent_inputs",
+    "sm103_fp8_block128_persistent_forward",
+    "sm103_fp8_block128_persistent_backward",
 )
 
 REQUIRED_PYTHON_SYMBOLS = (
@@ -54,29 +41,31 @@ REQUIRED_PYTHON_SYMBOLS = (
 
 
 def get_fp8_block128_mega_moe_capabilities() -> dict[str, Any]:
-    """Return a non-launching, exact capability manifest for preflight."""
+    """Return a non-launching exact capability manifest for preflight."""
     native = dict(_C.get_sm103_fp8_block128_capabilities())
     missing = [name for name in REQUIRED_NATIVE_SYMBOLS if not hasattr(_C, name)]
     try:
-        from deep_ep import ElasticBuffer
+        import torch.distributed._symmetric_memory as symm_mem
 
-        has_elastic_buffer = callable(ElasticBuffer)
+        if not callable(getattr(symm_mem, "empty", None)) or not callable(
+            getattr(symm_mem, "rendezvous", None)
+        ):
+            missing.append("torch.distributed._symmetric_memory")
     except (AttributeError, ImportError):
-        has_elastic_buffer = False
-    if not has_elastic_buffer:
-        missing.append("deep_ep.ElasticBuffer")
+        missing.append("torch.distributed._symmetric_memory")
     native.update(
         {
             "native_symbols": REQUIRED_NATIVE_SYMBOLS,
             "python_symbols": REQUIRED_PYTHON_SYMBOLS,
             "forward": not missing,
             "backward": not missing,
-            "distributed_transport": "deep_ep.ElasticBuffer.expanded",
-            "transport_layout": "expert_aligned_128",
-            "transport_scale_layout": "row_major_fp32_group128",
+            "distributed_transport": "persistent_symmetric_ring",
+            "transport_layout": "ring_l1_l2_wave",
+            "transport_scale_layout": "ue8m0_power2_group128",
             "transport_deterministic": True,
             "combine_reductions": 1,
-            "wgrad_backend": "sm103_companion_grouped_bf16",
+            "wgrad_backend": "two_persistent_fused_dequant_bf16",
+            "supported_ep": _SUPPORTED_EP,
             "missing_symbols": tuple(missing),
         }
     )
@@ -87,11 +76,11 @@ def transform_glm_w13_for_fp8_block128_mega_moe(
     canonical_weight: torch.Tensor,
     canonical_scale: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Convert canonical ``[gate, up]`` GLM storage to ``[up; gate]``.
+    """Validate and return canonical ``[gate, up]`` storage without a copy.
 
-    ``canonical_weight`` is ``[2E, H, D]`` and ``canonical_scale`` is
-    ``[2E, H/128, D/128]``.  Returned tensors are contiguous
-    ``[E, 2H, D]`` and ``[E, 2H/128, D/128]`` respectively.
+    The persistent scheduler issues independent TMA offsets for gate and up
+    and presents ``[up; gate]`` only as a logical MMA/output order.  Returning
+    the original tensors is intentional and is part of the no-repack ABI.
     """
     if canonical_weight.ndim != 3 or canonical_scale.ndim != 3:
         raise ValueError("canonical W13 weight and scale must both be rank 3")
@@ -99,29 +88,17 @@ def transform_glm_w13_for_fp8_block128_mega_moe(
         raise ValueError("canonical W13 must contain gate/up pairs")
     experts = canonical_weight.shape[0] // 2
     hidden, model_dim = canonical_weight.shape[1:]
+    expected_scale = (experts * 2, hidden // _BLOCK, model_dim // _BLOCK)
     if hidden % _BLOCK or model_dim % _BLOCK:
-        raise ValueError("W13 dimensions must be divisible by 128")
-    expected_scale_shape = (experts * 2, hidden // _BLOCK, model_dim // _BLOCK)
-    if tuple(canonical_scale.shape) != expected_scale_shape:
+        raise ValueError("canonical W13 dimensions must be divisible by 128")
+    if tuple(canonical_scale.shape) != expected_scale:
         raise ValueError(
-            f"canonical W13 scale shape must be {expected_scale_shape}, got {tuple(canonical_scale.shape)}"
+            f"canonical W13 scale shape must be {expected_scale}, "
+            f"got {tuple(canonical_scale.shape)}"
         )
-    # Canonical pair index 0 is gate and 1 is up.  The fused preactivation ABI
-    # requires up first, followed by gate.
-    pair_order = torch.tensor([1, 0], dtype=torch.int64, device=canonical_weight.device)
-    active_weight = (
-        canonical_weight.view(experts, 2, hidden, model_dim)
-        .index_select(1, pair_order)
-        .reshape(experts, hidden * 2, model_dim)
-        .contiguous()
-    )
-    active_scale = (
-        canonical_scale.view(experts, 2, hidden // _BLOCK, model_dim // _BLOCK)
-        .index_select(1, pair_order)
-        .reshape(experts, hidden * 2 // _BLOCK, model_dim // _BLOCK)
-        .contiguous()
-    )
-    return active_weight, active_scale
+    if not canonical_weight.is_contiguous() or not canonical_scale.is_contiguous():
+        raise ValueError("canonical W13 q/s must be contiguous")
+    return canonical_weight, canonical_scale
 
 
 @dataclass(frozen=True)
@@ -133,17 +110,19 @@ class _GroupState:
 
 def _resolve_group(group: Any) -> _GroupState:
     if not dist.is_available() or not dist.is_initialized():
-        if group is not None:
-            raise RuntimeError(
-                "a process group was provided before torch.distributed initialization"
-            )
-        return _GroupState(group=None, rank=0, world_size=1)
-    resolved_group = dist.group.WORLD if group is None else group
-    return _GroupState(
-        group=resolved_group,
-        rank=dist.get_rank(resolved_group),
-        world_size=dist.get_world_size(resolved_group),
+        raise RuntimeError("persistent MegaMoE requires initialized torch.distributed")
+    resolved = dist.group.WORLD if group is None else group
+    state = _GroupState(
+        group=resolved,
+        rank=dist.get_rank(resolved),
+        world_size=dist.get_world_size(resolved),
     )
+    if state.world_size not in _SUPPORTED_EP:
+        raise RuntimeError(
+            f"persistent GLM MegaMoE supports EP{_SUPPORTED_EP}, "
+            f"got EP{state.world_size}"
+        )
+    return state
 
 
 def _check_tensor(
@@ -165,12 +144,6 @@ def _check_tensor(
 
 
 def _local_tensor(tensor: torch.Tensor) -> torch.Tensor:
-    """Return a plain local tensor without taking ownership from FireTitan.
-
-    Expert masters may be DTensors.  Their placement and gradient reduction
-    remain a FireTitan concern; this companion only validates their resident
-    local slice and returns local BF16 gradients through the optional wrapper.
-    """
     to_local = getattr(tensor, "to_local", None)
     return to_local() if callable(to_local) else tensor
 
@@ -184,13 +157,6 @@ def _validate_master_tensor(
     device: torch.device,
     master_gradient_wrapper: Any,
 ) -> None:
-    """Validate either a resident EP-local master or an at-rest DTensor shard.
-
-    The masters are autograd anchors only; MegaMoE never reads their values.
-    FireTitan may therefore keep them eFSDP-sharded while the active q/s
-    tensors are all-gathered. In that case the framework-provided gradient
-    wrapper maps the full EP-local wgrad back to the master's DTensor layout.
-    """
     local = _local_tensor(tensor)
     _check_tensor(local, name=name, ndim=3, dtype=torch.bfloat16, device=device)
     if tuple(local.shape) == local_shape:
@@ -202,7 +168,8 @@ def _validate_master_tensor(
         )
     if tuple(tensor.shape) != global_shape:
         raise ValueError(
-            f"{name} distributed logical shape must be {global_shape}, got {tuple(tensor.shape)}"
+            f"{name} distributed logical shape must be {global_shape}, "
+            f"got {tuple(tensor.shape)}"
         )
     if local.numel() == 0:
         raise ValueError(f"{name} distributed local shard must be resident")
@@ -221,114 +188,122 @@ def _validate_inputs(
     w3_master: torch.Tensor,
     group_state: _GroupState,
     master_gradient_wrapper: Any,
-) -> tuple[int, int, int, int, int]:
+) -> None:
     if not x.is_cuda:
         raise ValueError("FP8-block128 MegaMoE requires CUDA")
-    if torch.cuda.get_device_capability(x.device) != (10, 3):
-        capability = torch.cuda.get_device_capability(x.device)
+    capability = torch.cuda.get_device_capability(x.device)
+    if capability != (10, 3):
         raise RuntimeError(
-            f"FP8-block128 MegaMoE is SM103-only; runtime capability is {capability}. "
-            "No fallback is available."
+            f"FP8-block128 MegaMoE is SM103-only; runtime capability is "
+            f"{capability}. No fallback is available."
         )
+    if master_gradient_wrapper is not None and not callable(master_gradient_wrapper):
+        raise TypeError("master_gradient_wrapper must be callable or None")
     device = x.device
     _check_tensor(x, name="x", ndim=2, dtype=torch.bfloat16, device=device)
     _check_tensor(topk_ids, name="topk_ids", ndim=2, dtype=torch.int64, device=device)
     _check_tensor(
-        topk_scores, name="topk_scores", ndim=2, dtype=torch.float32, device=device
+        topk_scores,
+        name="topk_scores",
+        ndim=2,
+        dtype=torch.float32,
+        device=device,
     )
     _check_tensor(
-        w13_weight, name="w13_weight", ndim=3, dtype=torch.float8_e4m3fn, device=device
+        w13_weight,
+        name="w13_weight",
+        ndim=3,
+        dtype=torch.float8_e4m3fn,
+        device=device,
     )
     _check_tensor(
-        w13_scale, name="w13_scale", ndim=3, dtype=torch.float32, device=device
+        w13_scale,
+        name="w13_scale",
+        ndim=3,
+        dtype=torch.float32,
+        device=device,
     )
     _check_tensor(
-        w2_weight, name="w2_weight", ndim=3, dtype=torch.float8_e4m3fn, device=device
+        w2_weight,
+        name="w2_weight",
+        ndim=3,
+        dtype=torch.float8_e4m3fn,
+        device=device,
     )
-    _check_tensor(w2_scale, name="w2_scale", ndim=3, dtype=torch.float32, device=device)
-    tokens, model_dim = x.shape
-    if model_dim % _BLOCK:
-        raise ValueError("model dimension must be divisible by 128")
-    if topk_ids.shape != topk_scores.shape or topk_ids.shape[0] != tokens:
-        raise ValueError("top-k IDs/scores must have identical [tokens, top_k] shape")
-    topk = topk_ids.shape[1]
-    if topk <= 0:
-        raise ValueError("top_k must be positive")
+    _check_tensor(
+        w2_scale,
+        name="w2_scale",
+        ndim=3,
+        dtype=torch.float32,
+        device=device,
+    )
+    tokens = x.shape[0]
+    if tuple(x.shape[1:]) != (_MODEL_DIM,):
+        raise ValueError(f"persistent GLM MegaMoE requires token width {_MODEL_DIM}")
+    if tuple(topk_ids.shape) != (tokens, _TOPK) or topk_scores.shape != topk_ids.shape:
+        raise ValueError(f"top-k IDs/scores must have shape [tokens, {_TOPK}]")
 
-    if w13_weight.shape[0] % 2:
-        raise ValueError("canonical W13 must contain gate/up pairs")
-    local_experts = w13_weight.shape[0] // 2
-    hidden, w13_k = w13_weight.shape[1:]
-    if local_experts <= 0 or hidden % _BLOCK or w13_k != model_dim:
-        raise ValueError(
-            "canonical W13 must have shape [2E, H, D] with D/H divisible by 128"
-        )
-    if tuple(w13_scale.shape) != (
-        local_experts * 2,
-        hidden // _BLOCK,
-        model_dim // _BLOCK,
-    ):
-        raise ValueError(
-            "canonical W13 scale shape does not match 128x128 weight blocks"
-        )
-    if tuple(w2_weight.shape) != (local_experts, model_dim, hidden):
-        raise ValueError("W2 must have shape [local_experts, D, H]")
-    if tuple(w2_scale.shape) != (
-        local_experts,
-        model_dim // _BLOCK,
-        hidden // _BLOCK,
-    ):
-        raise ValueError("W2 scale shape does not match 128x128 weight blocks")
-    global_experts = local_experts * group_state.world_size
-    local_w13_shape = (local_experts, hidden, model_dim)
-    global_w13_shape = (global_experts, hidden, model_dim)
-    local_w2_shape = tuple(w2_weight.shape)
-    global_w2_shape = (global_experts, model_dim, hidden)
+    local_experts = _GLOBAL_EXPERTS // group_state.world_size
+    expected_w13 = (2 * local_experts, _INTERMEDIATE, _MODEL_DIM)
+    expected_w13_scale = (2 * local_experts, _INTERMEDIATE // 128, _MODEL_DIM // 128)
+    expected_w2 = (local_experts, _MODEL_DIM, _INTERMEDIATE)
+    expected_w2_scale = (local_experts, _MODEL_DIM // 128, _INTERMEDIATE // 128)
+    if tuple(w13_weight.shape) != expected_w13:
+        raise ValueError(f"canonical W13 must have shape {expected_w13}")
+    if tuple(w13_scale.shape) != expected_w13_scale:
+        raise ValueError(f"canonical W13 scales must have shape {expected_w13_scale}")
+    if tuple(w2_weight.shape) != expected_w2:
+        raise ValueError(f"W2 must have shape {expected_w2}")
+    if tuple(w2_scale.shape) != expected_w2_scale:
+        raise ValueError(f"W2 scales must have shape {expected_w2_scale}")
+
+    local_w13 = (local_experts, _INTERMEDIATE, _MODEL_DIM)
+    global_w13 = (_GLOBAL_EXPERTS, _INTERMEDIATE, _MODEL_DIM)
+    local_w2 = (local_experts, _MODEL_DIM, _INTERMEDIATE)
+    global_w2 = (_GLOBAL_EXPERTS, _MODEL_DIM, _INTERMEDIATE)
     _validate_master_tensor(
         w1_master,
         name="w1_master",
-        local_shape=local_w13_shape,
-        global_shape=global_w13_shape,
+        local_shape=local_w13,
+        global_shape=global_w13,
         device=device,
         master_gradient_wrapper=master_gradient_wrapper,
     )
     _validate_master_tensor(
         w2_master,
         name="w2_master",
-        local_shape=local_w2_shape,
-        global_shape=global_w2_shape,
+        local_shape=local_w2,
+        global_shape=global_w2,
         device=device,
         master_gradient_wrapper=master_gradient_wrapper,
     )
     _validate_master_tensor(
         w3_master,
         name="w3_master",
-        local_shape=local_w13_shape,
-        global_shape=global_w13_shape,
+        local_shape=local_w13,
+        global_shape=global_w13,
         device=device,
         master_gradient_wrapper=master_gradient_wrapper,
     )
     if topk_ids.numel():
-        # Keep the hot path free of a device-to-host scalar synchronization.
-        # The assertion is enqueued on the current CUDA stream and fails the
-        # operation rather than admitting an out-of-range route.
         torch._assert_async(
-            ((topk_ids >= 0) & (topk_ids < global_experts)).all(),
-            f"top-k IDs must lie in [0, {global_experts})",
+            ((topk_ids >= 0) & (topk_ids < _GLOBAL_EXPERTS)).all(),
+            f"top-k IDs must lie in [0, {_GLOBAL_EXPERTS})",
         )
-    return tokens, model_dim, hidden, local_experts, topk
 
 
 @dataclass(frozen=True)
-class _DeepEPBufferState:
-    buffer: Any
-    capacity: int
-    num_sms: int
-    num_qps: int
+class _PersistentBufferState:
+    buffer: torch.Tensor
+    handle: Any
+    buffer_ptrs: tuple[int, ...]
+    rank: int
+    context_tokens_per_rank: int
+    workspace_info: dict[str, Any]
 
 
-_deepep_buffers: dict[tuple[int, int, int, int, int], _DeepEPBufferState] = {}
-_deepep_context_tokens_per_rank: dict[int, int] = {}
+_persistent_context_tokens_per_rank: dict[int, int] = {}
+_persistent_buffers: dict[tuple[int, int], _PersistentBufferState] = {}
 
 
 def _configure_fp8_block128_mega_moe_transport(
@@ -336,7 +311,12 @@ def _configure_fp8_block128_mega_moe_transport(
     *,
     context_tokens_per_rank: int,
 ) -> None:
-    """Register the owning model's existing context/CP envelope once."""
+    """Install the model's existing ``seq_len / CP`` envelope once.
+
+    This internal setup hook is not an operation flag.  FireTitan derives the
+    value from its model context and CP degree; callers cannot tune route-pool
+    capacity, and the hot path never resizes or runs a sizing collective.
+    """
     if (
         isinstance(context_tokens_per_rank, bool)
         or not isinstance(context_tokens_per_rank, int)
@@ -344,279 +324,70 @@ def _configure_fp8_block128_mega_moe_transport(
     ):
         raise ValueError("context_tokens_per_rank must be a positive integer")
     group_state = _resolve_group(group)
-    if group_state.world_size <= 1:
-        raise RuntimeError("expanded DeepEP transport requires a multi-rank group")
     key = id(group_state.group)
-    existing = _deepep_context_tokens_per_rank.get(key)
+    existing = _persistent_context_tokens_per_rank.get(key)
     if existing is not None and existing != context_tokens_per_rank:
         raise RuntimeError(
-            "MegaMoE context envelope changed after transport configuration: "
+            "MegaMoE context/CP envelope changed after setup: "
             f"configured={context_tokens_per_rank}, existing={existing}"
         )
-    if existing is None and any(buffer_key[0] == key for buffer_key in _deepep_buffers):
-        raise RuntimeError("MegaMoE transport cannot be configured after arena construction")
-    if existing is None:
-        # DeepEP reads the native NCCL communicator while calculating its arena
-        # size. Materialize that communicator once during model setup; otherwise
-        # a first-use EP group can expose an uninitialized handle to
-        # ncclTeamWorld. This is not a per-layer sizing collective.
-        if dist.get_backend(group_state.group) == "nccl":
-            dist.barrier(
-                group=group_state.group,
-                device_ids=[torch.cuda.current_device()],
-            )
-        _deepep_context_tokens_per_rank[key] = context_tokens_per_rank
+    if existing is None and any(buffer_key[0] == key for buffer_key in _persistent_buffers):
+        raise RuntimeError("MegaMoE context must be installed before arena allocation")
+    _persistent_context_tokens_per_rank.setdefault(key, context_tokens_per_rank)
 
 
-def _get_deepep_buffer(
+def _get_persistent_buffer(
     group_state: _GroupState,
     *,
     device: torch.device,
     tokens: int,
-    model_dim: int,
-    topk: int,
-    global_experts: int,
-) -> _DeepEPBufferState:
-    """Create one runtime-context-sized DeepEP arena per EP/model shape.
-
-    FireTitan registers its already-resolved context/CP envelope when it
-    installs the EP group. Warmup shape therefore never affects sizing, while
-    changing the existing context length or CP configuration only requires a
-    normal trainer restart, not an image rebuild. No hot-path sizing collective
-    or caller-visible operation argument exists.
-    """
-    if group_state.world_size <= 1:
-        raise RuntimeError("expanded DeepEP requires a multi-rank process group")
-    capacity = _deepep_context_tokens_per_rank.get(id(group_state.group))
-    if capacity is None:
+) -> _PersistentBufferState:
+    context_tokens = _persistent_context_tokens_per_rank.get(id(group_state.group))
+    if context_tokens is None:
+        raise RuntimeError("MegaMoE was not configured from the owning model context")
+    if tokens > context_tokens:
         raise RuntimeError(
-            "MegaMoE transport was not configured from the owning model context"
+            "SM103 MegaMoE input exceeds the derived seq_len/CP envelope: "
+            f"actual={tokens}, envelope={context_tokens}"
         )
-    if tokens > capacity:
-        raise RuntimeError(
-            "SM103 MegaMoE input exceeds the resolved context/CP envelope: "
-            f"actual={tokens}, capacity={capacity}"
-        )
-
-    device_index = (
-        device.index if device.index is not None else torch.cuda.current_device()
-    )
-    key = (id(group_state.group), device_index, model_dim, topk, global_experts)
-    cached = _deepep_buffers.get(key)
+    device_index = device.index if device.index is not None else torch.cuda.current_device()
+    key = (id(group_state.group), device_index)
+    cached = _persistent_buffers.get(key)
     if cached is not None:
         return cached
 
-    try:
-        from deep_ep import ElasticBuffer
-    except (AttributeError, ImportError) as exc:
-        raise RuntimeError(
-            "MegaMoE requires deep_ep.ElasticBuffer; no transport fallback exists"
-        ) from exc
+    import torch.distributed._symmetric_memory as symm_mem
 
-    buffer_kwargs = dict(
-        num_max_tokens_per_rank=capacity,
-        hidden=model_dim,
-        num_topk=topk,
-        allow_hybrid_mode=True,
-        allow_multiple_reduction=False,
-    )
-    fp8_bytes = ElasticBuffer.get_buffer_size_hint(
-        group_state.group, use_fp8_dispatch=True, **buffer_kwargs
-    )
-    bf16_bytes = ElasticBuffer.get_buffer_size_hint(
-        group_state.group, use_fp8_dispatch=False, **buffer_kwargs
-    )
-    buffer = ElasticBuffer(
-        group_state.group,
-        num_bytes=max(fp8_bytes, bf16_bytes),
-        use_fp8_dispatch=True,
-        deterministic=True,
-        prefer_overlap_with_compute=True,
-        **buffer_kwargs,
-    )
-    num_sms = int(buffer.get_theoretical_num_sms(global_experts, topk))
-    device_sms = torch.cuda.get_device_properties(device).multi_processor_count
-    if not 1 <= num_sms <= device_sms:
-        raise RuntimeError(
-            "DeepEP returned an invalid SM103 launch width: "
-            f"selected={num_sms}, device_sms={device_sms}"
+    info = dict(
+        _C.sm103_fp8_block128_persistent_workspace_info(
+            group_state.world_size, context_tokens
         )
-    num_qps = int(buffer.get_theoretical_num_qps(num_sms))
-    if num_qps < 1:
-        raise RuntimeError(f"DeepEP returned an invalid QP count: {num_qps}")
-    state = _DeepEPBufferState(
-        buffer=buffer,
-        capacity=capacity,
-        num_sms=num_sms,
-        num_qps=num_qps,
     )
-    _deepep_buffers[key] = state
+    buffer = symm_mem.empty(
+        int(info["num_bytes"]), dtype=torch.int8, device=device
+    )
+    handle = symm_mem.rendezvous(buffer, group=group_state.group)
+    buffer.zero_()
+    # One setup synchronization publishes the fixed arena before any layer can
+    # use remote pointers.  There is no per-call capacity synchronization.
+    dist.barrier(group=group_state.group, device_ids=[device_index])
+    torch.cuda.synchronize(device)
+    pointers = tuple(int(pointer) for pointer in handle.buffer_ptrs)
+    if len(pointers) != group_state.world_size:
+        raise RuntimeError("symmetric-memory rendezvous returned an invalid rank map")
+    state = _PersistentBufferState(
+        buffer=buffer,
+        handle=handle,
+        buffer_ptrs=pointers,
+        rank=group_state.rank,
+        context_tokens_per_rank=context_tokens,
+        workspace_info=info,
+    )
+    _persistent_buffers[key] = state
     return state
 
 
-def _host_expanded_storage_counts(handle: Any, local_experts: int) -> tuple[int, ...]:
-    counts = getattr(handle, "num_recv_tokens_per_expert_list", None)
-    if counts is None:
-        raise RuntimeError(
-            "DeepEP expanded dispatch did not return host storage counts"
-        )
-    if isinstance(counts, torch.Tensor):
-        if counts.device.type != "cpu":
-            raise RuntimeError("DeepEP host expert counts unexpectedly reside on CUDA")
-        counts = counts.tolist()
-    result = tuple(int(value) for value in counts)
-    if (
-        len(result) != local_experts
-        or any(value < 0 for value in result)
-        or any(value and value % _PAD_ROWS for value in result)
-    ):
-        raise RuntimeError(
-            "DeepEP expanded storage counts violate the aligned local expert contract: "
-            f"expected={local_experts}, actual={result}"
-        )
-    return result
-
-
-def _expanded_routes(handle: Any) -> torch.Tensor:
-    metadata = getattr(handle, "recv_src_metadata", None)
-    if (
-        not isinstance(metadata, torch.Tensor)
-        or metadata.ndim != 2
-        or metadata.shape[1] < 3
-    ):
-        shape = tuple(metadata.shape) if isinstance(metadata, torch.Tensor) else None
-        raise RuntimeError(f"invalid DeepEP expanded route metadata: {shape}")
-    return metadata[:, 2:]
-
-
-def _shadow_compact_handle(handle: Any) -> Any:
-    shadow = copy(handle)
-    shadow.do_expand = False
-    return shadow
-
-
-def _exchange_counts(
-    send_counts: Sequence[int], group_state: _GroupState, device: torch.device
-) -> list[int]:
-    if group_state.world_size == 1:
-        return list(send_counts)
-    send = torch.tensor(send_counts, device=device, dtype=torch.int64)
-    receive = torch.empty_like(send)
-    dist.all_to_all_single(receive, send, group=group_state.group)
-    return [int(value) for value in receive.cpu().tolist()]
-
-
-def _all_to_all_rows(
-    tensor: torch.Tensor,
-    send_counts: Sequence[int],
-    receive_counts: Sequence[int],
-    group_state: _GroupState,
-) -> torch.Tensor:
-    if group_state.world_size == 1:
-        return tensor
-    output = torch.empty(
-        (sum(receive_counts), *tensor.shape[1:]),
-        dtype=tensor.dtype,
-        device=tensor.device,
-    )
-    source = tensor.view(torch.uint8) if tensor.dtype == torch.float8_e4m3fn else tensor
-    destination = (
-        output.view(torch.uint8) if output.dtype == torch.float8_e4m3fn else output
-    )
-    dist.all_to_all_single(
-        destination,
-        source,
-        output_split_sizes=list(receive_counts),
-        input_split_sizes=list(send_counts),
-        group=group_state.group,
-    )
-    return output
-
-
-def _inverse_permutation(order: torch.Tensor) -> torch.Tensor:
-    inverse = torch.empty_like(order)
-    inverse.scatter_(0, order, torch.arange(order.numel(), device=order.device))
-    return inverse
-
-
-def _padding_state(
-    counts: Sequence[int], device: torch.device
-) -> tuple[list[int], torch.Tensor]:
-    padded_counts = [
-        ((count + _PAD_ROWS - 1) // _PAD_ROWS) * _PAD_ROWS if count else 0
-        for count in counts
-    ]
-    total_actual = sum(counts)
-    if total_actual == 0:
-        return padded_counts, torch.empty(0, dtype=torch.int64, device=device)
-    count_tensor = torch.tensor(counts, dtype=torch.int64, device=device)
-    padded_tensor = torch.tensor(padded_counts, dtype=torch.int64, device=device)
-    group_ids = torch.repeat_interleave(
-        torch.arange(len(counts), dtype=torch.int64, device=device), count_tensor
-    )
-    padding_before = torch.cumsum(padded_tensor - count_tensor, dim=0) - (
-        padded_tensor - count_tensor
-    )
-    actual_to_padded = torch.arange(total_actual, dtype=torch.int64, device=device)
-    actual_to_padded.add_(padding_before.index_select(0, group_ids))
-    return padded_counts, actual_to_padded
-
-
-def _pad_rows(
-    tensor: torch.Tensor,
-    actual_to_padded: torch.Tensor,
-    padded_rows: int,
-    *,
-    fill_value: float,
-) -> torch.Tensor:
-    output = torch.full(
-        (padded_rows, *tensor.shape[1:]),
-        fill_value,
-        dtype=tensor.dtype,
-        device=tensor.device,
-    )
-    if tensor.shape[0]:
-        if tensor.dtype == torch.float8_e4m3fn:
-            output.view(torch.uint8).index_copy_(
-                0, actual_to_padded, tensor.view(torch.uint8)
-            )
-        else:
-            output.index_copy_(0, actual_to_padded, tensor)
-    return output
-
-
-def _unpad_rows(tensor: torch.Tensor, actual_to_padded: torch.Tensor) -> torch.Tensor:
-    if tensor.dtype == torch.float8_e4m3fn:
-        output = tensor.view(torch.uint8).index_select(0, actual_to_padded)
-        return output.view(torch.float8_e4m3fn)
-    return tensor.index_select(0, actual_to_padded)
-
-
-def _bf16_grouped_wgrad(
-    left: torch.Tensor,
-    right: torch.Tensor,
-    padded_counts: Sequence[int],
-) -> torch.Tensor:
-    return _C.sm103_fp8_block128_grouped_bf16_wgrad(
-        left.contiguous(),
-        right.contiguous(),
-        list(padded_counts),
-    )
-
-
-def _bf16_grouped_wgrad_expanded(
-    left: torch.Tensor,
-    right: torch.Tensor,
-    psum: torch.Tensor,
-) -> torch.Tensor:
-    return _C.sm103_fp8_block128_grouped_bf16_wgrad_expanded(
-        left.contiguous(),
-        right.contiguous(),
-        psum,
-    )
-
-
-class _FP8Block128MegaMoELocal(torch.autograd.Function):
+class _FP8Block128MegaMoEPersistent(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx: Any,
@@ -634,13 +405,7 @@ class _FP8Block128MegaMoELocal(torch.autograd.Function):
         master_gradient_wrapper: Any,
     ) -> torch.Tensor:
         group_state = _resolve_group(group)
-        if group_state.world_size != 1:
-            raise RuntimeError("the packed local MegaMoE path is single-rank only")
-        if master_gradient_wrapper is not None and not callable(
-            master_gradient_wrapper
-        ):
-            raise TypeError("master_gradient_wrapper must be callable or None")
-        tokens, model_dim, hidden, local_experts, topk = _validate_inputs(
+        _validate_inputs(
             x,
             topk_ids,
             topk_scores,
@@ -654,461 +419,40 @@ class _FP8Block128MegaMoELocal(torch.autograd.Function):
             group_state,
             master_gradient_wrapper,
         )
-
+        state = _get_persistent_buffer(
+            group_state, device=x.device, tokens=x.shape[0]
+        )
         with torch.autograd.profiler.record_function(
-            "sm103_fp8_block128_megamoe_forward"
+            "sm103_fp8_block128_megamoe_persistent_forward"
         ):
-            flat_ids = topk_ids.flatten()
-            send_order = torch.argsort(flat_ids, stable=True)
-            sorted_ids = flat_ids.index_select(0, send_order)
-            destinations = torch.div(sorted_ids, local_experts, rounding_mode="floor")
-            send_counts = [
-                int(value)
-                for value in torch.bincount(
-                    destinations, minlength=group_state.world_size
-                )
-                .cpu()
-                .tolist()
-            ]
-            receive_counts = _exchange_counts(send_counts, group_state, x.device)
-
-            token_quantized, token_scales = _C.sm103_fp8_block128_quantize(x)
-            sorted_tokens = torch.div(send_order, topk, rounding_mode="floor")
-            send_activations = token_quantized.index_select(0, sorted_tokens)
-            send_activation_scales = token_scales.index_select(0, sorted_tokens)
-            receive_activations = _all_to_all_rows(
-                send_activations, send_counts, receive_counts, group_state
+            _C.sm103_fp8_block128_prepare_persistent_inputs(
+                state.buffer,
+                x,
+                topk_ids,
+                topk_scores,
+                group_state.world_size,
+                state.context_tokens_per_rank,
             )
-            receive_activation_scales = _all_to_all_rows(
-                send_activation_scales, send_counts, receive_counts, group_state
-            )
-            receive_ids = _all_to_all_rows(
-                sorted_ids, send_counts, receive_counts, group_state
-            )
-
-            local_ids = torch.remainder(receive_ids, local_experts)
-            group_order = torch.argsort(local_ids, stable=True)
-            ungroup_order = _inverse_permutation(group_order)
-            grouped_activations = receive_activations.index_select(0, group_order)
-            grouped_activation_scales = receive_activation_scales.index_select(
-                0, group_order
-            )
-            grouped_local_ids = local_ids.index_select(0, group_order)
-            actual_counts = [
-                int(value)
-                for value in torch.bincount(grouped_local_ids, minlength=local_experts)
-                .cpu()
-                .tolist()
-            ]
-            padded_counts, actual_to_padded = _padding_state(actual_counts, x.device)
-            padded_rows = sum(padded_counts)
-            padded_activations = _pad_rows(
-                grouped_activations,
-                actual_to_padded,
-                padded_rows,
-                fill_value=0,
-            )
-            padded_activation_scales = _pad_rows(
-                grouped_activation_scales,
-                actual_to_padded,
-                padded_rows,
-                fill_value=1,
-            )
-
-            preactivation = _C.sm103_fp8_block128_grouped_w13_gemm_nt_canonical(
-                padded_activations,
-                padded_activation_scales,
-                w13_weight,
-                w13_scale,
-                padded_counts,
-            )
-            hidden_quantized, hidden_scales = _C.sm103_fp8_block128_swiglu_quantize(
-                preactivation
-            )
-            routed_output_padded = _C.sm103_fp8_block128_grouped_gemm_nt(
-                hidden_quantized,
-                hidden_scales,
-                w2_weight,
-                w2_scale,
-                padded_counts,
-            )
-            routed_output_grouped = _unpad_rows(routed_output_padded, actual_to_padded)
-            routed_output_receive_order = routed_output_grouped.index_select(
-                0, ungroup_order
-            )
-            routed_output_send_order = _all_to_all_rows(
-                routed_output_receive_order,
-                receive_counts,
-                send_counts,
-                group_state,
-            )
-            routed_output = torch.empty(
-                (tokens * topk, model_dim),
-                dtype=torch.bfloat16,
-                device=x.device,
-            )
-            if routed_output.shape[0]:
-                routed_output.index_copy_(0, send_order, routed_output_send_order)
-            output = _C.sm103_fp8_block128_post_down_combine(routed_output, topk_scores)
-
-        ctx.group_state = group_state
-        ctx.send_counts = send_counts
-        ctx.receive_counts = receive_counts
-        ctx.padded_counts = padded_counts
-        ctx.tokens = tokens
-        ctx.model_dim = model_dim
-        ctx.hidden = hidden
-        ctx.local_experts = local_experts
-        ctx.topk = topk
-        ctx.master_gradient_wrapper = master_gradient_wrapper
-        ctx.save_for_backward(
-            topk_scores,
-            send_order,
-            group_order,
-            ungroup_order,
-            actual_to_padded,
-            padded_activations,
-            padded_activation_scales,
-            preactivation,
-            hidden_quantized,
-            hidden_scales,
-            routed_output,
-            w13_weight,
-            w13_scale,
-            w2_weight,
-            w2_scale,
-        )
-        return output
-
-    @staticmethod
-    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[Any, ...]:
-        (
-            topk_scores,
-            send_order,
-            group_order,
-            ungroup_order,
-            actual_to_padded,
-            padded_activations,
-            padded_activation_scales,
-            preactivation,
-            hidden_quantized,
-            hidden_scales,
-            routed_output,
-            w13_weight,
-            w13_scale,
-            w2_weight,
-            w2_scale,
-        ) = ctx.saved_tensors
-        grad_output = grad_output.contiguous()
-        if grad_output.dtype != torch.bfloat16:
-            grad_output = grad_output.to(torch.bfloat16)
-
-        with torch.autograd.profiler.record_function(
-            "sm103_fp8_block128_megamoe_backward"
-        ):
-            grad_scores = _C.sm103_fp8_block128_post_down_score_grad(
-                routed_output, grad_output, ctx.topk
-            )
-            grad_route_quantized_send, grad_route_scales_send = (
-                _C.sm103_fp8_block128_route_scale_quantize(
-                    grad_output, topk_scores, send_order
-                )
-            )
-            grad_route_quantized_receive = _all_to_all_rows(
-                grad_route_quantized_send,
-                ctx.send_counts,
-                ctx.receive_counts,
-                ctx.group_state,
-            )
-            grad_route_scales_receive = _all_to_all_rows(
-                grad_route_scales_send,
-                ctx.send_counts,
-                ctx.receive_counts,
-                ctx.group_state,
-            )
-            grad_route_quantized_grouped = grad_route_quantized_receive.index_select(
-                0, group_order
-            )
-            grad_route_scales_grouped = grad_route_scales_receive.index_select(
-                0, group_order
-            )
-            padded_rows = sum(ctx.padded_counts)
-            grad_route_quantized = _pad_rows(
-                grad_route_quantized_grouped,
-                actual_to_padded,
-                padded_rows,
-                fill_value=0,
-            )
-            grad_route_scales = _pad_rows(
-                grad_route_scales_grouped,
-                actual_to_padded,
-                padded_rows,
-                fill_value=1,
-            )
-
-            grad_hidden = _C.sm103_fp8_block128_grouped_gemm_nn(
-                grad_route_quantized,
-                grad_route_scales,
-                w2_weight,
-                w2_scale,
-                ctx.padded_counts,
-            )
-            grad_preactivation = _C.sm103_fp8_block128_swiglu_backward_canonical(
-                grad_hidden, preactivation
-            )
-            grad_preactivation_quantized, grad_preactivation_scales = (
-                _C.sm103_fp8_block128_quantize(grad_preactivation)
-            )
-            grad_input_padded = _C.sm103_fp8_block128_grouped_gemm_nn(
-                grad_preactivation_quantized,
-                grad_preactivation_scales,
-                w13_weight.view(ctx.local_experts, ctx.hidden * 2, ctx.model_dim),
-                w13_scale.view(
-                    ctx.local_experts,
-                    ctx.hidden * 2 // _BLOCK,
-                    ctx.model_dim // _BLOCK,
-                ),
-                ctx.padded_counts,
-            )
-
-            grad_route_dequantized = _C.sm103_fp8_block128_dequantize(
-                grad_route_quantized, grad_route_scales
-            )
-            hidden_dequantized = _C.sm103_fp8_block128_dequantize(
-                hidden_quantized, hidden_scales
-            )
-            grad_w2 = _bf16_grouped_wgrad(
-                grad_route_dequantized,
-                hidden_dequantized,
-                ctx.padded_counts,
-            )
-            input_dequantized = _C.sm103_fp8_block128_dequantize(
-                padded_activations, padded_activation_scales
-            )
-            grad_w13_canonical = _bf16_grouped_wgrad(
-                grad_preactivation,
-                input_dequantized,
-                ctx.padded_counts,
-            )
-            grad_w1 = grad_w13_canonical[:, : ctx.hidden].contiguous()
-            grad_w3 = grad_w13_canonical[:, ctx.hidden :].contiguous()
-
-            grad_input_grouped = _unpad_rows(grad_input_padded, actual_to_padded)
-            grad_input_receive_order = grad_input_grouped.index_select(0, ungroup_order)
-            grad_input_send_order = _all_to_all_rows(
-                grad_input_receive_order,
-                ctx.receive_counts,
-                ctx.send_counts,
-                ctx.group_state,
-            )
-            grad_input_routes = torch.empty(
-                (ctx.tokens * ctx.topk, ctx.model_dim),
-                dtype=torch.bfloat16,
-                device=grad_output.device,
-            )
-            if grad_input_routes.shape[0]:
-                grad_input_routes.index_copy_(0, send_order, grad_input_send_order)
-            grad_input = _C.sm103_fp8_block128_route_sum(
-                grad_input_routes, ctx.tokens, ctx.topk
-            )
-
-        wrapper = ctx.master_gradient_wrapper
-        if wrapper is not None:
-            grad_w1, grad_w2, grad_w3 = wrapper(grad_w1, grad_w2, grad_w3)
-
-        return (
-            grad_input,
-            None,
-            grad_scores,
-            None,
-            None,
-            None,
-            None,
-            grad_w1,
-            grad_w2,
-            grad_w3,
-            None,
-            None,
-        )
-
-
-class _FP8Block128MegaMoEDeepEP(torch.autograd.Function):
-    """Invocation-owned SM103 compute over DeepEP's expanded route layout."""
-
-    @staticmethod
-    def forward(
-        ctx: Any,
-        x: torch.Tensor,
-        topk_ids: torch.Tensor,
-        topk_scores: torch.Tensor,
-        w13_weight: torch.Tensor,
-        w13_scale: torch.Tensor,
-        w2_weight: torch.Tensor,
-        w2_scale: torch.Tensor,
-        w1_master: torch.Tensor,
-        w2_master: torch.Tensor,
-        w3_master: torch.Tensor,
-        group: Any,
-        master_gradient_wrapper: Any,
-    ) -> torch.Tensor:
-        group_state = _resolve_group(group)
-        if group_state.world_size <= 1:
-            raise RuntimeError(
-                "the expanded DeepEP MegaMoE path requires multiple ranks"
-            )
-        if master_gradient_wrapper is not None and not callable(
-            master_gradient_wrapper
-        ):
-            raise TypeError("master_gradient_wrapper must be callable or None")
-        tokens, model_dim, hidden, local_experts, topk = _validate_inputs(
-            x,
-            topk_ids,
-            topk_scores,
-            w13_weight,
-            w13_scale,
-            w2_weight,
-            w2_scale,
-            w1_master,
-            w2_master,
-            w3_master,
-            group_state,
-            master_gradient_wrapper,
-        )
-        global_experts = local_experts * group_state.world_size
-        buffer_state = _get_deepep_buffer(
-            group_state,
-            device=x.device,
-            tokens=tokens,
-            model_dim=model_dim,
-            topk=topk,
-            global_experts=global_experts,
-        )
-
-        with torch.autograd.profiler.record_function(
-            "sm103_fp8_block128_megamoe_forward"
-        ):
-            token_quantized, token_scales = _C.sm103_fp8_block128_quantize(x)
-            payload, recv_ids, routed_scores, handle, event = (
-                buffer_state.buffer.dispatch(
-                    (token_quantized, token_scales),
-                    topk_idx=topk_ids,
-                    topk_weights=topk_scores,
-                    num_experts=global_experts,
-                    num_max_tokens_per_rank=buffer_state.capacity,
-                    expert_alignment=_PAD_ROWS,
-                    num_sms=buffer_state.num_sms,
-                    num_qps=buffer_state.num_qps,
-                    async_with_compute_stream=True,
-                    allocate_on_comm_stream=False,
-                    do_cpu_sync=True,
-                    do_expand=True,
-                    use_tma_aligned_col_major_sf=False,
-                )
-            )
-            event.current_stream_wait()
-            if recv_ids is not None or routed_scores is None:
-                raise RuntimeError(
-                    "DeepEP did not return an expanded scored FP8 payload"
-                )
-            if not isinstance(payload, tuple) or len(payload) != 2:
-                raise RuntimeError("DeepEP expanded dispatch did not return FP8 q/s")
-            receive_activations, receive_activation_scales = payload
-            if (
-                receive_activations.dtype != torch.float8_e4m3fn
-                or receive_activation_scales.dtype != torch.float32
-                or not receive_activations.is_contiguous()
-                or not receive_activation_scales.is_contiguous()
-            ):
-                raise RuntimeError(
-                    "DeepEP expanded payload must retain contiguous E4M3 q and row-major FP32 scales"
-                )
-            expanded_group_rows = _host_expanded_storage_counts(handle, local_experts)
-            expanded_rows = sum(expanded_group_rows)
-            if receive_activations.shape != (expanded_rows, model_dim):
-                raise RuntimeError(
-                    "DeepEP expanded activation shape disagrees with expert counts: "
-                    f"payload={tuple(receive_activations.shape)}, rows={expanded_rows}"
-                )
-            if receive_activation_scales.shape != (
-                expanded_rows,
-                model_dim // _BLOCK,
-            ):
-                raise RuntimeError("DeepEP expanded activation-scale shape mismatch")
-            routed_scores = routed_scores.contiguous().view(-1)
-            if (
-                routed_scores.dtype != torch.float32
-                or routed_scores.numel() != expanded_rows
-            ):
-                raise RuntimeError("DeepEP expanded route-score shape/dtype mismatch")
-            routes = _expanded_routes(handle)
-            psum = handle.psum_num_recv_tokens_per_expert
-            if (
-                routes.device != x.device
-                or routes.shape[1] != topk
-                or psum.device != x.device
-                or psum.dtype != torch.int32
-                or not psum.is_contiguous()
-                or psum.numel() != local_experts
-            ):
-                raise RuntimeError("DeepEP expanded metadata violates the MegaMoE ABI")
-
-            preactivation = (
-                _C.sm103_fp8_block128_grouped_w13_gemm_nt_canonical_expanded(
-                    receive_activations,
-                    receive_activation_scales,
+            output, expert_counts, token_src_metadata = (
+                _C.sm103_fp8_block128_persistent_forward(
+                    state.buffer,
+                    list(state.buffer_ptrs),
+                    state.rank,
+                    state.context_tokens_per_rank,
+                    x.shape[0],
                     w13_weight,
                     w13_scale,
-                    expanded_group_rows,
+                    w2_weight,
+                    w2_scale,
                 )
             )
-            hidden_quantized, hidden_scales = _C.sm103_fp8_block128_swiglu_quantize(
-                preactivation
-            )
-            routed_output = _C.sm103_fp8_block128_grouped_gemm_nt_expanded(
-                hidden_quantized,
-                hidden_scales,
-                w2_weight,
-                w2_scale,
-                expanded_group_rows,
-            )
-            scaled_output = _C.sm103_fp8_block128_expanded_post_down_scale(
-                routed_output, routed_scores
-            )
-            output, combined_scores, event = buffer_state.buffer.combine(
-                scaled_output,
-                handle=handle,
-                num_sms=buffer_state.num_sms,
-                num_qps=buffer_state.num_qps,
-                async_with_compute_stream=True,
-                allocate_on_comm_stream=False,
-            )
-            event.current_stream_wait()
-            if combined_scores is not None or output.shape != x.shape:
-                raise RuntimeError(
-                    "DeepEP expanded combine violated the output contract"
-                )
-
-        ctx.group_state = group_state
-        ctx.buffer_state = buffer_state
-        ctx.handle = handle
-        ctx.expanded_group_rows = expanded_group_rows
-        ctx.tokens = tokens
-        ctx.model_dim = model_dim
-        ctx.hidden = hidden
-        ctx.local_experts = local_experts
-        ctx.topk = topk
-        ctx.expanded_rows = expanded_rows
+        ctx.buffer_state = state
         ctx.master_gradient_wrapper = master_gradient_wrapper
         ctx.save_for_backward(
-            routed_scores,
-            routes,
-            psum,
-            receive_activations,
-            receive_activation_scales,
-            preactivation,
-            hidden_quantized,
-            hidden_scales,
-            routed_output,
+            x,
+            topk_scores,
+            expert_counts,
+            token_src_metadata,
             w13_weight,
             w13_scale,
             w2_weight,
@@ -1119,135 +463,44 @@ class _FP8Block128MegaMoEDeepEP(torch.autograd.Function):
     @staticmethod
     def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[Any, ...]:
         (
-            routed_scores,
-            routes,
-            psum,
-            receive_activations,
-            receive_activation_scales,
-            preactivation,
-            hidden_quantized,
-            hidden_scales,
-            routed_output,
+            x,
+            topk_scores,
+            expert_counts,
+            token_src_metadata,
             w13_weight,
             w13_scale,
             w2_weight,
             w2_scale,
         ) = ctx.saved_tensors
+        state = ctx.buffer_state
         grad_output = grad_output.contiguous()
         if grad_output.dtype != torch.bfloat16:
             grad_output = grad_output.to(torch.bfloat16)
-
         with torch.autograd.profiler.record_function(
-            "sm103_fp8_block128_megamoe_backward"
+            "sm103_fp8_block128_megamoe_persistent_backward"
         ):
-            (
-                grad_output_compact,
-                _recv_ids,
-                _recv_scores,
-                _reverse_handle,
-                event,
-            ) = ctx.buffer_state.buffer.dispatch(
-                grad_output,
-                handle=ctx.handle,
-                num_sms=ctx.buffer_state.num_sms,
-                num_qps=ctx.buffer_state.num_qps,
-                async_with_compute_stream=True,
-                allocate_on_comm_stream=False,
-                do_cpu_sync=False,
-                do_expand=False,
-            )
-            event.current_stream_wait()
-            if not isinstance(grad_output_compact, torch.Tensor):
-                raise RuntimeError(
-                    "DeepEP reverse dispatch returned a non-tensor payload"
-                )
-            if grad_output_compact.shape != (routes.shape[0], ctx.model_dim):
-                raise RuntimeError("DeepEP reverse dispatch compact shape mismatch")
-            grad_output_expanded = _C.sm103_fp8_block128_expand_compact_routes(
-                grad_output_compact.contiguous(), routes, ctx.expanded_rows
-            )
-            grad_scores_compact = _C.sm103_fp8_block128_expanded_post_down_score_grad(
-                routed_output, grad_output_expanded, routes
-            )
-            grad_route_quantized, grad_route_scales = (
-                _C.sm103_fp8_block128_expanded_route_scale_quantize(
-                    grad_output_expanded, routed_scores
+            grad_x, grad_scores, grad_w1, grad_w2, grad_w3 = (
+                _C.sm103_fp8_block128_persistent_backward(
+                    state.buffer,
+                    list(state.buffer_ptrs),
+                    state.rank,
+                    state.context_tokens_per_rank,
+                    x,
+                    grad_output,
+                    topk_scores,
+                    expert_counts,
+                    token_src_metadata,
+                    w13_weight,
+                    w13_scale,
+                    w2_weight,
+                    w2_scale,
                 )
             )
-
-            grad_hidden = _C.sm103_fp8_block128_grouped_gemm_nn_expanded(
-                grad_route_quantized,
-                grad_route_scales,
-                w2_weight,
-                w2_scale,
-                ctx.expanded_group_rows,
-            )
-            grad_preactivation = _C.sm103_fp8_block128_swiglu_backward_canonical(
-                grad_hidden, preactivation
-            )
-            grad_preactivation_quantized, grad_preactivation_scales = (
-                _C.sm103_fp8_block128_quantize(grad_preactivation)
-            )
-            grad_input_expanded = _C.sm103_fp8_block128_grouped_gemm_nn_expanded(
-                grad_preactivation_quantized,
-                grad_preactivation_scales,
-                w13_weight.view(ctx.local_experts, ctx.hidden * 2, ctx.model_dim),
-                w13_scale.view(
-                    ctx.local_experts,
-                    ctx.hidden * 2 // _BLOCK,
-                    ctx.model_dim // _BLOCK,
-                ),
-                ctx.expanded_group_rows,
-            )
-
-            grad_route_dequantized = _C.sm103_fp8_block128_dequantize(
-                grad_route_quantized, grad_route_scales
-            )
-            hidden_dequantized = _C.sm103_fp8_block128_dequantize(
-                hidden_quantized, hidden_scales
-            )
-            grad_w2 = _bf16_grouped_wgrad_expanded(
-                grad_route_dequantized,
-                hidden_dequantized,
-                psum,
-            )
-            del grad_route_dequantized, hidden_dequantized
-            input_dequantized = _C.sm103_fp8_block128_dequantize(
-                receive_activations, receive_activation_scales
-            )
-            grad_w13_canonical = _bf16_grouped_wgrad_expanded(
-                grad_preactivation,
-                input_dequantized,
-                psum,
-            )
-            grad_w1 = grad_w13_canonical[:, : ctx.hidden].contiguous()
-            grad_w3 = grad_w13_canonical[:, ctx.hidden :].contiguous()
-
-            grad_input_compact = _C.sm103_fp8_block128_collapse_expanded_routes(
-                grad_input_expanded, routes
-            )
-            grad_input, grad_scores, event = ctx.buffer_state.buffer.combine(
-                grad_input_compact,
-                handle=_shadow_compact_handle(ctx.handle),
-                topk_weights=grad_scores_compact,
-                num_sms=ctx.buffer_state.num_sms,
-                num_qps=ctx.buffer_state.num_qps,
-                async_with_compute_stream=True,
-                allocate_on_comm_stream=False,
-            )
-            event.current_stream_wait()
-            if grad_scores is None:
-                raise RuntimeError(
-                    "DeepEP backward combine omitted route-score gradients"
-                )
-            grad_scores = grad_scores.to(torch.float32)
-
         wrapper = ctx.master_gradient_wrapper
         if wrapper is not None:
             grad_w1, grad_w2, grad_w3 = wrapper(grad_w1, grad_w2, grad_w3)
-
         return (
-            grad_input,
+            grad_x,
             None,
             grad_scores,
             None,
@@ -1276,29 +529,15 @@ def fp8_block128_mega_moe(
     group: Any = None,
     master_gradient_wrapper: Any = None,
 ) -> torch.Tensor:
-    """Run the complete SM103 FP8-block128 routed branch.
+    """Run GLM's complete routed branch in the fixed SM103 pipeline.
 
-    Quantized W13 tensors retain FireTitan's canonical interleaved
-    ``[gate, up]`` storage.  The native grouped W13 launch presents its
-    preactivation as ``[up; gate]`` without copying that storage.  BF16 gate,
-    down, and up masters are passed separately, matching their checkpoint
-    FQNs without a packed-master allocation.  Route scores are applied only
-    after W2 and their gradients are accumulated in FP32.  ``group`` is the
-    expert-parallel process group; no other token transport may wrap this
-    operation.  ``master_gradient_wrapper`` lets the owning framework restore
-    DTensor placement/reduction metadata to the three local BF16 gradients.
-    Multi-rank execution owns one automatically sized expanded
-    ``deep_ep.ElasticBuffer`` transport path internally. The single-rank
-    specialization exists only for focused kernel validation; neither path
-    admits another GPU architecture or backend.
+    Workspace capacity comes only from the model's preinstalled
+    ``seq_len / CP`` envelope.  The operation exposes no route-pool bound,
+    performs no arena growth, and consumes canonical gate/up expert pairs
+    directly with separate TMA offsets.
     """
     group_state = _resolve_group(group)
-    operation = (
-        _FP8Block128MegaMoELocal
-        if group_state.world_size == 1
-        else _FP8Block128MegaMoEDeepEP
-    )
-    return operation.apply(
+    return _FP8Block128MegaMoEPersistent.apply(
         x,
         topk_ids,
         topk_scores,

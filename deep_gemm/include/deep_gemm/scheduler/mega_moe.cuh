@@ -16,6 +16,132 @@ enum class BlockPhase {
     Linear2 = 2
 };
 
+// Fixed training reverse for the GLM large-M specialization.  Unlike the
+// forward scheduler, the expert counts are immutable outputs from the saved
+// forward call, so no Workspace polling is needed.  One expert constitutes a
+// wave: its W13 recompute, W2 dgrad, and W13 dgrad traverse the same ring slot
+// before the next expert may reuse it.
+enum class BackwardBlockPhase {
+    None = 0,
+    RecomputeW13 = 1,
+    W2Dgrad = 2,
+    W13Dgrad = 3,
+};
+
+template <
+    uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
+    uint32_t kHidden, uint32_t kIntermediateHidden,
+    uint32_t kNumExpertsPerRank, uint32_t kNumSMs>
+struct MegaMoEBackwardScheduler {
+    static constexpr uint32_t kRecomputeBlockNs =
+        (2 * kIntermediateHidden) / BLOCK_N;
+    static constexpr uint32_t kW2DgradBlockNs =
+        kIntermediateHidden / BLOCK_N;
+    static constexpr uint32_t kW13DgradBlockNs =
+        kHidden / BLOCK_N;
+    static constexpr uint32_t kRecomputeBlockKs = kHidden / BLOCK_K;
+    static constexpr uint32_t kW2DgradBlockKs = kHidden / BLOCK_K;
+    static constexpr uint32_t kW13DgradBlockKs =
+        (2 * kIntermediateHidden) / BLOCK_K;
+
+    DG_STATIC_ASSERT(kNumSMs % 2 == 0,
+                     "Backward 2-CTA scheduler requires an even SM count");
+    DG_STATIC_ASSERT(kRecomputeBlockNs % 2 == 0 &&
+                         kW2DgradBlockNs % 2 == 0 &&
+                         kW13DgradBlockNs % 2 == 0,
+                     "Every backward phase must assign adjacent N blocks to a cluster");
+
+    const int* expert_counts;
+    BackwardBlockPhase phase = BackwardBlockPhase::RecomputeW13;
+    uint32_t local_expert_idx = 0;
+    uint32_t pool_block_offset = 0;
+    uint32_t num_tokens = 0;
+    uint32_t block_idx = 0;
+    uint32_t m_block_idx = 0;
+    uint32_t n_block_idx = 0;
+
+    CUTLASS_DEVICE explicit MegaMoEBackwardScheduler(const int* counts)
+        : expert_counts(counts), block_idx(blockIdx.x) {
+        num_tokens = static_cast<uint32_t>(__ldg(expert_counts));
+    }
+
+    CUTLASS_DEVICE uint32_t get_num_block_ns() const {
+        return phase == BackwardBlockPhase::RecomputeW13
+                   ? kRecomputeBlockNs
+                   : phase == BackwardBlockPhase::W2Dgrad
+                         ? kW2DgradBlockNs
+                         : kW13DgradBlockNs;
+    }
+
+    CUTLASS_DEVICE uint32_t get_num_block_ks() const {
+        return phase == BackwardBlockPhase::RecomputeW13
+                   ? kRecomputeBlockKs
+                   : phase == BackwardBlockPhase::W2Dgrad
+                         ? kW2DgradBlockKs
+                         : kW13DgradBlockKs;
+    }
+
+    CUTLASS_DEVICE uint32_t get_current_pool_block_offset() const {
+        return pool_block_offset;
+    }
+
+    CUTLASS_DEVICE uint32_t get_current_num_m_blocks() const {
+        return math::ceil_div(num_tokens, BLOCK_M);
+    }
+
+    template <bool kDoUMMAAligned = false>
+    CUTLASS_DEVICE uint32_t get_valid_m() const {
+        const auto value = cute::min(
+            num_tokens - m_block_idx * BLOCK_M, BLOCK_M);
+        return kDoUMMAAligned ? math::align(value, 16u) : value;
+    }
+
+    CUTLASS_DEVICE cute::tuple<BackwardBlockPhase, uint32_t, uint32_t, uint32_t>
+    get_next_block() {
+        while (local_expert_idx < kNumExpertsPerRank) {
+            const uint32_t block_ns = get_num_block_ns();
+            const uint32_t phase_blocks = get_current_num_m_blocks() * block_ns;
+            if (block_idx < phase_blocks) {
+                m_block_idx = block_idx / block_ns;
+                n_block_idx = block_idx - m_block_idx * block_ns;
+                block_idx += kNumSMs;
+                return {phase, local_expert_idx, m_block_idx, n_block_idx};
+            }
+
+            // Every role restarts from its physical CTA index for the next
+            // phase.  Readiness counters, not a grid-wide host launch, carry
+            // the producer/consumer dependency between the three phases.
+            block_idx = blockIdx.x;
+            if (phase == BackwardBlockPhase::RecomputeW13) {
+                phase = BackwardBlockPhase::W2Dgrad;
+            } else if (phase == BackwardBlockPhase::W2Dgrad) {
+                phase = BackwardBlockPhase::W13Dgrad;
+            } else {
+                pool_block_offset += get_current_num_m_blocks();
+                ++local_expert_idx;
+                if (local_expert_idx >= kNumExpertsPerRank)
+                    break;
+                num_tokens = static_cast<uint32_t>(
+                    __ldg(expert_counts + local_expert_idx));
+                phase = BackwardBlockPhase::RecomputeW13;
+            }
+        }
+        return {BackwardBlockPhase::None, 0, 0, 0};
+    }
+
+    template <typename Func>
+    CUTLASS_DEVICE void for_each_block(Func&& func) {
+        while (true) {
+            CUTE_TIE_DECL(get_next_block(), current_phase, expert_idx,
+                          current_m_block_idx, current_n_block_idx);
+            if (current_phase == BackwardBlockPhase::None)
+                break;
+            func(current_phase, expert_idx, get_num_block_ks(),
+                 current_m_block_idx, current_n_block_idx);
+        }
+    }
+};
+
 template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t L1_SHAPE_N, uint32_t L1_SHAPE_K,
           uint32_t L2_SHAPE_N, uint32_t L2_SHAPE_K,
