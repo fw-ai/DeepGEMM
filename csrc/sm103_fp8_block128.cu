@@ -2321,11 +2321,52 @@ void launch_persistent_wgrad(
     const PersistentWorkspaceLayout& layout,
     const torch::Tensor& expert_counts
 ) {
+    constexpr int64_t shape_m =
+        kW2 ? kPersistentHidden : 2 * kPersistentIntermediate;
+    constexpr int64_t shape_n =
+        kW2 ? kPersistentIntermediate : kPersistentHidden;
     constexpr int64_t output_rows =
         kW2 ? kPersistentHidden : kPersistentIntermediate;
     constexpr int64_t output_columns =
         kW2 ? kPersistentIntermediate : kPersistentHidden;
     const int64_t local_experts = kPersistentExperts / kNumRanks;
+    const auto fp8_options = torch::TensorOptions()
+        .dtype(torch::kFloat8_e4m3fn)
+        .device(buffer.device());
+    void* full_a_base = kW2
+        ? layout.backward_full_grad_y.base
+        : layout.backward_full_grad_preact.base;
+    void* full_b_base = kW2
+        ? layout.backward_full_h.base
+        : layout.backward_full_x.base;
+    const uint32_t* full_a_sf = kW2
+        ? layout.backward_full_grad_y_scales.get_base_ptr<uint32_t>()
+        : layout.backward_full_grad_preact_scales.get_base_ptr<uint32_t>();
+    const uint32_t* full_b_sf = kW2
+        ? layout.backward_full_h_scales.get_base_ptr<uint32_t>()
+        : layout.backward_full_x_scales.get_base_ptr<uint32_t>();
+    auto full_a = torch::from_blob(
+        full_a_base,
+        {static_cast<int64_t>(layout.workspace.num_max_pool_tokens), shape_m},
+        fp8_options);
+    auto full_b = torch::from_blob(
+        full_b_base,
+        {static_cast<int64_t>(layout.workspace.num_max_pool_tokens), shape_n},
+        fp8_options);
+    const auto tensor_map_a = deep_gemm::make_tma_2d_desc(
+        full_a,
+        static_cast<int>(shape_m),
+        static_cast<int>(layout.workspace.num_max_pool_tokens),
+        deep_gemm::sm103_block128_wgrad::kBlockM,
+        deep_gemm::sm103_block128_wgrad::kBlockK,
+        static_cast<int>(shape_m), 0);
+    const auto tensor_map_b = deep_gemm::make_tma_2d_desc(
+        full_b,
+        static_cast<int>(shape_n),
+        static_cast<int>(layout.workspace.num_max_pool_tokens),
+        deep_gemm::sm103_block128_wgrad::kLoadBlockN,
+        deep_gemm::sm103_block128_wgrad::kBlockK,
+        static_cast<int>(shape_n), 0);
     const auto output_0_flat = output_0.view(
         {local_experts * output_rows, output_columns});
     const auto output_1_flat = output_1.view(
@@ -2372,17 +2413,10 @@ void launch_persistent_wgrad(
         &config, kernel,
         expert_counts.data_ptr<int>(),
         layout.workspace.num_max_pool_tokens,
-        layout.backward_full_x.get_base_ptr<cutlass::float_e4m3_t>(),
-        layout.backward_full_x_scales.get_base_ptr<uint32_t>(),
-        layout.backward_full_grad_y
-            .get_base_ptr<cutlass::float_e4m3_t>(),
-        layout.backward_full_grad_y_scales.get_base_ptr<uint32_t>(),
+        full_a_sf,
+        full_b_sf,
         layout.backward_full_scores.get_base_ptr<float>(),
-        layout.backward_full_h.get_base_ptr<cutlass::float_e4m3_t>(),
-        layout.backward_full_h_scales.get_base_ptr<uint32_t>(),
-        layout.backward_full_grad_preact
-            .get_base_ptr<cutlass::float_e4m3_t>(),
-        layout.backward_full_grad_preact_scales.get_base_ptr<uint32_t>(),
+        tensor_map_a, tensor_map_b,
         tensor_map_output_0, tensor_map_output_1));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

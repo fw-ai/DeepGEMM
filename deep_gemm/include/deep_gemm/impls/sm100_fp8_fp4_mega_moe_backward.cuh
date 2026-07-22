@@ -6230,12 +6230,14 @@ sm103_fp8_block128_mega_moe_backward_impl(
             const float gate = static_cast<float>(
                 ring_bf16[static_cast<uint64_t>(row) * kHidden +
                             physical_gate]);
+            const float rounded_score = static_cast<float>(
+                bf16_t(ring_scores[row]));
             const float dy_h = static_cast<float>(
                                    ring_bf16[
                                        static_cast<uint64_t>(row) * kHidden +
                                        2 * kIntermediate +
                                        col]) *
-                               ring_scores[row];
+                               rounded_score;
             const float sigmoid = 1.0f / (1.0f + expf(-gate));
             const float grad_value = gate_plane
                 ? dy_h * up * sigmoid *
