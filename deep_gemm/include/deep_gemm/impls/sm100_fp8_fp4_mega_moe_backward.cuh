@@ -5811,7 +5811,7 @@ CUTLASS_DEVICE void run_gemm_phase(
                                 accum_stage * kUMMAN,
                                 k_block_idx > 0 || k > 0,
                                 runtime_desc,
-                                kTmemSFBStart, kTmemSFAStart);
+                                392u, 384u);
                         }
                     }
                     __syncwarp();
