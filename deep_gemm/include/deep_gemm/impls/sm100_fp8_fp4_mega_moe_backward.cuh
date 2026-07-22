@@ -5403,6 +5403,12 @@ static constexpr uint32_t kUMMAM = 256;
 static constexpr uint32_t kUMMAN = kBlockM;
 static constexpr uint32_t kUMMAK = 32;
 static constexpr uint32_t kSwizzle = 128;
+static constexpr uint32_t kUTCCPAlignedElements = 128;
+// BAR 0 is owned by __syncthreads and BAR 8 by the 256-thread TMA epilogue.
+// Four independent reduction groups therefore use BAR 4..7. Reusing BAR 0
+// for a 128-thread group immediately before a 512-thread __syncthreads is a
+// barrier-count race when another group reaches the block barrier first.
+static constexpr uint32_t kReductionBarrierBase = 4;
 static constexpr uint32_t kNumTmemAccumCols =
     kUMMAN * kNumEpilogueStages;
 static constexpr uint32_t kNumTmemSFACols = kSFBlockM / 32;
@@ -5459,7 +5465,7 @@ CUTLASS_DEVICE float reduce_group_128(
     value = kMax ? warp_reduce_max(value) : warp_reduce_sum(value);
     if (lane == 0)
         storage.reduce_values[group_idx][warp_in_group] = value;
-    ptx::sync_aligned(128, group_idx);
+    ptx::sync_aligned(128, kReductionBarrierBase + group_idx);
     if (warp_in_group == 0) {
         value = lane < 4
                     ? storage.reduce_values[group_idx][lane]
@@ -5468,7 +5474,7 @@ CUTLASS_DEVICE float reduce_group_128(
         if (lane == 0)
             storage.reduce_values[group_idx][4] = value;
     }
-    ptx::sync_aligned(128, group_idx);
+    ptx::sync_aligned(128, kReductionBarrierBase + group_idx);
     return storage.reduce_values[group_idx][4];
 }
 
@@ -5767,14 +5773,28 @@ CUTLASS_DEVICE void run_gemm_phase(
                     const uint32_t b_base =
                         ptx::exchange(b_desc_lo, stage_idx);
                     if (cute::elect_one_sync()) {
-                        auto* sfa = storage.smem_sfa[stage_idx];
-                        mma::sm100::replace_smem_desc_addr(sf_desc, sfa);
-                        cute::SM100_UTCCP_4x32dp128bit_2cta::copy(
-                            sf_desc, 384u);
-                        mma::sm100::replace_smem_desc_addr(
-                            sf_desc, storage.smem_sfb[stage_idx]);
-                        cute::SM100_UTCCP_4x32dp128bit_2cta::copy(
-                            sf_desc, 392u);
+                        using utccp_t =
+                            cute::SM100_UTCCP_4x32dp128bit_2cta;
+                        #pragma unroll
+                        for (uint32_t i = 0;
+                             i < kSFBlockM / kUTCCPAlignedElements; ++i) {
+                            mma::sm100::replace_smem_desc_addr(
+                                sf_desc,
+                                storage.smem_sfa[stage_idx] +
+                                    i * kUTCCPAlignedElements);
+                            utccp_t::copy(
+                                sf_desc, kTmemSFAStart + i * 4);
+                        }
+                        #pragma unroll
+                        for (uint32_t i = 0;
+                             i < kSFBlockN / kUTCCPAlignedElements; ++i) {
+                            mma::sm100::replace_smem_desc_addr(
+                                sf_desc,
+                                storage.smem_sfb[stage_idx] +
+                                    i * kUTCCPAlignedElements);
+                            utccp_t::copy(
+                                sf_desc, kTmemSFBStart + i * 4);
+                        }
                         #pragma unroll
                         for (uint32_t k = 0; k < kBlockK / kUMMAK; ++k) {
                             const auto runtime_desc =
@@ -5791,7 +5811,7 @@ CUTLASS_DEVICE void run_gemm_phase(
                                 accum_stage * kUMMAN,
                                 k_block_idx > 0 || k > 0,
                                 runtime_desc,
-                                392u, 384u);
+                                kTmemSFBStart, kTmemSFAStart);
                         }
                     }
                     __syncwarp();
@@ -6175,13 +6195,14 @@ sm103_fp8_block128_mega_moe_backward_impl(
             const uint32_t w13_block = col / 64;
             const uint32_t in_block = col % 64;
             const uint32_t physical_up =
-                w13_block * 128 + (in_block / 8) * 16 + in_block % 8;
+                w13_block * 128 + in_block;
+            const uint32_t physical_gate = physical_up + 64;
             const float up = static_cast<float>(
                 ring_bf16[static_cast<uint64_t>(row) * kHidden +
                             physical_up]);
             const float gate = static_cast<float>(
                 ring_bf16[static_cast<uint64_t>(row) * kHidden +
-                            physical_up + 8]);
+                            physical_gate]);
             const float dy_h = static_cast<float>(
                                    ring_bf16[
                                        static_cast<uint64_t>(row) * kHidden +
