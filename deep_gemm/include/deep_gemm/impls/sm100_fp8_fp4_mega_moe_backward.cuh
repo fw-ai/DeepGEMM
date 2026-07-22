@@ -5393,8 +5393,12 @@ static constexpr uint32_t kSFBlockM = 256;
 static constexpr uint32_t kSFBlockN = 128;
 static constexpr uint32_t kStages = 6;
 static constexpr uint32_t kThreads = 512;
-static constexpr uint32_t kStoreBlockM = 32;
-static constexpr uint32_t kEpilogueThreads = 256;
+// sm100_store_cd_swap_ab maps one 128-thread warpgroup over the two 64-column
+// BF16 atoms of BLOCK_N.  STORE_BLOCK_M=16 is also required so every valid
+// UMMA-N extent (which is 16-row aligned) emits at least one store and returns
+// the TMEM-empty arrival.
+static constexpr uint32_t kStoreBlockM = 16;
+static constexpr uint32_t kEpilogueThreads = 128;
 static constexpr uint32_t kNumEpilogueStages = 2;
 static constexpr uint32_t kNumTMAStoreStages = 2;
 static constexpr uint32_t kLoadBlockM = kBlockM / 2;
@@ -5404,10 +5408,9 @@ static constexpr uint32_t kUMMAN = kBlockM;
 static constexpr uint32_t kUMMAK = 32;
 static constexpr uint32_t kSwizzle = 128;
 static constexpr uint32_t kUTCCPAlignedElements = 128;
-// BAR 0 is used both by __syncthreads and by the 256-thread TMA epilogue's
-// named barrier. Four independent reduction groups therefore use BAR 4..7,
-// and no block-wide barrier may run concurrently with a GEMM epilogue.
-// Reusing BAR 0 with a different arrival count is a barrier-count race.
+// CUTLASS user named-barrier ID 0 maps to physical BAR 8.  The four independent
+// reduction groups use BAR 4..7, so neither overlaps BAR 0 (__syncthreads) or
+// the TMA epilogue.
 static constexpr uint32_t kReductionBarrierBase = 4;
 static constexpr uint32_t kNumTmemAccumCols =
     kUMMAN * kNumEpilogueStages;
@@ -5440,6 +5443,9 @@ struct alignas(1024) SharedStorage {
 };
 
 DG_STATIC_ASSERT(kNumTmemCols <= 512, "SM103 backward exceeds TMEM");
+DG_STATIC_ASSERT(
+    kEpilogueThreads == 128 && kStoreBlockM == 16,
+    "SM103 swap-AB epilogue requires one warpgroup and 16-row stores");
 
 CUTLASS_DEVICE float warp_reduce_max(float value) {
     #pragma unroll
@@ -5836,7 +5842,7 @@ CUTLASS_DEVICE void run_gemm_phase(
                     .wait((last / kNumEpilogueStages) & 1);
             }
         }
-    } else if (warp_idx >= 8) {
+    } else if (warp_idx >= 8 && warp_idx < 12) {
         cutlass::arch::warpgroup_reg_alloc<208>();
         const uint32_t epilogue_warp_idx = warp_idx - 8;
         uint32_t current_iter = 0;
@@ -5877,13 +5883,8 @@ CUTLASS_DEVICE void run_gemm_phase(
         cutlass::arch::warpgroup_reg_dealloc<40>();
     }
 
-    // The TMA epilogue uses named barrier 0 with a 256-thread arrival count.
-    // A block-wide __syncthreads here would reuse that physical barrier while
-    // the epilogue can still be draining, so non-epilogue warps could corrupt
-    // its count and strand the active CTA. The upstream 2-CTA GEMM terminates
-    // this role split with cluster synchronization only; the caller's next
-    // grid barrier supplies the subsequent block-wide synchronization after
-    // every thread has crossed this cluster boundary.
+    // Match the upstream 2-CTA GEMM role join.  The epilogue has drained its
+    // final TMA stage before its warpgroup reaches this cluster boundary.
     comm::cluster_sync_with_relaxed_arrive();
 }
 

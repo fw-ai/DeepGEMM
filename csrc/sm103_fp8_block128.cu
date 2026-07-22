@@ -109,6 +109,7 @@ constexpr uint32_t kPersistentBlockM = 192;
 constexpr uint32_t kPersistentBlockN = 128;
 constexpr uint32_t kPersistentBlockK = 128;
 constexpr uint32_t kPersistentStoreBlockM = 32;
+constexpr uint32_t kPersistentReverseStoreBlockM = 16;
 constexpr uint32_t kPersistentSFBlockM = 256;
 constexpr uint32_t kPersistentSFBlockN = 128;
 constexpr uint32_t kPersistentStages = 6;
@@ -2190,15 +2191,15 @@ void launch_persistent_backward_activation(
         static_cast<int>(w13_weight.size(0) / 2), 128);
     const auto tensor_map_gate_up = deep_gemm::make_tma_2d_desc(
         gate_up, 2 * kPersistentIntermediate, layout.ring_tokens,
-        kPersistentBlockN, kPersistentStoreBlockM,
+        kPersistentBlockN, kPersistentReverseStoreBlockM,
         kPersistentHidden, 128);
     const auto tensor_map_grad_h = deep_gemm::make_tma_2d_desc(
         grad_h, kPersistentIntermediate, layout.ring_tokens,
-        kPersistentBlockN, kPersistentStoreBlockM,
+        kPersistentBlockN, kPersistentReverseStoreBlockM,
         kPersistentHidden, 128);
     const auto tensor_map_grad_x = deep_gemm::make_tma_2d_desc(
         ring_grad_x, kPersistentHidden, layout.ring_tokens,
-        kPersistentBlockN, kPersistentStoreBlockM,
+        kPersistentBlockN, kPersistentReverseStoreBlockM,
         kPersistentHidden, 128);
 
     using Kernel = decltype(
