@@ -109,7 +109,6 @@ constexpr uint32_t kPersistentBlockM = 192;
 constexpr uint32_t kPersistentBlockN = 128;
 constexpr uint32_t kPersistentBlockK = 128;
 constexpr uint32_t kPersistentStoreBlockM = 32;
-constexpr uint32_t kPersistentReverseStoreBlockM = 16;
 constexpr uint32_t kPersistentSFBlockM = 256;
 constexpr uint32_t kPersistentSFBlockN = 128;
 constexpr uint32_t kPersistentStages = 6;
@@ -2193,32 +2192,13 @@ void launch_persistent_backward_activation(
     const auto int_options = torch::TensorOptions()
         .dtype(torch::kInt)
         .device(device);
-    const auto bf16_options = torch::TensorOptions()
-        .dtype(torch::kBFloat16)
-        .device(device);
 
-    auto ring_x = torch::from_blob(
-        layout.l1_tokens.base,
-        {layout.ring_tokens, kPersistentHidden}, fp8_options);
-    auto ring_x_sf = torch::from_blob(
-        layout.l1_scales.base,
-        {layout.sf_ring_tokens, kPersistentHidden / 128},
-        {1, static_cast<int64_t>(layout.sf_ring_tokens)},
-        int_options);
     auto ring_grad_y = torch::from_blob(
         layout.backward_ring_grad_y.base,
         {layout.ring_tokens, kPersistentHidden}, fp8_options);
     auto ring_grad_y_sf = torch::from_blob(
         layout.backward_ring_grad_y_scales.base,
         {layout.sf_ring_tokens, kPersistentHidden / 128},
-        {1, static_cast<int64_t>(layout.sf_ring_tokens)},
-        int_options);
-    auto ring_h = torch::from_blob(
-        layout.l2_tokens.base,
-        {layout.ring_tokens, kPersistentIntermediate}, fp8_options);
-    auto ring_h_sf = torch::from_blob(
-        layout.l2_scales.base,
-        {layout.sf_ring_tokens, kPersistentIntermediate / 128},
         {1, static_cast<int64_t>(layout.sf_ring_tokens)},
         int_options);
     auto ring_grad_preact = torch::from_blob(
@@ -2229,31 +2209,6 @@ void launch_persistent_backward_activation(
         {layout.sf_ring_tokens, 2 * kPersistentIntermediate / 128},
         {1, static_cast<int64_t>(layout.sf_ring_tokens)},
         int_options);
-
-    auto gate_up = torch::from_blob(
-        layout.backward_ring_bf16.base,
-        {layout.ring_tokens, 2 * kPersistentIntermediate},
-        {static_cast<int64_t>(kPersistentHidden), 1},
-        bf16_options);
-    auto grad_h = torch::from_blob(
-        layout.backward_ring_bf16.base,
-        {layout.ring_tokens, kPersistentIntermediate},
-        {static_cast<int64_t>(kPersistentHidden), 1},
-        bf16_options);
-    auto ring_grad_x = torch::from_blob(
-        layout.backward_ring_bf16.base,
-        {layout.ring_tokens, kPersistentHidden},
-        {static_cast<int64_t>(kPersistentHidden), 1},
-        bf16_options);
-
-    const auto tensor_map_ring_x = deep_gemm::make_tma_2d_desc(
-        ring_x, kPersistentHidden, layout.ring_tokens,
-        kPersistentBlockK, kPersistentBlockM / 2,
-        kPersistentHidden, 128);
-    const auto tensor_map_ring_x_sf = deep_gemm::make_tma_sf_desc(
-        cute::UMMA::Major::MN, ring_x_sf,
-        layout.sf_ring_tokens, kPersistentHidden,
-        kPersistentSFBlockM, 32, 1, 0, 0, false, 1);
     const auto tensor_map_ring_grad_y = deep_gemm::make_tma_2d_desc(
         ring_grad_y, kPersistentHidden, layout.ring_tokens,
         kPersistentBlockK, kPersistentBlockM / 2,
@@ -2261,14 +2216,6 @@ void launch_persistent_backward_activation(
     const auto tensor_map_ring_grad_y_sf = deep_gemm::make_tma_sf_desc(
         cute::UMMA::Major::MN, ring_grad_y_sf,
         layout.sf_ring_tokens, kPersistentHidden,
-        kPersistentSFBlockM, 32, 1, 0, 0, false, 1);
-    const auto tensor_map_ring_h = deep_gemm::make_tma_2d_desc(
-        ring_h, kPersistentIntermediate, layout.ring_tokens,
-        kPersistentBlockK, kPersistentBlockM / 2,
-        kPersistentIntermediate, 128);
-    const auto tensor_map_ring_h_sf = deep_gemm::make_tma_sf_desc(
-        cute::UMMA::Major::MN, ring_h_sf,
-        layout.sf_ring_tokens, kPersistentIntermediate,
         kPersistentSFBlockM, 32, 1, 0, 0, false, 1);
     const auto tensor_map_ring_grad_preact =
         deep_gemm::make_tma_2d_desc(
@@ -2281,12 +2228,6 @@ void launch_persistent_backward_activation(
             cute::UMMA::Major::MN, ring_grad_preact_sf,
             layout.sf_ring_tokens, 2 * kPersistentIntermediate,
             kPersistentSFBlockM, 32, 1, 0, 0, false, 1);
-
-    const auto tensor_map_w13_recompute = deep_gemm::make_tma_2d_desc(
-        w13_weight, kPersistentHidden,
-        static_cast<int>(w13_weight.size(0) * w13_weight.size(1)),
-        kPersistentBlockK, kPersistentBlockN / 2,
-        static_cast<int>(w13_weight.stride(-2)), 128);
     const auto tensor_map_w2_dgrad = deep_gemm::make_tma_b_desc(
         cute::UMMA::Major::MN, w2_weight,
         kPersistentIntermediate, kPersistentHidden,
@@ -2299,19 +2240,6 @@ void launch_persistent_backward_activation(
         kPersistentBlockN, kPersistentBlockK,
         static_cast<int>(w13_weight.stride(-2)),
         static_cast<int>(w13_weight.size(0) / 2), 128);
-    const auto tensor_map_gate_up = deep_gemm::make_tma_2d_desc(
-        gate_up, 2 * kPersistentIntermediate, layout.ring_tokens,
-        kPersistentBlockN, kPersistentReverseStoreBlockM,
-        kPersistentHidden, 128);
-    const auto tensor_map_grad_h = deep_gemm::make_tma_2d_desc(
-        grad_h, kPersistentIntermediate, layout.ring_tokens,
-        kPersistentBlockN, kPersistentReverseStoreBlockM,
-        kPersistentHidden, 128);
-    const auto tensor_map_grad_x = deep_gemm::make_tma_2d_desc(
-        ring_grad_x, kPersistentHidden, layout.ring_tokens,
-        kPersistentBlockN, kPersistentReverseStoreBlockM,
-        kPersistentHidden, 128);
-
     using Kernel = decltype(
         &deep_gemm::sm103_block128_backward::
             sm103_fp8_block128_mega_moe_backward_persistent_impl<
@@ -2362,7 +2290,6 @@ void launch_persistent_backward_activation(
         layout.backward_ring_grad_preact
             .get_base_ptr<cutlass::float_e4m3_t>(),
         layout.backward_ring_grad_preact_scales.get_base_ptr<uint32_t>(),
-        layout.backward_ring_bf16.get_base_ptr<cutlass::bfloat16_t>(),
         layout.backward_full_grad_y.get_base_ptr<cutlass::float_e4m3_t>(),
         layout.backward_full_grad_y_scales.get_base_ptr<uint32_t>(),
         layout.backward_full_scores.get_base_ptr<float>(),
@@ -2377,7 +2304,6 @@ void launch_persistent_backward_activation(
         tensor_map_ring_grad_y, tensor_map_ring_grad_y_sf,
         tensor_map_ring_grad_preact, tensor_map_ring_grad_preact_sf,
         tensor_map_w2_dgrad, tensor_map_w13_dgrad,
-        tensor_map_grad_h, tensor_map_grad_x,
         w13_scale.data_ptr<float>(), w2_scale.data_ptr<float>()));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

@@ -5403,10 +5403,10 @@ static constexpr uint32_t kDispatchPullElements =
     kDispatchPullBytes / sizeof(cutlass::bfloat16_t);
 static constexpr uint32_t kDispatchPullChunks =
     kHidden * sizeof(cutlass::bfloat16_t) / kDispatchPullBytes;
-// sm100_store_cd_swap_ab maps one 128-thread warpgroup over the two 64-column
-// BF16 atoms of BLOCK_N.  STORE_BLOCK_M=16 is also required so every valid
-// UMMA-N extent (which is 16-row aligned) emits at least one store and returns
-// the TMEM-empty arrival.
+// The reverse epilogue retains sm100_store_cd_swap_ab's exact 128-thread TMEM
+// mapping over the two 64-column BF16 atoms of BLOCK_N, but consumes the tile
+// in place: W2 feeds fused SwiGLU backward/quantization and W13 feeds remote
+// combine. STORE_BLOCK_M=16 covers every 16-row-aligned UMMA-N extent.
 static constexpr uint32_t kStoreBlockM = 16;
 static constexpr uint32_t kEpilogueThreads = 128;
 static constexpr uint32_t kNumEpilogueStages = 2;
@@ -5501,6 +5501,37 @@ CUTLASS_DEVICE float reduce_group_128(
     }
     ptx::sync_aligned(128, kReductionBarrierBase + group_idx);
     return storage.reduce_values[group_idx][4];
+}
+
+CUTLASS_DEVICE float2 reduce_group_128_max_pair(
+    float2 value, SharedStorage& storage, const uint32_t group_idx) {
+    const uint32_t lane = threadIdx.x & 31;
+    const uint32_t warp_in_group = (threadIdx.x >> 5) & 3;
+    value.x = warp_reduce_max(value.x);
+    value.y = warp_reduce_max(value.y);
+    if (lane == 0) {
+        storage.reduce_values[group_idx][warp_in_group] = value.x;
+        storage.reduce_values[group_idx][4 + warp_in_group] = value.y;
+    }
+    ptx::sync_aligned(128, kReductionBarrierBase + group_idx);
+    if (warp_in_group == 0) {
+        value.x = lane < 4
+            ? storage.reduce_values[group_idx][lane]
+            : 0.0f;
+        value.y = lane < 4
+            ? storage.reduce_values[group_idx][4 + lane]
+            : 0.0f;
+        value.x = warp_reduce_max(value.x);
+        value.y = warp_reduce_max(value.y);
+        if (lane == 0) {
+            storage.reduce_values[group_idx][0] = value.x;
+            storage.reduce_values[group_idx][4] = value.y;
+        }
+    }
+    ptx::sync_aligned(128, kReductionBarrierBase + group_idx);
+    return {
+        storage.reduce_values[group_idx][0],
+        storage.reduce_values[group_idx][4]};
 }
 
 CUTLASS_DEVICE uint32_t packed_power2_scale(
@@ -6405,7 +6436,6 @@ sm103_fp8_block128_mega_moe_backward_persistent_impl(
     uint32_t* ring_grad_y_sf,
     fp8_t* ring_grad_preact,
     uint32_t* ring_grad_preact_sf,
-    bf16_t* ring_bf16,
     fp8_t* full_grad_y,
     uint32_t* full_grad_y_sf,
     const float* full_scores,
@@ -6422,8 +6452,6 @@ sm103_fp8_block128_mega_moe_backward_persistent_impl(
     const __grid_constant__ cute::TmaDescriptor tensor_map_ring_grad_preact_sf,
     const __grid_constant__ cute::TmaDescriptor tensor_map_w2_dgrad,
     const __grid_constant__ cute::TmaDescriptor tensor_map_w13_dgrad,
-    const __grid_constant__ cute::TmaDescriptor tensor_map_grad_h,
-    const __grid_constant__ cute::TmaDescriptor tensor_map_grad_x,
     const float* w13_scales,
     const float* w2_scales) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1030
@@ -6458,8 +6486,6 @@ sm103_fp8_block128_mega_moe_backward_persistent_impl(
         cute::prefetch_tma_descriptor(&tensor_map_ring_grad_preact_sf);
         cute::prefetch_tma_descriptor(&tensor_map_w2_dgrad);
         cute::prefetch_tma_descriptor(&tensor_map_w13_dgrad);
-        cute::prefetch_tma_descriptor(&tensor_map_grad_h);
-        cute::prefetch_tma_descriptor(&tensor_map_grad_x);
     }
 
     // Match upstream's separate input and combine transport lifetimes. The
@@ -6977,10 +7003,6 @@ sm103_fp8_block128_mega_moe_backward_persistent_impl(
         const uint32_t epilogue_thread =
             epilogue_warp * 32 + lane_idx;
         uint32_t current_iter = 0;
-        uint32_t tma_stage = 0;
-        auto smem_cd = utils::PatternVisitor([&](const uint32_t& i) {
-            return storage.smem_cd[i];
-        });
         Scheduler scheduler(expert_counts);
         scheduler.for_each_block(
             [&](const sched::BackwardBlockPhase block_phase,
@@ -7005,11 +7027,6 @@ sm103_fp8_block128_mega_moe_backward_persistent_impl(
                 const uint32_t pool_m = pool_block * kBlockM;
                 const uint32_t valid_m =
                     scheduler.template get_valid_m<false>();
-                const auto* output_map =
-                    block_phase == sched::BackwardBlockPhase::W2Dgrad
-                        ? &tensor_map_grad_h
-                        : &tensor_map_grad_x;
-
                 if (block_phase ==
                     sched::BackwardBlockPhase::W2Dgrad) {
                     const uint32_t empty_target =
@@ -7019,103 +7036,151 @@ sm103_fp8_block128_mega_moe_backward_persistent_impl(
                                    ring_block)) != empty_target) {
                     }
                 }
-
-                epilogue::sm100_store_cd_swap_ab<
-                    kBlockM, kBlockN, kStoreBlockM, kBlockN,
-                    kSwizzle, kNumTMAStoreStages,
-                    128u, GemmType::Normal, false,
-                    bf16_t,
-                    epilogue::transform::EpilogueIdentity>(
-                        smem_cd, tma_stage,
-                        accum_stage * kUMMAN,
-                        ring_m, n_block * kBlockN, 0,
-                        math::align(valid_m, 16u),
-                        epilogue_warp, lane_idx,
-                        &storage.tmem_empty_barriers[accum_stage],
-                        *output_map);
-                if (epilogue_warp == 0)
-                    cute::tma_store_wait<0>();
-                ptx::sync_aligned(
-                    128u, kEpilogueBarrier);
-
+                const uint32_t aligned_m = math::align(valid_m, 16u);
+                const uint32_t num_stores = aligned_m / kStoreBlockM;
+                constexpr uint32_t kRowsPerLoad = 8;
+                constexpr uint32_t kLoadsPerStore =
+                    kStoreBlockM / kRowsPerLoad;
+                DG_STATIC_ASSERT(
+                    kLoadsPerStore == 2,
+                    "reverse fused epilogue assumes two 8-row TMEM atoms");
                 if (block_phase ==
                     sched::BackwardBlockPhase::W2Dgrad) {
+                    // Consume W2 dgrad directly from TMEM.  Each epilogue
+                    // thread owns one of the 128 logical hidden columns and
+                    // eight token rows per TMEM load.  Round the accumulator
+                    // to BF16 in registers, exactly as the generic store
+                    // epilogue did, then fuse SwiGLU backward and E4M3/UE8M0
+                    // quantization.  There is no BF16 global-ring store/reload
+                    // boundary between W2 dgrad and W13 dgrad.
                     const uint32_t hidden_col =
                         n_block * kBlockN + epilogue_thread;
-                    #pragma unroll 1
-                    for (uint32_t row = 0; row < valid_m; ++row) {
-                        const uint32_t ring_row = ring_m + row;
-                        const uint32_t pool_row = pool_m + row;
-                        const float dh = static_cast<float>(
-                            ring_bf16[
-                                static_cast<uint64_t>(ring_row) *
-                                    kHidden +
-                                hidden_col]);
-                        const float gate = static_cast<float>(
-                            saved_l1_preact[
-                                static_cast<uint64_t>(pool_row) *
-                                    (2 * kIntermediate) +
-                                hidden_col]);
-                        const float up = static_cast<float>(
-                            saved_l1_preact[
-                                static_cast<uint64_t>(pool_row) *
-                                    (2 * kIntermediate) +
-                                kIntermediate + hidden_col]);
-                        const float sigmoid =
-                            math::fast_rcp(1.0f + __expf(-gate));
-                        const float dgate =
-                            dh * up * sigmoid *
-                            (1.0f + gate * (1.0f - sigmoid));
-                        const float dup = dh * gate * sigmoid;
-                        const float gate_amax =
-                            reduce_group_128<true>(
-                                cute::abs(dgate), storage, 2);
-                        const float up_amax =
-                            reduce_group_128<true>(
-                                cute::abs(dup), storage, 2);
-                        float gate_inv, up_inv;
-                        const uint32_t gate_scale =
-                            packed_power2_scale(
-                                gate_amax, gate_inv);
-                        const uint32_t up_scale =
-                            packed_power2_scale(up_amax, up_inv);
-                        const uint32_t gate_col = hidden_col;
-                        const uint32_t up_col =
-                            kIntermediate + hidden_col;
-                        ring_grad_preact[
-                            static_cast<uint64_t>(ring_row) *
-                                (2 * kIntermediate) +
-                            gate_col] = fp8_t(dgate * gate_inv);
-                        ring_grad_preact[
-                            static_cast<uint64_t>(ring_row) *
-                                (2 * kIntermediate) +
-                            up_col] = fp8_t(dup * up_inv);
-                        full_grad_preact[
-                            static_cast<uint64_t>(pool_row) *
-                                (2 * kIntermediate) +
-                            gate_col] = fp8_t(dgate * gate_inv);
-                        full_grad_preact[
-                            static_cast<uint64_t>(pool_row) *
-                                (2 * kIntermediate) +
-                            up_col] = fp8_t(dup * up_inv);
-                        if (epilogue_thread == 0) {
-                            const uint32_t sf_row =
-                                transform_sf_row(ring_row);
-                            ring_grad_preact_sf[
-                                n_block * sf_ring_tokens +
-                                sf_row] = gate_scale;
-                            ring_grad_preact_sf[
-                                (kW2BlockNs + n_block) *
-                                    sf_ring_tokens +
-                                sf_row] = up_scale;
-                            full_grad_preact_sf[
-                                static_cast<uint64_t>(pool_row) *
-                                    kGradPreactScaleBlocks +
-                                n_block] = gate_scale;
-                            full_grad_preact_sf[
-                                static_cast<uint64_t>(pool_row) *
-                                    kGradPreactScaleBlocks +
-                                kW2BlockNs + n_block] = up_scale;
+                    for (uint32_t store = 0; store < num_stores;
+                         ++store) {
+                        #pragma unroll
+                        for (uint32_t atom = 0;
+                             atom < kLoadsPerStore; ++atom) {
+                            const uint32_t row_base =
+                                store * kStoreBlockM +
+                                atom * kRowsPerLoad;
+                            const uint32_t tmem_addr =
+                                accum_stage * kUMMAN + row_base;
+                            uint32_t values[kRowsPerLoad];
+                            cute::SM100_TMEM_LOAD_16dp256b1x::copy(
+                                tmem_addr,
+                                values[0], values[1], values[2], values[3]);
+                            cute::SM100_TMEM_LOAD_16dp256b1x::copy(
+                                tmem_addr | 0x00100000,
+                                values[4], values[5], values[6], values[7]);
+                            cutlass::arch::fence_view_async_tmem_load();
+                            if (store + 1 == num_stores &&
+                                atom + 1 == kLoadsPerStore) {
+                                ptx::tcgen05_before_thread_sync();
+                                storage.tmem_empty_barriers[accum_stage]
+                                    .arrive(0u);
+                            }
+
+                            uint32_t packed_dh[kRowsPerLoad / 2];
+                            #pragma unroll
+                            for (uint32_t pair = 0;
+                                 pair < kRowsPerLoad / 2; ++pair) {
+                                packed_dh[pair] =
+                                    math::cast_into_bf16_and_pack(
+                                        values[pair * 2],
+                                        values[pair * 2 + 1]);
+                            }
+                            #pragma unroll
+                            for (uint32_t row_in_atom = 0;
+                                 row_in_atom < kRowsPerLoad;
+                                 ++row_in_atom) {
+                                const uint32_t row =
+                                    row_base + row_in_atom;
+                                const auto dh_pair =
+                                    __bfloat1622float2(
+                                        *reinterpret_cast<const nv_bfloat162*>(
+                                            &packed_dh[row_in_atom / 2]));
+                                const float dh = (row_in_atom & 1u)
+                                    ? dh_pair.y : dh_pair.x;
+                                const uint32_t ring_row = ring_m + row;
+                                const uint32_t pool_row = pool_m + row;
+                                const bool valid = row < valid_m;
+                                const float gate = valid
+                                    ? static_cast<float>(
+                                          saved_l1_preact[
+                                              static_cast<uint64_t>(pool_row) *
+                                                  (2 * kIntermediate) +
+                                              hidden_col])
+                                    : 0.0f;
+                                const float up = valid
+                                    ? static_cast<float>(
+                                          saved_l1_preact[
+                                              static_cast<uint64_t>(pool_row) *
+                                                  (2 * kIntermediate) +
+                                              kIntermediate + hidden_col])
+                                    : 0.0f;
+                                const float sigmoid =
+                                    math::fast_rcp(1.0f + __expf(-gate));
+                                const float dgate = valid
+                                    ? dh * up * sigmoid *
+                                          (1.0f + gate * (1.0f - sigmoid))
+                                    : 0.0f;
+                                const float dup = valid
+                                    ? dh * gate * sigmoid : 0.0f;
+                                const float2 amax =
+                                    reduce_group_128_max_pair(
+                                        {cute::abs(dgate), cute::abs(dup)},
+                                        storage, 2);
+                                float gate_inv, up_inv;
+                                const uint32_t gate_scale =
+                                    packed_power2_scale(
+                                        amax.x, gate_inv);
+                                const uint32_t up_scale =
+                                    packed_power2_scale(
+                                        amax.y, up_inv);
+                                if (valid) {
+                                    const uint32_t gate_col = hidden_col;
+                                    const uint32_t up_col =
+                                        kIntermediate + hidden_col;
+                                    const fp8_t gate_value(
+                                        dgate * gate_inv);
+                                    const fp8_t up_value(dup * up_inv);
+                                    ring_grad_preact[
+                                        static_cast<uint64_t>(ring_row) *
+                                            (2 * kIntermediate) +
+                                        gate_col] = gate_value;
+                                    ring_grad_preact[
+                                        static_cast<uint64_t>(ring_row) *
+                                            (2 * kIntermediate) +
+                                        up_col] = up_value;
+                                    full_grad_preact[
+                                        static_cast<uint64_t>(pool_row) *
+                                            (2 * kIntermediate) +
+                                        gate_col] = gate_value;
+                                    full_grad_preact[
+                                        static_cast<uint64_t>(pool_row) *
+                                            (2 * kIntermediate) +
+                                        up_col] = up_value;
+                                    if (epilogue_thread == 0) {
+                                        const uint32_t sf_row =
+                                            transform_sf_row(ring_row);
+                                        ring_grad_preact_sf[
+                                            n_block * sf_ring_tokens +
+                                            sf_row] = gate_scale;
+                                        ring_grad_preact_sf[
+                                            (kW2BlockNs + n_block) *
+                                                sf_ring_tokens +
+                                            sf_row] = up_scale;
+                                        full_grad_preact_sf[
+                                            static_cast<uint64_t>(pool_row) *
+                                                kGradPreactScaleBlocks +
+                                            n_block] = gate_scale;
+                                        full_grad_preact_sf[
+                                            static_cast<uint64_t>(pool_row) *
+                                                kGradPreactScaleBlocks +
+                                            kW2BlockNs + n_block] = up_scale;
+                                    }
+                                }
+                            }
                         }
                     }
                     ptx::sync_aligned(
@@ -7134,42 +7199,111 @@ sm103_fp8_block128_mega_moe_backward_persistent_impl(
                     }
                     __syncwarp();
                 } else {
+                    // Mirror upstream's L2 epilogue: round W13 dgrad to BF16
+                    // while moving TMEM into one shared store tile, then publish
+                    // that tile directly to the owning rank's combine plane.
+                    // The reusable global BF16 ring is deliberately absent.
+                    constexpr uint32_t kBankGroupBytes = 16;
                     constexpr uint32_t kVecElements =
                         sizeof(uint4) / sizeof(bf16_t);
                     constexpr uint32_t kVecsPerNBlock =
                         kBlockN / kVecElements;
-                    for (uint32_t linear = epilogue_thread;
-                         linear < valid_m * kVecsPerNBlock;
-                         linear += 128u) {
-                        const uint32_t row =
-                            linear / kVecsPerNBlock;
-                        const uint32_t vec =
-                            linear - row * kVecsPerNBlock;
-                        const uint32_t pool_row = pool_m + row;
-                        const uint32_t ring_row = ring_m + row;
-                        const auto metadata =
-                            token_src_metadata[pool_row];
-                        const uint32_t source_vec =
-                            n_block * kVecsPerNBlock + vec;
-                        const uint4 value =
-                            reinterpret_cast<const uint4*>(
-                                ring_bf16 +
-                                static_cast<uint64_t>(ring_row) *
-                                    kHidden)[source_vec];
-                        auto* remote = sym_buffer.map(
-                            reinterpret_cast<uint4*>(
-                                symmetric_grad_x +
-                                (static_cast<uint64_t>(
-                                     metadata.topk_idx) *
-                                     capacity +
-                                 metadata.token_idx) *
-                                    kHidden) +
-                                source_vec,
-                            metadata.rank_idx);
-                        *remote = value;
+                    constexpr uint32_t kRowsPerWarp =
+                        kStoreBlockM / 8;
+                    for (uint32_t store = 0; store < num_stores;
+                         ++store) {
+                        #pragma unroll
+                        for (uint32_t atom = 0;
+                             atom < kLoadsPerStore; ++atom) {
+                            const uint32_t row_base =
+                                store * kStoreBlockM +
+                                atom * kRowsPerLoad;
+                            const uint32_t tmem_addr =
+                                accum_stage * kUMMAN + row_base;
+                            uint32_t values[kRowsPerLoad];
+                            cute::SM100_TMEM_LOAD_16dp256b1x::copy(
+                                tmem_addr,
+                                values[0], values[1], values[2], values[3]);
+                            cute::SM100_TMEM_LOAD_16dp256b1x::copy(
+                                tmem_addr | 0x00100000,
+                                values[4], values[5], values[6], values[7]);
+                            cutlass::arch::fence_view_async_tmem_load();
+                            const uint32_t outer_atom_offset =
+                                (epilogue_warp / 2) *
+                                kStoreBlockM * kSwizzle;
+                            const uint32_t inner_atom_offset =
+                                atom * kRowsPerLoad * kSwizzle;
+                            auto* smem_base =
+                                reinterpret_cast<uint8_t*>(
+                                    storage.smem_cd[0]) +
+                                outer_atom_offset + inner_atom_offset;
+                            const uint32_t smem_row = lane_idx % 8;
+                            const uint32_t smem_col =
+                                (epilogue_warp % 2) * 4 + lane_idx / 8;
+                            auto* smem_ptr = smem_base +
+                                smem_row * (kBankGroupBytes * 8) +
+                                (smem_col ^ smem_row) * kBankGroupBytes;
+                            ptx::SM90_U32x4_STSM_T<uint32_t>::copy(
+                                math::cast_into_bf16_and_pack(
+                                    values[0], values[1]),
+                                math::cast_into_bf16_and_pack(
+                                    values[2], values[3]),
+                                math::cast_into_bf16_and_pack(
+                                    values[4], values[5]),
+                                math::cast_into_bf16_and_pack(
+                                    values[6], values[7]),
+                                smem_ptr);
+                            if (store + 1 == num_stores &&
+                                atom + 1 == kLoadsPerStore) {
+                                ptx::tcgen05_before_thread_sync();
+                                storage.tmem_empty_barriers[accum_stage]
+                                    .arrive(0u);
+                            }
+                        }
+                        ptx::sync_aligned(128u, kEpilogueBarrier);
+
+                        const uint32_t row_in_atom =
+                            (epilogue_warp * 2 + lane_idx / 16) % 8;
+                        const uint32_t bank_group = lane_idx % 8;
+                        #pragma unroll
+                        for (uint32_t j = 0; j < kRowsPerWarp; ++j) {
+                            const uint32_t row_in_store =
+                                j * 8 + epilogue_warp * 2 + lane_idx / 16;
+                            const uint32_t row =
+                                store * kStoreBlockM + row_in_store;
+                            if (row < valid_m) {
+                                const uint32_t pool_row = pool_m + row;
+                                const auto metadata =
+                                    token_src_metadata[pool_row];
+                                const uint32_t vec = lane_idx % 16;
+                                const uint32_t source_vec =
+                                    n_block * kVecsPerNBlock + vec;
+                                const auto* smem_ptr =
+                                    reinterpret_cast<const uint8_t*>(
+                                        storage.smem_cd[0]) +
+                                    (lane_idx % 16 / 8) *
+                                        kStoreBlockM * kSwizzle +
+                                    row_in_store * kSwizzle +
+                                    (bank_group ^ row_in_atom) *
+                                        kBankGroupBytes;
+                                const uint4 value = ptx::ld_shared(
+                                    reinterpret_cast<const uint4*>(
+                                        smem_ptr));
+                                auto* remote = sym_buffer.map(
+                                    reinterpret_cast<uint4*>(
+                                        symmetric_grad_x +
+                                        (static_cast<uint64_t>(
+                                             metadata.topk_idx) *
+                                             capacity +
+                                         metadata.token_idx) *
+                                            kHidden) +
+                                        source_vec,
+                                    metadata.rank_idx);
+                                *remote = value;
+                            }
+                        }
+                        ptx::sync_aligned(128u, kEpilogueBarrier);
                     }
-                    ptx::sync_aligned(
-                        128u, kEpilogueBarrier);
                     if (epilogue_warp == 0 &&
                         cute::elect_one_sync()) {
                         __threadfence_system();
