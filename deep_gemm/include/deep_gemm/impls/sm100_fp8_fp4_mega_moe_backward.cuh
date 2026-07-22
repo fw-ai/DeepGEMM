@@ -5921,6 +5921,11 @@ sm103_fp8_block128_mega_moe_backward_impl(
     uint32_t* ring_grad_preact_sf,
     bf16_t* ring_bf16,
     float* ring_dscore,
+    fp8_t* full_x,
+    uint32_t* full_x_sf,
+    fp8_t* full_grad_y,
+    uint32_t* full_grad_y_sf,
+    float* full_scores,
     fp8_t* full_h,
     uint32_t* full_h_sf,
     fp8_t* full_grad_preact,
@@ -6039,12 +6044,19 @@ sm103_fp8_block128_mega_moe_backward_impl(
                     static_cast<uint64_t>(metadata.token_idx) * vecs_per_row +
                     vec,
                 metadata.rank_idx);
+            const uint4 x_value = *remote_x;
+            const uint4 grad_y_value = *remote_dy;
             reinterpret_cast<uint4*>(ring_x)[
-                static_cast<uint64_t>(row) * vecs_per_row + vec] =
-                *remote_x;
+                static_cast<uint64_t>(row) * vecs_per_row + vec] = x_value;
             reinterpret_cast<uint4*>(ring_grad_y)[
                 static_cast<uint64_t>(row) * vecs_per_row + vec] =
-                *remote_dy;
+                grad_y_value;
+            const uint64_t full_vec =
+                static_cast<uint64_t>(pool_row_offset + row) *
+                    vecs_per_row +
+                vec;
+            reinterpret_cast<uint4*>(full_x)[full_vec] = x_value;
+            reinterpret_cast<uint4*>(full_grad_y)[full_vec] = grad_y_value;
         }
         for (uint64_t linear = global_thread;
              linear < static_cast<uint64_t>(count) * hidden_blocks;
@@ -6058,22 +6070,30 @@ sm103_fp8_block128_mega_moe_backward_impl(
                 static_cast<uint64_t>(metadata.token_idx) * hidden_blocks +
                 block;
             const uint32_t sf_row = transform_sf_row(row);
-            ring_x_sf[block * sf_ring_tokens + sf_row] =
-                *sym_buffer.map(symmetric_x_sf + remote_index,
-                                metadata.rank_idx);
-            ring_grad_y_sf[block * sf_ring_tokens + sf_row] =
-                *sym_buffer.map(symmetric_grad_y_sf + remote_index,
-                                metadata.rank_idx);
+            const uint32_t x_scale = *sym_buffer.map(
+                symmetric_x_sf + remote_index, metadata.rank_idx);
+            const uint32_t grad_y_scale = *sym_buffer.map(
+                symmetric_grad_y_sf + remote_index, metadata.rank_idx);
+            ring_x_sf[block * sf_ring_tokens + sf_row] = x_scale;
+            ring_grad_y_sf[block * sf_ring_tokens + sf_row] = grad_y_scale;
+            const uint64_t full_scale =
+                static_cast<uint64_t>(pool_row_offset + row) *
+                    hidden_blocks +
+                block;
+            full_x_sf[full_scale] = x_scale;
+            full_grad_y_sf[full_scale] = grad_y_scale;
         }
         for (uint32_t row = global_thread; row < count;
              row += global_stride) {
             const auto metadata =
                 token_src_metadata[pool_row_offset + row];
-            ring_scores[row] = *sym_buffer.map(
+            const float score = *sym_buffer.map(
                 symmetric_scores +
                     static_cast<uint64_t>(metadata.token_idx) * kTopK +
                     metadata.topk_idx,
                 metadata.rank_idx);
+            ring_scores[row] = score;
+            full_scores[pool_row_offset + row] = score;
             ring_dscore[row] = 0.0f;
         }
         comm::grid_sync<kNumSMs, 0>(

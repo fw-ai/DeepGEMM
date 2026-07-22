@@ -1078,17 +1078,28 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
                         // Load weights from global into register cache per 32 tokens
                         DG_STATIC_ASSERT(32 % ATOM_M == 0, "Invalid block size");
-                        if ((j * ATOM_M) % 32 == 0 and (WG_BLOCK_M % 32 == 0 or j * ATOM_M + lane_idx < WG_BLOCK_M)) {
-                            stored_cached_weight = *l1_topk_weights_buffer
-                                .get_data_buffer(ring_m_idx + epilogue_wg_idx * WG_BLOCK_M + j * ATOM_M + lane_idx)
-                                .template get_base_ptr<float>();
+                        if constexpr (!kFP8Block128Weights) {
+                            if ((j * ATOM_M) % 32 == 0 and (WG_BLOCK_M % 32 == 0 or j * ATOM_M + lane_idx < WG_BLOCK_M)) {
+                                stored_cached_weight = *l1_topk_weights_buffer
+                                    .get_data_buffer(ring_m_idx + epilogue_wg_idx * WG_BLOCK_M + j * ATOM_M + lane_idx)
+                                    .template get_base_ptr<float>();
+                            }
                         }
 
-                        // Load weights from register cache
-                        const float2 weights = {
-                            ptx::exchange(stored_cached_weight, (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 0),
-                            ptx::exchange(stored_cached_weight, (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 1)
-                        };
+                        // Upstream MegaMoE folds each route score into L1
+                        // before the low-precision intermediate.  GLM's
+                        // canonical POST_DOWN contract instead applies the
+                        // FP32 score after W2 has produced BF16.  Retain the
+                        // upstream exchange only for the original FP4 path;
+                        // the FP8-block128 L2 epilogue reads the score for its
+                        // final BF16 row directly.
+                        float2 weights = {1.0f, 1.0f};
+                        if constexpr (!kFP8Block128Weights) {
+                            weights = {
+                                ptx::exchange(stored_cached_weight, (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 0),
+                                ptx::exchange(stored_cached_weight, (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 1)
+                            };
+                        }
 
                         // Load from TMEM
                         uint2 raw_values[4];
@@ -1210,7 +1221,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             } else {
                                 activated = {gate.x / denom.x, gate.y / denom.y};
                             }
-                            activation_values[i][k] = __fmul2_rn(__fmul2_rn(activated, up), weights);
+                            const auto unweighted = __fmul2_rn(activated, up);
+                            if constexpr (kFP8Block128Weights)
+                                activation_values[i][k] = unweighted;
+                            else
+                                activation_values[i][k] =
+                                    __fmul2_rn(unweighted, weights);
                         }
 
                         // Amax reduction (thread-level)
@@ -1429,7 +1445,34 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             (lane_idx % 16 / 8) * STORE_BLOCK_M * kSwizzleCDMode +
                             row_in_store * kSwizzleCDMode +
                             (bank_group_idx ^ row_in_atom) * kNumBankGroupBytes;
-                        const auto packed = ptx::ld_shared(reinterpret_cast<float4*>(smem_ptr));
+                        auto packed = ptx::ld_shared(reinterpret_cast<float4*>(smem_ptr));
+
+                        if constexpr (kFP8Block128Weights) {
+                            // Match GLM's frozen post-down semantics exactly:
+                            // W2's FP32 accumulator was rounded to BF16 when
+                            // written to shared memory above; convert that BF16
+                            // value back to FP32, multiply by the exact FP32
+                            // route score, and round once more to BF16 before
+                            // remote combine.  Moving this multiply into L1 is
+                            // not equivalent because it changes the E4M3
+                            // requantization scale and rounding before W2.
+                            const float route_weight = *l1_topk_weights_buffer
+                                .get_data_buffer(ring_m_idx + m_idx_in_block)
+                                .template get_base_ptr<float>();
+                            auto* packed_bf16 =
+                                reinterpret_cast<nv_bfloat162*>(&packed);
+                            #pragma unroll
+                            for (uint32_t pair = 0;
+                                 pair < sizeof(float4) / sizeof(nv_bfloat162);
+                                 ++pair) {
+                                const auto value =
+                                    __bfloat1622float2(packed_bf16[pair]);
+                                packed_bf16[pair] = __float22bfloat162_rn(
+                                    __fmul2_rn(
+                                        value,
+                                        {route_weight, route_weight}));
+                            }
+                        }
 
                         // Write into remote
                         const auto dst_token = combine_token_buffer.get_rank_buffer(dst_topk_idx)

@@ -179,6 +179,11 @@ struct PersistentWorkspaceLayout {
     deep_gemm::layout::Buffer backward_ring_grad_preact_scales;
     deep_gemm::layout::Buffer backward_ring_bf16;
     deep_gemm::layout::Buffer backward_ring_dscore;
+    deep_gemm::layout::Buffer backward_full_x;
+    deep_gemm::layout::Buffer backward_full_x_scales;
+    deep_gemm::layout::Buffer backward_full_grad_y;
+    deep_gemm::layout::Buffer backward_full_grad_y_scales;
+    deep_gemm::layout::Buffer backward_full_scores;
     deep_gemm::layout::Buffer backward_full_h;
     deep_gemm::layout::Buffer backward_full_h_scales;
     deep_gemm::layout::Buffer backward_full_grad_preact;
@@ -301,11 +306,36 @@ struct PersistentWorkspaceLayout {
             1,
             ring_tokens,
             backward_ring_bf16.get_end_ptr()),
+        backward_full_x(
+            deep_gemm::layout::Data(kPersistentHidden),
+            1,
+            workspace.num_max_pool_tokens,
+            backward_ring_dscore.get_end_ptr()),
+        backward_full_x_scales(
+            deep_gemm::layout::Data(kPersistentHidden / 32),
+            1,
+            workspace.num_max_pool_tokens,
+            backward_full_x.get_end_ptr()),
+        backward_full_grad_y(
+            deep_gemm::layout::Data(kPersistentHidden),
+            1,
+            workspace.num_max_pool_tokens,
+            backward_full_x_scales.get_end_ptr()),
+        backward_full_grad_y_scales(
+            deep_gemm::layout::Data(kPersistentHidden / 32),
+            1,
+            workspace.num_max_pool_tokens,
+            backward_full_grad_y.get_end_ptr()),
+        backward_full_scores(
+            deep_gemm::layout::Data(sizeof(float), false),
+            1,
+            workspace.num_max_pool_tokens,
+            backward_full_grad_y_scales.get_end_ptr()),
         backward_full_h(
             deep_gemm::layout::Data(kPersistentIntermediate),
             1,
             workspace.num_max_pool_tokens,
-            backward_ring_dscore.get_end_ptr()),
+            backward_full_scores.get_end_ptr()),
         backward_full_h_scales(
             deep_gemm::layout::Data(kPersistentIntermediate / 32),
             1,
@@ -2260,6 +2290,11 @@ void launch_persistent_backward_activation(
         layout.backward_ring_grad_preact_scales.get_base_ptr<uint32_t>(),
         layout.backward_ring_bf16.get_base_ptr<cutlass::bfloat16_t>(),
         layout.backward_ring_dscore.get_base_ptr<float>(),
+        layout.backward_full_x.get_base_ptr<cutlass::float_e4m3_t>(),
+        layout.backward_full_x_scales.get_base_ptr<uint32_t>(),
+        layout.backward_full_grad_y.get_base_ptr<cutlass::float_e4m3_t>(),
+        layout.backward_full_grad_y_scales.get_base_ptr<uint32_t>(),
+        layout.backward_full_scores.get_base_ptr<float>(),
         layout.backward_full_h.get_base_ptr<cutlass::float_e4m3_t>(),
         layout.backward_full_h_scales.get_base_ptr<uint32_t>(),
         layout.backward_full_grad_preact
@@ -2283,11 +2318,8 @@ void launch_persistent_wgrad(
     const torch::Tensor& output_0,
     const torch::Tensor& output_1,
     const torch::Tensor& buffer,
-    const std::vector<int64_t>& buffer_ptrs,
-    const int64_t rank,
     const PersistentWorkspaceLayout& layout,
-    const torch::Tensor& expert_counts,
-    const torch::Tensor& token_src_metadata
+    const torch::Tensor& expert_counts
 ) {
     constexpr int64_t output_rows =
         kW2 ? kPersistentHidden : kPersistentIntermediate;
@@ -2336,31 +2368,16 @@ void launch_persistent_wgrad(
     config.stream = at::cuda::getCurrentCUDAStream(buffer.get_device());
     config.attrs = &attribute;
     config.numAttrs = 1;
-    const auto sym_buffer = deep_gemm::layout::SymBuffer<kNumRanks>(
-        buffer_ptrs, static_cast<uint32_t>(rank));
-
-    auto* ring_operand = kW2
-        ? layout.backward_ring_grad_y
-              .get_base_ptr<cutlass::float_e4m3_t>()
-        : layout.l1_tokens.get_base_ptr<cutlass::float_e4m3_t>();
-    auto* ring_operand_sf = kW2
-        ? layout.backward_ring_grad_y_scales.get_base_ptr<uint32_t>()
-        : layout.l1_scales.get_base_ptr<uint32_t>();
     C10_CUDA_CHECK(cudaLaunchKernelEx(
         &config, kernel,
         expert_counts.data_ptr<int>(),
-        reinterpret_cast<const deep_gemm::layout::TokenSrcMetadata*>(
-            token_src_metadata.data_ptr<int>()),
-        layout.sf_ring_tokens,
-        sym_buffer, layout.workspace,
-        layout.input_tokens.get_base_ptr<cutlass::float_e4m3_t>(),
-        layout.input_scales.get_base_ptr<uint32_t>(),
-        layout.backward_grad_y_tokens
+        layout.workspace.num_max_pool_tokens,
+        layout.backward_full_x.get_base_ptr<cutlass::float_e4m3_t>(),
+        layout.backward_full_x_scales.get_base_ptr<uint32_t>(),
+        layout.backward_full_grad_y
             .get_base_ptr<cutlass::float_e4m3_t>(),
-        layout.backward_grad_y_scales.get_base_ptr<uint32_t>(),
-        layout.input_topk_scores.get_base_ptr<float>(),
-        ring_operand, ring_operand_sf,
-        layout.l1_scores.get_base_ptr<float>(),
+        layout.backward_full_grad_y_scales.get_base_ptr<uint32_t>(),
+        layout.backward_full_scores.get_base_ptr<float>(),
         layout.backward_full_h.get_base_ptr<cutlass::float_e4m3_t>(),
         layout.backward_full_h_scales.get_base_ptr<uint32_t>(),
         layout.backward_full_grad_preact
@@ -2554,34 +2571,26 @@ persistent_backward(
     if (num_sms == kPersistentLocalSMs) {
         if (buffer_ptrs.size() == 2) {
             launch_persistent_wgrad<2, kPersistentLocalSMs, true>(
-                grad_w2, grad_w2, buffer, buffer_ptrs, rank, layout,
-                expert_counts, token_src_metadata);
+                grad_w2, grad_w2, buffer, layout, expert_counts);
             launch_persistent_wgrad<2, kPersistentLocalSMs, false>(
-                grad_w1, grad_w3, buffer, buffer_ptrs, rank, layout,
-                expert_counts, token_src_metadata);
+                grad_w1, grad_w3, buffer, layout, expert_counts);
         } else {
             launch_persistent_wgrad<16, kPersistentLocalSMs, true>(
-                grad_w2, grad_w2, buffer, buffer_ptrs, rank, layout,
-                expert_counts, token_src_metadata);
+                grad_w2, grad_w2, buffer, layout, expert_counts);
             launch_persistent_wgrad<16, kPersistentLocalSMs, false>(
-                grad_w1, grad_w3, buffer, buffer_ptrs, rank, layout,
-                expert_counts, token_src_metadata);
+                grad_w1, grad_w3, buffer, layout, expert_counts);
         }
     } else {
         if (buffer_ptrs.size() == 2) {
             launch_persistent_wgrad<2, kPersistentProductionSMs, true>(
-                grad_w2, grad_w2, buffer, buffer_ptrs, rank, layout,
-                expert_counts, token_src_metadata);
+                grad_w2, grad_w2, buffer, layout, expert_counts);
             launch_persistent_wgrad<2, kPersistentProductionSMs, false>(
-                grad_w1, grad_w3, buffer, buffer_ptrs, rank, layout,
-                expert_counts, token_src_metadata);
+                grad_w1, grad_w3, buffer, layout, expert_counts);
         } else {
             launch_persistent_wgrad<16, kPersistentProductionSMs, true>(
-                grad_w2, grad_w2, buffer, buffer_ptrs, rank, layout,
-                expert_counts, token_src_metadata);
+                grad_w2, grad_w2, buffer, layout, expert_counts);
             launch_persistent_wgrad<16, kPersistentProductionSMs, false>(
-                grad_w1, grad_w3, buffer, buffer_ptrs, rank, layout,
-                expert_counts, token_src_metadata);
+                grad_w1, grad_w3, buffer, layout, expert_counts);
         }
     }
     return {grad_x, grad_scores, grad_w1, grad_w2, grad_w3};
