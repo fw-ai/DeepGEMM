@@ -35,6 +35,7 @@ template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
           GemmType kGemmType, bool kWithAccumulation, typename cd_dtype_t,
           uint64_t kTensorCoreUtilControl,
           uint32_t kCombineNumRanks, bool kFuseCombine,
+          CombineOrderMode kCombineOrderMode,
           uint32_t kNumExtraCombineThreads>
 CUTLASS_GLOBAL void __launch_bounds__(
     kNumNonEpilogueThreads + kNumEpilogueThreads +
@@ -49,6 +50,7 @@ sm100_bf16_gemm_impl(int* grouped_layout,
                      const __grid_constant__ layout::Workspace combine_workspace,
                      cutlass::bfloat16_t* grad_x_output,
                      cutlass::bfloat16_t* combine_buffer,
+                     const int64_t* combine_topk_ids,
                      uint32_t combine_num_tokens,
                      uint32_t combine_num_max_tokens,
                      uint32_t combine_num_topk,
@@ -79,7 +81,9 @@ sm100_bf16_gemm_impl(int* grouped_layout,
     constexpr uint32_t UMMA_K = 16;
     constexpr uint32_t LOAD_BLOCK_M = BLOCK_M / (kIsMulticastOnA ? kNumMulticast: 1);
     constexpr uint32_t LOAD_BLOCK_N = BLOCK_N / (kIsMulticastOnA ? 1 : kNumMulticast);
-    DG_STATIC_ASSERT(BLOCK_K_ == 64, "Invalid block K");
+    DG_STATIC_ASSERT(
+        BLOCK_K_ == 16 || BLOCK_K_ == 32 || BLOCK_K_ == 64,
+        "Invalid block K");
     DG_STATIC_ASSERT(BLOCK_K % UMMA_K == 0, "Block K must be divisible by UMMA K");
     DG_STATIC_ASSERT(kKAlignment % UMMA_K == 0, "K alignment must be divisible by UMMA K");
     DG_STATIC_ASSERT(kNumMulticast == 1 or kNumMulticast == 2, "Only support 1/2 multicast");
@@ -469,7 +473,9 @@ sm100_bf16_gemm_impl(int* grouped_layout,
                     kBeforeCombineReuseTag>(
                     combine_workspace, combine_sym_buffer,
                     blockIdx.x, combine_thread_idx,
-                    combine_sync);
+                    combine_sync,
+                    /* Kernel launch order publishes Kernel A locally. */ false,
+                    /* Kernel completion joins SM 0 after cross-rank sync. */ false);
             } else {
                 // Kernel A has already written every remote top-k plane.
                 // W13's combine warps reduce those planes while the
@@ -499,37 +505,191 @@ sm100_bf16_gemm_impl(int* grouped_layout,
                             num_vecs_per_token;
                     float values[kReduceValuesPerVec] = {
                         0.0f};
-                    #pragma unroll
-                    for (uint32_t topk_idx = 0;
-                         topk_idx < combine_num_topk;
-                         ++topk_idx) {
-                        const uint64_t packed_idx =
-                            ((static_cast<uint64_t>(
-                                  topk_idx) *
+                    const auto accumulate_slot =
+                        [&](float* dst,
+                            const uint32_t topk_idx) {
+                            const uint64_t packed_idx =
+                                ((static_cast<uint64_t>(
+                                      topk_idx) *
                                   combine_num_max_tokens +
-                              token_idx) *
-                                 num_vecs_per_token +
-                             vec_idx) *
-                            2;
-                        uint4 packed[2];
-                        packed[0] =
-                            reinterpret_cast<const uint4*>(
-                                combine_buffer)[
-                                packed_idx];
-                        packed[1] =
-                            reinterpret_cast<const uint4*>(
-                                combine_buffer)[
-                                packed_idx + 1];
-                        const auto* packed_values =
-                            reinterpret_cast<
-                                const cutlass::bfloat16_t*>(
-                                packed);
-                        #pragma unroll
-                        for (uint32_t i = 0;
-                             i < kReduceValuesPerVec; ++i)
-                            values[i] +=
-                                static_cast<float>(
-                                    packed_values[i]);
+                                  token_idx) *
+                                     num_vecs_per_token +
+                                 vec_idx) *
+                                2;
+                            uint4 packed[2];
+                            packed[0] =
+                                reinterpret_cast<
+                                    const uint4*>(
+                                    combine_buffer)[
+                                    packed_idx];
+                            packed[1] =
+                                reinterpret_cast<
+                                    const uint4*>(
+                                    combine_buffer)[
+                                    packed_idx + 1];
+                            const auto* packed_values =
+                                reinterpret_cast<
+                                    const cutlass::bfloat16_t*>(
+                                    packed);
+                            #pragma unroll
+                            for (uint32_t i = 0;
+                                 i < kReduceValuesPerVec;
+                                 ++i) {
+                                dst[i] +=
+                                    static_cast<float>(
+                                        packed_values[i]);
+                            }
+                        };
+                    if constexpr (
+                        kCombineOrderMode ==
+                        CombineOrderMode::FixedTopK) {
+                        for (uint32_t topk_idx = 0;
+                             topk_idx <
+                                 combine_num_topk;
+                             ++topk_idx) {
+                            accumulate_slot(
+                                values, topk_idx);
+                        }
+                    } else {
+                        DG_DEVICE_ASSERT(
+                            combine_topk_ids != nullptr);
+                        DG_DEVICE_ASSERT(
+                            combine_num_topk <= 32);
+                        const uint32_t
+                            num_rank_iterations =
+                                kCombineOrderMode ==
+                                        CombineOrderMode::
+                                            DeepEPV1
+                                ? kCombineNumRanks
+                                : combine_num_topk;
+                        for (uint32_t rank_iteration = 0;
+                             rank_iteration <
+                                 num_rank_iterations;
+                             ++rank_iteration) {
+                            int dst_rank;
+                            if constexpr (
+                                kCombineOrderMode ==
+                                CombineOrderMode::
+                                    DeepEPV1) {
+                                dst_rank =
+                                    static_cast<int>(
+                                        rank_iteration);
+                                bool rank_is_present =
+                                    false;
+                                for (uint32_t i = 0;
+                                     i <
+                                         combine_num_topk;
+                                     ++i) {
+                                    const int64_t
+                                        expert_idx =
+                                            combine_topk_ids[
+                                                static_cast<
+                                                    uint64_t>(
+                                                    token_idx) *
+                                                    combine_num_topk +
+                                                i];
+                                    rank_is_present |=
+                                        expert_idx >= 0 &&
+                                        expert_idx /
+                                                kNumGroups ==
+                                            dst_rank;
+                                }
+                                if (!rank_is_present)
+                                    continue;
+                            } else {
+                                const int64_t
+                                    expert_idx =
+                                        combine_topk_ids[
+                                            static_cast<
+                                                uint64_t>(
+                                                token_idx) *
+                                                combine_num_topk +
+                                            rank_iteration];
+                                if (expert_idx < 0)
+                                    continue;
+                                dst_rank =
+                                    static_cast<int>(
+                                        expert_idx /
+                                        kNumGroups);
+                                bool appears_later =
+                                    false;
+                                for (uint32_t i =
+                                         rank_iteration +
+                                         1;
+                                     i <
+                                         combine_num_topk;
+                                     ++i) {
+                                    const int64_t
+                                        later_expert_idx =
+                                            combine_topk_ids[
+                                                static_cast<
+                                                    uint64_t>(
+                                                    token_idx) *
+                                                    combine_num_topk +
+                                                i];
+                                    appears_later |=
+                                        later_expert_idx >=
+                                            0 &&
+                                        later_expert_idx /
+                                                kNumGroups ==
+                                            dst_rank;
+                                }
+                                if (appears_later)
+                                    continue;
+                            }
+
+                            float rank_values[
+                                kReduceValuesPerVec] = {
+                                0.0f};
+                            uint32_t rank_mask = 0;
+                            for (uint32_t topk_idx = 0;
+                                 topk_idx <
+                                     combine_num_topk;
+                                 ++topk_idx) {
+                                const int64_t
+                                    expert_idx =
+                                        combine_topk_ids[
+                                            static_cast<
+                                                uint64_t>(
+                                                token_idx) *
+                                                combine_num_topk +
+                                            topk_idx];
+                                if (expert_idx >= 0 &&
+                                    expert_idx /
+                                            kNumGroups ==
+                                        dst_rank) {
+                                    rank_mask |=
+                                        1u << topk_idx;
+                                }
+                            }
+                            // TorchTitan's deterministic DeepEP V1 and V2
+                            // paths both reduce each rank partial in source
+                            // top-k slot order. Their cross-rank orders remain
+                            // distinct.
+                            while (rank_mask) {
+                                uint32_t selected_slot =
+                                    __ffs(rank_mask) - 1;
+                                rank_mask &=
+                                    ~(1u << selected_slot);
+                                accumulate_slot(
+                                    rank_values,
+                                    selected_slot);
+                            }
+                            #pragma unroll
+                            for (uint32_t i = 0;
+                                 i <
+                                     kReduceValuesPerVec;
+                                 ++i) {
+                                const cutlass::
+                                    bfloat16_t
+                                        rank_partial(
+                                            rank_values[
+                                                i]);
+                                values[i] +=
+                                    static_cast<float>(
+                                        rank_partial);
+                            }
+                        }
                     }
                     uint4 packed_output[2];
                     auto* output_values =

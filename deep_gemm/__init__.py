@@ -91,6 +91,8 @@ except ImportError:
 
 # Mega kernels
 from .mega import (
+    CombineOrderMode,
+    RouteWeightMode,
     SymmBuffer,
     get_symm_buffer_for_mega_moe,
     transform_weights_for_mega_moe,
@@ -98,11 +100,13 @@ from .mega import (
     bf16_mega_moe,
 )
 from .mega.backward import (
+    bf16_mega_moe_backward_dgrad,
     bf16_mega_moe_backward_w13,
     bf16_mega_moe_backward_w13_combine,
     bf16_mega_moe_backward_w2,
     bf16_mega_moe_backward_w2_combine,
     fp8_fp4_mega_moe_backward_dgrad_swiglu,
+    mega_moe_backward_combine_grad_x,
 )
 
 # Some utils

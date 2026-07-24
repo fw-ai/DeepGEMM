@@ -11,11 +11,13 @@ struct MegaMoEBackwardCombineArgs {
     layout::Workspace workspace{nullptr, 1, 1, 1, 1, 1};
     cutlass::bfloat16_t* grad_x_output = nullptr;
     cutlass::bfloat16_t* combine_buffer = nullptr;
+    const int64_t* topk_ids = nullptr;
     uint32_t num_tokens = 0;
     uint32_t num_max_tokens = 0;
     uint32_t num_topk = 0;
     uint32_t hidden = 0;
     bool reduce = false;
+    std::string order_mode = "fixed_topk";
 };
 
 // Dedicated single-CTA specialization for MegaMoE local expert wgrad.
@@ -26,6 +28,7 @@ static void sm100_bf16_mega_moe_wgrad_1sm(
     const torch::Tensor& b,
     const torch::Tensor& d,
     const torch::Tensor& padded_expert_counts,
+    const int pool_block_m,
     const MegaMoEBackwardCombineArgs& combine = {}) {
     const auto [num_groups, m, n] = get_shape<3>(d);
     const auto [pool_rows_a, m_] = get_shape<2>(a);
@@ -41,15 +44,33 @@ static void sm100_bf16_mega_moe_wgrad_1sm(
         d.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(a.is_contiguous() and b.is_contiguous() and d.is_contiguous());
 
-    constexpr int kBlockM = 128;
+    DG_HOST_ASSERT(
+        pool_block_m == 16 || pool_block_m == 32 ||
+        pool_block_m == 64 || pool_block_m == 96 ||
+        pool_block_m == 128 || pool_block_m == 192);
+    const int kBlockM = get_env<int>(
+        "DG_BF16_MEGA_MOE_WGRAD_BLOCK_M", 128);
     // Amortize each A tile and scheduler assignment across twice as much
     // tensor-core work whenever the output width permits a full 256-column
     // tile. Keep the 128-column fallback for non-divisible model dimensions.
-    const int kBlockN = n % 256 == 0 ? 256 : 128;
-    constexpr int kBlockK = 64;
-    constexpr int kNumStages = 4;
-    constexpr int kSwizzle = 128;
-    constexpr int kStoreBlockN = 64;
+    const int kBlockN = get_env<int>(
+        "DG_BF16_MEGA_MOE_WGRAD_BLOCK_N",
+        n % 256 == 0 ? 256 : 128);
+    // The K-grouped scheduler addresses each expert in the shared physical
+    // pool. Its K tile must divide the forward pool alignment; otherwise the
+    // final tile of one expert reads rows from the next expert. In particular,
+    // BLOCK_M=96 previously contaminated Qwen top-8 wgrads while BLOCK_M=128
+    // happened to pass.
+    const int kBlockK = get_env<int>(
+        "DG_BF16_MEGA_MOE_WGRAD_BLOCK_K",
+        pool_block_m % 64 == 0 ? 64 :
+        pool_block_m % 32 == 0 ? 32 : 16);
+    const int kNumStages = get_env<int>(
+        "DG_BF16_MEGA_MOE_WGRAD_NUM_STAGES", 4);
+    const int kSwizzle =
+        kBlockK * static_cast<int>(sizeof(cutlass::bfloat16_t));
+    const int kStoreBlockN = get_env<int>(
+        "DG_BF16_MEGA_MOE_WGRAD_STORE_BLOCK_N", 64);
     constexpr int kNumNonEpilogueThreads = 128;
     constexpr int kNumEpilogueThreads = 128;
     // Production combine always uses four warps: the two original non-MMA
@@ -148,11 +169,13 @@ static void sm100_bf16_mega_moe_wgrad_1sm(
         .combine_workspace = combine.workspace,
         .grad_x_output = combine.grad_x_output,
         .combine_buffer = combine.combine_buffer,
+        .combine_topk_ids = combine.topk_ids,
         .combine_num_tokens = combine.num_tokens,
         .combine_num_max_tokens = combine.num_max_tokens,
         .combine_num_topk = combine.num_topk,
         .combine_hidden = combine.hidden,
         .combine_reduce = combine.reduce,
+        .combine_order_mode = combine.order_mode,
         .combine_num_extra_threads =
             static_cast<uint32_t>(num_extra_combine_threads),
     };

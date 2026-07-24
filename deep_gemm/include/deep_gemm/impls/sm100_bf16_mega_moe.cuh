@@ -6,6 +6,7 @@
 
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/tma_copy.cuh>
+#include <deep_gemm/common/types.cuh>
 #include <deep_gemm/common/utils.cuh>
 #include <deep_gemm/comm/barrier.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
@@ -33,6 +34,13 @@ template <
     uint32_t kNumSMs, uint32_t kNumRanks,
     float kActivationClamp,
     bool kFastMath,
+    ActivationType kActivationType,
+    bool kSaveL1Preact,
+    bool kSaveStageActivations,
+    RouteWeightMode kRouteWeightMode,
+    CombineOrderMode kCombineOrderMode,
+    bool kSaveDownUnweighted,
+    bool kSaveX,
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
     uint32_t L2_SHAPE_N = kHidden,
@@ -48,14 +56,22 @@ template <
 >
 CUTLASS_GLOBAL __launch_bounds__(kNumThreads, 1) void
 sm100_bf16_mega_moe_impl(void* y,
+                         nv_bfloat16* saved_l1_preact,
+                         nv_bfloat16* saved_h_unweighted,
+                         nv_bfloat16* saved_h_weighted,
+                         nv_bfloat16* saved_x,
                          int* cumulative_local_expert_recv_stats,
+                         const int* precomputed_route_counts,
+                         int* route_count_mismatch,
                          const uint32_t num_tokens,
+                         const uint32_t num_saved_pool_tokens,
                          const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_l1_weights,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_l1_output,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts,
-                         const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights) {
+                         const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights,
+                         const __grid_constant__ cute::TmaDescriptor tensor_map_down_unweighted) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::TMEM::Allocator2Sm;
@@ -80,6 +96,9 @@ sm100_bf16_mega_moe_impl(void* y,
         cute::prefetch_tma_descriptor(&tensor_map_l1_output);
         cute::prefetch_tma_descriptor(&tensor_map_l2_acts);
         cute::prefetch_tma_descriptor(&tensor_map_l2_weights);
+        if constexpr (kSaveDownUnweighted)
+            cute::prefetch_tma_descriptor(
+                &tensor_map_down_unweighted);
     }
 
     // Workspaces
@@ -326,14 +345,243 @@ sm100_bf16_mega_moe_impl(void* y,
         }
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
-        // Write source indices (~2 us with 512 tokens)
-        read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
-            const auto dst_rank_idx = expert_idx / kNumExpertsPerRank;
-            const auto dst_slot_idx = atomicAdd_block(shared_storage.expert_token_count + expert_idx, 1);
-            const auto dst_ptr = workspace.get_src_token_topk_idx_ptr(
-                expert_idx % kNumExpertsPerRank, sym_buffer.rank_idx, dst_slot_idx);
-            *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;
-        });
+        if constexpr (kSaveL1Preact) {
+            // Training wgrads must traverse the same stable
+            // expert/source-rank/token/top-k order as native DeepEP. Partition
+            // the source routes into contiguous global-warp ranges, build an
+            // expert prefix for every range, then compact each range in route
+            // order. This preserves the exact order without making every
+            // expert warp rescan the complete route tensor.
+            const uint32_t global_warp_idx =
+                sm_idx * kNumDispatchWarps + warp_idx;
+            constexpr uint32_t kNumGlobalWarps =
+                kNumSMs * kNumDispatchWarps;
+            constexpr uint32_t kWarpSize = 32;
+            constexpr uint32_t kScratchValues =
+                kNumGlobalWarps * kNumExperts;
+            const bool use_parallel_stable_compaction =
+                3 * workspace.num_max_pool_tokens >= kScratchValues;
+            if (use_parallel_stable_compaction) {
+                auto warp_expert_prefix = reinterpret_cast<uint32_t*>(
+                    workspace.get_token_src_metadata_ptr());
+                const uint32_t num_routes = num_tokens * kNumTopk;
+                const uint32_t routes_per_warp = math::align(
+                    math::ceil_div(num_routes, kNumGlobalWarps),
+                    kWarpSize);
+                const uint32_t route_begin =
+                    global_warp_idx * routes_per_warp;
+                const uint32_t route_end =
+                    cute::min(route_begin + routes_per_warp, num_routes);
+                auto warp_prefix_row =
+                    warp_expert_prefix +
+                    global_warp_idx * kNumExperts;
+
+                DG_STATIC_ASSERT(
+                    kNumBytesPerPull >=
+                        kNumExperts * sizeof(uint32_t),
+                    "Dispatch scratch is too small for stable counters");
+                auto local_expert_count =
+                    reinterpret_cast<uint32_t*>(
+                        shared_storage
+                            .dispatch_send_buffer[warp_idx]);
+                for (uint32_t expert_idx = lane_idx;
+                     expert_idx < kNumExperts;
+                     expert_idx += kWarpSize) {
+                    local_expert_count[expert_idx] = 0;
+                }
+                __syncwarp();
+                for (uint32_t route_base = route_begin;
+                     route_base < route_end;
+                     route_base += kWarpSize) {
+                    const uint32_t token_topk_idx =
+                        route_base + lane_idx;
+                    int expert_idx = -1;
+                    if (token_topk_idx < route_end) {
+                        expert_idx = static_cast<int>(
+                            __ldg(
+                                input_topk_idx_buffer
+                                    .get_base_ptr<int64_t>() +
+                                token_topk_idx));
+                    }
+                    if (expert_idx >= 0)
+                        atomicAdd_block(
+                            local_expert_count + expert_idx, 1u);
+                }
+                __syncwarp();
+                for (uint32_t expert_idx = lane_idx;
+                     expert_idx < kNumExperts;
+                     expert_idx += kWarpSize) {
+                    warp_prefix_row[expert_idx] =
+                        local_expert_count[expert_idx];
+                }
+
+                comm::grid_sync<
+                    kNumSMs, kDispatchGridSyncIndex>(
+                    workspace, sm_idx, thread_idx,
+                    [=]() {
+                        ptx::sync_aligned(
+                            kNumDispatchThreads,
+                            kDispatchBarrierIdx);
+                    });
+
+                if (
+                    global_warp_idx < kNumExperts &&
+                    lane_idx == 0) {
+                    uint32_t prefix = 0;
+                    for (uint32_t source_warp = 0;
+                         source_warp < kNumGlobalWarps;
+                         ++source_warp) {
+                        auto count_ptr =
+                            warp_expert_prefix +
+                            source_warp * kNumExperts +
+                            global_warp_idx;
+                        const uint32_t count = *count_ptr;
+                        *count_ptr = prefix;
+                        prefix += count;
+                    }
+                }
+
+                comm::grid_sync<
+                    kNumSMs, kDispatchGridSyncIndex>(
+                    workspace, sm_idx, thread_idx,
+                    [=]() {
+                        ptx::sync_aligned(
+                            kNumDispatchThreads,
+                            kDispatchBarrierIdx);
+                    });
+
+                for (uint32_t expert_idx = lane_idx;
+                     expert_idx < kNumExperts;
+                     expert_idx += kWarpSize) {
+                    local_expert_count[expert_idx] = 0;
+                }
+                __syncwarp();
+
+                for (uint32_t route_base = route_begin;
+                     route_base < route_end;
+                     route_base += kWarpSize) {
+                    const uint32_t token_topk_idx =
+                        route_base + lane_idx;
+                    int expert_idx = -1;
+                    if (token_topk_idx < route_end) {
+                        expert_idx = static_cast<int>(
+                            __ldg(
+                                input_topk_idx_buffer
+                                    .get_base_ptr<int64_t>() +
+                                token_topk_idx));
+                    }
+                    const uint32_t active_mask =
+                        __ballot_sync(
+                            0xffffffff, expert_idx >= 0);
+                    if (expert_idx >= 0) {
+                        const uint32_t matches =
+                            __match_any_sync(
+                                active_mask, expert_idx);
+                        const uint32_t lanes_before =
+                            (1u << lane_idx) - 1u;
+                        const uint32_t dst_slot_idx =
+                            warp_prefix_row[expert_idx] +
+                            local_expert_count[expert_idx] +
+                            __popc(matches & lanes_before);
+                        const uint32_t dst_rank_idx =
+                            expert_idx / kNumExpertsPerRank;
+                        const auto dst_ptr =
+                            workspace
+                                .get_src_token_topk_idx_ptr(
+                                    expert_idx %
+                                        kNumExpertsPerRank,
+                                    sym_buffer.rank_idx,
+                                    dst_slot_idx);
+                        *sym_buffer.map(
+                            dst_ptr, dst_rank_idx) =
+                            token_topk_idx;
+                        if (
+                            lane_idx ==
+                            static_cast<uint32_t>(
+                                __ffs(matches) - 1)) {
+                            local_expert_count[expert_idx] +=
+                                __popc(matches);
+                        }
+                    }
+                    __syncwarp();
+                }
+            } else {
+                // Tiny workspaces cannot hold the global-warp prefix table.
+                // Retain the original one-warp-per-expert exact path.
+                for (uint32_t target_expert = global_warp_idx;
+                     target_expert < kNumExperts;
+                     target_expert += kNumGlobalWarps) {
+                    uint32_t dst_slot_base = 0;
+                    for (uint32_t route_base = 0;
+                         route_base < num_tokens * kNumTopk;
+                         route_base += kWarpSize) {
+                        const uint32_t token_topk_idx =
+                            route_base + lane_idx;
+                        int expert_idx = -1;
+                        if (
+                            token_topk_idx <
+                            num_tokens * kNumTopk) {
+                            expert_idx = static_cast<int>(
+                                __ldg(
+                                    input_topk_idx_buffer
+                                        .get_base_ptr<int64_t>() +
+                                    token_topk_idx));
+                        }
+                        const uint32_t matches =
+                            __ballot_sync(
+                                0xffffffff,
+                                expert_idx ==
+                                    static_cast<int>(
+                                        target_expert));
+                        if (
+                            expert_idx ==
+                            static_cast<int>(target_expert)) {
+                            const uint32_t lanes_before =
+                                (1u << lane_idx) - 1u;
+                            const uint32_t dst_slot_idx =
+                                dst_slot_base +
+                                __popc(
+                                    matches & lanes_before);
+                            const uint32_t dst_rank_idx =
+                                target_expert /
+                                kNumExpertsPerRank;
+                            const auto dst_ptr =
+                                workspace
+                                    .get_src_token_topk_idx_ptr(
+                                        target_expert %
+                                            kNumExpertsPerRank,
+                                        sym_buffer.rank_idx,
+                                        dst_slot_idx);
+                            *sym_buffer.map(
+                                dst_ptr, dst_rank_idx) =
+                                token_topk_idx;
+                        }
+                        dst_slot_base += __popc(matches);
+                    }
+                }
+            }
+        } else {
+            // Inference keeps round-robin pull order for NVLink balance.
+            read_topk_idx([&](
+                              const uint32_t&
+                                  token_topk_idx,
+                              const int& expert_idx) {
+                const auto dst_rank_idx =
+                    expert_idx / kNumExpertsPerRank;
+                const auto dst_slot_idx =
+                    atomicAdd_block(
+                        shared_storage.expert_token_count +
+                        expert_idx,
+                        1);
+                const auto dst_ptr =
+                    workspace.get_src_token_topk_idx_ptr(
+                        expert_idx % kNumExpertsPerRank,
+                        sym_buffer.rank_idx,
+                        dst_slot_idx);
+                *sym_buffer.map(dst_ptr, dst_rank_idx) =
+                    token_topk_idx;
+            });
+        }
 
         // Grid sync
         comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(
@@ -348,12 +596,37 @@ sm100_bf16_mega_moe_impl(void* y,
                 const auto dst_rank_idx = i / kNumExpertsPerRank;
                 const auto dst_local_expert_idx = i % kNumExpertsPerRank;
                 const auto expert_status = *workspace.get_expert_send_count_ptr(i);
+                const uint32_t actual_count =
+                    static_cast<uint32_t>(
+                        expert_status & 0xffffffff);
+                uint32_t published_count = actual_count;
+                if (precomputed_route_counts != nullptr) {
+                    const int expected_count =
+                        precomputed_route_counts[i];
+                    if (
+                        expected_count < 0 ||
+                        static_cast<uint32_t>(
+                            expected_count) != actual_count
+                    ) {
+                        atomicExch(
+                            route_count_mismatch, 1);
+                    }
+                    published_count =
+                        expected_count >= 0
+                        ? static_cast<uint32_t>(
+                              expected_count)
+                        : actual_count;
+                }
+                const uint64_t published_status =
+                    (expert_status &
+                     0xffffffff00000000ull) |
+                    published_count;
                 *sym_buffer.map(
                     workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
-                    dst_rank_idx) = expert_status & 0xffffffff;
+                    dst_rank_idx) = published_count;
                 ptx::atomic_add_sys(
                     sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx), dst_rank_idx),
-                    expert_status);
+                    published_status);
             }
         }
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
@@ -417,54 +690,92 @@ sm100_bf16_mega_moe_impl(void* y,
                 }
             }
 
-            // Round-robin rank selection via iterative min-peeling
             uint32_t current_rank_in_expert_idx;
-            uint32_t remaining[kNumRanksPerLane];
-            #pragma unroll
-            for (uint32_t i = 0; i < kNumRanksPerLane; ++ i)
-                remaining[i] = stored_rank_count[i];
-            uint32_t offset = 0;
             uint32_t token_idx_in_expert = token_idx - expert_start_idx;
-            uint32_t slot_idx = token_idx_in_expert;
             uint32_t token_idx_in_rank;
-            while (true) {
-                // Compute active count and min across all ranks
-                // NOTES: reduce within each lane first, then warp-reduce once
-                uint32_t num_actives_in_lane = 0;
-                uint32_t min_in_lane = 0xffffffff;
+            if constexpr (kSaveL1Preact) {
+                // Match native DeepEP's rank-major stable route order.
+                uint32_t slot_idx = token_idx_in_expert;
+                current_rank_in_expert_idx = 0;
+                token_idx_in_rank = 0;
                 #pragma unroll
-                for (uint32_t i = 0; i < kNumRanksPerLane; ++ i) {
-                    num_actives_in_lane += remaining[i] > 0;
-                    if (remaining[i] > 0)
-                        min_in_lane = cute::min(min_in_lane, remaining[i]);
+                for (uint32_t rank_idx = 0;
+                     rank_idx < kNumRanks; ++rank_idx) {
+                    const uint32_t rank_count =
+                        __shfl_sync(
+                            0xffffffff,
+                            stored_rank_count[
+                                rank_idx / 32],
+                            rank_idx % 32);
+                    if (slot_idx < rank_count) {
+                        current_rank_in_expert_idx =
+                            rank_idx;
+                        token_idx_in_rank = slot_idx;
+                        break;
+                    }
+                    slot_idx -= rank_count;
                 }
-                const uint32_t num_active_ranks = __reduce_add_sync(0xffffffff, num_actives_in_lane);
-                const uint32_t length = __reduce_min_sync(0xffffffff, min_in_lane);
-
-                // Hit in the current round
-                const uint32_t num_round_tokens = length * num_active_ranks;
-                if (slot_idx < num_round_tokens) {
-                    const uint32_t slot_idx_in_round = slot_idx % num_active_ranks;
-                    uint32_t num_seen_ranks = 0;
-                    current_rank_in_expert_idx = 0;
+            } else {
+                // Round-robin rank selection via iterative min-peeling.
+                uint32_t remaining[kNumRanksPerLane];
+                #pragma unroll
+                for (uint32_t i = 0;
+                     i < kNumRanksPerLane; ++i)
+                    remaining[i] =
+                        stored_rank_count[i];
+                uint32_t offset = 0;
+                uint32_t slot_idx =
+                    token_idx_in_expert;
+                while (true) {
+                    uint32_t num_actives_in_lane = 0;
+                    uint32_t min_in_lane = 0xffffffff;
                     #pragma unroll
                     for (uint32_t i = 0; i < kNumRanksPerLane; ++ i) {
-                        const uint32_t mask = __ballot_sync(0xffffffff, remaining[i] > 0);
-                        const uint32_t num_active_lanes = __popc(mask);
-                        if (slot_idx_in_round >= num_seen_ranks and slot_idx_in_round < num_seen_ranks + num_active_lanes)
-                            current_rank_in_expert_idx = i * 32 + __fns(mask, 0, slot_idx_in_round - num_seen_ranks + 1);
-                        num_seen_ranks += num_active_lanes;
+                        num_actives_in_lane +=
+                            remaining[i] > 0;
+                        if (remaining[i] > 0)
+                            min_in_lane = cute::min(
+                                min_in_lane,
+                                remaining[i]);
                     }
-                    token_idx_in_rank = offset + (slot_idx / num_active_ranks);
-                    break;
+                    const uint32_t num_active_ranks =
+                        __reduce_add_sync(
+                            0xffffffff,
+                            num_actives_in_lane);
+                    const uint32_t length =
+                        __reduce_min_sync(
+                            0xffffffff, min_in_lane);
+                    const uint32_t num_round_tokens =
+                        length * num_active_ranks;
+                    if (slot_idx < num_round_tokens) {
+                        const uint32_t slot_idx_in_round =
+                            slot_idx % num_active_ranks;
+                        uint32_t num_seen_ranks = 0;
+                        current_rank_in_expert_idx = 0;
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kNumRanksPerLane; ++ i) {
+                            const uint32_t mask =
+                                __ballot_sync(
+                                    0xffffffff,
+                                    remaining[i] > 0);
+                            const uint32_t num_active_lanes =
+                                __popc(mask);
+                            if (slot_idx_in_round >= num_seen_ranks and slot_idx_in_round < num_seen_ranks + num_active_lanes)
+                                current_rank_in_expert_idx = i * 32 + __fns(mask, 0, slot_idx_in_round - num_seen_ranks + 1);
+                            num_seen_ranks += num_active_lanes;
+                        }
+                        token_idx_in_rank =
+                            offset +
+                            (slot_idx /
+                             num_active_ranks);
+                        break;
+                    }
+                    slot_idx -= num_round_tokens;
+                    offset += length;
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kNumRanksPerLane; ++ i)
+                        remaining[i] -= cute::min(remaining[i], length);
                 }
-
-                // Move into the next round
-                slot_idx -= num_round_tokens;
-                offset += length;
-                #pragma unroll
-                for (uint32_t i = 0; i < kNumRanksPerLane; ++ i)
-                    remaining[i] -= cute::min(remaining[i], length);
             }
 
             // Read source token-topk index (written by remote dispatch via NVLink)
@@ -500,6 +811,17 @@ sm100_bf16_mega_moe_impl(void* y,
                     pull_buffer.get_base_ptr(), kNumBytesPerPull
                 );
                 cute::tma_store_arrive();
+                if constexpr (kSaveX) {
+                    ptx::tma_store_1d(
+                        saved_x +
+                            static_cast<uint64_t>(pool_token_idx) *
+                                kHidden +
+                            i * kNumBytesPerPull /
+                                sizeof(nv_bfloat16),
+                        pull_buffer.get_base_ptr(), kNumBytesPerPull
+                    );
+                    cute::tma_store_arrive();
+                }
                 ptx::tma_store_wait<0>();
             };
             if (cute::elect_one_sync()) {
@@ -562,6 +884,27 @@ sm100_bf16_mega_moe_impl(void* y,
 
                 // Wait read count ready
                 ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+
+                if constexpr (kSaveX) {
+                    // The dispatch path stores only real routes. W13 wgrad
+                    // consumes BLOCK_M-padded expert ranges, so initialize
+                    // just the short per-expert tails instead of clearing the
+                    // entire multi-GiB saved pool before every forward.
+                    const uint32_t num_padding_tokens =
+                        num_recv_m_blocks * BLOCK_M - num_recv_tokens;
+                    const uint64_t padding_start =
+                        static_cast<uint64_t>(expert_pool_block_offset) *
+                            BLOCK_M +
+                        num_recv_tokens;
+                    for (uint64_t linear = thread_idx;
+                         linear <
+                         static_cast<uint64_t>(num_padding_tokens) *
+                             kHidden;
+                         linear += kNumDispatchThreads) {
+                        saved_x[padding_start * kHidden + linear] =
+                            nv_bfloat16(0.0f);
+                    }
+                }
 
                 // Clean expert token count, and add cumulative results
                 DG_STATIC_ASSERT(kNumDispatchWarps >= 2, "Not enough dispatch warps");
@@ -846,7 +1189,8 @@ sm100_bf16_mega_moe_impl(void* y,
                 const auto num_expected_blocks = (L2_SHAPE_N / BLOCK_N) * (pool_block_idx / kNumRingBlocks);
                 while (ptx::ld_acq(l2_empty_ptr) != num_expected_blocks);
 
-                // Unified L1 epilogue: SwiGLU in-place using granularity 8 interleaved weights
+                // Unified L1 epilogue: gated activation in-place using
+                // granularity 8 interleaved weights.
                 // With `SM100_TMEM_LOAD_16dp256b1x`, gate/up pairs are:
                 //   (values[0], values[2]), (values[1], values[3]),
                 //   (values[4], values[6]), (values[5], values[7])
@@ -898,13 +1242,70 @@ sm100_bf16_mega_moe_impl(void* y,
                             shared_storage.tmem_empty_barriers[accum_stage_idx].arrive(0u);
                         }
 
-                        // Apply SwiGLU: silu(gate) * up
+                        // Apply gated activation: act(gate) * up.
                         // Gate/up pairs: (0, 2), (1, 3), (4, 6), (5, 7)
                         auto fp32_values = reinterpret_cast<float*>(values);
                         #pragma unroll
                         for (uint32_t k = 0; k < 2; ++ k) {
                             auto bf16_gate = __float22bfloat162_rn(make_float2(fp32_values[k * 4], fp32_values[k * 4 + 1]));
                             auto bf16_up = __float22bfloat162_rn(make_float2(fp32_values[k * 4 + 2], fp32_values[k * 4 + 3]));
+
+                            if constexpr (kSaveL1Preact) {
+                                // Persist exact BF16 W13 output before clamp in
+                                // the caller-owned full-pool tensor. Convert
+                                // from the interleaved MMA column order back to
+                                // [gate | up].
+                                const uint32_t hidden_col =
+                                    warp_idx_in_wg * 16 +
+                                    (lane_idx / 4) * 2 + k;
+                                const uint32_t chunk = hidden_col / 8;
+                                const uint32_t in_chunk = hidden_col & 7;
+                                const uint32_t gate_col =
+                                    chunk * 16 + in_chunk;
+                                const auto output_col = [=](uint32_t col) {
+                                    const uint32_t low = col & 31;
+                                    return n_idx + (col & ~31u) +
+                                        ((low & 1) << 4) +
+                                        ((low >> 1) & 3) +
+                                        (low & 8) +
+                                        ((low & 16) >> 2);
+                                };
+                                const uint32_t physical_gate_col =
+                                    output_col(gate_col);
+                                const uint32_t deinterleaved_col =
+                                    (physical_gate_col / 16) * 8 +
+                                    (physical_gate_col & 7);
+                                const uint32_t row_base =
+                                    pool_m_idx +
+                                    epilogue_wg_idx * WG_BLOCK_M +
+                                    s * STORE_BLOCK_M +
+                                    i * ATOM_M +
+                                    (lane_idx % 4) * 2;
+                                const uint32_t gate_bits =
+                                    *reinterpret_cast<const uint32_t*>(&bf16_gate);
+                                const uint32_t up_bits =
+                                    *reinterpret_cast<const uint32_t*>(&bf16_up);
+                                #pragma unroll
+                                for (uint32_t r = 0; r < 2; ++ r) {
+                                    const uint32_t m_out = row_base + r;
+                                    if (
+                                        m_out < pool_m_idx + valid_m &&
+                                        m_out < num_saved_pool_tokens
+                                    ) {
+                                        auto* dst = reinterpret_cast<uint16_t*>(
+                                            saved_l1_preact +
+                                            static_cast<uint64_t>(m_out) *
+                                                (2 * kIntermediateHidden));
+                                        dst[deinterleaved_col] =
+                                            static_cast<uint16_t>(
+                                                gate_bits >> (r * 16));
+                                        dst[kIntermediateHidden +
+                                            deinterleaved_col] =
+                                            static_cast<uint16_t>(
+                                                up_bits >> (r * 16));
+                                    }
+                                }
+                            }
 
                             // Clamp
                             if constexpr (kActivationClamp != cute::numeric_limits<float>::infinity()) {
@@ -913,20 +1314,171 @@ sm100_bf16_mega_moe_impl(void* y,
                                 bf16_up = __hmin2(bf16_up, {kActivationClamp, kActivationClamp});
                             }
 
-                            // SwiGLU
-                            auto gate = __bfloat1622float2(bf16_gate);
-                            auto neg_gate_exp = make_float2(
-                                kFastMath ? __expf(-gate.x) : expf(-gate.x),
-                                kFastMath ? __expf(-gate.y) : expf(-gate.y));
-                            const auto denom = __fadd2_rn({1.0f, 1.0f}, neg_gate_exp);
-                            if constexpr (kFastMath) {
-                                gate = __fmul2_rn(gate, {math::fast_rcp(denom.x), math::fast_rcp(denom.y)});
-                            } else {
-                                gate = {gate.x / denom.x, gate.y / denom.y};
-                            }
+                            const auto gate = __bfloat1622float2(bf16_gate);
                             const auto up = __bfloat1622float2(bf16_up);
-                            bf16x2_output[i * 2 + k] = __float22bfloat162_rn(
-                                __fmul2_rn(__fmul2_rn(gate, up), weights));
+                            float2 z;
+                            if constexpr (kActivationType == ActivationType::GeGLU) {
+                                constexpr float kAlpha = 1.5957691216057308f;
+                                constexpr float kBeta = 0.044715f;
+                                const auto gate_sq = __fmul2_rn(gate, gate);
+                                z = __fmul2_rn(
+                                    __fmul2_rn(
+                                        {kAlpha, kAlpha}, gate),
+                                    __fadd2_rn(
+                                        {1.0f, 1.0f},
+                                        __fmul2_rn(
+                                            {kBeta, kBeta}, gate_sq)));
+                            } else {
+                                z = gate;
+                            }
+
+                            const auto neg_exp = make_float2(
+                                kFastMath ? __expf(-z.x) : expf(-z.x),
+                                kFastMath ? __expf(-z.y) : expf(-z.y));
+                            const auto denom =
+                                __fadd2_rn({1.0f, 1.0f}, neg_exp);
+                            float2 activated;
+                            if constexpr (kFastMath) {
+                                activated = __fmul2_rn(
+                                    gate,
+                                    {math::fast_rcp(denom.x),
+                                     math::fast_rcp(denom.y)});
+                            } else {
+                                if constexpr (
+                                    kActivationType ==
+                                        ActivationType::SwiGLU) {
+                                    // CUDA aten::silu evaluates x / (1 +
+                                    // exp(-x)) directly. Multiplying x by a
+                                    // separately rounded reciprocal differs
+                                    // at BF16 product ties (for example
+                                    // x=0.78515625).
+                                    activated = {
+                                        gate.x / denom.x,
+                                        gate.y / denom.y};
+                                } else {
+                                    // FireTitan's GeGLU expression materializes
+                                    // sigmoid(z) before multiplying by gate.
+                                    const float2 sig = {
+                                        1.0f / denom.x,
+                                        1.0f / denom.y};
+                                    activated =
+                                        __fmul2_rn(gate, sig);
+                                }
+                            }
+                            // Standard FireTitan grouped experts materialize
+                            // F.silu(gate_bf16) before the separate BF16
+                            // multiply by up_bf16. DSV4's clamped SwiGLU and
+                            // GeGLU instead evaluate activation*up in FP32 and
+                            // round only the product.
+                            const auto activated_for_mul =
+                                kActivationType ==
+                                            ActivationType::SwiGLU &&
+                                        kActivationClamp ==
+                                            cute::numeric_limits<
+                                                float>::infinity()
+                                ? __bfloat1622float2(
+                                      __float22bfloat162_rn(
+                                          activated))
+                                : activated;
+                            const auto h_fp32 =
+                                __fmul2_rn(
+                                    activated_for_mul, up);
+                            const auto h_bf16 =
+                                __float22bfloat162_rn(h_fp32);
+                            // DSV4 applies its pre-down route score while the
+                            // clamped activation is still FP32, then rounds the
+                            // weighted W2 input once. Other model families
+                            // materialize the activation as BF16 first.
+                            const auto h_for_weight =
+                                kRouteWeightMode ==
+                                            RouteWeightMode::PreDown &&
+                                        kActivationClamp !=
+                                            cute::numeric_limits<
+                                                float>::infinity()
+                                ? h_fp32
+                                : __bfloat1622float2(h_bf16);
+                            const auto h_weighted_bf16 =
+                                __float22bfloat162_rn(
+                                    __fmul2_rn(
+                                        h_for_weight,
+                                        weights));
+                            if constexpr (
+                                kRouteWeightMode ==
+                                RouteWeightMode::PreDown) {
+                                bf16x2_output[i * 2 + k] =
+                                    h_weighted_bf16;
+                            } else {
+                                bf16x2_output[i * 2 + k] =
+                                    h_bf16;
+                            }
+
+                            if constexpr (kSaveStageActivations) {
+                                const uint32_t hidden_col =
+                                    warp_idx_in_wg * 16 +
+                                    (lane_idx / 4) * 2 + k;
+                                const uint32_t chunk =
+                                    hidden_col / 8;
+                                const uint32_t in_chunk =
+                                    hidden_col & 7;
+                                const uint32_t interleaved_col =
+                                    chunk * 16 + in_chunk;
+                                const uint32_t low =
+                                    interleaved_col & 31;
+                                const uint32_t physical_col =
+                                    n_idx +
+                                    (interleaved_col & ~31u) +
+                                    ((low & 1) << 4) +
+                                    ((low >> 1) & 3) +
+                                    (low & 8) +
+                                    ((low & 16) >> 2);
+                                const uint32_t canonical_col =
+                                    (physical_col / 16) * 8 +
+                                    (physical_col & 7);
+                                const uint32_t row_base =
+                                    pool_m_idx +
+                                    epilogue_wg_idx * WG_BLOCK_M +
+                                    s * STORE_BLOCK_M +
+                                    i * ATOM_M +
+                                    (lane_idx % 4) * 2;
+                                const uint32_t h_bits =
+                                    *reinterpret_cast<
+                                        const uint32_t*>(
+                                        &h_bf16);
+                                const uint32_t weighted_bits =
+                                    *reinterpret_cast<
+                                        const uint32_t*>(
+                                        &h_weighted_bf16);
+                                #pragma unroll
+                                for (uint32_t r = 0;
+                                     r < 2; ++r) {
+                                    const uint32_t m_out =
+                                        row_base + r;
+                                    if (
+                                        m_out < pool_m_idx + valid_m &&
+                                        m_out < num_saved_pool_tokens
+                                    ) {
+                                        const uint64_t output_idx =
+                                            static_cast<uint64_t>(
+                                                m_out) *
+                                                kIntermediateHidden +
+                                            canonical_col;
+                                        *reinterpret_cast<
+                                            uint16_t*>(
+                                            saved_h_unweighted +
+                                            output_idx) =
+                                            static_cast<uint16_t>(
+                                                h_bits >>
+                                                (r * 16));
+                                        *reinterpret_cast<
+                                            uint16_t*>(
+                                            saved_h_weighted +
+                                            output_idx) =
+                                            static_cast<uint16_t>(
+                                                weighted_bits >>
+                                                (r * 16));
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -1044,6 +1596,49 @@ sm100_bf16_mega_moe_impl(void* y,
                     // Wait shared memory ready
                     ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
 
+                    if constexpr (kSaveDownUnweighted) {
+                        const uint32_t saved_store_row =
+                            pool_m_idx +
+                            epilogue_wg_idx * WG_BLOCK_M +
+                            s * STORE_BLOCK_M;
+                        // A cached active-pool plan may underestimate a later
+                        // routing histogram. The caller publishes the required
+                        // size through route_count_mismatch and replays the
+                        // capture before backward; do not turn that recoverable
+                        // cache miss into an out-of-bounds TMA store.
+                        if (saved_store_row + STORE_BLOCK_M <=
+                            num_saved_pool_tokens) {
+                            if (warp_idx_in_wg == 0 &&
+                                cute::elect_one_sync()) {
+                                cute::tma_store_fence();
+                                #pragma unroll
+                                for (uint32_t atom = 0;
+                                     atom <
+                                         BLOCK_N * sizeof(d_dtype_t) /
+                                             kSwizzleCDMode;
+                                     ++atom) {
+                                    cute::SM90_TMA_STORE_2D::copy(
+                                        &tensor_map_down_unweighted,
+                                        shared_storage.smem_d
+                                            .l2[epilogue_wg_idx] +
+                                            atom * STORE_BLOCK_M *
+                                                (kSwizzleCDMode /
+                                                 sizeof(d_dtype_t)),
+                                        n_idx +
+                                            atom *
+                                                (kSwizzleCDMode /
+                                                 sizeof(d_dtype_t)),
+                                        saved_store_row);
+                                    cute::tma_store_arrive();
+                                }
+                            }
+                            if (warp_idx_in_wg == 0) {
+                                cute::tma_store_wait<0>();
+                            }
+                            __syncwarp();
+                        }
+                    }
+
                     // Write into remote buffers
                     // Each warp writes 2 rows (lane_idx/16 splits the warp into two halves, one per row)
                     const uint32_t row_in_atom = (warp_idx_in_wg * 2 + lane_idx / 16) % ATOM_M;
@@ -1068,7 +1663,38 @@ sm100_bf16_mega_moe_impl(void* y,
                             (lane_idx % 16 / 8) * STORE_BLOCK_M * (kSwizzleCDMode / sizeof(d_dtype_t)) +
                             row_in_store * (kSwizzleCDMode / sizeof(d_dtype_t)) +
                             (bank_group_idx ^ row_in_atom) * (kNumBankGroupBytes / sizeof(d_dtype_t));
-                        const auto packed = ptx::ld_shared(reinterpret_cast<float4*>(smem_ptr));
+                        auto packed = ptx::ld_shared(
+                            reinterpret_cast<float4*>(smem_ptr));
+                        if constexpr (
+                            kRouteWeightMode ==
+                                RouteWeightMode::PostDown &&
+                            kCombineOrderMode ==
+                                CombineOrderMode::FixedTopK) {
+                            // Keep forward offsets unchanged: recover the
+                            // immutable source token/slot score directly from
+                            // the existing symmetric input plane.
+                            const float route_weight =
+                                *sym_buffer.map(
+                                    input_topk_weights_buffer
+                                            .get_base_ptr<float>() +
+                                        static_cast<uint64_t>(
+                                            src_metadata.token_idx) *
+                                            kNumTopk +
+                                        src_metadata.topk_idx,
+                                    src_metadata.rank_idx);
+                            auto* values =
+                                reinterpret_cast<nv_bfloat16*>(
+                                    &packed);
+                            #pragma unroll
+                            for (uint32_t value_idx = 0;
+                                 value_idx < 8; ++value_idx) {
+                                values[value_idx] =
+                                    __float2bfloat16_rn(
+                                        __bfloat162float(
+                                            values[value_idx]) *
+                                        route_weight);
+                            }
+                        }
 
                         // Write into remote
                         const auto dst_token = combine_token_buffer.get_rank_buffer(dst_topk_idx)
@@ -1155,50 +1781,257 @@ sm100_bf16_mega_moe_impl(void* y,
             for (uint32_t chunk = 0; chunk < kNumChunks; ++ chunk) {
                 const uint32_t chunk_byte_offset = chunk * kNumChunkBytes;
 
-                // Move mask and load
-                uint32_t mask = total_mask;
-                const auto move_mask_and_load = [&](const uint32_t& i) {
-                    if (mask) {
-                        // Move
-                        const uint32_t slot_idx = __ffs(mask) - 1;
-                        mask ^= 1 << slot_idx;
-
-                        // Load
-                        if (cute::elect_one_sync()) {
-                            const auto src_ptr = math::advance_ptr<uint8_t>(
-                                combine_token_buffer.get_rank_buffer(slot_idx)
-                                                    .get_data_buffer(token_idx).get_base_ptr(),
-                                chunk_byte_offset);
-                            ptx::tma_load_1d(combine_load_buffer[i], src_ptr, combine_load_barriers[i], kNumChunkBytes);
-                            ptx::mbarrier_arrive_and_set_tx(combine_load_barriers[i], kNumChunkBytes);
-                        }
-                        __syncwarp();
-                        return true;
-                    }
-                    return false;
-                };
-
-                // Load the first selection
-                bool do_reduce = move_mask_and_load(load_stage_idx);
-
                 // Accumulate all top-k contributions for this chunk in float registers
                 float2 reduced[kNumUint4PerLane * kNumElemsPerUint4] = {};
-                while (do_reduce) {
-                    // Prefetch next top-k into the buffer while current is being accumulated
-                    do_reduce = move_mask_and_load(load_stage_idx ^ 1);
+                if constexpr (
+                    kCombineOrderMode ==
+                    CombineOrderMode::FixedTopK) {
+                    // Move mask and load
+                    uint32_t mask = total_mask;
+                    const auto move_mask_and_load =
+                        [&](const uint32_t& i) {
+                            if (mask) {
+                                // Move
+                                const uint32_t slot_idx =
+                                    __ffs(mask) - 1;
+                                mask ^= 1 << slot_idx;
 
-                    // Accumulate
-                    combine_load_barriers[load_stage_idx]->wait(combine_phase);
-                    #pragma unroll
-                    for (uint32_t j = 0; j < kNumUint4PerLane; ++ j) {
-                        const auto uint4_values = combine_load_buffer[load_stage_idx][j * 32 + lane_idx];
-                        const auto bf16_values = reinterpret_cast<const nv_bfloat162*>(&uint4_values);
+                                // Load
+                                if (cute::elect_one_sync()) {
+                                    const auto src_ptr =
+                                        math::advance_ptr<uint8_t>(
+                                            combine_token_buffer
+                                                .get_rank_buffer(
+                                                    slot_idx)
+                                                .get_data_buffer(
+                                                    token_idx)
+                                                .get_base_ptr(),
+                                            chunk_byte_offset);
+                                    ptx::tma_load_1d(
+                                        combine_load_buffer[i],
+                                        src_ptr,
+                                        combine_load_barriers[i],
+                                        kNumChunkBytes);
+                                    ptx::mbarrier_arrive_and_set_tx(
+                                        combine_load_barriers[i],
+                                        kNumChunkBytes);
+                                }
+                                __syncwarp();
+                                return true;
+                            }
+                            return false;
+                        };
+
+                    // Load the first selection
+                    bool do_reduce =
+                        move_mask_and_load(load_stage_idx);
+                    while (do_reduce) {
+                        // Prefetch next top-k while accumulating current.
+                        do_reduce = move_mask_and_load(
+                            load_stage_idx ^ 1);
+
+                        combine_load_barriers[load_stage_idx]->wait(
+                            combine_phase);
                         #pragma unroll
-                        for (uint32_t l = 0; l < kNumElemsPerUint4; ++ l)
-                            ptx::accumulate(reduced[j * kNumElemsPerUint4 + l], bf16_values[l]);
+                        for (uint32_t j = 0;
+                             j < kNumUint4PerLane; ++j) {
+                            const auto uint4_values =
+                                combine_load_buffer[
+                                    load_stage_idx][
+                                    j * 32 + lane_idx];
+                            const auto bf16_values =
+                                reinterpret_cast<
+                                    const nv_bfloat162*>(
+                                    &uint4_values);
+                            #pragma unroll
+                            for (uint32_t l = 0;
+                                 l < kNumElemsPerUint4; ++l) {
+                                ptx::accumulate(
+                                    reduced[
+                                        j *
+                                            kNumElemsPerUint4 +
+                                        l],
+                                    bf16_values[l]);
+                            }
+                        }
+                        combine_phase ^= load_stage_idx;
+                        load_stage_idx ^= 1;
                     }
-                    combine_phase ^= load_stage_idx;
-                    load_stage_idx ^= 1;
+                } else {
+                    // FireTitan's deterministic DeepEP V1 and V2 paths both
+                    // reduce each destination-rank partial in source top-k
+                    // slot order. V1 then uses rank order while V2 uses
+                    // last-slot rank order.
+                    constexpr uint32_t kNumExpertsPerRank =
+                        kNumExperts / kNumRanks;
+                    const int dst_rank =
+                        stored_topk_slot_idx >= 0
+                        ? stored_topk_slot_idx /
+                              static_cast<int>(
+                                  kNumExpertsPerRank)
+                        : -1;
+                    const uint32_t same_rank_mask =
+                        __match_any_sync(
+                            0xffffffff, dst_rank);
+                    uint32_t rank_master_mask =
+                        __ballot_sync(
+                            0xffffffff,
+                            stored_topk_slot_idx >= 0 &&
+                                lane_idx ==
+                                    (kCombineOrderMode ==
+                                             CombineOrderMode::
+                                                 DeepEPV1
+                                         ? __ffs(
+                                               same_rank_mask) -
+                                               1
+                                         : 31 -
+                                               __clz(
+                                                   same_rank_mask)));
+                    while (rank_master_mask) {
+                        uint32_t rank_master_slot =
+                            __ffs(rank_master_mask) - 1;
+                        if constexpr (
+                            kCombineOrderMode ==
+                            CombineOrderMode::DeepEPV1) {
+                            int selected_rank =
+                                ptx::exchange(
+                                    dst_rank,
+                                    rank_master_slot);
+                            uint32_t candidates =
+                                rank_master_mask &
+                                ~(1u <<
+                                  rank_master_slot);
+                            while (candidates) {
+                                const uint32_t
+                                    candidate_slot =
+                                        __ffs(candidates) -
+                                        1;
+                                candidates &=
+                                    candidates - 1;
+                                const int candidate_rank =
+                                    ptx::exchange(
+                                        dst_rank,
+                                        candidate_slot);
+                                if (candidate_rank <
+                                    selected_rank) {
+                                    selected_rank =
+                                        candidate_rank;
+                                    rank_master_slot =
+                                        candidate_slot;
+                                }
+                            }
+                        }
+                        rank_master_mask &=
+                            ~(1u << rank_master_slot);
+                        const int current_rank =
+                            ptx::exchange(
+                                dst_rank,
+                                rank_master_slot);
+                        uint32_t rank_mask = __ballot_sync(
+                            0xffffffff,
+                            dst_rank == current_rank);
+
+                        float2 rank_reduced[
+                            kNumUint4PerLane *
+                            kNumElemsPerUint4] = {};
+                        while (rank_mask) {
+                            uint32_t slot_idx =
+                                __ffs(rank_mask) - 1;
+                            rank_mask &= ~(1u << slot_idx);
+                            if (cute::elect_one_sync()) {
+                                const auto src_ptr =
+                                    math::advance_ptr<uint8_t>(
+                                        combine_token_buffer
+                                            .get_rank_buffer(
+                                                slot_idx)
+                                            .get_data_buffer(
+                                                token_idx)
+                                            .get_base_ptr(),
+                                        chunk_byte_offset);
+                                ptx::tma_load_1d(
+                                    combine_load_buffer[0],
+                                    src_ptr,
+                                    combine_load_barriers[0],
+                                    kNumChunkBytes);
+                                ptx::mbarrier_arrive_and_set_tx(
+                                    combine_load_barriers[0],
+                                    kNumChunkBytes);
+                            }
+                            __syncwarp();
+                            combine_load_barriers[0]->wait(
+                                combine_phase);
+                            #pragma unroll
+                            for (uint32_t j = 0;
+                                 j < kNumUint4PerLane; ++j) {
+                                const auto uint4_values =
+                                    combine_load_buffer[0][
+                                        j * 32 + lane_idx];
+                                const auto bf16_values =
+                                    reinterpret_cast<
+                                        const nv_bfloat162*>(
+                                        &uint4_values);
+                                const float route_weight =
+                                    kRouteWeightMode ==
+                                            RouteWeightMode::
+                                                PostDown
+                                    ? input_topk_weights_buffer
+                                          .get_data_buffer(
+                                              token_idx)
+                                          .template
+                                              get_base_ptr<
+                                                  float>()[slot_idx]
+                                    : 1.0f;
+                                #pragma unroll
+                                for (uint32_t l = 0;
+                                     l < kNumElemsPerUint4;
+                                     ++l) {
+                                    if constexpr (
+                                        kRouteWeightMode ==
+                                        RouteWeightMode::
+                                            PostDown) {
+                                        const float2 source =
+                                            __bfloat1622float2(
+                                                bf16_values[l]);
+                                        auto& value =
+                                            rank_reduced[
+                                                j *
+                                                    kNumElemsPerUint4 +
+                                                l];
+                                        value.x = __fmaf_rn(
+                                            source.x,
+                                            route_weight,
+                                            value.x);
+                                        value.y = __fmaf_rn(
+                                            source.y,
+                                            route_weight,
+                                            value.y);
+                                    } else {
+                                        ptx::accumulate(
+                                            rank_reduced[
+                                                j *
+                                                    kNumElemsPerUint4 +
+                                                l],
+                                            bf16_values[l]);
+                                    }
+                                }
+                            }
+                            combine_phase ^= 1;
+                        }
+
+                        #pragma unroll
+                        for (uint32_t value_idx = 0;
+                             value_idx <
+                                 kNumUint4PerLane *
+                                     kNumElemsPerUint4;
+                             ++value_idx) {
+                            const nv_bfloat162 rank_partial =
+                                __float22bfloat162_rn(
+                                    rank_reduced[value_idx]);
+                            ptx::accumulate(
+                                reduced[value_idx],
+                                rank_partial);
+                        }
+                    }
                 }
 
                 // Cast
