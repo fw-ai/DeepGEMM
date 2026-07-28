@@ -2853,6 +2853,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                     cumulative_local_expert_recv_stats_fused.zero_()
                     legacy_inference_y = run_legacy_low_level_inference()
                     assert torch.equal(fused_results[0], legacy_inference_y)
+                    cumulative_local_expert_recv_stats_fused.zero_()
+                    fused_results = run_fused()
                 cumulative_local_expert_recv_stats_fused.zero_()
             for fused_result, baseline_result in zip(
                 fused_results, run_baseline()
