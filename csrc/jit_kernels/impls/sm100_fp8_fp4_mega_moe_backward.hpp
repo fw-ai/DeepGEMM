@@ -187,6 +187,7 @@ public:
         int intermediate_hidden;
         int num_experts;
         int num_pool_rows;
+        int num_acts_rows;
         int num_sf_pool_rows;
         int block_m;
         int block_n;
@@ -341,6 +342,7 @@ static void __instantiate_kernel() {{
             args.token_src_metadata,
             args.num_topk,
             args.num_pool_rows,
+            args.num_acts_rows,
             args.acts_sf_stride,
             args.tensor_map_acts,
             args.tensor_map_acts_sf,
@@ -770,6 +772,7 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
         .intermediate_hidden = intermediate_hidden,
         .num_experts = num_experts,
         .num_pool_rows = num_pool_rows,
+        .num_acts_rows = num_acts_rows,
         .num_sf_pool_rows = num_sf_pool_rows,
         .block_m = block_m,
         .block_n = block_n,
@@ -1636,6 +1639,7 @@ static void sm100_bf16_mega_moe_backward_dgrad(
         .intermediate_hidden = intermediate_hidden,
         .num_experts = num_experts,
         .num_pool_rows = num_pool_rows,
+        .num_acts_rows = 0,
         .num_sf_pool_rows = 1,
         .block_m = block_m,
         .block_n = block_n,

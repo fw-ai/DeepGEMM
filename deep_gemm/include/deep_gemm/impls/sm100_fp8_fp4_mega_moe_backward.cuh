@@ -1340,6 +1340,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
     const layout::TokenSrcMetadata* token_src_metadata,
     const uint32_t num_topk,
     const uint32_t num_pool_rows,
+    const uint32_t num_acts_rows,
     const uint32_t acts_sf_stride,
     const __grid_constant__ cute::TmaDescriptor tensor_map_acts,
     const __grid_constant__ cute::TmaDescriptor tensor_map_acts_sf,
@@ -2499,6 +2500,9 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                 }
                             }
                         } else {
+                            if (pool_row >= num_acts_rows) {
+                                asm volatile("trap;");
+                            }
                             const uint32_t idx = row % BLOCK_M;
                             const uint32_t sf_token =
                                 pool_block * SF_BLOCK_M +

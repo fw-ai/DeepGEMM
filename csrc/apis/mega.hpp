@@ -334,12 +334,16 @@ static void fp8_fp4_mega_moe(
             saved_down_unweighted->size(0) <=
             num_max_pool_tokens);
     }
-    const auto [num_required_bytes, slice] =
+    const auto [expanded_num_required_bytes, slice] =
         get_symm_buffer_size_for_mega_moe_v2(
         num_ranks, num_experts,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
         "fp8xfp4", activation, num_ring_tokens);
+    const auto num_required_bytes =
+        expanded_num_required_bytes -
+        static_cast<int64_t>(num_max_tokens_per_rank) *
+            num_topk * sizeof(float);
     DG_HOST_ASSERT(sym_buffer.nbytes() >= static_cast<size_t>(num_required_bytes));
     DG_HOST_ASSERT(num_experts == num_experts_);
 
@@ -463,12 +467,16 @@ static void bf16_mega_moe(
     // Check buffer bytes
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts_ = num_experts_per_rank * num_ranks;
-    const auto [num_required_bytes, slice] =
+    const auto [expanded_num_required_bytes, slice] =
         get_symm_buffer_size_for_mega_moe_v2(
         num_ranks, num_experts,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
         "bf16xbf16", activation, num_ring_tokens);
+    const auto num_required_bytes =
+        expanded_num_required_bytes -
+        static_cast<int64_t>(num_max_tokens_per_rank) *
+            num_topk * sizeof(float);
     DG_HOST_ASSERT(sym_buffer.nbytes() >= static_cast<size_t>(num_required_bytes));
     DG_HOST_ASSERT(num_experts == num_experts_);
 

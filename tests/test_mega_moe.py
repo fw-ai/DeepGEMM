@@ -224,10 +224,21 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             args.mma_type, args.activation,
             buffer.num_ring_tokens))
     assert len(legacy_slicer(buffer.buffer)) == 10
+    expanded_num_bytes, expanded_slicer = (
+        deep_gemm._C.get_symm_buffer_size_for_mega_moe_v2(
+            num_ranks, num_experts,
+            buffer.num_max_tokens_per_rank, num_topk,
+            hidden, intermediate_hidden,
+            args.mma_type, args.activation,
+            buffer.num_ring_tokens))
+    legacy_buffer = buffer.buffer.narrow(0, 0, legacy_num_bytes)
+    legacy_v2_slices = expanded_slicer(legacy_buffer)
+    assert len(legacy_v2_slices) == 11
+    assert legacy_v2_slices[-1].numel() == 0
     assert (
         legacy_num_bytes +
         buffer.backward_grad_route.nbytes ==
-        buffer.buffer.nbytes
+        expanded_num_bytes
     ), 'v2 must append the route plane without shifting legacy storage'
 
     # Cast weights into FP4
