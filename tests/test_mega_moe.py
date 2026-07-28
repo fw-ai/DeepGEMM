@@ -234,7 +234,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     legacy_buffer = buffer.buffer.narrow(0, 0, legacy_num_bytes)
     legacy_v2_slices = expanded_slicer(legacy_buffer)
     assert len(legacy_v2_slices) == 11
-    assert legacy_v2_slices[-1].numel() == 0
+    assert legacy_v2_slices[-1] is None
     assert (
         legacy_num_bytes +
         buffer.backward_grad_route.nbytes ==
