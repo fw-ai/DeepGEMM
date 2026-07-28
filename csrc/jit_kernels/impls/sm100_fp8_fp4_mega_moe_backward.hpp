@@ -938,7 +938,9 @@ static void sm100_mega_moe_backward_combine_grad_x(
         combine_buffer.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(combine_buffer.is_contiguous());
     DG_HOST_ASSERT(combine_buffer.dim() == 2);
-    DG_HOST_ASSERT(combine_buffer.size(0) >= num_max_tokens);
+    DG_HOST_ASSERT(
+        combine_buffer.size(0) >=
+        static_cast<int64_t>(num_topk) * num_max_tokens);
     DG_HOST_ASSERT(combine_buffer.size(1) == hidden);
     if (combine_order_mode != "fixed_topk") {
         DG_HOST_ASSERT(topk_ids.has_value());

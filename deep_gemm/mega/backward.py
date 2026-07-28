@@ -976,6 +976,17 @@ def bf16_mega_moe_backward_w13(
     )
 
 
+def _direct_grad_x_planes(sym_buffer: Any) -> torch.Tensor:
+    return torch.as_strided(
+        sym_buffer.backward_grad_y,
+        size=(
+            sym_buffer.num_topk * sym_buffer.num_max_tokens_per_rank,
+            sym_buffer.hidden,
+        ),
+        stride=(sym_buffer.hidden, 1),
+    )
+
+
 def mega_moe_backward_combine_grad_x(
     grad_x_output: torch.Tensor,
     sym_buffer: Any,
@@ -988,7 +999,7 @@ def mega_moe_backward_combine_grad_x(
         raise ValueError("num_experts must be divisible by the EP group size")
     _C.mega_moe_backward_combine_grad_x(
         grad_x_output,
-        sym_buffer.backward_grad_y,
+        _direct_grad_x_planes(sym_buffer),
         sym_buffer.num_max_tokens_per_rank,
         sym_buffer.num_topk,
         num_ranks,
@@ -1021,7 +1032,7 @@ def bf16_mega_moe_backward_w2_combine(
         padded_expert_counts,
         pool_block_m,
         grad_x_output,
-        sym_buffer.backward_grad_y,
+        _direct_grad_x_planes(sym_buffer),
         sym_buffer.handle.buffer_ptrs,
         sym_buffer.group.rank(),
         sym_buffer.num_max_tokens_per_rank,
@@ -1066,7 +1077,7 @@ def bf16_mega_moe_backward_w13_combine(
         padded_expert_counts,
         pool_block_m,
         grad_x_output,
-        sym_buffer.backward_grad_y,
+        _direct_grad_x_planes(sym_buffer),
         sym_buffer.handle.buffer_ptrs,
         sym_buffer.group.rank(),
         sym_buffer.num_max_tokens_per_rank,

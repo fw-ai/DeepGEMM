@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from typing import Tuple
 
 import deep_gemm
+from deep_gemm.mega.backward import _direct_grad_x_planes
 from deep_gemm.utils import (
     per_token_cast_to_fp4, per_token_cast_to_fp8,
     cast_back_from_fp4, unpack_ue8m0_from_int,
@@ -52,15 +53,21 @@ def test_fp8_backward_canonicalizes_block_m_and_clears_padding(
     rows, hidden, intermediate = 2, 4, 4
     grad_y = torch.zeros(rows, hidden)
     topk_weights = torch.ones(rows, 1)
+    backward_grad_x_storage = torch.zeros(
+        2 * rows, hidden, dtype=torch.bfloat16)
     sym_buffer = SimpleNamespace(
         group=FakeGroup(),
-        backward_grad_y=torch.zeros(rows, hidden, dtype=torch.bfloat16),
+        backward_grad_y=backward_grad_x_storage[:rows],
         topk_weights=torch.zeros(rows, 1),
         backward_grad_route=torch.zeros(rows, 1),
         handle=SimpleNamespace(buffer_ptrs=[1, 2]),
         num_max_tokens_per_rank=rows,
-        num_topk=1,
+        num_topk=2,
+        hidden=hidden,
     )
+    direct_planes = _direct_grad_x_planes(sym_buffer)
+    assert direct_planes.shape == (2 * rows, hidden)
+    assert direct_planes.data_ptr() == sym_buffer.backward_grad_y.data_ptr()
     pool_hidden = torch.zeros(rows, hidden, dtype=torch.bfloat16)
     pool_intermediate = torch.zeros(
         rows, intermediate, dtype=torch.bfloat16)

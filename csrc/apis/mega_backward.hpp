@@ -367,6 +367,13 @@ static MegaMoEBackwardCombineArgs make_backward_combine_args(
     DG_HOST_ASSERT(grad_x_output.is_contiguous());
     DG_HOST_ASSERT(combine_buffer.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(combine_buffer.is_contiguous());
+    DG_HOST_ASSERT(combine_buffer.dim() == 2);
+    DG_HOST_ASSERT(
+        combine_buffer.size(0) >=
+        static_cast<int64_t>(num_topk) *
+            num_max_tokens_per_rank);
+    DG_HOST_ASSERT(
+        combine_buffer.size(1) == grad_x_output.size(1));
     DG_HOST_ASSERT(grad_x_output.dim() == 2);
     DG_HOST_ASSERT(num_max_tokens_per_rank >= grad_x_output.size(0));
     DG_HOST_ASSERT(
