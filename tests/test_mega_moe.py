@@ -1,4 +1,5 @@
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -235,6 +236,21 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     legacy_v2_slices = expanded_slicer(legacy_buffer)
     assert len(legacy_v2_slices) == 11
     assert legacy_v2_slices[-1] is None
+    legacy_forward_buffer = copy.copy(buffer)
+    legacy_forward_buffer.buffer = legacy_buffer
+    (
+        legacy_forward_buffer.x,
+        legacy_forward_buffer.x_sf,
+        legacy_forward_buffer.topk_idx,
+        legacy_forward_buffer.topk_weights,
+        legacy_forward_buffer.l1_acts,
+        legacy_forward_buffer.l1_acts_sf,
+        legacy_forward_buffer.l2_acts,
+        legacy_forward_buffer.l2_acts_sf,
+        legacy_forward_buffer.token_src_metadata,
+        legacy_forward_buffer.backward_grad_y,
+    ) = legacy_slicer(legacy_buffer)
+    legacy_forward_buffer.backward_grad_route = None
     assert (
         legacy_num_bytes +
         buffer.backward_grad_route.nbytes ==
@@ -408,19 +424,19 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     # Run fused mega MoE
     # NOTES: copy x into buffer before each call because debug mode zeros the entire buffer
-    def run_fused():
+    def run_fused(sym_buffer=buffer):
         if is_bf16xbf16:
-            buffer.x[:num_tokens].copy_(x)
+            sym_buffer.x[:num_tokens].copy_(x)
         else:
-            buffer.x[:num_tokens].copy_(x[0])
-            buffer.x_sf[:num_tokens].copy_(x[1])
-        buffer.topk_idx[:num_tokens].copy_(topk_idx)
-        buffer.topk_weights[:num_tokens].copy_(topk_weights)
+            sym_buffer.x[:num_tokens].copy_(x[0])
+            sym_buffer.x_sf[:num_tokens].copy_(x[1])
+        sym_buffer.topk_idx[:num_tokens].copy_(topk_idx)
+        sym_buffer.topk_weights[:num_tokens].copy_(topk_weights)
 
         y = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
         kernel_kwargs = dict(
             y=y, l1_weights=transformed_l1_weights, l2_weights=transformed_l2_weights,
-            sym_buffer=buffer,
+            sym_buffer=sym_buffer,
             cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats_fused,
             activation=args.activation,
             activation_clamp=args.activation_clamp,
@@ -2668,7 +2684,18 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         dist_print('Running correctness tests (bitwise vs legacy baseline):', once_in_node=True)
         for i in range(num_correctness_tests):
             create_inputs()
-            for fused_result, baseline_result in zip(run_fused(), run_baseline()):
+            fused_results = run_fused()
+            if i == 0:
+                cumulative_local_expert_recv_stats_fused.zero_()
+                legacy_results = run_fused(legacy_forward_buffer)
+                for full_result, legacy_result in zip(
+                    fused_results, legacy_results
+                ):
+                    assert torch.equal(full_result, legacy_result)
+                cumulative_local_expert_recv_stats_fused.zero_()
+            for fused_result, baseline_result in zip(
+                fused_results, run_baseline()
+            ):
                 assert torch.equal(fused_result, baseline_result)
             if (i + 1) % 100 == 0 or i == num_correctness_tests - 1:
                 dist_print(f' > Correctness test #{i + 1}/{num_correctness_tests} passed', once_in_node=True)
