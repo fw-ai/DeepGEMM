@@ -7,6 +7,7 @@ import random
 import sys
 import torch
 import torch.distributed as dist
+from types import SimpleNamespace
 from typing import Tuple
 
 import deep_gemm
@@ -16,6 +17,99 @@ from deep_gemm.utils import (
 )
 from deep_gemm.utils.dist import dist_print, init_dist, uneven_all_gather
 from deep_gemm.testing import bench_kineto, calc_diff
+
+
+def test_fp8_backward_canonicalizes_block_m_and_clears_padding(
+    monkeypatch,
+):
+    class FakeGroup:
+        @staticmethod
+        def size():
+            return 2
+
+        @staticmethod
+        def rank():
+            return 0
+
+    captured = {}
+
+    def fake_all_reduce(tensor, *, op, group):
+        assert op == dist.ReduceOp.MAX
+        assert isinstance(group, FakeGroup)
+        tensor.fill_(96)
+
+    def fake_backward(*args):
+        captured["block_m"] = args[20]
+        captured["clear_wgrad_padding"] = args[23]
+
+    monkeypatch.setattr(dist, "all_reduce", fake_all_reduce)
+    monkeypatch.setattr(
+        deep_gemm._C,
+        "fp8_fp4_mega_moe_backward_dgrad_swiglu_v2",
+        fake_backward,
+    )
+
+    rows, hidden, intermediate = 2, 4, 4
+    grad_y = torch.zeros(rows, hidden)
+    topk_weights = torch.ones(rows, 1)
+    sym_buffer = SimpleNamespace(
+        group=FakeGroup(),
+        backward_grad_y=torch.zeros(rows, hidden, dtype=torch.bfloat16),
+        topk_weights=torch.zeros(rows, 1),
+        backward_grad_route=torch.zeros(rows, 1),
+        handle=SimpleNamespace(buffer_ptrs=[1, 2]),
+        num_max_tokens_per_rank=rows,
+        num_topk=1,
+    )
+    pool_hidden = torch.zeros(rows, hidden, dtype=torch.bfloat16)
+    pool_intermediate = torch.zeros(
+        rows, intermediate, dtype=torch.bfloat16)
+
+    deep_gemm.fp8_fp4_mega_moe_backward_dgrad_swiglu(
+        gate_up_output=torch.zeros(
+            rows, 2 * intermediate, dtype=torch.bfloat16),
+        grad_h_output=pool_intermediate,
+        grad_gate_up_output=torch.zeros(
+            rows, 2 * intermediate, dtype=torch.bfloat16),
+        h_act_output=pool_intermediate.clone(),
+        h_weighted_output=pool_intermediate.clone(),
+        x_pool_output=pool_hidden,
+        grad_x_pool_output=pool_hidden.clone(),
+        l1_acts=torch.zeros(rows, hidden, dtype=torch.float8_e4m3fn),
+        l1_acts_sf=torch.zeros(rows, 1, dtype=torch.int32),
+        l1_weights=(
+            torch.zeros(1, 2 * intermediate, hidden // 2, dtype=torch.int8),
+            torch.zeros(1, 2 * intermediate, 1, dtype=torch.int32),
+        ),
+        grad_ye=pool_hidden.clone(),
+        route_weights=torch.ones(rows, dtype=torch.bfloat16),
+        w2_weights=(
+            torch.zeros(1, hidden, intermediate // 2, dtype=torch.int8),
+            torch.zeros(1, hidden, 1, dtype=torch.int32),
+        ),
+        w2_dequant_scratch=torch.zeros(
+            1, hidden, intermediate, dtype=torch.bfloat16),
+        w13_weights=(
+            torch.zeros(1, 2 * intermediate, hidden // 2, dtype=torch.int8),
+            torch.zeros(1, 2 * intermediate, 1, dtype=torch.int32),
+        ),
+        w13_dequant_scratch=torch.zeros(
+            1, 2 * intermediate, hidden, dtype=torch.bfloat16),
+        expert_counts=torch.tensor([rows], dtype=torch.int32),
+        grid_sync_counter=torch.zeros(1, dtype=torch.int32),
+        activation_limit=10.0,
+        block_m=16,
+        compute_w13_dgrad=False,
+        sym_buffer=sym_buffer,
+        grad_y=grad_y,
+        topk_weights=topk_weights,
+        token_src_metadata=torch.zeros(rows, 3, dtype=torch.int32),
+    )
+
+    assert captured == {
+        "block_m": 96,
+        "clear_wgrad_padding": True,
+    }
 
 
 def import_baseline():

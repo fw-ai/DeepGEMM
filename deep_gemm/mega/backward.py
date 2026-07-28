@@ -815,7 +815,7 @@ def fp8_fp4_mega_moe_backward_dgrad_swiglu(
     compute_w13_dgrad: bool = True,
     direct_remote_grad_x: bool = False,
     write_grad_x_pool: bool = True,
-    clear_wgrad_padding: bool = False,
+    clear_wgrad_padding: bool = True,
     sym_buffer: Optional[Any] = None,
     grad_y: Optional[torch.Tensor] = None,
     topk_weights: Optional[torch.Tensor] = None,
@@ -824,6 +824,7 @@ def fp8_fp4_mega_moe_backward_dgrad_swiglu(
     grad_y_unweighted_output: Optional[torch.Tensor] = None,
     down_unweighted_output: Optional[torch.Tensor] = None,
     grad_route_output: Optional[torch.Tensor] = None,
+    rank_uniform_block_m: bool = False,
 ) -> None:
     """Run the production L1 replay, dgrad/SwiGLU, and grad-x dispatch.
 
@@ -885,6 +886,18 @@ def fp8_fp4_mega_moe_backward_dgrad_swiglu(
                 dtype=torch.float32,
                 device=route_weights.device,
             )
+        if sym_buffer.group.size() > 1 and not rank_uniform_block_m:
+            rank_uniform_block_m_tensor = torch.tensor(
+                block_m,
+                dtype=torch.int32,
+                device=grad_ye.device,
+            )
+            dist.all_reduce(
+                rank_uniform_block_m_tensor,
+                op=dist.ReduceOp.MAX,
+                group=sym_buffer.group,
+            )
+            block_m = int(rank_uniform_block_m_tensor.item())
 
     _C.fp8_fp4_mega_moe_backward_dgrad_swiglu_v2(
         gate_up_output,
