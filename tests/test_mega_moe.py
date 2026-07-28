@@ -466,6 +466,34 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             assert route_count_mismatch.item() == 0
         return y, cumulative_local_expert_recv_stats_fused
 
+    def run_legacy_low_level_inference():
+        assert not is_bf16xbf16
+        buffer.x[:num_tokens].copy_(x[0])
+        buffer.x_sf[:num_tokens].copy_(x[1])
+        buffer.topk_idx[:num_tokens].copy_(topk_idx)
+        buffer.topk_weights[:num_tokens].copy_(topk_weights)
+        y = torch.empty(
+            (num_tokens, hidden),
+            dtype=torch.bfloat16,
+            device='cuda')
+        deep_gemm._C.fp8_fp4_mega_moe(
+            y,
+            transformed_l1_weights,
+            transformed_l2_weights,
+            cumulative_local_expert_recv_stats_fused,
+            buffer.buffer,
+            buffer.handle.buffer_ptrs,
+            buffer.group.rank(),
+            buffer.num_max_tokens_per_rank,
+            buffer.num_experts,
+            buffer.num_topk,
+            (1, 1, 32),
+            args.activation,
+            args.activation_clamp,
+            bool(args.fast_math),
+            buffer.num_ring_tokens)
+        return y
+
     def active_pool_route_rows(
         destination_rank: int = rank_idx,
     ) -> torch.Tensor:
@@ -2692,6 +2720,13 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                     fused_results, legacy_results
                 ):
                     assert torch.equal(full_result, legacy_result)
+                if (
+                    not is_bf16xbf16 and
+                    args.route_weight_mode == 'pre_down'
+                ):
+                    cumulative_local_expert_recv_stats_fused.zero_()
+                    legacy_inference_y = run_legacy_low_level_inference()
+                    assert torch.equal(fused_results[0], legacy_inference_y)
                 cumulative_local_expert_recv_stats_fused.zero_()
             for fused_result, baseline_result in zip(
                 fused_results, run_baseline()

@@ -541,7 +541,7 @@ static void register_apis(pybind11::module_& m) {
         py::arg("activation_clamp_opt"),
         py::arg("fast_math"),
         py::arg("num_ring_tokens"),
-        py::arg("saved_l1_preact"),
+        py::arg("saved_l1_preact") = py::none(),
         py::arg("route_weight_mode") = "pre_down",
         py::arg("saved_down_unweighted") = py::none(),
         py::arg("num_config_tokens") = py::none());
