@@ -361,7 +361,7 @@ static MegaMoEBackwardCombineArgs make_backward_combine_args(
     const std::string& combine_order_mode =
         "fixed_topk") {
     const int num_ranks = static_cast<int>(sym_buffer_ptrs.size());
-    DG_HOST_ASSERT(num_ranks > 1);
+    DG_HOST_ASSERT(num_ranks >= 1);
     DG_HOST_ASSERT(rank >= 0 and rank < num_ranks);
     DG_HOST_ASSERT(grad_x_output.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(grad_x_output.is_contiguous());

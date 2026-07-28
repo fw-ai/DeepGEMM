@@ -2574,6 +2574,31 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             expected_grad_x_planes[rank_idx, :num_tokens])
         assert torch.equal(
             combined_grad_x, expected_combined_grad_x)
+        if num_ranks == 1:
+            fused_grad_w2 = torch.zeros_like(l2_weights_bf16)
+            fused_grad_w13 = torch.zeros_like(l1_weights_bf16)
+            fused_grad_x = torch.empty_like(combined_grad_x)
+            deep_gemm.bf16_mega_moe_backward_w2_combine(
+                fused_grad_w2, combine_outputs['grad_ye'],
+                combine_outputs['h_weighted'],
+                padded_expert_counts, block_m, fused_grad_x,
+                buffer,
+                route_weight_mode=deep_gemm.RouteWeightMode(
+                    args.route_weight_mode))
+            deep_gemm.bf16_mega_moe_backward_w13_combine(
+                fused_grad_w13, combine_outputs['grad_gate_up'],
+                combine_outputs['x_pool'],
+                padded_expert_counts, block_m, fused_grad_x,
+                buffer,
+                combine_order_mode=deep_gemm.CombineOrderMode(
+                    args.combine_order_mode))
+            assert_gradient_close(
+                fused_grad_w2, ref_grad_w2,
+                'single_rank_fused_grad_w2')
+            assert_gradient_close(
+                fused_grad_w13, ref_grad_w13,
+                'single_rank_fused_grad_w13')
+            assert torch.equal(fused_grad_x, expected_combined_grad_x)
 
         # Route-gradient production is a W2-side operation and must not force
         # W13 dgrad or a grad-x destination.
