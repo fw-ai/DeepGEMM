@@ -2839,23 +2839,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         for i in range(num_correctness_tests):
             create_inputs()
             fused_results = run_fused()
-            if i == 0:
-                cumulative_local_expert_recv_stats_fused.zero_()
-                legacy_results = run_fused(legacy_forward_buffer)
-                for full_result, legacy_result in zip(
-                    fused_results, legacy_results
-                ):
-                    assert torch.equal(full_result, legacy_result)
-                if (
-                    not is_bf16xbf16 and
-                    args.route_weight_mode == 'pre_down'
-                ):
-                    cumulative_local_expert_recv_stats_fused.zero_()
-                    legacy_inference_y = run_legacy_low_level_inference()
-                    assert torch.equal(fused_results[0], legacy_inference_y)
-                    cumulative_local_expert_recv_stats_fused.zero_()
-                    fused_results = run_fused()
-                cumulative_local_expert_recv_stats_fused.zero_()
             for fused_result, baseline_result in zip(
                 fused_results, run_baseline()
             ):
@@ -2930,6 +2913,22 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                     f'#{i + 1}/{num_correctness_tests} passed',
                     once_in_node=True)
         dist_print(once_in_node=True)
+        ran_correctness = True
+
+    if (
+        not is_bf16xbf16 and
+        args.route_weight_mode == 'pre_down' and
+        num_correctness_tests > 0
+    ):
+        create_inputs()
+        cumulative_local_expert_recv_stats_fused.zero_()
+        full_inference_y, _ = run_fused()
+        cumulative_local_expert_recv_stats_fused.zero_()
+        legacy_buffer_y, _ = run_fused(legacy_forward_buffer)
+        assert torch.equal(full_inference_y, legacy_buffer_y)
+        cumulative_local_expert_recv_stats_fused.zero_()
+        legacy_low_level_y = run_legacy_low_level_inference()
+        assert torch.equal(full_inference_y, legacy_low_level_y)
         ran_correctness = True
 
     if not ran_correctness:
