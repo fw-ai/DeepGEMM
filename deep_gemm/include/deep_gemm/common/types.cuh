@@ -56,4 +56,24 @@ enum class ActivationType {
     GeGLU  = 1,
 };
 
+enum class RouteWeightMode {
+    // Round the activated expert input to BF16, then apply the route weight
+    // and round again before the down projection.
+    PreDown = 0,
+    // Round the unweighted down-projection output to BF16, then apply the
+    // route weight and round again before top-k combine.
+    PostDown = 1,
+};
+
+enum class CombineOrderMode {
+    // Accumulate valid routes in their original top-k slot order.
+    FixedTopK = 0,
+    // Match DeepEP V2's per-rank BF16 materialization boundary and reduce the
+    // rank partials in the order of each rank's last top-k occurrence.
+    DeepEP = 1,
+    // Match deterministic legacy DeepEP: reduce source top-k slots into one
+    // BF16 partial per destination rank, then add rank partials by rank.
+    DeepEPV1 = 2,
+};
+
 } // namespace deep_gemm

@@ -136,48 +136,51 @@ struct Workspace {
         return math::advance_ptr<int>(base, (kNumMaxGridSyncCounters + 1) * sizeof(uint32_t) + phase * sizeof(int));
     }
 
-    CUTLASS_DEVICE
+    // NOTE: made HOST_DEVICE (was DEVICE-only) so the host binding can compute
+    // these Workspace byte offsets (base=nullptr) and expose the recv-count-sum
+    // and combine TokenSrcMetadata regions to Python for the training backward.
+    CUTLASS_HOST_DEVICE
     uint64_t* get_expert_send_count_ptr(const uint32_t& expert_idx = 0) const {
         return math::advance_ptr<uint64_t>(base, kNumBarrierSignalBytes) + expert_idx;
     }
 
-    CUTLASS_DEVICE
+    CUTLASS_HOST_DEVICE
     uint64_t* get_expert_recv_count_ptr(
         const uint32_t& rank_idx = 0, const uint32_t& expert_idx = 0) const {
         return get_expert_send_count_ptr(num_experts) + rank_idx * num_experts_per_rank + expert_idx;
     }
 
-    CUTLASS_DEVICE
+    CUTLASS_HOST_DEVICE
     uint64_t* get_expert_recv_count_sum_ptr(const uint32_t& expert_idx = 0) const {
         return get_expert_send_count_ptr(num_experts * 2) + expert_idx;
     }
 
-    CUTLASS_DEVICE
+    CUTLASS_HOST_DEVICE
     uint32_t* get_l1_full_count_ptr(const uint32_t& ring_block_idx = 0) const {
         const auto base = get_expert_recv_count_sum_ptr(num_experts_per_rank);
         return reinterpret_cast<uint32_t*>(base) + ring_block_idx;
     }
 
-    CUTLASS_DEVICE
+    CUTLASS_HOST_DEVICE
     uint32_t* get_l1_empty_count_ptr(const uint32_t& ring_block_idx = 0) const {
         const auto base = get_l1_full_count_ptr(num_ring_blocks);
         return reinterpret_cast<uint32_t*>(base) + ring_block_idx;
     }
 
-    CUTLASS_DEVICE
+    CUTLASS_HOST_DEVICE
     uint32_t* get_l2_full_count_ptr(const uint32_t& ring_block_idx = 0) const {
         const auto base = get_l1_empty_count_ptr(num_ring_blocks);
         return reinterpret_cast<uint32_t*>(base) + ring_block_idx;
     }
 
-    CUTLASS_DEVICE
+    CUTLASS_HOST_DEVICE
     uint32_t* get_l2_empty_count_ptr(const uint32_t& ring_block_idx = 0) const {
         const auto base = get_l2_full_count_ptr(num_ring_blocks);
         return reinterpret_cast<uint32_t*>(base) + ring_block_idx;
     }
 
     // For dispatch pulling
-    CUTLASS_DEVICE
+    CUTLASS_HOST_DEVICE
     uint32_t* get_src_token_topk_idx_ptr(
         const uint32_t& expert_idx = 0, const uint32_t& rank_idx = 0, const uint32_t& token_idx = 0) const {
         const auto base = get_l2_empty_count_ptr(num_ring_blocks);
@@ -187,7 +190,7 @@ struct Workspace {
     }
 
     // For combine usages (full)
-    CUTLASS_DEVICE
+    CUTLASS_HOST_DEVICE
     TokenSrcMetadata* get_token_src_metadata_ptr(const uint32_t& pool_token_idx = 0) const {
         const auto base = reinterpret_cast<TokenSrcMetadata*>(get_src_token_topk_idx_ptr(num_experts_per_rank));
         return base + pool_token_idx;

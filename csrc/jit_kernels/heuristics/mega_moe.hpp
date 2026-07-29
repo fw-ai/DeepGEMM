@@ -120,6 +120,15 @@ static std::tuple<int, int, int, int, int> get_block_config_for_mega_moe(
         }
     }();
     block_k /= get_num_mma_elem_bytes(mma_kind);
+    if (mma_kind == MmaKind::BF16) {
+        block_m = get_env<int>("DG_BF16_MEGA_MOE_BLOCK_M", block_m);
+        store_block_m = get_env<int>(
+            "DG_BF16_MEGA_MOE_STORE_BLOCK_M", store_block_m);
+        block_k = get_env<int>("DG_BF16_MEGA_MOE_BLOCK_K", block_k);
+        num_epilogue_warpgroups = get_env<int>(
+            "DG_BF16_MEGA_MOE_EPILOGUE_WARPGROUPS",
+            num_epilogue_warpgroups);
+    }
 
     // Check whether our `block_m` lies in `kCandidateBlockM`
     DG_HOST_ASSERT(std::any_of(
@@ -237,8 +246,14 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     const int smem_fixed = smem_dispatch_size + smem_cd + smem_amax_reduction + smem_barriers + smem_tmem_ptr;
 
     // Select maximum number of stages
-    const int num_stages = (smem_capacity - smem_fixed) / smem_size_per_stage;
+    int num_stages = (smem_capacity - smem_fixed) / smem_size_per_stage;
+    if (mma_kind == MmaKind::BF16) {
+        num_stages = get_env<int>(
+            "DG_BF16_MEGA_MOE_NUM_STAGES", num_stages);
+    }
     DG_HOST_ASSERT(num_stages >= 2);
+    DG_HOST_ASSERT(
+        smem_fixed + num_stages * smem_size_per_stage <= smem_capacity);
 
     return {num_stages, smem_fixed + num_stages * smem_size_per_stage};
 }
@@ -267,10 +282,15 @@ static MegaMoEConfig get_mega_moe_config(
     // Waves: clamp by pool capacity
     // TODO: more delicated wave calculation for BF16
     const int num_sms = device_runtime->get_num_sms();
-    const int num_experts_per_wave = get_num_experts_per_wave_for_mega_moe(
+    int num_experts_per_wave = get_num_experts_per_wave_for_mega_moe(
         num_experts_per_rank, num_tokens, num_topk,
         intermediate_hidden, block_m, block_n, num_sms,
         num_ring_tokens, num_max_tokens_per_rank, num_ranks);
+    if (mma_kind == MmaKind::BF16) {
+        num_experts_per_wave = get_env<int>(
+            "DG_BF16_MEGA_MOE_EXPERTS_PER_WAVE",
+            num_experts_per_wave);
+    }
 
     // Thread layout
     const int num_dispatch_threads = 128;

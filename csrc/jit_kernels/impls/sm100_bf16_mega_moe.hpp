@@ -15,6 +15,35 @@
 
 namespace deep_gemm {
 
+static std::string get_bf16_activation_type_name(
+    const std::string& activation) {
+    if (activation == "swiglu")
+        return "ActivationType::SwiGLU";
+    if (activation == "geglu")
+        return "ActivationType::GeGLU";
+    DG_HOST_UNREACHABLE("Unsupported activation");
+}
+
+static std::string get_route_weight_mode_name(
+    const std::string& route_weight_mode) {
+    if (route_weight_mode == "pre_down")
+        return "RouteWeightMode::PreDown";
+    if (route_weight_mode == "post_down")
+        return "RouteWeightMode::PostDown";
+    DG_HOST_UNREACHABLE("Unsupported route weight mode");
+}
+
+static std::string get_combine_order_mode_name(
+    const std::string& combine_order_mode) {
+    if (combine_order_mode == "fixed_topk")
+        return "CombineOrderMode::FixedTopK";
+    if (combine_order_mode == "deepep")
+        return "CombineOrderMode::DeepEP";
+    if (combine_order_mode == "deepep_v1")
+        return "CombineOrderMode::DeepEPV1";
+    DG_HOST_UNREACHABLE("Unsupported combine order mode");
+}
+
 class SM100BF16MegaMoERuntime final : public LaunchRuntime<SM100BF16MegaMoERuntime> {
 public:
     struct Args {
@@ -25,12 +54,26 @@ public:
         int num_ranks;
         float activation_clamp;
         bool fast_math;
+        std::string activation;
+        bool save_l1_preact;
+        bool save_stage_activations;
+        std::string route_weight_mode;
+        std::string combine_order_mode;
+        bool save_down_unweighted;
+        bool save_x;
         MegaMoEConfig config;
 
         // Runtime arguments
         void* y;
+        void* saved_l1_preact;
+        void* saved_h_unweighted;
+        void* saved_h_weighted;
+        void* saved_x;
         int* cumulative_local_expert_recv_stats;
+        const int* precomputed_route_counts;
+        int* route_count_mismatch;
         int num_tokens;
+        int num_saved_pool_tokens;
         layout::SymBuffer<> sym_buffer_ptrs;
 
         // Tensormap
@@ -39,6 +82,7 @@ public:
         CUtensorMap tensor_map_l1_output;
         CUtensorMap tensor_map_l2_acts;
         CUtensorMap tensor_map_l2_weights;
+        CUtensorMap tensor_map_down_unweighted;
 
         // Launch configs
         LaunchArgs launch_args;
@@ -64,6 +108,13 @@ static void __instantiate_kernel() {{
         {}, {}, {},
         {}, {},
         {},
+        {},
+        {},
+        {},
+        {},
+        {},
+        {},
+        {},
         {}
     >);
 }};
@@ -79,37 +130,64 @@ static void __instantiate_kernel() {{
     args.config.num_dispatch_threads, args.config.num_non_epilogue_threads, args.config.num_epilogue_threads,
     args.launch_args.grid_dim.first, args.num_ranks,
     to_string(args.activation_clamp),
-    args.fast_math ? "true" : "false");
+    args.fast_math ? "true" : "false",
+    get_bf16_activation_type_name(args.activation),
+    args.save_l1_preact ? "true" : "false",
+    args.save_stage_activations ? "true" : "false",
+    get_route_weight_mode_name(args.route_weight_mode),
+    get_combine_order_mode_name(args.combine_order_mode),
+    args.save_down_unweighted ? "true" : "false",
+    args.save_x ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
         // TODO: optimize `args` copy
         DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
             args.y,
+            args.saved_l1_preact,
+            args.saved_h_unweighted,
+            args.saved_h_weighted,
+            args.saved_x,
             args.cumulative_local_expert_recv_stats,
+            args.precomputed_route_counts,
+            args.route_count_mismatch,
             args.num_tokens,
+            args.num_saved_pool_tokens,
             args.sym_buffer_ptrs,
             args.tensor_map_l1_acts,
             args.tensor_map_l1_weights,
             args.tensor_map_l1_output,
             args.tensor_map_l2_acts,
-            args.tensor_map_l2_weights
+            args.tensor_map_l2_weights,
+            args.tensor_map_down_unweighted
         ));
     }
 };
 
 static void sm100_bf16_mega_moe(
     const torch::Tensor& y,
+    const std::optional<torch::Tensor>& saved_l1_preact,
     const torch::Tensor& l1_acts, const torch::Tensor& l2_acts, 
     const torch::Tensor& l1_weights, const torch::Tensor& l2_weights,
     const std::optional<torch::Tensor> cumulative_local_expert_recv_stats,
     const std::vector<int64_t>& sym_buffer_ptrs,
     const int& rank_idx, const int& num_max_tokens_per_rank,
     const int& num_experts_per_rank,
-    const int& num_tokens, const int& num_topk,
+    const int& num_tokens, const int& num_config_tokens,
+    const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
+    const std::string& activation,
     const float& activation_clamp,
-    const bool& fast_math
+    const bool& fast_math,
+    const std::string& route_weight_mode,
+    const std::optional<torch::Tensor>& saved_h_unweighted,
+    const std::optional<torch::Tensor>& saved_h_weighted,
+    const std::optional<torch::Tensor>& saved_down_unweighted,
+    const std::string& combine_order_mode,
+    const std::optional<torch::Tensor>& precomputed_route_counts,
+    const std::optional<int>& active_pool_rows,
+    const std::optional<torch::Tensor>& route_count_mismatch,
+    const std::optional<torch::Tensor>& saved_x
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -118,8 +196,62 @@ static void sm100_bf16_mega_moe(
     // Heuristics
     const auto config = get_mega_moe_config(
         num_ranks, num_experts, num_experts_per_rank,
-        num_max_tokens_per_rank, num_tokens, num_topk, hidden, intermediate_hidden,
+        num_max_tokens_per_rank, num_config_tokens, num_topk,
+        hidden, intermediate_hidden,
         num_ring_tokens, 0, MmaKind::BF16);
+    const auto num_max_pool_tokens =
+        layout::get_num_max_pool_tokens(
+            num_ranks, num_max_tokens_per_rank, num_topk,
+            num_experts_per_rank);
+    const auto num_saved_pool_tokens =
+        active_pool_rows.value_or(num_max_pool_tokens);
+    DG_HOST_ASSERT(
+        num_saved_pool_tokens > 0 &&
+        num_saved_pool_tokens <= num_max_pool_tokens);
+    if (saved_l1_preact.has_value()) {
+        DG_HOST_ASSERT(saved_l1_preact->scalar_type() == torch::kBFloat16);
+        DG_HOST_ASSERT(saved_l1_preact->is_contiguous());
+        DG_HOST_ASSERT(
+            saved_l1_preact->sizes() ==
+            torch::IntArrayRef(
+                {num_saved_pool_tokens, 2 * intermediate_hidden}));
+    }
+    DG_HOST_ASSERT(
+        route_weight_mode == "pre_down" ||
+        route_weight_mode == "post_down");
+    DG_HOST_ASSERT(
+        combine_order_mode == "fixed_topk" ||
+        combine_order_mode == "deepep" ||
+        combine_order_mode == "deepep_v1");
+    DG_HOST_ASSERT(
+        saved_h_unweighted.has_value() ==
+        saved_h_weighted.has_value());
+    if (saved_h_unweighted.has_value()) {
+        for (const auto* saved :
+             {&*saved_h_unweighted, &*saved_h_weighted}) {
+            DG_HOST_ASSERT(
+                saved->scalar_type() == torch::kBFloat16);
+            DG_HOST_ASSERT(saved->is_contiguous());
+            DG_HOST_ASSERT(
+                saved->sizes() == torch::IntArrayRef(
+                    {num_saved_pool_tokens, intermediate_hidden}));
+        }
+    }
+    if (saved_down_unweighted.has_value()) {
+        DG_HOST_ASSERT(
+            saved_down_unweighted->scalar_type() == torch::kBFloat16);
+        DG_HOST_ASSERT(saved_down_unweighted->is_contiguous());
+        DG_HOST_ASSERT(
+            saved_down_unweighted->sizes() ==
+            torch::IntArrayRef({num_saved_pool_tokens, hidden}));
+    }
+    if (saved_x.has_value()) {
+        DG_HOST_ASSERT(saved_x->scalar_type() == torch::kBFloat16);
+        DG_HOST_ASSERT(saved_x->is_contiguous());
+        DG_HOST_ASSERT(
+            saved_x->sizes() ==
+            torch::IntArrayRef({num_saved_pool_tokens, hidden}));
+    }
 
     // Make tensormap
     const auto tensor_map_l1_acts = make_tma_2d_desc(l1_acts,
@@ -147,6 +279,15 @@ static void sm100_bf16_mega_moe(
                                                         config.block_k, config.load_block_n,
                                                         static_cast<int>(l2_weights.stride(-2)),
                                                         config.swizzle_weights_mode);
+    const auto tensor_map_down_unweighted =
+        saved_down_unweighted.has_value()
+        ? make_tma_2d_desc(
+              *saved_down_unweighted,
+              hidden, saved_down_unweighted->size(0),
+              config.block_n, config.store_block_m,
+              static_cast<int>(saved_down_unweighted->stride(-2)),
+              config.swizzle_acts_mode)
+        : tensor_map_l2_acts;
 
     // Stats can be optional
     int* cumulative_local_expert_recv_stats_ptr = nullptr;
@@ -154,7 +295,11 @@ static void sm100_bf16_mega_moe(
         cumulative_local_expert_recv_stats_ptr = cumulative_local_expert_recv_stats->data_ptr<int>();
 
     // Launch
-    const auto num_sms = device_runtime->get_num_sms();
+    const auto physical_num_sms = device_runtime->get_num_sms();
+    const auto num_sms = get_env<int>(
+        "DG_BF16_MEGA_MOE_NUM_SMS",
+        physical_num_sms);
+    DG_HOST_ASSERT(num_sms > 0 && num_sms <= physical_num_sms);
     const SM100BF16MegaMoERuntime::Args args = {
         .num_max_tokens_per_rank = num_max_tokens_per_rank,
         .hidden = hidden, .intermediate_hidden = intermediate_hidden,
@@ -162,16 +307,50 @@ static void sm100_bf16_mega_moe(
         .num_ranks = num_ranks,
         .activation_clamp = activation_clamp,
         .fast_math = fast_math,
+        .activation = activation,
+        .save_l1_preact = saved_l1_preact.has_value(),
+        .save_stage_activations =
+            saved_h_unweighted.has_value(),
+        .route_weight_mode = route_weight_mode,
+        .combine_order_mode = combine_order_mode,
+        .save_down_unweighted =
+            saved_down_unweighted.has_value(),
+        .save_x = saved_x.has_value(),
         .config = config,
         .y = y.data_ptr(),
+        .saved_l1_preact = saved_l1_preact.has_value()
+            ? saved_l1_preact->data_ptr()
+            : nullptr,
+        .saved_h_unweighted =
+            saved_h_unweighted.has_value()
+            ? saved_h_unweighted->data_ptr()
+            : nullptr,
+        .saved_h_weighted =
+            saved_h_weighted.has_value()
+            ? saved_h_weighted->data_ptr()
+            : nullptr,
+        .saved_x = saved_x.has_value()
+            ? saved_x->data_ptr()
+            : nullptr,
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,
+        .precomputed_route_counts =
+            precomputed_route_counts.has_value()
+            ? precomputed_route_counts->data_ptr<int>()
+            : nullptr,
+        .route_count_mismatch =
+            route_count_mismatch.has_value()
+            ? route_count_mismatch->data_ptr<int>()
+            : nullptr,
         .num_tokens = num_tokens,
+        .num_saved_pool_tokens = num_saved_pool_tokens,
         .sym_buffer_ptrs = layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
         .tensor_map_l1_acts = tensor_map_l1_acts,
         .tensor_map_l1_weights = tensor_map_l1_weights,
         .tensor_map_l1_output = tensor_map_l1_output,
         .tensor_map_l2_acts = tensor_map_l2_acts,
         .tensor_map_l2_weights = tensor_map_l2_weights,
+        .tensor_map_down_unweighted =
+            tensor_map_down_unweighted,
         .launch_args = LaunchArgs(num_sms,
                                   config.num_dispatch_threads + config.num_non_epilogue_threads + config.num_epilogue_threads,
                                   config.smem_size, 2)
