@@ -1,6 +1,6 @@
 import os
 import time
-from typing import Any, Callable, Optional, Tuple
+from typing import Any, Callable, NamedTuple, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -937,6 +937,308 @@ def fp8_fp4_mega_moe_backward_dgrad_swiglu(
         down_unweighted_output,
         grad_route_output,
     )
+
+
+class MegaMoESideLoraBackwardResult(NamedTuple):
+    """Outputs of the native side-LoRA training backward.
+
+    ``grad_side_lora`` uses the conventional trainable layouts supplied to
+    :func:`transform_side_lora_for_mega_moe`, not the transposed inference
+    layouts. Shared A1/A3/B2 gradients are EP-local partials, matching the
+    caller contract that reduces replicated 2-D factors across EP ranks.
+    The frozen base W1/W2/W3 gradients are deliberately absent.
+    """
+
+    grad_x_pool: torch.Tensor
+    grad_x: Optional[torch.Tensor]
+    grad_route: torch.Tensor
+    grad_ye: torch.Tensor
+    grad_h: torch.Tensor
+    grad_gate_up: torch.Tensor
+    h_act: torch.Tensor
+    h_weighted: torch.Tensor
+    x_pool: torch.Tensor
+    route_weights: torch.Tensor
+    t13: torch.Tensor
+    t2: torch.Tensor
+    grad_side_lora: Tuple[torch.Tensor, ...]
+
+
+def _allocate_side_lora_backward_outputs(
+    gate_up: torch.Tensor,
+    side_lora: Tuple[torch.Tensor, ...],
+    hidden: int,
+    intermediate_hidden: int,
+    write_grad_x_pool: bool = True,
+) -> tuple[torch.Tensor, ...]:
+    pool_rows = gate_up.size(0)
+    options = dict(dtype=torch.bfloat16, device=gate_up.device)
+    grad_ye = torch.empty((pool_rows, hidden), **options)
+    grad_h = torch.empty((pool_rows, intermediate_hidden), **options)
+    grad_gate_up = torch.empty_like(gate_up)
+    h_act = torch.empty_like(grad_h)
+    h_weighted = torch.empty_like(grad_h)
+    x_pool = torch.empty_like(grad_ye)
+    grad_x_pool = (
+        torch.empty_like(grad_ye)
+        if write_grad_x_pool
+        else torch.empty((0, hidden), **options)
+    )
+    route_weights = torch.empty(
+        pool_rows, dtype=torch.float32, device=gate_up.device)
+    grad_route = torch.empty_like(route_weights)
+    t13 = torch.empty((pool_rows, 2, 128), **options)
+    t2 = torch.empty((pool_rows, 128), **options)
+    # Every inference tensor is K-major. Transposing only its shape yields the
+    # conventional optimizer layout without performing a runtime data copy.
+    # Some expert-local output tiles can be structurally empty for a routing
+    # realization.  The native wgrad kernels overwrite every visited tile but
+    # intentionally skip those empty tiles, so these buffers must start at
+    # zero rather than exposing allocator contents to the optimizer.
+    grad_side_lora = tuple(
+        torch.zeros(
+            (*tensor.shape[:-2], tensor.size(-1), tensor.size(-2)),
+            dtype=torch.bfloat16,
+            device=gate_up.device,
+        )
+        for tensor in side_lora
+    )
+    return (
+        grad_ye, grad_h, grad_gate_up, h_act, h_weighted, x_pool,
+        grad_x_pool, route_weights, grad_route, t13, t2,
+        grad_side_lora,
+    )
+
+
+def bf16_mega_moe_side_lora_backward(
+    gate_up_output: torch.Tensor,
+    saved_h: torch.Tensor,
+    saved_down_unweighted: torch.Tensor,
+    q13: torch.Tensor,
+    q2: torch.Tensor,
+    side_lora: Tuple[torch.Tensor, ...],
+    w2_weights: torch.Tensor,
+    w13_weights: torch.Tensor,
+    expert_counts: torch.Tensor,
+    padded_expert_counts: torch.Tensor,
+    grad_y: torch.Tensor,
+    sym_buffer: Any,
+    block_m: int,
+    activation_limit: float = float("inf"),
+    activation: str = "swiglu",
+    fast_math: bool = False,
+    route_weight_mode: RouteWeightMode = RouteWeightMode.PRE_DOWN,
+    combine_order_mode: CombineOrderMode = CombineOrderMode.FIXED_TOPK,
+    side_lora_scale: float = 1.0,
+    direct_remote_grad_x: Optional[bool] = None,
+    combine_grad_x: bool = True,
+    write_grad_x_pool: Optional[bool] = None,
+    out: Optional[MegaMoESideLoraBackwardResult] = None,
+    grid_sync_counter: Optional[torch.Tensor] = None,
+    expert_psum_rows: Optional[torch.Tensor] = None,
+) -> MegaMoESideLoraBackwardResult:
+    """Run the dedicated BF16 base-dgrad + rank-128 LoRA backward.
+
+    The native path produces six adapter gradients and intentionally performs
+    no frozen base-weight gradients. It also avoids hidden-width LoRA delta or
+    gradient scratch buffers. ``w13_weights`` uses the same 8-row gate/up
+    interleave returned by :func:`transform_weights_for_mega_moe`; the
+    internal ``grad_gate_up`` result is emitted in that matching interleave.
+    """
+    route_weight_mode = RouteWeightMode(route_weight_mode)
+    combine_order_mode = CombineOrderMode(combine_order_mode)
+    if route_weight_mode is RouteWeightMode.POST_DOWN:
+        raise NotImplementedError(
+            "BF16 side-LoRA backward currently supports pre_down routing only")
+    if len(side_lora) != 6 or side_lora[0].size(0) != 128:
+        raise ValueError("side_lora must be a rank-128 transformed tuple")
+    if direct_remote_grad_x is None:
+        direct_remote_grad_x = sym_buffer.group.size() > 1
+    if write_grad_x_pool is None:
+        write_grad_x_pool = not direct_remote_grad_x
+    if not write_grad_x_pool and not direct_remote_grad_x:
+        raise ValueError("grad-x requires a local or direct remote output")
+    # The native specialization materializes the base dgrad pool, folds both
+    # side branches into it, then publishes the final value once. This is the
+    # ordinary base-dgrad output, not an additional side-LoRA wide scratch.
+    write_grad_x_pool = True
+    outputs = (
+        _allocate_side_lora_backward_outputs(
+            gate_up_output, side_lora, w13_weights.size(2),
+            w2_weights.size(2), write_grad_x_pool)
+        if out is None else (
+            out.grad_ye, out.grad_h, out.grad_gate_up, out.h_act,
+            out.h_weighted, out.x_pool, out.grad_x_pool,
+            out.route_weights, out.grad_route, out.t13, out.t2,
+            out.grad_side_lora)
+    )
+    (grad_ye, grad_h, grad_gate_up, h_act, h_weighted, x_pool,
+     grad_x_pool, route_weights, grad_route, t13, t2,
+     grad_side_lora) = outputs
+    _direct_grad_x_planes(sym_buffer).zero_()
+    sym_buffer.backward_grad_y[:grad_y.size(0)].copy_(
+        grad_y.to(torch.bfloat16).contiguous())
+    sym_buffer.backward_grad_route.zero_()
+    num_grid_states = (
+        expert_counts.numel() *
+        ((w13_weights.size(2) // 64) * (w2_weights.size(2) // 128) +
+         (w13_weights.size(1) // 64) * (w13_weights.size(2) // 128)) + 2)
+    if grid_sync_counter is None:
+        grid_sync_counter = torch.zeros(
+            num_grid_states, dtype=torch.int32, device=gate_up_output.device)
+    if expert_psum_rows is None:
+        expert_psum_rows = padded_expert_counts.cumsum(0).to(torch.int32)
+    # Publish and pull grad-y/x/route metadata before the rank shrink. The
+    # following persistent specialization is told that dispatch is complete,
+    # so it does not repeat communication. This is a native CUDA prelude; no
+    # framework GEMM participates in the production backward.
+    _C.bf16_mega_moe_backward_post_down_prelude_v2(
+        grad_ye, grad_ye, x_pool, route_weights, grad_route,
+        saved_down_unweighted, expert_counts,
+        sym_buffer.backward_grad_y, sym_buffer.x,
+        sym_buffer.topk_weights, sym_buffer.backward_grad_route,
+        sym_buffer.token_src_metadata, sym_buffer.handle.buffer_ptrs,
+        sym_buffer.group.rank(), sym_buffer.num_topk, block_m,
+        combine_order_mode.value, True, False, False, True, True,
+        False, False, 256)
+    _C.bf16_mega_moe_side_lora_backward(
+        gate_up_output, grad_h, grad_gate_up, h_act, h_weighted,
+        x_pool, grad_x_pool, grad_route, grad_ye, grad_ye,
+        route_weights, w2_weights, w13_weights, expert_counts,
+        grid_sync_counter, float(activation_limit), activation,
+        bool(fast_math), route_weight_mode.value,
+        combine_order_mode.value, saved_down_unweighted, block_m,
+        bool(direct_remote_grad_x),
+        bool(write_grad_x_pool), True,
+        sym_buffer.backward_grad_y, sym_buffer.x,
+        sym_buffer.topk_weights, sym_buffer.backward_grad_route,
+        sym_buffer.token_src_metadata, sym_buffer.handle.buffer_ptrs,
+        sym_buffer.group.rank(), sym_buffer.num_max_tokens_per_rank,
+        sym_buffer.num_topk, "dispatch_prepared", *side_lora, q13, q2, saved_h,
+        t13, t2, *grad_side_lora, expert_psum_rows,
+        padded_expert_counts, float(side_lora_scale), None)
+    grad_x = None
+    if direct_remote_grad_x and combine_grad_x:
+        grad_x = (
+            torch.empty_like(grad_y, dtype=torch.bfloat16)
+            if out is None or out.grad_x is None else out.grad_x)
+        mega_moe_backward_combine_grad_x(
+            grad_x, sym_buffer, combine_order_mode)
+    return MegaMoESideLoraBackwardResult(
+        grad_x_pool, grad_x, grad_route, grad_ye, grad_h,
+        grad_gate_up, h_act, h_weighted, x_pool, route_weights,
+        t13, t2, grad_side_lora)
+
+
+def fp8_fp4_mega_moe_side_lora_backward(
+    gate_up_output: torch.Tensor,
+    saved_h: torch.Tensor,
+    saved_down_unweighted: torch.Tensor,
+    q13: torch.Tensor,
+    q2: torch.Tensor,
+    side_lora: Tuple[torch.Tensor, ...],
+    l1_acts: torch.Tensor,
+    l1_acts_sf: torch.Tensor,
+    l1_weights: Tuple[torch.Tensor, torch.Tensor],
+    w13_weights: Tuple[torch.Tensor, torch.Tensor],
+    w2_weights: Tuple[torch.Tensor, torch.Tensor],
+    w13_dequant_scratch: torch.Tensor,
+    w2_dequant_scratch: torch.Tensor,
+    expert_counts: torch.Tensor,
+    padded_expert_counts: torch.Tensor,
+    grad_y: torch.Tensor,
+    sym_buffer: Any,
+    block_m: int,
+    activation_limit: float = float("inf"),
+    route_weight_mode: RouteWeightMode = RouteWeightMode.PRE_DOWN,
+    side_lora_scale: float = 1.0,
+    direct_remote_grad_x: Optional[bool] = None,
+    combine_grad_x: bool = True,
+    write_grad_x_pool: Optional[bool] = None,
+    out: Optional[MegaMoESideLoraBackwardResult] = None,
+    grid_sync_counter: Optional[torch.Tensor] = None,
+    expert_psum_rows: Optional[torch.Tensor] = None,
+) -> MegaMoESideLoraBackwardResult:
+    """Run the dedicated MXFP4 base-dgrad + BF16 side-LoRA backward."""
+    route_weight_mode = RouteWeightMode(route_weight_mode)
+    if route_weight_mode is RouteWeightMode.POST_DOWN:
+        raise NotImplementedError(
+            "MXFP4 side-LoRA backward currently supports pre_down routing only")
+    if len(side_lora) != 6 or side_lora[0].size(0) != 128:
+        raise ValueError("side_lora must be a rank-128 transformed tuple")
+    if direct_remote_grad_x is None:
+        direct_remote_grad_x = sym_buffer.group.size() > 1
+    if write_grad_x_pool is None:
+        write_grad_x_pool = not direct_remote_grad_x
+    if not write_grad_x_pool and not direct_remote_grad_x:
+        raise ValueError("grad-x requires a local or direct remote output")
+    write_grad_x_pool = True
+    hidden = w2_weights[0].size(1)
+    intermediate_hidden = w2_dequant_scratch.size(2)
+    outputs = (
+        _allocate_side_lora_backward_outputs(
+            gate_up_output, side_lora, hidden, intermediate_hidden,
+            write_grad_x_pool)
+        if out is None else (
+            out.grad_ye, out.grad_h, out.grad_gate_up, out.h_act,
+            out.h_weighted, out.x_pool, out.grad_x_pool,
+            out.route_weights, out.grad_route, out.t13, out.t2,
+            out.grad_side_lora)
+    )
+    (grad_ye, grad_h, grad_gate_up, h_act, h_weighted, x_pool,
+     grad_x_pool, route_weights, grad_route, t13, t2,
+     grad_side_lora) = outputs
+    _direct_grad_x_planes(sym_buffer).zero_()
+    sym_buffer.backward_grad_y[:grad_y.size(0)].copy_(
+        grad_y.to(torch.bfloat16).contiguous())
+    sym_buffer.backward_grad_route.zero_()
+    num_grid_states = (
+        expert_counts.numel() *
+        ((hidden // 64) * (intermediate_hidden // 128) +
+         ((2 * intermediate_hidden) // 64) * (hidden // 128)) + 2)
+    if grid_sync_counter is None:
+        grid_sync_counter = torch.zeros(
+            num_grid_states, dtype=torch.int32, device=gate_up_output.device)
+    if expert_psum_rows is None:
+        expert_psum_rows = padded_expert_counts.cumsum(0).to(torch.int32)
+    _C.bf16_mega_moe_backward_post_down_prelude_v2(
+        grad_ye, grad_ye, x_pool, route_weights, grad_route,
+        saved_down_unweighted, expert_counts,
+        sym_buffer.backward_grad_y, sym_buffer.side_lora_source,
+        sym_buffer.topk_weights, sym_buffer.backward_grad_route,
+        sym_buffer.token_src_metadata, sym_buffer.handle.buffer_ptrs,
+        sym_buffer.group.rank(), sym_buffer.num_topk, block_m,
+        CombineOrderMode.FIXED_TOPK.value, True, False,
+        False, True, True, False, False, 256)
+    _C.fp8_fp4_mega_moe_side_lora_backward(
+        gate_up_output, grad_h, grad_gate_up, h_act, h_weighted,
+        x_pool, grad_x_pool, l1_acts, l1_acts_sf,
+        l1_weights[0], l1_weights[1], grad_ye, route_weights,
+        w2_weights[0], w2_weights[1], w2_dequant_scratch,
+        w13_weights[0], w13_weights[1], w13_dequant_scratch,
+        expert_counts, grid_sync_counter, float(activation_limit), True,
+        bool(direct_remote_grad_x),
+        bool(write_grad_x_pool), True, block_m,
+        sym_buffer.handle.buffer_ptrs,
+        sym_buffer.group.rank(), sym_buffer.num_max_tokens_per_rank,
+        sym_buffer.num_topk,
+        sym_buffer.backward_grad_y, sym_buffer.topk_weights,
+        sym_buffer.backward_grad_route, sym_buffer.token_src_metadata,
+        route_weight_mode.value, grad_ye, saved_down_unweighted,
+        grad_route, *side_lora, q13, q2, saved_h, t13, t2,
+        *grad_side_lora, expert_psum_rows, padded_expert_counts,
+        float(side_lora_scale))
+    grad_x = None
+    if direct_remote_grad_x and combine_grad_x:
+        grad_x = (
+            torch.empty_like(grad_y, dtype=torch.bfloat16)
+            if out is None or out.grad_x is None else out.grad_x)
+        mega_moe_backward_combine_grad_x(
+            grad_x, sym_buffer, CombineOrderMode.FIXED_TOPK)
+    return MegaMoESideLoraBackwardResult(
+        grad_x_pool, grad_x, grad_route, grad_ye, grad_h,
+        grad_gate_up, h_act, h_weighted, x_pool, route_weights,
+        t13, t2, grad_side_lora)
 
 
 def bf16_mega_moe_backward_w2(

@@ -2,6 +2,7 @@
 
 #include "../jit_kernels/impls/sm100_bf16_mega_moe_wgrad.hpp"
 #include "../jit_kernels/impls/sm100_fp8_fp4_mega_moe_backward.hpp"
+#include "../jit_kernels/impls/sm100_bf16_mega_moe_side_lora_backward.hpp"
 
 namespace deep_gemm::mega_backward {
 
@@ -477,6 +478,41 @@ static void bf16_mega_moe_backward_w13_combine(
 
 static void register_apis(pybind11::module_& m) {
 #if DG_TENSORMAP_COMPATIBLE
+    m.def(
+        "fp8_fp4_mega_moe_side_lora_backward",
+        &deep_gemm::sm100_fp8_fp4_mega_moe_side_lora_backward);
+    m.def(
+        "bf16_mega_moe_side_lora_backward",
+        &deep_gemm::sm100_bf16_mega_moe_side_lora_backward,
+        py::arg("gate_up_output"), py::arg("grad_h_output"),
+        py::arg("grad_gate_up_output"), py::arg("h_act_output"),
+        py::arg("h_weighted_output"), py::arg("x_pool_output"),
+        py::arg("grad_x_pool_output"), py::arg("grad_route_output"),
+        py::arg("grad_ye"), py::arg("grad_y_unweighted_output"),
+        py::arg("route_weights"), py::arg("w2_weights"),
+        py::arg("w13_weights"), py::arg("expert_counts"),
+        py::arg("grid_sync_counter"), py::arg("activation_limit"),
+        py::arg("activation"), py::arg("fast_math"),
+        py::arg("route_weight_mode"), py::arg("combine_order_mode"),
+        py::arg("down_unweighted_output"), py::arg("block_m"),
+        py::arg("direct_remote_grad_x"), py::arg("write_grad_x_pool"),
+        py::arg("clear_wgrad_padding"), py::arg("backward_grad_y"),
+        py::arg("backward_x"), py::arg("backward_topk_weights"),
+        py::arg("backward_grad_route"), py::arg("token_src_metadata"),
+        py::arg("backward_sym_buffer_ptrs"), py::arg("backward_rank"),
+        py::arg("num_max_tokens_per_rank"), py::arg("num_topk"),
+        py::arg("memory_mode"),
+        py::arg("side_lora_a1"), py::arg("side_lora_b1"),
+        py::arg("side_lora_a3"), py::arg("side_lora_b3"),
+        py::arg("side_lora_a2"), py::arg("side_lora_b2"),
+        py::arg("side_lora_q13"), py::arg("side_lora_q2"),
+        py::arg("side_lora_saved_h"), py::arg("side_lora_t13"),
+        py::arg("side_lora_t2"), py::arg("grad_side_lora_a1"),
+        py::arg("grad_side_lora_b1"), py::arg("grad_side_lora_a3"),
+        py::arg("grad_side_lora_b3"), py::arg("grad_side_lora_a2"),
+        py::arg("grad_side_lora_b2"), py::arg("expert_psum_rows"),
+        py::arg("padded_expert_counts"), py::arg("side_lora_scale"),
+        py::arg("kernel_trace") = py::none());
     m.def("fp8_fp4_mega_moe_backward_dgrad_swiglu_v2",
           &fp8_fp4_mega_moe_backward_dgrad_swiglu_v2,
           py::arg("gate_up_output"), py::arg("grad_h_output"),
