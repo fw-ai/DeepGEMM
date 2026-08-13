@@ -487,14 +487,20 @@ class SM100BF16MegaMoESideLoraClearPaddingRuntime final
     : public LaunchRuntime<SM100BF16MegaMoESideLoraClearPaddingRuntime> {
 public:
     struct Args {
+        int hidden;
         int intermediate_hidden;
         int num_experts;
         int block_m;
         int num_sms;
         const int* expert_counts;
+        uint32_t num_pool_rows;
         cutlass::bfloat16_t* saved_h;
         cutlass::bfloat16_t* q13;
         cutlass::bfloat16_t* q2;
+        cutlass::bfloat16_t* t13;
+        cutlass::bfloat16_t* t2;
+        cutlass::bfloat16_t* x_pool;
+        cutlass::bfloat16_t* grad_ye;
         LaunchArgs launch_args;
     };
 
@@ -504,9 +510,9 @@ public:
 using namespace deep_gemm;
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(
-        &sm100_bf16_mega_moe_side_lora_clear_padding_impl<{}, {}, {}, {}>);
+        &sm100_bf16_mega_moe_side_lora_clear_padding_impl<{}, {}, {}, {}, {}>);
 }}
-)", args.intermediate_hidden, args.num_experts, args.block_m,
+)", args.hidden, args.intermediate_hidden, args.num_experts, args.block_m,
             args.num_sms);
     }
 
@@ -515,8 +521,9 @@ static void __instantiate_kernel() {{
         const LaunchConfigHandle& config,
         Args args) {
         DG_CUDA_UNIFIED_CHECK(launch_kernel(
-            kernel, config, args.expert_counts, args.saved_h,
-            args.q13, args.q2));
+            kernel, config, args.expert_counts, args.num_pool_rows, args.saved_h,
+            args.q13, args.q2, args.t13, args.t2,
+            args.x_pool, args.grad_ye));
     }
 };
 
@@ -1231,17 +1238,27 @@ static void sm100_bf16_mega_moe_side_lora_backward(
     // Clear forward padding before the adapter wgrads. B2 is formed now so
     // the dead grad-ye plane can hold the second L1 dgrad expansion.
     const SM100BF16MegaMoESideLoraClearPaddingRuntime::Args clear_args{
+        .hidden = hidden,
         .intermediate_hidden = intermediate_hidden,
         .num_experts = num_experts,
         .block_m = block_m,
         .num_sms = num_sms,
         .expert_counts = expert_counts.data_ptr<int>(),
+        .num_pool_rows = static_cast<uint32_t>(num_pool_rows),
         .saved_h = reinterpret_cast<cutlass::bfloat16_t*>(
             side_lora_saved_h.data_ptr<at::BFloat16>()),
         .q13 = reinterpret_cast<cutlass::bfloat16_t*>(
             side_lora_q13.data_ptr<at::BFloat16>()),
         .q2 = reinterpret_cast<cutlass::bfloat16_t*>(
             side_lora_q2.data_ptr<at::BFloat16>()),
+        .t13 = reinterpret_cast<cutlass::bfloat16_t*>(
+            side_lora_t13.data_ptr<at::BFloat16>()),
+        .t2 = reinterpret_cast<cutlass::bfloat16_t*>(
+            side_lora_t2.data_ptr<at::BFloat16>()),
+        .x_pool = reinterpret_cast<cutlass::bfloat16_t*>(
+            x_pool_output.data_ptr<at::BFloat16>()),
+        .grad_ye = reinterpret_cast<cutlass::bfloat16_t*>(
+            grad_ye.data_ptr<at::BFloat16>()),
         .launch_args = LaunchArgs(num_sms, 256, 0, 1),
     };
     const auto clear_code =
@@ -2025,17 +2042,27 @@ static void sm100_fp8_fp4_mega_moe_side_lora_backward(
         get_major_type_ab(b3_nt));
 
     const SM100BF16MegaMoESideLoraClearPaddingRuntime::Args clear_args{
+        .hidden = hidden,
         .intermediate_hidden = intermediate_hidden,
         .num_experts = num_experts,
         .block_m = block_m,
         .num_sms = num_sms,
         .expert_counts = expert_counts.data_ptr<int>(),
+        .num_pool_rows = static_cast<uint32_t>(num_pool_rows),
         .saved_h = reinterpret_cast<cutlass::bfloat16_t*>(
             side_lora_saved_h.data_ptr<at::BFloat16>()),
         .q13 = reinterpret_cast<cutlass::bfloat16_t*>(
             side_lora_q13.data_ptr<at::BFloat16>()),
         .q2 = reinterpret_cast<cutlass::bfloat16_t*>(
             side_lora_q2.data_ptr<at::BFloat16>()),
+        .t13 = reinterpret_cast<cutlass::bfloat16_t*>(
+            side_lora_t13.data_ptr<at::BFloat16>()),
+        .t2 = reinterpret_cast<cutlass::bfloat16_t*>(
+            side_lora_t2.data_ptr<at::BFloat16>()),
+        .x_pool = reinterpret_cast<cutlass::bfloat16_t*>(
+            x_pool_output.data_ptr<at::BFloat16>()),
+        .grad_ye = reinterpret_cast<cutlass::bfloat16_t*>(
+            grad_ye.data_ptr<at::BFloat16>()),
         .launch_args = LaunchArgs(num_sms, 256, 0, 1),
     };
     const auto clear_code =

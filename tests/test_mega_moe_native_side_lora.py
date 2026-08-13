@@ -234,6 +234,11 @@ def _relative(actual: torch.Tensor, expected: torch.Tensor) -> float:
     return float(calc_diff(actual.detach().float(), expected.detach().float()))
 
 
+def _max_abs_diff(actual: torch.Tensor, expected: torch.Tensor) -> float:
+    delta = actual.detach().float() - expected.detach().float()
+    return float(delta.abs().max()) if delta.numel() else 0.0
+
+
 def _accuracy(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, float]:
     actual_f = actual.detach().float()
     expected_f = expected.detach().float()
@@ -488,21 +493,52 @@ def run_bf16_correctness(local_rank: int, world: int, args) -> None:
         _relative(actual, expected.grad)
         for actual, expected in zip(result.grad_side_lora, adapter_ref)
     ]
+    grad_accuracy = [
+        _accuracy(actual, expected.grad)
+        for actual, expected in zip(result.grad_side_lora, adapter_ref)
+    ]
     grad_x_diff = _relative(result.grad_x_pool[active], x_ref.grad)
+    grad_x_accuracy = _accuracy(result.grad_x_pool[active], x_ref.grad)
+    # Validate the three shared native contractions on the kernel's own saved
+    # forward/backward boundaries. The separate autograd comparison above is
+    # still useful, but at tiny route counts its BF16 reduction order can
+    # dominate cosine even when the fused contraction itself is exact.
+    native_boundary_shared_grad_refs = [
+        (saved_x[active].float().t() @ result.t13[active, 0].float()
+         * args.scale).bfloat16(),
+        (saved_x[active].float().t() @ result.t13[active, 1].float()
+         * args.scale).bfloat16(),
+        (q2[active].float().t()
+         @ (route_grad.float() *
+            (route_ref.detach().float().unsqueeze(1)
+             if args.route_weight_mode == "post_down" else 1.0))
+         * args.scale).bfloat16(),
+    ]
+    native_boundary_shared_adapter_accuracy = [
+        _accuracy(actual, expected)
+        for actual, expected in zip(
+            (
+                result.grad_side_lora[0],
+                result.grad_side_lora[2],
+                result.grad_side_lora[5],
+            ),
+            native_boundary_shared_grad_refs,
+            strict=True,
+        )
+    ]
     source_grad_x = _scatter_to_sources(
         x_ref.grad.to(torch.bfloat16), metadata, ranks, tokens, group)[rank]
     combined_grad_x_diff = (
         _relative(result.grad_x, source_grad_x) if ranks > 1 else 0.0)
     route_grad_diff = _relative(result.grad_route[active], route_ref.grad)
-    route_grad_max_abs = float(
-        (result.grad_route[active] - route_ref.grad).abs().max())
+    route_grad_max_abs = _max_abs_diff(
+        result.grad_route[active], route_ref.grad)
     source_route_grad = _scatter_route_grads(
         route_ref.grad, metadata, ranks, tokens, topk, group)[rank]
     combined_route_grad_diff = _relative(
         buffer.backward_grad_route[:tokens, :topk], source_route_grad)
-    combined_route_grad_max_abs = float((
-        buffer.backward_grad_route[:tokens, :topk] - source_route_grad
-    ).abs().max())
+    combined_route_grad_max_abs = _max_abs_diff(
+        buffer.backward_grad_route[:tokens, :topk], source_route_grad)
     route_grad_close = (
         route_grad_diff < 0.03 or route_grad_max_abs < 0.01)
     combined_route_grad_close = (
@@ -540,6 +576,10 @@ def run_bf16_correctness(local_rank: int, world: int, args) -> None:
         assert output_diff < forward_tolerance, output_diff
     assert q_diff < forward_tolerance, q_diff
     assert max(grad_diffs) < 0.03, grad_diffs
+    assert min(
+        metric["cosine_similarity"]
+        for metric in native_boundary_shared_adapter_accuracy
+    ) > 0.9999, native_boundary_shared_adapter_accuracy
     assert grad_x_diff < 0.03, grad_x_diff
     assert combined_grad_x_diff < 0.03, combined_grad_x_diff
     assert route_grad_close, (route_grad_diff, route_grad_max_abs)
@@ -571,7 +611,12 @@ def run_bf16_correctness(local_rank: int, world: int, args) -> None:
             "forward_diff": forward_diff, "activation_diff": h_diff,
             "down_diff": down_diff, "output_diff": output_diff,
             "side_q_diff": q_diff, "adapter_grad_diffs": grad_diffs,
+            "adapter_grad_accuracy": grad_accuracy,
+            "native_boundary_shared_adapter_accuracy": (
+                native_boundary_shared_adapter_accuracy
+            ),
             "grad_x_diff": grad_x_diff,
+            "grad_x_accuracy": grad_x_accuracy,
             "combined_grad_x_diff": combined_grad_x_diff,
             "route_grad_diff": route_grad_diff,
             "route_grad_max_abs": route_grad_max_abs,
@@ -886,7 +931,11 @@ def run_mxfp4_correctness(local_rank: int, world: int, args) -> None:
     ]
     assert max(forward_diffs.values()) < 0.04, forward_diffs
     assert max(grad_diffs) < 0.04, grad_diffs
+    assert min(
+        metric["cosine_similarity"] for metric in grad_accuracy
+    ) > 0.9999, grad_accuracy
     assert grad_x_diff < 0.04, grad_x_diff
+    assert grad_x_accuracy["cosine_similarity"] > 0.9999, grad_x_accuracy
     assert combined_grad_x_diff < 0.04, combined_grad_x_diff
     assert route_grad_diff < 0.04, route_grad_diff
     assert combined_route_grad_diff < 0.04, combined_route_grad_diff

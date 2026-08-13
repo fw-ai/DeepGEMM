@@ -23,6 +23,24 @@ def _case(name: str, *arguments: str) -> tuple[str, tuple[str, ...]]:
     return name, (*COMMON, *arguments)
 
 
+def _production_case(
+    mode: str, tokens: int,
+) -> tuple[str, tuple[str, ...]]:
+    return (
+        f"{mode}_production_boundary_{tokens}_ep4",
+        (
+            "--hidden", "4096",
+            "--intermediate", "2048",
+            "--experts", "256",
+            "--topk", "6",
+            "--mode", mode,
+            "--tokens", str(tokens),
+            "--routing", "remote",
+            "--masked-ratio", "0.2",
+        ),
+    )
+
+
 EP1_CASES = (
     _case(
         "bf16_single_route_single_token",
@@ -71,11 +89,32 @@ EP_CASES = (
 )
 
 
+# Every point immediately below and above a production scheduler transition,
+# plus a zero-active-rank case and a larger steady-state case. These exact
+# DSV4 Flash widths reproduce padding and rank-uniform route-pool suffixes that
+# the compact default cases cannot exercise.
+PRODUCTION_BOUNDARY_TOKENS = (
+    1, 15, 16, 17, 90, 91, 176, 177, 346, 347, 688, 689, 1029, 1030, 2048,
+)
+PRODUCTION_EP4_CASES = tuple(
+    _production_case(mode, tokens)
+    for mode in ("bf16", "mxfp4")
+    for tokens in PRODUCTION_BOUNDARY_TOKENS
+)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--ep-processes", type=int, default=2,
         help="number of GPUs for remote-route cases; use 1 to skip them")
+    parser.add_argument(
+        "--production-boundaries", action="store_true",
+        help=(
+            "also run the exact 4096x2048, 256-expert EP4 boundary sweep "
+            "on four GPUs"
+        ),
+    )
     args = parser.parse_args()
     if args.ep_processes < 1:
         parser.error("ep-processes must be positive")
@@ -83,9 +122,13 @@ def main() -> None:
     cases = list(EP1_CASES)
     if args.ep_processes > 1:
         cases.extend(EP_CASES)
+    if args.production_boundaries:
+        cases.extend(PRODUCTION_EP4_CASES)
     for name, arguments in cases:
-        processes = (
-            args.ep_processes if name.endswith("_ep") else 1)
+        if name.endswith("_ep4"):
+            processes = 4
+        else:
+            processes = args.ep_processes if name.endswith("_ep") else 1
         command = (
             sys.executable, str(WORKER),
             "--num-processes", str(processes), *arguments)

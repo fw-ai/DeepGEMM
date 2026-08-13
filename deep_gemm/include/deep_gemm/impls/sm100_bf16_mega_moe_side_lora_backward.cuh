@@ -1514,51 +1514,116 @@ CUTLASS_GLOBAL void sm100_bf16_mega_moe_side_lora_scale_grads_impl(
 #endif
 }
 
+template <uint32_t kHidden, uint32_t kIntermediateHidden>
+CUTLASS_DEVICE void sm100_bf16_mega_moe_side_lora_clear_padding_element(
+    const uint32_t pool_row,
+    const uint32_t column,
+    cutlass::bfloat16_t* saved_h,
+    cutlass::bfloat16_t* q13,
+    cutlass::bfloat16_t* q2,
+    cutlass::bfloat16_t* t13,
+    cutlass::bfloat16_t* t2,
+    cutlass::bfloat16_t* x_pool,
+    cutlass::bfloat16_t* grad_ye) {
+    if (column < kIntermediateHidden) {
+        saved_h[static_cast<uint64_t>(pool_row) * kIntermediateHidden +
+                column] = cutlass::bfloat16_t(0.0f);
+        return;
+    }
+    uint32_t remaining = column - kIntermediateHidden;
+    const uint64_t rank_row = static_cast<uint64_t>(pool_row) * 128;
+    const uint64_t rank_pair_row = static_cast<uint64_t>(pool_row) * 256;
+    if (remaining < 256) {
+        q13[rank_pair_row + remaining] = cutlass::bfloat16_t(0.0f);
+        return;
+    }
+    remaining -= 256;
+    if (remaining < 128) {
+        q2[rank_row + remaining] = cutlass::bfloat16_t(0.0f);
+        return;
+    }
+    remaining -= 128;
+    if (remaining < 256) {
+        t13[rank_pair_row + remaining] = cutlass::bfloat16_t(0.0f);
+        return;
+    }
+    remaining -= 256;
+    if (remaining < 128) {
+        t2[rank_row + remaining] = cutlass::bfloat16_t(0.0f);
+        return;
+    }
+    remaining -= 128;
+    const uint64_t hidden_row = static_cast<uint64_t>(pool_row) * kHidden;
+    if (remaining < kHidden) {
+        x_pool[hidden_row + remaining] = cutlass::bfloat16_t(0.0f);
+    } else {
+        grad_ye[hidden_row + remaining - kHidden] =
+            cutlass::bfloat16_t(0.0f);
+    }
+}
+
 // Forward saves only logical expert rows. Clear the already-allocated padded
 // tails before K-grouped adapter wgrads so they contribute exact zeros.
-template <uint32_t kIntermediateHidden, uint32_t kNumExperts,
+template <uint32_t kHidden, uint32_t kIntermediateHidden, uint32_t kNumExperts,
           uint32_t BLOCK_M, uint32_t kNumSMs>
 CUTLASS_GLOBAL void sm100_bf16_mega_moe_side_lora_clear_padding_impl(
     const int* expert_counts,
+    const uint32_t num_pool_rows,
     cutlass::bfloat16_t* saved_h,
     cutlass::bfloat16_t* q13,
-    cutlass::bfloat16_t* q2) {
+    cutlass::bfloat16_t* q2,
+    cutlass::bfloat16_t* t13,
+    cutlass::bfloat16_t* t2,
+    cutlass::bfloat16_t* x_pool,
+    cutlass::bfloat16_t* grad_ye) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)) || defined(__CLION_IDE__)
-    constexpr uint32_t kRankStorage = 3 * 128;
+    // Every operand below participates in a GEMM whose K dimension spans the
+    // complete block-padded route pool.  Clearing only one operand is not
+    // sufficient: IEEE 0 * NaN still produces NaN, so allocator contents in
+    // the other operand can poison a shared A1/A3/B2 reduction.
+    constexpr uint32_t kRankStorage = 6 * 128;
+    constexpr uint32_t kHiddenStorage = 2 * kHidden;
+    constexpr uint32_t kRowStorage =
+        kIntermediateHidden + kRankStorage + kHiddenStorage;
     uint32_t pool_offset = 0;
     for (uint32_t expert = 0; expert < kNumExperts; ++expert) {
         const uint32_t count = static_cast<uint32_t>(
             __ldg(expert_counts + expert));
         const uint32_t capacity = math::ceil_div(count, BLOCK_M) * BLOCK_M;
         const uint32_t padding = capacity - count;
-        const uint64_t elements = static_cast<uint64_t>(padding) *
-            (kIntermediateHidden + kRankStorage);
+        const uint64_t elements =
+            static_cast<uint64_t>(padding) * kRowStorage;
         for (uint64_t linear =
                  static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
              linear < elements;
              linear += static_cast<uint64_t>(kNumSMs) * blockDim.x) {
-            const uint32_t padding_row = linear /
-                (kIntermediateHidden + kRankStorage);
+            const uint32_t padding_row = linear / kRowStorage;
             const uint32_t column = linear -
-                static_cast<uint64_t>(padding_row) *
-                    (kIntermediateHidden + kRankStorage);
+                static_cast<uint64_t>(padding_row) * kRowStorage;
             const uint32_t pool_row = pool_offset + count + padding_row;
-            if (column < kIntermediateHidden) {
-                saved_h[static_cast<uint64_t>(pool_row) *
-                        kIntermediateHidden + column] =
-                    cutlass::bfloat16_t(0.0f);
-            } else {
-                const uint32_t rank_column = column - kIntermediateHidden;
-                if (rank_column < 256) {
-                    q13[static_cast<uint64_t>(pool_row) * 256 +
-                        rank_column] = cutlass::bfloat16_t(0.0f);
-                } else {
-                    q2[static_cast<uint64_t>(pool_row) * 128 +
-                       rank_column - 256] = cutlass::bfloat16_t(0.0f);
-                }
-            }
+            sm100_bf16_mega_moe_side_lora_clear_padding_element<
+                kHidden, kIntermediateHidden>(
+                    pool_row, column, saved_h, q13, q2, t13, t2,
+                    x_pool, grad_ye);
         }
         pool_offset += capacity;
+    }
+    // Distributed buffers are sized to the maximum route-pool length across
+    // ranks. A sparse rank can therefore have a whole unowned suffix beyond
+    // its final local expert; shared wgrads still reduce across that suffix.
+    const uint64_t suffix_elements =
+        static_cast<uint64_t>(num_pool_rows - pool_offset) * kRowStorage;
+    for (uint64_t linear =
+             static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         linear < suffix_elements;
+         linear += static_cast<uint64_t>(kNumSMs) * blockDim.x) {
+        const uint32_t suffix_row = linear / kRowStorage;
+        const uint32_t column = linear -
+            static_cast<uint64_t>(suffix_row) * kRowStorage;
+        sm100_bf16_mega_moe_side_lora_clear_padding_element<
+            kHidden, kIntermediateHidden>(
+                pool_offset + suffix_row, column, saved_h, q13, q2, t13,
+                t2, x_pool, grad_ye);
     }
 #endif
 }
