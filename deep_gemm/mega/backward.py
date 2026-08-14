@@ -1175,6 +1175,22 @@ def fp8_fp4_mega_moe_side_lora_backward(
     write_grad_x_pool = True
     hidden = w2_weights[0].size(1)
     intermediate_hidden = w2_dequant_scratch.size(2)
+    expected_down_shape = (gate_up_output.size(0), hidden)
+    if saved_down_unweighted.dtype != torch.bfloat16:
+        raise TypeError("saved_down_unweighted must be BF16")
+    if saved_down_unweighted.device != gate_up_output.device:
+        raise ValueError(
+            "saved_down_unweighted must be on the same device as "
+            "gate_up_output"
+        )
+    if not saved_down_unweighted.is_contiguous():
+        raise ValueError("saved_down_unweighted must be contiguous")
+    if tuple(saved_down_unweighted.shape) != expected_down_shape:
+        raise ValueError(
+            "saved_down_unweighted must cover the full route pool with "
+            f"shape {expected_down_shape}; got "
+            f"{tuple(saved_down_unweighted.shape)}"
+        )
     outputs = (
         _allocate_side_lora_backward_outputs(
             gate_up_output, side_lora, hidden, intermediate_hidden,

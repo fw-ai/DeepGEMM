@@ -363,8 +363,7 @@ def fp8_fp4_mega_moe_side_lora(
                 (pool_rows, 128), dtype=torch.bfloat16,
                 device=y.device),
             torch.zeros(
-                4 * sym_buffer.num_ring_tokens //
-                _C.get_token_alignment_for_mega_moe(),
+                4 * sym_buffer.num_ring_tokens // 8,
                 dtype=torch.int32, device=y.device),
         )
     if len(side_lora_scratch) != 3:

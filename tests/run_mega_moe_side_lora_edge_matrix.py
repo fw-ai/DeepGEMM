@@ -64,7 +64,8 @@ EP1_CASES = (
         "--scale", "0"),
     _case(
         "mxfp4_balanced_bm_plus_one",
-        "--mode", "mxfp4", "--tokens", "17", "--topk", "2"),
+        "--mode", "mxfp4", "--tokens", "17", "--topk", "2",
+        "--default-side-lora-scratch", "--check-short-saved-down"),
     _case(
         "mxfp4_zero_scale_base_preservation",
         "--mode", "mxfp4", "--tokens", "17", "--topk", "2",

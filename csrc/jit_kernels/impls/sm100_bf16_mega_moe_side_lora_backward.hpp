@@ -1523,18 +1523,11 @@ static void sm100_fp8_fp4_mega_moe_side_lora_backward(
     if (grad_y_unweighted_output.has_value())
         check_bf16_hidden_pool(
             *grad_y_unweighted_output);
-    if (down_unweighted_output.has_value()) {
-        DG_HOST_ASSERT(
-            down_unweighted_output->scalar_type() ==
-            torch::kBFloat16);
-        DG_HOST_ASSERT(down_unweighted_output->is_contiguous());
-        DG_HOST_ASSERT(down_unweighted_output->dim() == 2);
-        DG_HOST_ASSERT(
-            down_unweighted_output->size(1) == hidden);
-        DG_HOST_ASSERT(
-            down_unweighted_output->size(0) > 0 &&
-            down_unweighted_output->size(0) <= num_pool_rows);
-    }
+    // The MXFP4 side path reuses this dead forward save as a full hidden-width
+    // dgrad scratch. It is therefore mandatory even for pre-down routing and
+    // must cover the entire rank-uniform route pool.
+    DG_HOST_ASSERT(down_unweighted_output.has_value());
+    check_bf16_hidden_pool(*down_unweighted_output);
     if (grad_route_output.has_value()) {
         DG_HOST_ASSERT(
             grad_route_output->scalar_type() ==

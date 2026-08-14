@@ -404,6 +404,8 @@ def run_bf16_correctness(local_rank: int, world: int, args) -> None:
         activation_clamp=args.activation_limit,
         route_weight_mode=args.route_weight_mode,
         fast_math=False)
+    if args.default_side_lora_scratch:
+        assert ready.numel() == 4 * buffer.num_ring_tokens // 8
     torch.cuda.synchronize()
     assert mismatch.item() == 0
     base_preservation = None
@@ -682,14 +684,17 @@ def run_mxfp4_correctness(local_rank: int, world: int, args) -> None:
     buffer.topk_idx[:tokens].copy_(topk_idx)
     buffer.topk_weights[:tokens].copy_(topk_weights)
     y = torch.empty_like(x_bf16)
-    deep_gemm.fp8_fp4_mega_moe_side_lora(
+    q13, q2, ready = deep_gemm.fp8_fp4_mega_moe_side_lora(
         y, transformed_w13, transformed_w2, buffer,
         side_lora_input=x_bf16, side_lora=side,
         saved_x=saved_x, saved_h_unweighted=saved_h,
         saved_l1_preact=saved_gate_up,
         saved_down_unweighted=saved_down,
         num_config_tokens=tokens, side_lora_scale=args.scale,
-        side_lora_scratch=(q13, q2, ready),
+        side_lora_scratch=(
+            None if args.default_side_lora_scratch
+            else (q13, q2, ready)
+        ),
         activation_clamp=args.activation_limit,
         route_weight_mode=args.route_weight_mode,
         fast_math=False)
@@ -779,12 +784,34 @@ def run_mxfp4_correctness(local_rank: int, world: int, args) -> None:
             _relative(q13[active, 1], torch.cat(q3_rows)),
             _relative(q2[active], torch.cat(q2_rows))),
     }
+    w13_dequant_scratch = torch.empty(
+        (local_experts, 2 * intermediate, hidden),
+        device="cuda", dtype=torch.bfloat16)
+    w2_dequant_scratch = torch.empty(
+        (local_experts, hidden, intermediate),
+        device="cuda", dtype=torch.bfloat16)
+    if args.check_short_saved_down:
+        try:
+            deep_gemm.fp8_fp4_mega_moe_side_lora_backward(
+                saved_gate_up, saved_h, saved_down[:-1], q13, q2, side,
+                buffer.l1_acts[:pool_rows], buffer.l1_acts_sf,
+                transformed_w13, backward_w13, backward_w2,
+                w13_dequant_scratch, w2_dequant_scratch,
+                counts, padded, grad_y, buffer, block_m,
+                activation_limit=args.activation_limit,
+                route_weight_mode=args.route_weight_mode,
+                side_lora_scale=args.scale,
+                direct_remote_grad_x=ranks > 1)
+        except ValueError as error:
+            assert "full route pool" in str(error), str(error)
+        else:
+            raise AssertionError(
+                "short saved_down_unweighted was not rejected")
     result = deep_gemm.fp8_fp4_mega_moe_side_lora_backward(
         saved_gate_up, saved_h, saved_down, q13, q2, side,
         buffer.l1_acts[:pool_rows], buffer.l1_acts_sf,
         transformed_w13, backward_w13, backward_w2,
-        torch.empty((local_experts, 2 * intermediate, hidden), device="cuda", dtype=torch.bfloat16),
-        torch.empty((local_experts, hidden, intermediate), device="cuda", dtype=torch.bfloat16),
+        w13_dequant_scratch, w2_dequant_scratch,
         counts, padded, grad_y, buffer, block_m,
         activation_limit=args.activation_limit,
         route_weight_mode=args.route_weight_mode,
@@ -1006,6 +1033,8 @@ if __name__ == "__main__":
         "--route-weight-mode", choices=("pre_down", "post_down"),
         default="pre_down")
     parser.add_argument("--mode", choices=("bf16", "mxfp4"), default="bf16")
+    parser.add_argument("--default-side-lora-scratch", action="store_true")
+    parser.add_argument("--check-short-saved-down", action="store_true")
     args = parser.parse_args()
     if args.experts % args.num_processes:
         parser.error("experts must be divisible by num-processes")
