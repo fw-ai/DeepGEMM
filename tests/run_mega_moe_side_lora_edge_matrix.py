@@ -67,6 +67,11 @@ EP1_CASES = (
         "--mode", "mxfp4", "--tokens", "17", "--topk", "2",
         "--default-side-lora-scratch", "--check-short-saved-down"),
     _case(
+        "mxfp4_geglu_bm_boundary",
+        "--mode", "mxfp4", "--tokens", "16", "--topk", "1",
+        "--routing", "skewed", "--activation", "geglu",
+        "--activation-limit", "1.5"),
+    _case(
         "mxfp4_zero_scale_base_preservation",
         "--mode", "mxfp4", "--tokens", "17", "--topk", "2",
         "--scale", "0"),

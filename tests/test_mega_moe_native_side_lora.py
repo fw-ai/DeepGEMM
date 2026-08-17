@@ -315,6 +315,25 @@ def test_side_lora_backward_rejects_unsupported_post_down() -> None:
                 f"{function.__name__} accepted unsupported post_down")
 
 
+def test_mxfp4_side_lora_backward_rejects_unknown_activation() -> None:
+    try:
+        deep_gemm.fp8_fp4_mega_moe_side_lora_backward(
+            gate_up_output=None, saved_h=None,
+            saved_down_unweighted=None, q13=None, q2=None,
+            side_lora=None, l1_acts=None, l1_acts_sf=None,
+            l1_weights=None, w13_weights=None, w2_weights=None,
+            w13_dequant_scratch=None, w2_dequant_scratch=None,
+            expert_counts=None, padded_expert_counts=None,
+            grad_y=None, sym_buffer=None, block_m=16,
+            activation="relu",
+        )
+    except ValueError as error:
+        assert "unsupported activation" in str(error)
+    else:
+        raise AssertionError(
+            "MXFP4 side-LoRA backward accepted an unknown activation")
+
+
 def test_side_lora_transform_validates_shared_layout() -> None:
     hidden, intermediate, experts, rank = 256, 128, 4, 128
     side_lora = (
@@ -633,8 +652,6 @@ def run_bf16_correctness(local_rank: int, world: int, args) -> None:
 
 def run_mxfp4_correctness(local_rank: int, world: int, args) -> None:
     rank, ranks, group = init_dist(local_rank, world)
-    if args.activation != "swiglu":
-        raise ValueError("MXFP4 side-LoRA backward currently supports SwiGLU")
     torch.manual_seed(4321 + rank)
     tokens, hidden, intermediate = args.tokens, args.hidden, args.intermediate
     experts, topk = args.experts, args.topk
@@ -642,7 +659,7 @@ def run_mxfp4_correctness(local_rank: int, world: int, args) -> None:
     block_m = _block_m(tokens, ranks, topk, experts)
     buffer = deep_gemm.get_symm_buffer_for_mega_moe(
         group, experts, tokens, topk, hidden, intermediate,
-        mma_type="fp8xfp4", activation="swiglu")
+        mma_type="fp8xfp4", activation=args.activation)
 
     x_bf16 = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16) * 0.1
     x_fp8 = per_token_cast_to_fp8(
@@ -739,7 +756,7 @@ def run_mxfp4_correctness(local_rank: int, world: int, args) -> None:
             (xe_base @ w13_deq[expert, intermediate:].t()).to(torch.bfloat16),
             (q3 @ b3).to(torch.bfloat16), alpha=args.scale)
         h_unweighted = _apply_activation(
-            gate, up, "swiglu", args.activation_limit)
+            gate, up, args.activation, args.activation_limit)
         route = route_ref[cursor:cursor + count]
         h_weighted = (
             h_unweighted.float() * route.float().unsqueeze(1)
@@ -799,6 +816,8 @@ def run_mxfp4_correctness(local_rank: int, world: int, args) -> None:
                 w13_dequant_scratch, w2_dequant_scratch,
                 counts, padded, grad_y, buffer, block_m,
                 activation_limit=args.activation_limit,
+                activation=args.activation,
+                fast_math=False,
                 route_weight_mode=args.route_weight_mode,
                 side_lora_scale=args.scale,
                 direct_remote_grad_x=ranks > 1)
@@ -814,6 +833,8 @@ def run_mxfp4_correctness(local_rank: int, world: int, args) -> None:
         w13_dequant_scratch, w2_dequant_scratch,
         counts, padded, grad_y, buffer, block_m,
         activation_limit=args.activation_limit,
+        activation=args.activation,
+        fast_math=False,
         route_weight_mode=args.route_weight_mode,
         side_lora_scale=args.scale, direct_remote_grad_x=ranks > 1)
     torch.cuda.synchronize()
@@ -868,9 +889,9 @@ def run_mxfp4_correctness(local_rank: int, world: int, args) -> None:
             torch.cat([tensor.grad for tensor in q3_rows]),
         ),
     }
-    # Diagnose the exact fused dSwiGLU boundary independently of either base
-    # dgrad kernel.  This reference starts from the native W2+LoRA grad-h and
-    # the native forward's saved gate/up values, so any discrepancy here is
+    # Diagnose the exact fused gated-activation boundary independently of
+    # either base dgrad kernel. This reference starts from the native W2+LoRA
+    # grad-h and the native forward's saved gate/up values, so discrepancies are
     # owned by the activation-backward phase itself.
     saved_gate, saved_up = _mx_deinterleave_pair(
         saved_gate_up_before_backward[active])
@@ -883,7 +904,7 @@ def run_mxfp4_correctness(local_rank: int, world: int, args) -> None:
     native_gate = saved_gate.detach().clone().requires_grad_(True)
     native_up = saved_up.detach().clone().requires_grad_(True)
     native_h = _apply_activation(
-        native_gate, native_up, "swiglu", args.activation_limit)
+        native_gate, native_up, args.activation, args.activation_limit)
     (native_h.float() * grad_h_for_activation.float()).sum().backward()
     exact_grad_gate = native_gate.grad
     exact_grad_up = native_up.grad
@@ -909,10 +930,10 @@ def run_mxfp4_correctness(local_rank: int, world: int, args) -> None:
         saved_gate, torch.cat(gate_rows))
     backward_boundary_accuracy["saved_vs_autograd_up_value"] = _accuracy(
         saved_up, torch.cat(up_rows))
-    backward_boundary_accuracy["saved_vs_autograd_silu_value"] = _accuracy(
+    backward_boundary_accuracy["saved_vs_autograd_activation_value"] = _accuracy(
         native_h, _apply_activation(
             torch.cat(gate_rows), torch.cat(up_rows),
-            "swiglu", args.activation_limit))
+            args.activation, args.activation_limit))
     backward_boundary_accuracy["saved_gate_up_after_backward_reuse"] = _accuracy(
         saved_gate_up[active], saved_gate_up_before_backward[active])
     # Validate the six native wgrad contractions on the kernel's own exact

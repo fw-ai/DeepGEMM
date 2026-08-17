@@ -1150,6 +1150,8 @@ def fp8_fp4_mega_moe_side_lora_backward(
     sym_buffer: Any,
     block_m: int,
     activation_limit: float = float("inf"),
+    activation: str = "swiglu",
+    fast_math: bool = True,
     route_weight_mode: RouteWeightMode = RouteWeightMode.PRE_DOWN,
     side_lora_scale: float = 1.0,
     direct_remote_grad_x: Optional[bool] = None,
@@ -1160,6 +1162,8 @@ def fp8_fp4_mega_moe_side_lora_backward(
     expert_psum_rows: Optional[torch.Tensor] = None,
 ) -> MegaMoESideLoraBackwardResult:
     """Run the dedicated MXFP4 base-dgrad + BF16 side-LoRA backward."""
+    if activation not in ("swiglu", "geglu"):
+        raise ValueError(f"unsupported activation: {activation}")
     route_weight_mode = RouteWeightMode(route_weight_mode)
     if route_weight_mode is RouteWeightMode.POST_DOWN:
         raise NotImplementedError(
@@ -1232,7 +1236,8 @@ def fp8_fp4_mega_moe_side_lora_backward(
         l1_weights[0], l1_weights[1], grad_ye, route_weights,
         w2_weights[0], w2_weights[1], w2_dequant_scratch,
         w13_weights[0], w13_weights[1], w13_dequant_scratch,
-        expert_counts, grid_sync_counter, float(activation_limit), True,
+        expert_counts, grid_sync_counter, float(activation_limit),
+        activation, bool(fast_math), True,
         bool(direct_remote_grad_x),
         bool(write_grad_x_pool), True, block_m,
         sym_buffer.handle.buffer_ptrs,

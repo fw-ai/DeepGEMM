@@ -1394,6 +1394,8 @@ static void sm100_fp8_fp4_mega_moe_side_lora_backward(
     const torch::Tensor& expert_counts,
     const torch::Tensor& grid_sync_counter,
     const float& activation_limit,
+    const std::string& activation,
+    const bool& fast_math,
     const bool& compute_w13_dgrad,
     const bool& direct_remote_grad_x,
     const bool& write_grad_x_pool,
@@ -1459,9 +1461,11 @@ static void sm100_fp8_fp4_mega_moe_side_lora_backward(
 
     DG_HOST_ASSERT(device_runtime->get_arch_major() == 10);
     DG_HOST_ASSERT(num_ranks >= 1);
+    DG_HOST_ASSERT(activation == "swiglu" || activation == "geglu");
     DG_HOST_ASSERT(
         route_weight_mode == "pre_down" ||
         route_weight_mode == "post_down");
+    DG_HOST_ASSERT(route_weight_mode == "pre_down");
     DG_HOST_ASSERT(num_ranks == 1 ||
                    (backward_rank >= 0 && backward_rank < num_ranks));
     DG_HOST_ASSERT(block_m % 16 == 0);
@@ -1879,6 +1883,8 @@ static void sm100_fp8_fp4_mega_moe_side_lora_backward(
         .num_stages = num_stages,
         .num_sms = num_sms,
         .num_ranks = num_ranks,
+        .activation = activation,
+        .fast_math = fast_math,
         .route_weight_mode = route_weight_mode,
         .expert_counts = expert_counts.data_ptr<int>(),
         .backward_sym_buffer = backward_sym_buffer,
@@ -2008,8 +2014,8 @@ static void sm100_fp8_fp4_mega_moe_side_lora_backward(
     const auto code =
         SM100BF16MegaMoESideLoraBackwardWaveRuntime::generate(args);
     const auto runtime = compiler->build(fmt::format(
-        "sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu_{}_r{}",
-        route_weight_mode,
+        "sm100_fp8_fp4_mega_moe_side_lora_backward_{}_fast{}_{}_r{}",
+        activation, fast_math, route_weight_mode,
         grad_route_output.has_value()), code);
     SM100BF16MegaMoESideLoraBackwardWaveRuntime::launch(runtime, args);
 
