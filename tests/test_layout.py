@@ -5,8 +5,10 @@ from deep_gemm.utils import (
     align, ceil_div,
     per_token_cast_to_fp8, per_channel_cast_to_fp8,
     get_tma_aligned_size,
+    get_mk_alignment_for_contiguous_layout,
     get_mn_major_tma_aligned_tensor,
     get_mn_major_tma_aligned_packed_ue8m0_tensor,
+    set_mk_alignment_for_contiguous_layout,
     get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor,
 )
 
@@ -77,6 +79,61 @@ def test_sf_layout_kernels() -> None:
             t = 0
         print(f' > Perf ({num_groups=:2}, {mn=:5}, {k=:5}, transpose={int(with_transpose)}, use_ue8m0={int(use_ue8m0)}, gran_k={gran_k:3}): '
               f'{t * 1e6:4.0f} us | {count_bytes(fp32_sf, impl(fp32_sf)) / 1e9 / t if t else 0:4.0f} GB/s')
+    print()
+
+
+def test_m_grouped_psum_strided_sf_layout() -> None:
+    print('Testing m-grouped psum strided SF layout:')
+    if get_arch_major() != 10:
+        print(' > Skipped (psum SF pack kernel only supported on SM100)')
+        return
+
+    old_alignment = get_mk_alignment_for_contiguous_layout()
+    alignment = 128
+    set_mk_alignment_for_contiguous_layout(alignment)
+    try:
+        counts = [5, 129, 17]
+        starts = []
+        ends = []
+        offset = 0
+        for count in counts:
+            starts.append(offset)
+            ends.append(offset + count)
+            offset += align(count, alignment)
+
+        mn, sf_k = offset, 7
+        exponent_bits = torch.randint(
+            1,
+            240,
+            (mn, sf_k),
+            dtype=torch.int32,
+            device='cuda',
+        )
+        scales = exponent_bits.bitwise_left_shift(23).view(torch.float32)
+        valid_rows = torch.zeros(mn, dtype=torch.bool, device='cuda')
+        for start, end in zip(starts, ends):
+            valid_rows[start:end] = True
+        scales[~valid_rows] = torch.nan
+
+        psum_layout = torch.tensor(ends, dtype=torch.int32, device='cuda')
+        strided_scales = scales.T.contiguous().T
+        assert not strided_scales.is_contiguous()
+        assert strided_scales.stride() == (1, mn)
+
+        packed = get_mn_major_tma_aligned_packed_ue8m0_tensor(
+            strided_scales,
+            psum_layout,
+        )
+        sanitized = scales.clone()
+        sanitized[~valid_rows] = 0
+        expected = get_mn_major_tma_aligned_packed_ue8m0_tensor_torch_impl(
+            sanitized,
+        )
+        assert torch.equal(packed, expected)
+        assert packed.stride() == expected.stride()
+        print(f' > Passed ({mn=}, {sf_k=}, stride={strided_scales.stride()})')
+    finally:
+        set_mk_alignment_for_contiguous_layout(old_alignment)
     print()
 
 
@@ -156,5 +213,6 @@ if __name__ == '__main__':
     random.seed(1)
 
     test_sf_layout_kernels()
+    test_m_grouped_psum_strided_sf_layout()
     test_k_grouped_sf_layout_kernels()
     test_k_grouped_psum_sf_layout_kernels()

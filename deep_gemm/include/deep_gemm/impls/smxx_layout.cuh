@@ -54,6 +54,9 @@ CUTLASS_GLOBAL void transpose_fp32(const float* sf, float* out, const uint32_t m
 template <uint32_t kNumThreads, uint32_t BLOCK_MN, uint32_t SF_K,
           uint32_t kNumPsumGroups = 1, bool kUsePsumLayout = false>
 CUTLASS_GLOBAL void transpose_and_pack_fp32_into_ue8m0(float* sf, uint32_t* out, const uint32_t mn,
+                                                       const uint64_t sf_stride_batch,
+                                                       const uint64_t sf_stride_mn,
+                                                       const uint64_t sf_stride_k,
                                                        const uint32_t* grouped_layout, const uint32_t m_alignment) {
     extern __shared__ uint32_t smem_buffer[];
 
@@ -93,24 +96,68 @@ CUTLASS_GLOBAL void transpose_and_pack_fp32_into_ue8m0(float* sf, uint32_t* out,
         }
     };
 
-    // Shift into the group
-    sf = sf + static_cast<uint64_t>(blockIdx.y) * mn * SF_K;
+    // Shift into the batch. PSUM inputs are two-dimensional, while the
+    // non-PSUM path may pack multiple contiguous batches.
+    sf = sf + static_cast<uint64_t>(blockIdx.y) * sf_stride_batch;
     out = out + static_cast<uint64_t>(blockIdx.y) * tma_aligned_mn * kNumPackedSFK;
 
     // Load FP32 SFs
     DG_STATIC_ASSERT(BLOCK_MN % 4 == 0, "Invalid block size");
-    const auto local_sf = reinterpret_cast<uint32_t*>(sf + static_cast<uint64_t>(blockIdx.x) * (BLOCK_MN * SF_K));
     const auto num_values = in_block_mn * SF_K;
-    const auto num_uint4 = num_values / 4;
-    #pragma unroll
-    for (uint32_t i = threadIdx.x; i < num_uint4; i += kNumThreads) {
-        const auto& [x, y, z, w] = reinterpret_cast<const uint4*>(local_sf)[i];
-        ptx::st_shared(reinterpret_cast<uint4*>(sf_smem_buffer) + i, x, y, z, w);
+    if (sf_stride_mn == SF_K and sf_stride_k == 1) {
+        // Row-major contiguous input: retain the original vectorized path.
+        const auto local_sf = reinterpret_cast<uint32_t*>(
+            sf + static_cast<uint64_t>(blockIdx.x) * (BLOCK_MN * SF_K));
+        const auto num_uint4 = num_values / 4;
+        #pragma unroll
+        for (uint32_t i = threadIdx.x; i < num_uint4; i += kNumThreads) {
+            const auto& [x, y, z, w] = reinterpret_cast<const uint4*>(local_sf)[i];
+            ptx::st_shared(reinterpret_cast<uint4*>(sf_smem_buffer) + i, x, y, z, w);
+        }
+        if (const auto unaligned_idx = num_uint4 * 4 + threadIdx.x; unaligned_idx < num_values)
+            ptx::st_shared(sf_smem_buffer + unaligned_idx, local_sf[unaligned_idx]);
+    } else if (sf_stride_mn == 1) {
+        // DeepEP's TMA-aligned column-major scales are contiguous across M.
+        // Vectorize four rows at a time and transpose only inside shared memory.
+        const auto num_row_quads = in_block_mn / 4;
+        #pragma unroll
+        for (uint32_t i = threadIdx.x; i < SF_K * num_row_quads; i += kNumThreads) {
+            const auto sf_k_idx = i / num_row_quads;
+            const auto mn_idx = (i % num_row_quads) * 4;
+            const auto global_mn_idx = blockIdx.x * BLOCK_MN + mn_idx;
+            const auto& [x, y, z, w] = *reinterpret_cast<const uint4*>(
+                sf + static_cast<uint64_t>(global_mn_idx) * sf_stride_mn +
+                static_cast<uint64_t>(sf_k_idx) * sf_stride_k);
+            ptx::st_shared(sf_smem_buffer + (mn_idx + 0) * SF_K + sf_k_idx, x);
+            ptx::st_shared(sf_smem_buffer + (mn_idx + 1) * SF_K + sf_k_idx, y);
+            ptx::st_shared(sf_smem_buffer + (mn_idx + 2) * SF_K + sf_k_idx, z);
+            ptx::st_shared(sf_smem_buffer + (mn_idx + 3) * SF_K + sf_k_idx, w);
+        }
+        const auto vectorized_rows = num_row_quads * 4;
+        const auto num_tail_values = (in_block_mn - vectorized_rows) * SF_K;
+        #pragma unroll
+        for (uint32_t i = threadIdx.x; i < num_tail_values; i += kNumThreads) {
+            const auto mn_idx = vectorized_rows + i / SF_K;
+            const auto sf_k_idx = i % SF_K;
+            const auto global_mn_idx = blockIdx.x * BLOCK_MN + mn_idx;
+            const auto value = reinterpret_cast<const uint32_t*>(sf)[
+                static_cast<uint64_t>(global_mn_idx) * sf_stride_mn +
+                static_cast<uint64_t>(sf_k_idx) * sf_stride_k];
+            ptx::st_shared(sf_smem_buffer + mn_idx * SF_K + sf_k_idx, value);
+        }
+    } else {
+        // Generic positive-stride fallback for valid 2D scale views.
+        #pragma unroll
+        for (uint32_t i = threadIdx.x; i < num_values; i += kNumThreads) {
+            const auto mn_idx = i / SF_K;
+            const auto sf_k_idx = i % SF_K;
+            const auto global_mn_idx = blockIdx.x * BLOCK_MN + mn_idx;
+            const auto value = reinterpret_cast<const uint32_t*>(sf)[
+                static_cast<uint64_t>(global_mn_idx) * sf_stride_mn +
+                static_cast<uint64_t>(sf_k_idx) * sf_stride_k];
+            ptx::st_shared(sf_smem_buffer + mn_idx * SF_K + sf_k_idx, value);
+        }
     }
-
-    // Fill unaligned values as well
-    if (const auto unaligned_idx = num_uint4 * 4 + threadIdx.x; unaligned_idx < num_values)
-        ptx::st_shared(sf_smem_buffer + unaligned_idx, local_sf[unaligned_idx]);
     __syncthreads();
 
     // Pack into UE8M0 and store
