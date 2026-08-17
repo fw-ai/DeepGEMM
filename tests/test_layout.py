@@ -116,9 +116,15 @@ def test_m_grouped_psum_strided_sf_layout() -> None:
         scales[~valid_rows] = torch.nan
 
         psum_layout = torch.tensor(ends, dtype=torch.int32, device='cuda')
-        strided_scales = scales.T.contiguous().T
+        column_major_storage = torch.empty(
+            (sf_k, mn + 4),
+            dtype=scales.dtype,
+            device=scales.device,
+        )
+        strided_scales = column_major_storage[:, :mn].T
+        strided_scales.copy_(scales)
         assert not strided_scales.is_contiguous()
-        assert strided_scales.stride() == (1, mn)
+        assert strided_scales.stride() == (1, mn + 4)
 
         packed = get_mn_major_tma_aligned_packed_ue8m0_tensor(
             strided_scales,

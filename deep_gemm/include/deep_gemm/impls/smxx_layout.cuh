@@ -116,7 +116,8 @@ CUTLASS_GLOBAL void transpose_and_pack_fp32_into_ue8m0(float* sf, uint32_t* out,
         }
         if (const auto unaligned_idx = num_uint4 * 4 + threadIdx.x; unaligned_idx < num_values)
             ptx::st_shared(sf_smem_buffer + unaligned_idx, local_sf[unaligned_idx]);
-    } else if (sf_stride_mn == 1) {
+    } else if (sf_stride_mn == 1 and sf_stride_k % 4 == 0 and
+               (reinterpret_cast<uint64_t>(sf) & 0xfu) == 0) {
         // DeepEP's TMA-aligned column-major scales are contiguous across M.
         // Vectorize four rows at a time and transpose only inside shared memory.
         const auto num_row_quads = in_block_mn / 4;
