@@ -1151,7 +1151,7 @@ def fp8_fp4_mega_moe_side_lora_backward(
     block_m: int,
     activation_limit: float = float("inf"),
     activation: str = "swiglu",
-    fast_math: bool = True,
+    fast_math: bool = False,
     route_weight_mode: RouteWeightMode = RouteWeightMode.PRE_DOWN,
     side_lora_scale: float = 1.0,
     direct_remote_grad_x: Optional[bool] = None,

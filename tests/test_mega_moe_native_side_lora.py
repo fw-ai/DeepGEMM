@@ -5,6 +5,7 @@ only to construct a numerical reference after the native call has completed.
 """
 
 import argparse
+import inspect
 import json
 import math
 
@@ -315,7 +316,11 @@ def test_side_lora_backward_rejects_unsupported_post_down() -> None:
                 f"{function.__name__} accepted unsupported post_down")
 
 
-def test_mxfp4_side_lora_backward_rejects_unknown_activation() -> None:
+def test_mxfp4_side_lora_backward_signature_and_unknown_activation() -> None:
+    signature = inspect.signature(
+        deep_gemm.fp8_fp4_mega_moe_side_lora_backward)
+    assert signature.parameters["activation"].default == "swiglu"
+    assert signature.parameters["fast_math"].default is False
     try:
         deep_gemm.fp8_fp4_mega_moe_side_lora_backward(
             gate_up_output=None, saved_h=None,
