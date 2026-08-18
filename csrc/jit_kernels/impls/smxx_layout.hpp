@@ -45,7 +45,7 @@ class TransposeAndPackFP32IntoUE8M0Runtime final: public LaunchRuntime<Transpose
 public:
     struct Args {
         int mn, sf_k;
-        int64_t sf_stride_batch, sf_stride_mn, sf_stride_k;
+        int64_t sf_stride_mn, sf_stride_k;
         int sf_layout;
         int num_psum_groups, m_alignment;
         bool use_psum_layout;
@@ -56,13 +56,27 @@ public:
     };
 
     static std::string generate_impl(const Args& args) {
-        return fmt::format(R"(
+        if (args.sf_layout == 0)
+            return fmt::format(R"(
 #include <deep_gemm/impls/smxx_layout.cuh>
 
 using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&transpose_and_pack_fp32_into_ue8m0<
+        {}, {}, {}, {}, {}
+    >);
+}};
+)", args.launch_args.num_threads, args.block_mn, args.sf_k,
+    args.num_psum_groups, args.use_psum_layout ? "true" : "false");
+
+        return fmt::format(R"(
+#include <deep_gemm/impls/smxx_layout.cuh>
+
+using namespace deep_gemm;
+
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(&transpose_and_pack_strided_fp32_into_ue8m0<
         {}, {}, {}, {}, {}, {}
     >);
 }};
@@ -72,8 +86,12 @@ static void __instantiate_kernel() {{
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
+        if (args.sf_layout == 0) {
+            DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config, args.sf, args.out, static_cast<uint32_t>(args.mn),
+                args.grouped_layout, static_cast<uint32_t>(args.m_alignment)));
+            return;
+        }
         DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config, args.sf, args.out, static_cast<uint32_t>(args.mn),
-            static_cast<uint64_t>(args.sf_stride_batch),
             static_cast<uint64_t>(args.sf_stride_mn),
             static_cast<uint64_t>(args.sf_stride_k),
             args.grouped_layout, static_cast<uint32_t>(args.m_alignment)));
@@ -220,7 +238,6 @@ static torch::Tensor get_mn_major_tma_aligned_packed_ue8m0_tensor(const torch::T
         const TransposeAndPackFP32IntoUE8M0Runtime::Args& args = {
             .mn = mn,
             .sf_k = sf_k,
-            .sf_stride_batch = batched_sf.stride(0),
             .sf_stride_mn = batched_sf.stride(1),
             .sf_stride_k = batched_sf.stride(2),
             .sf_layout = sf_layout,
