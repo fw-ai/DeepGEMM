@@ -82,62 +82,89 @@ def test_sf_layout_kernels() -> None:
     print()
 
 
+def _make_psum_scale_view(scales: torch.Tensor, layout: str) -> torch.Tensor:
+    mn, sf_k = scales.shape
+    if layout == 'contiguous':
+        return scales
+    if layout == 'column_major':
+        stride_k = align(mn + 4, 4)
+        storage = torch.empty((sf_k, stride_k), dtype=scales.dtype, device=scales.device)
+        view = storage[:, :mn].T
+    elif layout == 'column_major_unaligned':
+        stride_k = mn + 1
+        storage = torch.empty(stride_k * sf_k + 1, dtype=scales.dtype, device=scales.device)
+        view = torch.as_strided(storage, (mn, sf_k), (1, stride_k), storage_offset=1)
+    elif layout == 'generic':
+        stride_mn, stride_k = 2, 2 * mn + 3
+        storage_size = (mn - 1) * stride_mn + (sf_k - 1) * stride_k + 1
+        storage = torch.empty(storage_size, dtype=scales.dtype, device=scales.device)
+        view = torch.as_strided(storage, (mn, sf_k), (stride_mn, stride_k))
+    else:
+        raise ValueError(f'Unknown scale layout: {layout}')
+    view.copy_(scales)
+    return view
+
+
 def test_m_grouped_psum_strided_sf_layout() -> None:
     print('Testing m-grouped psum strided SF layout:')
     if get_arch_major() != 10:
         print(' > Skipped (psum SF pack kernel only supported on SM100)')
         return
 
+    cases = (
+        # FireTitan PR #42640's exact two-expert grouped-GEMM contract.
+        (128, [64, 64], 2, 'column_major'),
+        # Small/tail shapes and an empty expert.
+        (128, [1], 1, 'column_major_unaligned'),
+        (128, [5, 0, 129, 17], 3, 'column_major'),
+        # Exercise the unchanged row-major path and generic positive strides.
+        (128, [47, 96, 1, 191], 4, 'contiguous'),
+        (256, [255, 1, 257, 0, 33], 7, 'generic'),
+        # GLM production-width scales with many local experts.
+        (128, [2047 + (i % 5) for i in range(32)], 48, 'column_major'),
+    )
+
     old_alignment = get_mk_alignment_for_contiguous_layout()
-    alignment = 128
-    set_mk_alignment_for_contiguous_layout(alignment)
     try:
-        counts = [5, 129, 17]
-        starts = []
-        ends = []
-        offset = 0
-        for count in counts:
-            starts.append(offset)
-            ends.append(offset + count)
-            offset += align(count, alignment)
+        for alignment, counts, sf_k, input_layout in cases:
+            set_mk_alignment_for_contiguous_layout(alignment)
+            starts = []
+            ends = []
+            mn = 0
+            for count in counts:
+                starts.append(mn)
+                ends.append(mn + count)
+                mn += align(count, alignment)
 
-        mn, sf_k = offset, 7
-        exponent_bits = torch.randint(
-            1,
-            240,
-            (mn, sf_k),
-            dtype=torch.int32,
-            device='cuda',
-        )
-        scales = exponent_bits.bitwise_left_shift(23).view(torch.float32)
-        valid_rows = torch.zeros(mn, dtype=torch.bool, device='cuda')
-        for start, end in zip(starts, ends):
-            valid_rows[start:end] = True
-        scales[~valid_rows] = torch.nan
+            exponent_bits = torch.randint(
+                1,
+                240,
+                (mn, sf_k),
+                dtype=torch.int32,
+                device='cuda',
+            )
+            scales = exponent_bits.bitwise_left_shift(23).view(torch.float32)
+            valid_rows = torch.zeros(mn, dtype=torch.bool, device='cuda')
+            for start, end in zip(starts, ends):
+                valid_rows[start:end] = True
+            scales[~valid_rows] = torch.nan
 
-        psum_layout = torch.tensor(ends, dtype=torch.int32, device='cuda')
-        column_major_storage = torch.empty(
-            (sf_k, mn + 4),
-            dtype=scales.dtype,
-            device=scales.device,
-        )
-        strided_scales = column_major_storage[:, :mn].T
-        strided_scales.copy_(scales)
-        assert not strided_scales.is_contiguous()
-        assert strided_scales.stride() == (1, mn + 4)
+            psum_layout = torch.tensor(ends, dtype=torch.int32, device='cuda')
+            input_scales = _make_psum_scale_view(scales, input_layout)
+            packed = get_mn_major_tma_aligned_packed_ue8m0_tensor(
+                input_scales,
+                psum_layout,
+            )
 
-        packed = get_mn_major_tma_aligned_packed_ue8m0_tensor(
-            strided_scales,
-            psum_layout,
-        )
-        sanitized = scales.clone()
-        sanitized[~valid_rows] = 0
-        expected = get_mn_major_tma_aligned_packed_ue8m0_tensor_torch_impl(
-            sanitized,
-        )
-        assert torch.equal(packed, expected)
-        assert packed.stride() == expected.stride()
-        print(f' > Passed ({mn=}, {sf_k=}, stride={strided_scales.stride()})')
+            sanitized = scales.clone()
+            sanitized[~valid_rows] = 0
+            expected = get_mn_major_tma_aligned_packed_ue8m0_tensor_torch_impl(
+                sanitized,
+            )
+            case = f'{alignment=}, counts={len(counts)}, {mn=}, {sf_k=}, layout={input_layout}'
+            assert torch.equal(packed, expected), case
+            assert packed.stride() == expected.stride(), case
+            print(f' > Passed ({case}, stride={input_scales.stride()})')
     finally:
         set_mk_alignment_for_contiguous_layout(old_alignment)
     print()
