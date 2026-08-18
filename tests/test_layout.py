@@ -92,8 +92,8 @@ def _make_psum_scale_view(scales: torch.Tensor, layout: str) -> torch.Tensor:
         view = storage[:, :mn].T
     elif layout == 'column_major_unaligned':
         stride_k = mn + 1
-        storage = torch.empty(stride_k * sf_k + 1, dtype=scales.dtype, device=scales.device)
-        view = torch.as_strided(storage, (mn, sf_k), (1, stride_k), storage_offset=1)
+        storage = torch.empty(stride_k * sf_k, dtype=scales.dtype, device=scales.device)
+        view = torch.as_strided(storage, (mn, sf_k), (1, stride_k))
     elif layout == 'generic':
         stride_mn, stride_k = 2, 2 * mn + 3
         storage_size = (mn - 1) * stride_mn + (sf_k - 1) * stride_k + 1
@@ -115,7 +115,7 @@ def test_m_grouped_psum_strided_sf_layout() -> None:
         # FireTitan PR #42640's exact two-expert grouped-GEMM contract.
         (128, [64, 64], 2, 'column_major'),
         # Small/tail shapes and an empty expert.
-        (128, [1], 1, 'column_major_unaligned'),
+        (128, [1], 3, 'column_major_unaligned'),
         (128, [5, 0, 129, 17], 3, 'column_major'),
         # Exercise the unchanged row-major path and generic positive strides.
         (128, [47, 96, 1, 191], 4, 'contiguous'),
