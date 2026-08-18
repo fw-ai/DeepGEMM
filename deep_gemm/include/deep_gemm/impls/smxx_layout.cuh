@@ -52,7 +52,8 @@ CUTLASS_GLOBAL void transpose_fp32(const float* sf, float* out, const uint32_t m
 // NOTES: the two kernels below always pack the K dimension
 
 template <uint32_t kNumThreads, uint32_t BLOCK_MN, uint32_t SF_K,
-          uint32_t kNumPsumGroups = 1, bool kUsePsumLayout = false>
+          uint32_t kNumPsumGroups = 1, bool kUsePsumLayout = false,
+          uint32_t kSFLayout = 0>
 CUTLASS_GLOBAL void transpose_and_pack_fp32_into_ue8m0(float* sf, uint32_t* out, const uint32_t mn,
                                                        const uint64_t sf_stride_batch,
                                                        const uint64_t sf_stride_mn,
@@ -103,8 +104,9 @@ CUTLASS_GLOBAL void transpose_and_pack_fp32_into_ue8m0(float* sf, uint32_t* out,
 
     // Load FP32 SFs
     DG_STATIC_ASSERT(BLOCK_MN % 4 == 0, "Invalid block size");
+    DG_STATIC_ASSERT(kSFLayout <= 2, "Invalid SF layout");
     const auto num_values = in_block_mn * SF_K;
-    if (sf_stride_mn == SF_K and sf_stride_k == 1) {
+    if constexpr (kSFLayout == 0) {
         // Row-major contiguous input: retain the original vectorized path.
         const auto local_sf = reinterpret_cast<uint32_t*>(
             sf + static_cast<uint64_t>(blockIdx.x) * (BLOCK_MN * SF_K));
@@ -116,8 +118,7 @@ CUTLASS_GLOBAL void transpose_and_pack_fp32_into_ue8m0(float* sf, uint32_t* out,
         }
         if (const auto unaligned_idx = num_uint4 * 4 + threadIdx.x; unaligned_idx < num_values)
             ptx::st_shared(sf_smem_buffer + unaligned_idx, local_sf[unaligned_idx]);
-    } else if (sf_stride_mn == 1 and sf_stride_k % 4 == 0 and
-               (reinterpret_cast<uint64_t>(sf) & 0xfu) == 0) {
+    } else if constexpr (kSFLayout == 1) {
         // DeepEP's TMA-aligned column-major scales are contiguous across M.
         // Vectorize four rows at a time and transpose only inside shared memory.
         const auto num_row_quads = in_block_mn / 4;

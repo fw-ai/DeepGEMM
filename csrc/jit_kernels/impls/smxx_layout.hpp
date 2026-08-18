@@ -46,6 +46,7 @@ public:
     struct Args {
         int mn, sf_k;
         int64_t sf_stride_batch, sf_stride_mn, sf_stride_k;
+        int sf_layout;
         int num_psum_groups, m_alignment;
         bool use_psum_layout;
         int block_mn;
@@ -62,11 +63,12 @@ using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&transpose_and_pack_fp32_into_ue8m0<
-        {}, {}, {}, {}, {}
+        {}, {}, {}, {}, {}, {}
     >);
 }};
 )", args.launch_args.num_threads, args.block_mn, args.sf_k,
-    args.num_psum_groups, args.use_psum_layout ? "true" : "false");
+    args.num_psum_groups, args.use_psum_layout ? "true" : "false",
+    args.sf_layout);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -211,12 +213,17 @@ static torch::Tensor get_mn_major_tma_aligned_packed_ue8m0_tensor(const torch::T
         constexpr int num_threads = 512;
         const auto psum_smem_elems = use_psum_layout ? align(num_psum_groups * 2, 4) : 0;
         const auto smem_size = block_mn * sf_k * 4 + psum_smem_elems * 4;
+        const auto sf_layout =
+            batched_sf.is_contiguous() ? 0 :
+            (batched_sf.stride(1) == 1 and batched_sf.stride(2) % 4 == 0 and
+             (reinterpret_cast<uint64_t>(batched_sf.data_ptr()) & 0xfu) == 0) ? 1 : 2;
         const TransposeAndPackFP32IntoUE8M0Runtime::Args& args = {
             .mn = mn,
             .sf_k = sf_k,
             .sf_stride_batch = batched_sf.stride(0),
             .sf_stride_mn = batched_sf.stride(1),
             .sf_stride_k = batched_sf.stride(2),
+            .sf_layout = sf_layout,
             .num_psum_groups = num_psum_groups,
             .m_alignment = m_alignment,
             .use_psum_layout = use_psum_layout,
