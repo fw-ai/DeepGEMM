@@ -1,6 +1,7 @@
 import torch
 import random
 import pytest
+import deep_gemm
 from deep_gemm.testing import bench_kineto, count_bytes, get_arch_major
 from deep_gemm.utils import (
     align, ceil_div,
@@ -176,6 +177,57 @@ def test_m_grouped_psum_strided_sf_layout() -> None:
     finally:
         set_mk_alignment_for_contiguous_layout(old_alignment)
     print()
+
+
+def test_m_grouped_strided_psum_requires_explicit_opt_in() -> None:
+    if get_arch_major() != 10:
+        return
+
+    experts, rows, out_features, in_features = 2, 256, 128, 256
+    activations = torch.ones((rows, in_features), device='cuda', dtype=torch.float8_e4m3fn)
+    activation_scales = torch.ones(
+        (in_features // 128, rows),
+        device='cuda',
+        dtype=torch.float32,
+    ).T
+    weights = torch.ones(
+        (experts, out_features, in_features),
+        device='cuda',
+        dtype=torch.float8_e4m3fn,
+    )
+    weight_scales = torch.ones(
+        (experts, out_features // 128, in_features // 128),
+        device='cuda',
+        dtype=torch.float32,
+    )
+    output = torch.full((rows, out_features), float('nan'), device='cuda', dtype=torch.bfloat16)
+    prefix_sums = torch.tensor([64, 192], device='cuda', dtype=torch.int32)
+
+    old_alignment = get_mk_alignment_for_contiguous_layout()
+    try:
+        set_mk_alignment_for_contiguous_layout(128)
+        with pytest.raises(RuntimeError, match='allow_strided_psum_scales'):
+            deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
+                (activations, activation_scales),
+                (weights, weight_scales),
+                output,
+                prefix_sums,
+                use_psum_layout=True,
+            )
+        deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
+            (activations, activation_scales),
+            (weights, weight_scales),
+            output,
+            prefix_sums,
+            use_psum_layout=True,
+            allow_strided_psum_scales=True,
+        )
+        torch.cuda.synchronize()
+    finally:
+        set_mk_alignment_for_contiguous_layout(old_alignment)
+
+    valid_rows = torch.cat((output[:64], output[128:192]))
+    assert torch.equal(valid_rows, torch.full_like(valid_rows, in_features))
 
 
 def test_k_grouped_sf_layout_kernels() -> None:
