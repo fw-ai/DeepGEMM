@@ -202,7 +202,8 @@ static torch::Tensor get_mn_major_tma_aligned_packed_ue8m0_tensor_torch(const to
 }
 
 static torch::Tensor get_mn_major_tma_aligned_packed_ue8m0_tensor(const torch::Tensor& sf,
-                                                                  const std::optional<torch::Tensor>& psum_layout = std::nullopt) {
+                                                                  const std::optional<torch::Tensor>& psum_layout = std::nullopt,
+                                                                  const bool& allow_strided_psum_scales = false) {
     const auto [dim, num_sf_batches, mn, sf_k, tma_aligned_mn, batched_sf] = preprocess_sf(sf);
     const auto packed_sf_k = ceil_div(sf_k, 4);
     const auto out = torch::empty_strided({num_sf_batches, mn, packed_sf_k},
@@ -219,6 +220,11 @@ static torch::Tensor get_mn_major_tma_aligned_packed_ue8m0_tensor(const torch::T
         DG_HOST_ASSERT(psum_layout->scalar_type() == torch::kInt and psum_layout->is_contiguous());
         DG_HOST_ASSERT(psum_layout->numel() > 0);
     }
+    // Non-contiguous PSUM scales are an internal trainer integration. Keep the
+    // existing contiguous behavior as the default for every other caller.
+    const auto use_strided_psum_scales = use_psum_layout and not batched_sf.is_contiguous();
+    DG_HOST_ASSERT(not allow_strided_psum_scales or use_psum_layout);
+    DG_HOST_ASSERT(not use_strided_psum_scales or allow_strided_psum_scales);
     const auto m_alignment = use_psum_layout ? heuristics_runtime->get_mk_alignment_for_contiguous_layout() : 0;
     const auto num_psum_groups = use_psum_layout ? static_cast<int>(psum_layout->numel()) : 1;
 

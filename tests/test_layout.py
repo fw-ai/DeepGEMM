@@ -1,5 +1,6 @@
 import torch
 import random
+import pytest
 from deep_gemm.testing import bench_kineto, count_bytes, get_arch_major
 from deep_gemm.utils import (
     align, ceil_div,
@@ -151,9 +152,16 @@ def test_m_grouped_psum_strided_sf_layout() -> None:
 
             psum_layout = torch.tensor(ends, dtype=torch.int32, device='cuda')
             input_scales = _make_psum_scale_view(scales, input_layout)
+            if not input_scales.is_contiguous():
+                with pytest.raises(RuntimeError, match='allow_strided_psum_scales'):
+                    get_mn_major_tma_aligned_packed_ue8m0_tensor(
+                        input_scales,
+                        psum_layout,
+                    )
             packed = get_mn_major_tma_aligned_packed_ue8m0_tensor(
                 input_scales,
                 psum_layout,
+                allow_strided_psum_scales=not input_scales.is_contiguous(),
             )
 
             sanitized = scales.clone()
