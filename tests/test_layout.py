@@ -307,5 +307,6 @@ if __name__ == '__main__':
 
     test_sf_layout_kernels()
     test_m_grouped_psum_strided_sf_layout()
+    test_m_grouped_strided_psum_requires_explicit_opt_in()
     test_k_grouped_sf_layout_kernels()
     test_k_grouped_psum_sf_layout_kernels()
