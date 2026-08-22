@@ -45,6 +45,8 @@ class TransposeAndPackFP32IntoUE8M0Runtime final: public LaunchRuntime<Transpose
 public:
     struct Args {
         int mn, sf_k;
+        int64_t sf_stride_mn, sf_stride_k;
+        int sf_layout;
         int num_psum_groups, m_alignment;
         bool use_psum_layout;
         int block_mn;
@@ -54,7 +56,8 @@ public:
     };
 
     static std::string generate_impl(const Args& args) {
-        return fmt::format(R"(
+        if (args.sf_layout == 0)
+            return fmt::format(R"(
 #include <deep_gemm/impls/smxx_layout.cuh>
 
 using namespace deep_gemm;
@@ -66,10 +69,31 @@ static void __instantiate_kernel() {{
 }};
 )", args.launch_args.num_threads, args.block_mn, args.sf_k,
     args.num_psum_groups, args.use_psum_layout ? "true" : "false");
+
+        return fmt::format(R"(
+#include <deep_gemm/impls/smxx_layout.cuh>
+
+using namespace deep_gemm;
+
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(&transpose_and_pack_strided_fp32_into_ue8m0<
+        {}, {}, {}, {}, {}, {}
+    >);
+}};
+)", args.launch_args.num_threads, args.block_mn, args.sf_k,
+    args.num_psum_groups, args.use_psum_layout ? "true" : "false",
+    args.sf_layout);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
+        if (args.sf_layout == 0) {
+            DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config, args.sf, args.out, static_cast<uint32_t>(args.mn),
+                args.grouped_layout, static_cast<uint32_t>(args.m_alignment)));
+            return;
+        }
         DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config, args.sf, args.out, static_cast<uint32_t>(args.mn),
+            static_cast<uint64_t>(args.sf_stride_mn),
+            static_cast<uint64_t>(args.sf_stride_k),
             args.grouped_layout, static_cast<uint32_t>(args.m_alignment)));
     }
 };
@@ -178,25 +202,34 @@ static torch::Tensor get_mn_major_tma_aligned_packed_ue8m0_tensor_torch(const to
 }
 
 static torch::Tensor get_mn_major_tma_aligned_packed_ue8m0_tensor(const torch::Tensor& sf,
-                                                                  const std::optional<torch::Tensor>& psum_layout = std::nullopt) {
+                                                                  const std::optional<torch::Tensor>& psum_layout = std::nullopt,
+                                                                  const bool& allow_strided_psum_scales = false) {
     const auto [dim, num_sf_batches, mn, sf_k, tma_aligned_mn, batched_sf] = preprocess_sf(sf);
     const auto packed_sf_k = ceil_div(sf_k, 4);
     const auto out = torch::empty_strided({num_sf_batches, mn, packed_sf_k},
                                           {packed_sf_k * tma_aligned_mn, 1, tma_aligned_mn},
                                           at::TensorOptions().device(batched_sf.device()).dtype(torch::kInt));
 
-    // PSUM layout (always 2D contiguous) lets the pack kernel skip uninitialized MN gap rows
+    // PSUM layout is two-dimensional. DeepEP may expose its scale factors in
+    // TMA-aligned column-major storage, so preserve and pass the input strides
+    // instead of materializing a contiguous copy.
     const auto use_psum_layout = psum_layout.has_value();
     if (use_psum_layout) {
-        DG_HOST_ASSERT(num_sf_batches == 1 and batched_sf.is_contiguous());
+        DG_HOST_ASSERT(dim == 2 and num_sf_batches == 1);
+        DG_HOST_ASSERT(batched_sf.stride(1) > 0 and batched_sf.stride(2) > 0);
         DG_HOST_ASSERT(psum_layout->scalar_type() == torch::kInt and psum_layout->is_contiguous());
         DG_HOST_ASSERT(psum_layout->numel() > 0);
     }
+    // Non-contiguous PSUM scales are an internal trainer integration. Keep the
+    // existing contiguous behavior as the default for every other caller.
+    const auto use_strided_psum_scales = use_psum_layout and not batched_sf.is_contiguous();
+    DG_HOST_ASSERT(not allow_strided_psum_scales or use_psum_layout);
+    DG_HOST_ASSERT(not use_strided_psum_scales or allow_strided_psum_scales);
     const auto m_alignment = use_psum_layout ? heuristics_runtime->get_mk_alignment_for_contiguous_layout() : 0;
     const auto num_psum_groups = use_psum_layout ? static_cast<int>(psum_layout->numel()) : 1;
 
     // Launch the kernel
-    if (batched_sf.is_contiguous()) {
+    if (batched_sf.is_contiguous() or use_psum_layout) {
         if ((mn * sf_k) % 4 != 0 and num_sf_batches > 1)
             return get_mn_major_tma_aligned_packed_ue8m0_tensor_torch(sf);
 
@@ -204,9 +237,16 @@ static torch::Tensor get_mn_major_tma_aligned_packed_ue8m0_tensor(const torch::T
         constexpr int num_threads = 512;
         const auto psum_smem_elems = use_psum_layout ? align(num_psum_groups * 2, 4) : 0;
         const auto smem_size = block_mn * sf_k * 4 + psum_smem_elems * 4;
+        const auto sf_layout =
+            batched_sf.is_contiguous() ? 0 :
+            (batched_sf.stride(1) == 1 and batched_sf.stride(2) % 4 == 0 and
+             (reinterpret_cast<uint64_t>(batched_sf.data_ptr()) & 0xfu) == 0) ? 1 : 2;
         const TransposeAndPackFP32IntoUE8M0Runtime::Args& args = {
             .mn = mn,
             .sf_k = sf_k,
+            .sf_stride_mn = batched_sf.stride(1),
+            .sf_stride_k = batched_sf.stride(2),
+            .sf_layout = sf_layout,
             .num_psum_groups = num_psum_groups,
             .m_alignment = m_alignment,
             .use_psum_layout = use_psum_layout,

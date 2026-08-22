@@ -18,7 +18,8 @@ static torch::Tensor transform_sf_into_required_layout(const torch::Tensor& sf,
                                                        const std::optional<int>& num_groups,
                                                        const std::optional<bool>& is_sfa,
                                                        const bool& disable_ue8m0_cast,
-                                                       const std::optional<torch::Tensor>& psum_layout = std::nullopt) {
+                                                       const std::optional<torch::Tensor>& psum_layout = std::nullopt,
+                                                       const bool& allow_strided_psum_scales = false) {
     const auto arch_major = device_runtime->get_arch_major();
 
     // Get granularity MN/K from recipe
@@ -50,7 +51,8 @@ static torch::Tensor transform_sf_into_required_layout(const torch::Tensor& sf,
         DG_HOST_ASSERT(not disable_ue8m0_cast);
         const auto broadcasted = gran_mn == 1 ? sf :
                                  sf.index_select(-2, torch::arange(mn, at::TensorOptions().device(sf.device())).floor_divide_(gran_mn));
-        return get_mn_major_tma_aligned_packed_ue8m0_tensor(broadcasted, psum_layout);
+        return get_mn_major_tma_aligned_packed_ue8m0_tensor(
+            broadcasted, psum_layout, allow_strided_psum_scales);
     }
 
     // (INT, 1, gran_k) on SM100: transform to TMA-aligned and MN-major
@@ -70,7 +72,8 @@ static std::tuple<torch::Tensor, torch::Tensor, int, int> transform_sf_pair_into
         const std::optional<int>& num_groups_b,
         const bool& disable_ue8m0_cast = false,
         // PSUM layout only applies to SFA (B is weights with no gaps)
-        const std::optional<torch::Tensor>& psum_layout = std::nullopt) {
+        const std::optional<torch::Tensor>& psum_layout = std::nullopt,
+        const bool& allow_strided_psum_scales = false) {
     // Use default recipe, if none is specified
     if (not recipe_a.has_value() and not recipe.has_value())
         recipe = get_default_recipe(sfa.scalar_type(), sfb.scalar_type());
@@ -80,8 +83,8 @@ static std::tuple<torch::Tensor, torch::Tensor, int, int> transform_sf_pair_into
     DG_HOST_ASSERT(recipe_a.has_value() != recipe.has_value());
 
     // Transform SFA and SFB layout (PSUM only for SFA)
-    const auto transformed_sfa = recipe.has_value() ? transform_sf_into_required_layout(sfa, m, k, recipe.value(), num_groups_a, true, disable_ue8m0_cast, psum_layout)
-                                                    : transform_sf_into_required_layout(sfa, m, k, recipe_a.value(), num_groups_a, std::nullopt, disable_ue8m0_cast, psum_layout);
+    const auto transformed_sfa = recipe.has_value() ? transform_sf_into_required_layout(sfa, m, k, recipe.value(), num_groups_a, true, disable_ue8m0_cast, psum_layout, allow_strided_psum_scales)
+                                                    : transform_sf_into_required_layout(sfa, m, k, recipe_a.value(), num_groups_a, std::nullopt, disable_ue8m0_cast, psum_layout, allow_strided_psum_scales);
     const auto transformed_sfb = recipe.has_value() ? transform_sf_into_required_layout(sfb, n, k, recipe.value(), num_groups_b, false, disable_ue8m0_cast)
                                                     : transform_sf_into_required_layout(sfb, n, k, recipe_b.value(), num_groups_b, std::nullopt, disable_ue8m0_cast);
     const int gran_k_a = recipe_a.has_value() ? std::get<1>(recipe_a.value()) : std::get<2>(recipe.value());
@@ -128,12 +131,14 @@ static void register_apis(pybind11::module_& m) {
       py::arg("num_groups") = std::nullopt,
       py::arg("is_sfa") = std::nullopt,
       py::arg("disable_ue8m0_cast") = false,
-      py::arg("psum_layout") = std::nullopt);
+      py::arg("psum_layout") = std::nullopt,
+      py::arg("allow_strided_psum_scales") = false);
 
     m.def("get_tma_aligned_size", &get_tma_aligned_size);
     m.def("get_mn_major_tma_aligned_tensor", &get_mn_major_tma_aligned_tensor);
     m.def("get_mn_major_tma_aligned_packed_ue8m0_tensor", &get_mn_major_tma_aligned_packed_ue8m0_tensor,
-      py::arg("sf"), py::arg("psum_layout") = std::nullopt);
+      py::arg("sf"), py::arg("psum_layout") = std::nullopt,
+      py::arg("allow_strided_psum_scales") = false);
     m.def("get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor", &get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor,
       py::arg("sf"), py::arg("grouped_layout"), py::arg("ks_cpu"), py::arg("gran_k"), py::arg("k_alignment"),
       py::arg("use_psum_layout") = false);
