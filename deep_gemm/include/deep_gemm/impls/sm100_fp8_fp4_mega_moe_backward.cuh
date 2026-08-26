@@ -5599,8 +5599,9 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
     const auto run_branch_major_early_dw2 = [&]<bool kEnabled>() {
         if constexpr (kEnabled) {
             static_assert(
-                kK3BranchMajorBF16EarlyDW2Overlap &&
-                    !kEarlyW2Wgrad && kPublishRemoteGradients,
+                !kEnabled ||
+                    (kK3BranchMajorBF16EarlyDW2Overlap &&
+                     !kEarlyW2Wgrad && kPublishRemoteGradients),
                 "early branch-major dW2 requires exact two-range publication");
             DG_DEVICE_ASSERT(backward_ranges.num_ranges == 2u);
 
