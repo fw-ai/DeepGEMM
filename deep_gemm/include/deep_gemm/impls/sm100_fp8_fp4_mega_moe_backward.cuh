@@ -3417,6 +3417,14 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
         kHidden == 3584 && kIntermediateHidden == 3072 &&
         kNumExperts == 112 && BLOCK_M == 192 &&
         kNumSMs == 148;
+    // The exact two-range branch-major suffix has immutable dW2 operands
+    // before W13 starts.  Let each completed W13 cluster enter the existing
+    // dynamic dW2 queue immediately; later clusters join the same queue after
+    // retiring their local W13 work.  dW13 deliberately remains in its faster
+    // terminal body after the rank-wide publication edge.
+    constexpr bool kK3BranchMajorBF16EarlyDW2Overlap =
+        kK3BranchMajorBF16DynamicTail && kReadyWgradSchedule &&
+        kMultiRangeBackward;
     // The one-range terminal BF16 path stages source X in fixed-top-k combine
     // plane one. Keep that plane readable while W13 runs: idle warp three
     // pulls source X, W13 stages only slot-one dX in the now-dead unweighted
@@ -5586,6 +5594,123 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                 phase_one_tensor_map_b,
                 phase_one_tensor_map_d);
     };
+
+#if DG_EXPERIMENTAL_K3_BRANCH_MAJOR_BF16_DYNAMIC_TAIL
+    const auto run_branch_major_early_dw2 = [&]<bool kEnabled>() {
+        if constexpr (kEnabled) {
+            static_assert(
+                kK3BranchMajorBF16EarlyDW2Overlap &&
+                    !kEarlyW2Wgrad && kPublishRemoteGradients,
+                "early branch-major dW2 requires exact two-range publication");
+            DG_DEVICE_ASSERT(backward_ranges.num_ranges == 2u);
+
+            // The parent W13 resources are cluster-local.  A cluster may
+            // retire and replace them as soon as both peer CTAs have exhausted
+            // their static W13 streams; no device-wide handoff is required.
+            comm::cluster_sync_with_relaxed_arrive();
+            if (warp_idx == 0u && cute::elect_one_sync()) {
+                #pragma unroll
+                for (uint32_t i = 0u; i < kNumStages; ++i) {
+                    Barrier::invalidate(
+                        reinterpret_cast<Barrier::ValueType const*>(
+                            full_barriers[i]));
+                    Barrier::invalidate(
+                        reinterpret_cast<Barrier::ValueType const*>(
+                            empty_barriers[i]));
+                }
+                #pragma unroll
+                for (uint32_t i = 0u; i < kNumEpilogueStages; ++i) {
+                    Barrier::invalidate(
+                        reinterpret_cast<Barrier::ValueType const*>(
+                            tmem_full_barriers[i]));
+                    Barrier::invalidate(
+                        reinterpret_cast<Barrier::ValueType const*>(
+                            tmem_empty_barriers[i]));
+                }
+                #pragma unroll
+                for (uint32_t i = 0u; i < kNumDispatchBarriers; ++i) {
+                    Barrier::invalidate(
+                        reinterpret_cast<Barrier::ValueType const*>(
+                            dispatch_barriers[i]));
+                }
+                #pragma unroll
+                for (uint32_t i = 0u; i < 2u; ++i) {
+                    Barrier::invalidate(
+                        reinterpret_cast<Barrier::ValueType const*>(
+                            dequant_barriers + i));
+                }
+            }
+            comm::cluster_sync_with_relaxed_arrive();
+            if (warp_idx == 0u)
+                Allocator().free(0, kNumTmemCols);
+            __syncthreads();
+
+            static_assert(
+                !kUseReducedW2ProducerSet,
+                "early branch-major dW2 register entry state changed");
+            cutlass::arch::warpgroup_reg_alloc<64>();
+            __syncthreads();
+
+            constexpr uint32_t kDynamicBatchTasks = 4u;
+            using DynamicTwoSegmentDW2Provider = sched::
+                ExternalKGroupedTerminalTwoSegmentDynamicRangeProvider<
+                    kWgradBlockM, kWgradBlockN,
+                    2, false, kNumSMs,
+                    kHidden, kIntermediateHidden,
+                    kDynamicBatchTasks,
+                    kReadyDW2TasksPerExpert,
+                    BLOCK_M, kWgradBlockK,
+                    kReadyPoolPrefixWord,
+                    kReadyActiveExpertWord>;
+            using DynamicDW2RetainedResources =
+                Sm100Bf16GemmBatchResourceHooks<true, false>;
+            static_assert(
+                DynamicTwoSegmentDW2Provider::kCompleteAcquireMask ==
+                        kReadyCompleteRoleMask &&
+                    kReadyDW2TasksPerExpert % kDynamicBatchTasks == 0u,
+                "early two-segment dW2 scheduler contract changed");
+            static_assert(
+                DynamicDW2RetainedResources::kInitializeBatchResources &&
+                    !DynamicDW2RetainedResources::kReleaseBatchResources,
+                "early dW2 must retain BF16 resources for terminal dW13");
+
+            const uint32_t second_range_index =
+                backward_ranges.reverse_range_index(1u);
+            auto* const union_state =
+                weight_tile_states + kReadyTerminalUnionStateWord;
+            const auto* const second_state =
+                weight_tile_states +
+                second_range_index * kReadyRangeStateStride;
+            const uint32_t dynamic_cluster_idx = blockIdx.x / 2u;
+            auto* const dw2_mailbox =
+                union_state + kReadyDW2ClusterSlotWord +
+                dynamic_cluster_idx * kReadyClusterSlotWords;
+            const sched::ExternalKGroupedTerminalTwoSegmentRangeStream
+                dw2_stream{
+                    union_state,
+                    second_state,
+                    union_state + kReadyDW2CursorWord,
+                    union_state[kReadyDW2TasksWord],
+                    dw2_mailbox,
+                    kDynamicBatchTasks,
+                    kReadyDW2TasksPerExpert,
+                };
+            trace_begin(17);
+            run_ready_wgrad_range.template operator()<
+                DynamicTwoSegmentDW2Provider,
+                DynamicDW2RetainedResources,
+                kPublishRemoteGradients>(
+                    kHidden, kIntermediateHidden,
+                    tensor_map_w2_wgrad_a,
+                    tensor_map_w2_wgrad_b,
+                    tensor_map_w2_wgrad_d,
+                    dw2_stream, false,
+                    no_input_tile_retired,
+                    no_background_work);
+            trace_end(17);
+        }
+    };
+#endif
 #endif
 
     // Co-schedule a bounded prefix of the exact W13 packed-weight converter on
@@ -15897,6 +16022,15 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
 
         trace_end(21);
 
+#if DG_EXPERIMENTAL_K3_BRANCH_MAJOR_BF16_DYNAMIC_TAIL
+        if constexpr (kK3BranchMajorBF16EarlyDW2Overlap) {
+            // dW2 consumes only operands published before W13. Its dynamic
+            // body also owns the rank publication callback, so useful UMMA/TMA
+            // work proceeds while late clusters finish W13 and join the queue.
+            run_branch_major_early_dw2.template operator()<true>();
+        }
+#endif
+
 #if DG_EXPERIMENTAL_K3_MXFP8_THREE_TERM_WGRAD
         if constexpr (kK3MxFp8WgradOverlap) {
             using Overlap = K3MxFp8OverlapState;
@@ -17803,7 +17937,9 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                 clear_empty_wgrad_experts();
         }
         trace_begin(20);
-        if constexpr (kInlineWgrad && !kK3MxFp8WgradOverlap) {
+        if constexpr (
+            kInlineWgrad && !kK3MxFp8WgradOverlap &&
+            !kK3BranchMajorBF16EarlyDW2Overlap) {
           if (warp_idx == 0 && cute::elect_one_sync()) {
             // The final grouped wgrad body aliases the entire parent dynamic
             // shared allocation. Retire W13's transaction barriers before
@@ -17873,14 +18009,18 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
             }
           }
         }
-        if constexpr (!kK3MxFp8WgradOverlap) {
+        if constexpr (
+            !kK3MxFp8WgradOverlap &&
+            !kK3BranchMajorBF16EarlyDW2Overlap) {
             comm::cluster_sync_with_relaxed_arrive();
             if (warp_idx == 0)
                 Allocator().free(0, kNumTmemCols);
         }
         __syncthreads();
 
-        if constexpr (kK3BranchMajorBF16WgradTail) {
+        if constexpr (
+            kK3BranchMajorBF16WgradTail &&
+            !kK3BranchMajorBF16EarlyDW2Overlap) {
             // Parent role-divergent work is retired above. Restore the measured
             // uniform register budget before either outlined BF16 body aliases
             // parent SMEM and reclaims the base-zero TMEM allocation.
@@ -18408,7 +18548,9 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                         second_range_index * kReadyRangeStateStride;
                     const uint32_t dynamic_cluster_idx = blockIdx.x / 2u;
 
-                    if constexpr (!kEarlyW2Wgrad) {
+                    if constexpr (
+                        !kEarlyW2Wgrad &&
+                        !kK3BranchMajorBF16EarlyDW2Overlap) {
                         auto* const dw2_mailbox =
                             union_state + kReadyDW2ClusterSlotWord +
                             dynamic_cluster_idx * kReadyClusterSlotWords;
