@@ -200,7 +200,8 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     const int& num_bytes_per_pull, const int& store_block_m,
     const int& sf_block_m, const int& sf_block_n, const int& gran_k,
     const int& num_dispatch_warps, const int& num_epilogue_warps,
-    const MmaKind& mma_kind) {
+    const MmaKind& mma_kind,
+    const int& l2_activation_group_size = 32) {
     constexpr int kSmemAlignment = 1024;
     constexpr int kNumEpilogueStages = 2;
     constexpr int kNumTMAStoreStages = 2;
@@ -230,6 +231,21 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     const int smem_amax_reduction = is_mma_with_sf(mma_kind) ?
         store_block_m * num_epilogue_warps * static_cast<int>(sizeof(float)) : 0;
 
+    // Exact native_mxfp4 activation quantization reduces one Q128 group
+    // across the two adjacent 64-column L1 tiles in a CTA cluster. Account
+    // for the peer-maximum mailbox and one cluster barrier per epilogue
+    // warpgroup so pipeline-depth selection remains within the SMEM budget.
+    DG_HOST_ASSERT(
+        l2_activation_group_size == 32 ||
+        l2_activation_group_size == 128);
+    const int smem_l2_activation_group128 =
+        l2_activation_group_size == 128
+        ? num_epilogue_warpgroups *
+              (store_block_m / 2) *
+              static_cast<int>(sizeof(float) * 2) +
+              num_epilogue_warpgroups * 8
+        : 0;
+
     // Tensor memory pointer
     const int smem_tmem_ptr = 4;
 
@@ -243,7 +259,9 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     const int smem_size_per_stage = smem_a_size_per_stage + smem_b_size_per_stage + smem_sfa_per_stage + smem_sfb_per_stage + 2 * 8;
 
     // Fixed total
-    const int smem_fixed = smem_dispatch_size + smem_cd + smem_amax_reduction + smem_barriers + smem_tmem_ptr;
+    const int smem_fixed =
+        smem_dispatch_size + smem_cd + smem_amax_reduction +
+        smem_l2_activation_group128 + smem_barriers + smem_tmem_ptr;
 
     // Select maximum number of stages
     int num_stages = (smem_capacity - smem_fixed) / smem_size_per_stage;
@@ -264,7 +282,8 @@ static MegaMoEConfig get_mega_moe_config(
     const int& hidden, const int& intermediate_hidden,
     const int& num_ring_tokens,
     const int& num_sf_ring_tokens,
-    const MmaKind& mma_kind) {
+    const MmaKind& mma_kind,
+    const int& l2_activation_group_size = 32) {
 
     // Block config
     const auto [cluster_size, block_m, store_block_m, block_k, num_epilogue_threads] =
@@ -311,7 +330,7 @@ static MegaMoEConfig get_mega_moe_config(
         block_m, block_n, block_k, num_bytes_per_pull, store_block_m,
         sf_block_m, sf_block_n, gran_k,
         num_dispatch_threads / 32, num_epilogue_threads / 32,
-        mma_kind);
+        mma_kind, l2_activation_group_size);
 
     const auto config = MegaMoEConfig {
         block_m, block_n, block_k,

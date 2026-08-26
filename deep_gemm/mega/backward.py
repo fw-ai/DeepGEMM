@@ -1,12 +1,99 @@
 import os
 import time
-from typing import Any, Callable, Optional, Tuple
+from typing import Any, Callable, Optional, Sequence, Tuple
 
 import torch
 import torch.distributed as dist
 
 from .. import _C
 from . import CombineOrderMode, RouteWeightMode
+
+
+_BackwardRange = Tuple[int, int, int, int, int]
+_K3_MAX_BACKWARD_RANGES = 3
+
+
+def _normalize_backward_ranges(
+    backward_range_sizes: Optional[Sequence[int]],
+    *,
+    num_active_tokens: int,
+    symmetric_token_capacity: int,
+) -> Tuple[_BackwardRange, ...]:
+    """Validate and normalize the optional packed backward-range ABI.
+
+    Records are physical-order ``(active, capacity, pool, acts, sf)`` tuples.
+    Active source tensors stay logically packed, while their symmetric-memory
+    destinations advance by ``capacity``.  An empty tuple selects the legacy
+    single-range staging path without changing its behavior.
+    """
+    if backward_range_sizes is None:
+        return ()
+    values = tuple(int(value) for value in backward_range_sizes)
+    if not values:
+        return ()
+    if len(values) % 5:
+        raise ValueError(
+            "backward_range_sizes must contain five integers per range"
+        )
+    if len(values) > 5 * _K3_MAX_BACKWARD_RANGES:
+        raise ValueError(
+            "K3 backward supports at most "
+            f"{_K3_MAX_BACKWARD_RANGES} physical ranges"
+        )
+
+    ranges = tuple(
+        values[offset : offset + 5]
+        for offset in range(0, len(values), 5)
+    )
+    if any(value < 0 for record in ranges for value in record):
+        raise ValueError("backward range sizes must be nonnegative")
+    if any(active > capacity for active, capacity, *_ in ranges):
+        raise ValueError(
+            "backward range active tokens cannot exceed symmetric capacity"
+        )
+    if sum(record[0] for record in ranges) != num_active_tokens:
+        raise ValueError(
+            "backward range active-token total must match the logical input"
+        )
+    if sum(record[1] for record in ranges) != symmetric_token_capacity:
+        raise ValueError(
+            "backward range capacities must exactly cover symmetric storage"
+        )
+    return ranges
+
+
+def _stage_backward_ranges(
+    destination: torch.Tensor,
+    source: torch.Tensor,
+    ranges: Sequence[_BackwardRange],
+) -> None:
+    """Copy packed active rows into capacity-strided physical range slots."""
+    logical_begin = 0
+    physical_begin = 0
+    for active_tokens, token_capacity, *_ in ranges:
+        if active_tokens:
+            destination.narrow(0, physical_begin, active_tokens).copy_(
+                source.narrow(0, logical_begin, active_tokens)
+            )
+        logical_begin += active_tokens
+        physical_begin += token_capacity
+
+
+def _gather_backward_ranges(
+    destination: torch.Tensor,
+    source: torch.Tensor,
+    ranges: Sequence[_BackwardRange],
+) -> None:
+    """Gather capacity-strided active prefixes into one logical output."""
+    logical_begin = 0
+    physical_begin = 0
+    for active_tokens, token_capacity, *_ in ranges:
+        if active_tokens:
+            destination.narrow(0, logical_begin, active_tokens).copy_(
+                source.narrow(0, physical_begin, active_tokens)
+            )
+        logical_begin += active_tokens
+        physical_begin += token_capacity
 
 _BF16_BACKWARD_TIMING_HOOK: Optional[Callable[[str, torch.cuda.Event, torch.cuda.Event, float], None]] = None
 _BF16_BACKWARD_KERNEL_TRACE_HOOK: Optional[
@@ -816,6 +903,7 @@ def fp8_fp4_mega_moe_backward_dgrad_swiglu(
     direct_remote_grad_x: bool = False,
     write_grad_x_pool: bool = True,
     clear_wgrad_padding: bool = True,
+    clear_empty_wgrad_expert_outputs: bool = True,
     sym_buffer: Optional[Any] = None,
     grad_y: Optional[torch.Tensor] = None,
     topk_weights: Optional[torch.Tensor] = None,
@@ -825,13 +913,106 @@ def fp8_fp4_mega_moe_backward_dgrad_swiglu(
     down_unweighted_output: Optional[torch.Tensor] = None,
     grad_route_output: Optional[torch.Tensor] = None,
     rank_uniform_block_m: bool = False,
+    activation: str = "swiglu",
+    situ_beta: Optional[float] = None,
+    situ_linear_beta: Optional[float] = None,
+    inline_weight_dequant: bool = False,
+    inline_residual_mxfp8_dgrad: bool = False,
+    residual_dgrad_weights: Optional[
+        Tuple[
+            Tuple[torch.Tensor, torch.Tensor],
+            Tuple[torch.Tensor, torch.Tensor],
+        ]
+    ] = None,
+    source_x_bf16: Optional[torch.Tensor] = None,
+    kernel_trace: Optional[torch.Tensor] = None,
+    inline_wgrad: bool = False,
+    accumulate_wgrad: bool = False,
+    combined_grad_x_output: Optional[torch.Tensor] = None,
+    combined_grad_route_output: Optional[torch.Tensor] = None,
+    gate_up_prepared: bool = False,
+    wgrad_outputs: Optional[
+        Tuple[torch.Tensor, torch.Tensor]
+    ] = None,
+    backward_range_sizes: Optional[Sequence[int]] = None,
+    mxfp8_three_term_wgrad: bool = False,
 ) -> None:
-    """Run the production L1 replay, dgrad/SwiGLU, and grad-x dispatch.
+    """Run production L1 replay, gated activation dgrad, and grad-x dispatch.
+
+    ``mxfp8_three_term_wgrad`` is the explicit mode-owned opt-in used by
+    ``moe=mxfp8_mxfp4_megamoe`` for the exact Kimi-K3 EP=8 specialization.
+    It quantizes each of the three weight-gradient operands as group-32
+    primary-plus-residual MXFP8 and accumulates both terms into one FP32 TMEM
+    result before publication. DeepGEMM rejects the opt-in unless the exact
+    shape, SiTU, routing, and accumulation-output contracts are satisfied.
+    A packed three-range invocation selects the exact A/B symmetric-ring
+    specialization directly from this argument; there is no environment or
+    process-global override. The owning training mode is full-parameter only
+    and rejects LoRA before this API is called.
 
     POST_DOWN writes BF16 ``score * grad_y`` to ``grad_ye``, retains
     unweighted ``h_act`` in ``h_weighted_output`` for W2 wgrad, and computes
     ``grad_route_output = dot(grad_y_unweighted, down_unweighted)``.
+
+    ``activation="situ"`` specializes the same persistent 2-SM clustered
+    scheduler with Kimi-K3's exact SiTU derivative. Communication, MXFP4
+    dequantization, UMMA/TMA pipelines, and direct remote gradient publication
+    remain unchanged. ``situ_linear_beta=None`` selects the identity up branch.
+    ``inline_weight_dequant=True`` dequantizes each dgrad weight tile directly
+    into shared memory, allowing the full-size dequant scratch to alias an
+    existing multi-chunk wgrad accumulator without overwriting it.
+
+    ``source_x_bf16`` retains native-training W13 wgrad semantics.  The local
+    source rows are staged into an otherwise-dead symmetric combine plane and
+    Kernel A pulls them into expert order before that plane is reused for
+    direct grad-x publication.  This avoids a top-k-expanded BF16 snapshot.
+
+    ``kernel_trace`` optionally records the 22 in-kernel phase intervals as a
+    contiguous int64 ``[22, num_sms, 5]`` tensor for profiling.
+
+    ``inline_residual_mxfp8_dgrad=True`` re-encodes each transposed MXFP4
+    weight tile exactly into shared-memory MXFP8. The kernel quantizes each
+    BF16 dgrad activation into a primary MXFP8 term plus a residual MXFP8 term
+    and accumulates both with one FP32 UMMA accumulator. No full-size
+    transformed-weight tensor is allocated. ``residual_dgrad_weights`` is a
+    compatibility hook for the earlier externally transformed prototype.
+
+    ``clear_empty_wgrad_expert_outputs`` is true only for the first reversed
+    training chunk. It initializes dW slices for experts absent from that
+    chunk; later chunks preserve the caller's accumulated gradients while
+    still clearing partial-row activation padding.
+
+    ``inline_wgrad=True`` reuses the finished dgrad launch, dead scheduler
+    state, and shared-memory allocation to run clustered UMMA/TMA W2 and W13
+    weight gradients before the kernel returns. ``wgrad_outputs`` decouples
+    their TMA destinations from the dgrad dequant scratch. This is required
+    when a later chunk dequantizes into dead activation pools while reducing
+    into live accumulated dW tensors.
+    With direct remote grad-x publication, ``combined_grad_x_output`` receives
+    the local top-k reduction concurrently with the inline W13 UMMA pipeline.
+
+    ``gate_up_prepared=True`` consumes ``gate_up_output`` as an immutable BF16
+    preactivation published directly by MegaMoE Forward. The persistent
+    backward skips only its W13 L1 replay; communication, route gradients,
+    SiTU dgrad, direct grad-x publication, and wgrad remain in the same launch.
+
+    ``backward_range_sizes`` optionally describes multiple physical backward
+    ranges as flattened five-integer records: active tokens, symmetric token
+    capacity, pool rows, activation rows, and scale-factor rows. ``None``
+    preserves the single-range behavior. For multiple ranges, logical
+    ``grad_y``, ``topk_weights``, and ``source_x_bf16`` rows are staged into
+    capacity-strided symmetric slots. ``combined_grad_route_output`` gathers
+    those physical source-gradient slots back into logical row order.
     """
+    if activation not in ("swiglu", "geglu", "situ"):
+        raise ValueError(f"unsupported MegaMoE backward activation: {activation!r}")
+    if activation == "situ":
+        if situ_beta is None or situ_beta <= 0:
+            raise ValueError("SiTU MegaMoE backward requires situ_beta > 0")
+        if situ_linear_beta is not None and situ_linear_beta <= 0:
+            raise ValueError(
+                "SiTU MegaMoE backward requires situ_linear_beta > 0 when set"
+            )
     route_weight_mode = RouteWeightMode(route_weight_mode)
     if route_weight_mode is RouteWeightMode.POST_DOWN:
         if route_weights.dtype != torch.float32:
@@ -852,10 +1033,12 @@ def fp8_fp4_mega_moe_backward_dgrad_swiglu(
     backward_grad_y = None
     backward_topk_weights = None
     backward_grad_route = None
+    backward_x = None
     backward_sym_buffer_ptrs = []
     backward_rank = 0
     num_max_tokens_per_rank = 0
     num_topk = 0
+    backward_ranges: Tuple[_BackwardRange, ...] = ()
     if (
         compute_w13_dgrad and
         not write_grad_x_pool and
@@ -866,16 +1049,80 @@ def fp8_fp4_mega_moe_backward_dgrad_swiglu(
         raise ValueError("direct remote grad-x requires W13 dgrad")
     if direct_remote_grad_x and sym_buffer is None:
         raise ValueError("direct remote grad-x requires a symmetric buffer")
+    if backward_range_sizes and sym_buffer is None:
+        raise ValueError("backward ranges require a symmetric buffer")
     if sym_buffer is not None:
         if grad_y is None or topk_weights is None or token_src_metadata is None:
             raise ValueError("in-kernel EP dispatch requires grad_y, topk_weights, " "and token_src_metadata")
         num_tokens = grad_y.shape[0]
-        sym_buffer.backward_grad_y[:num_tokens].copy_(grad_y.to(torch.bfloat16).contiguous())
-        sym_buffer.topk_weights[:num_tokens].copy_(topk_weights.float().contiguous())
+        backward_ranges = _normalize_backward_ranges(
+            backward_range_sizes,
+            num_active_tokens=num_tokens,
+            symmetric_token_capacity=sym_buffer.num_max_tokens_per_rank,
+        )
+        if len(backward_ranges) > 1 and int(_C.get_num_sms()) != 148:
+            raise ValueError(
+                "multi-range K3 backward requires DeepGEMM runtime "
+                "num_sms=148"
+            )
+        grad_y_bf16 = grad_y.to(torch.bfloat16).contiguous()
+        topk_weights_fp32 = topk_weights.float().contiguous()
+        if len(backward_ranges) > 1:
+            _stage_backward_ranges(
+                sym_buffer.backward_grad_y,
+                grad_y_bf16,
+                backward_ranges,
+            )
+            _stage_backward_ranges(
+                sym_buffer.topk_weights,
+                topk_weights_fp32,
+                backward_ranges,
+            )
+        else:
+            sym_buffer.backward_grad_y[:num_tokens].copy_(grad_y_bf16)
+            sym_buffer.topk_weights[:num_tokens].copy_(topk_weights_fp32)
         sym_buffer.backward_grad_route.zero_()
         backward_grad_y = sym_buffer.backward_grad_y
         backward_topk_weights = sym_buffer.topk_weights
         backward_grad_route = sym_buffer.backward_grad_route
+        if source_x_bf16 is not None:
+            if (
+                source_x_bf16.dtype != torch.bfloat16
+                or source_x_bf16.dim() != 2
+                or source_x_bf16.shape != grad_y.shape
+                or not source_x_bf16.is_contiguous()
+            ):
+                raise ValueError(
+                    "source_x_bf16 must be contiguous BF16 with the same "
+                    f"shape as grad_y, got {tuple(source_x_bf16.shape)} "
+                    f"{source_x_bf16.dtype}"
+                )
+            if sym_buffer.num_topk < 2:
+                raise ValueError(
+                    "source_x_bf16 staging requires at least two symmetric "
+                    "combine planes"
+                )
+            combine_planes = torch.as_strided(
+                sym_buffer.backward_grad_y,
+                size=(
+                    sym_buffer.num_topk * sym_buffer.num_max_tokens_per_rank,
+                    sym_buffer.hidden,
+                ),
+                stride=(sym_buffer.hidden, 1),
+            )
+            backward_x = combine_planes.narrow(
+                0,
+                sym_buffer.num_max_tokens_per_rank,
+                sym_buffer.num_max_tokens_per_rank,
+            )
+            if len(backward_ranges) > 1:
+                _stage_backward_ranges(
+                    backward_x,
+                    source_x_bf16,
+                    backward_ranges,
+                )
+            else:
+                backward_x[:num_tokens].copy_(source_x_bf16)
         backward_sym_buffer_ptrs = sym_buffer.handle.buffer_ptrs
         backward_rank = sym_buffer.group.rank()
         num_max_tokens_per_rank = sym_buffer.num_max_tokens_per_rank
@@ -898,6 +1145,70 @@ def fp8_fp4_mega_moe_backward_dgrad_swiglu(
                 group=sym_buffer.group,
             )
             block_m = int(rank_uniform_block_m_tensor.item())
+
+    w2_dgrad_weights = None
+    w2_dgrad_weights_sf = None
+    w13_dgrad_weights = None
+    w13_dgrad_weights_sf = None
+    if residual_dgrad_weights is not None:
+        (w2_dgrad_weights, w2_dgrad_weights_sf), (
+            w13_dgrad_weights,
+            w13_dgrad_weights_sf,
+        ) = residual_dgrad_weights
+    if inline_residual_mxfp8_dgrad and inline_weight_dequant:
+        raise ValueError(
+            "inline residual MXFP8 and legacy inline BF16 weight dequant "
+            "are mutually exclusive"
+        )
+    if accumulate_wgrad and not inline_wgrad:
+        raise ValueError("accumulate_wgrad requires inline_wgrad")
+    if accumulate_wgrad and wgrad_outputs is None:
+        raise ValueError(
+            "accumulate_wgrad requires explicit wgrad_outputs"
+        )
+    w2_wgrad_output = None
+    w13_wgrad_output = None
+    if wgrad_outputs is not None:
+        if not inline_wgrad:
+            raise ValueError("wgrad_outputs requires inline_wgrad")
+        if len(wgrad_outputs) != 2:
+            raise ValueError("wgrad_outputs must contain (dW2, dW13)")
+        w2_wgrad_output, w13_wgrad_output = wgrad_outputs
+    if combined_grad_x_output is not None:
+        if not inline_wgrad or not direct_remote_grad_x:
+            raise ValueError(
+                "combined_grad_x_output requires inline_wgrad and direct "
+                "remote grad-x"
+            )
+        if (
+            combined_grad_x_output.dtype != torch.bfloat16
+            or combined_grad_x_output.shape != grad_y.shape
+            or not combined_grad_x_output.is_contiguous()
+        ):
+            raise ValueError(
+                "combined_grad_x_output must be contiguous BF16 with the "
+                f"same shape as grad_y, got {tuple(combined_grad_x_output.shape)} "
+                f"{combined_grad_x_output.dtype}"
+            )
+    if inline_wgrad and direct_remote_grad_x and combined_grad_x_output is None:
+        raise ValueError(
+            "inline_wgrad with direct remote grad-x requires "
+            "combined_grad_x_output"
+        )
+    if combined_grad_route_output is not None:
+        if sym_buffer is None or grad_y is None or topk_weights is None:
+            raise ValueError(
+                "combined_grad_route_output requires symmetric EP inputs"
+            )
+        if (
+            combined_grad_route_output.dtype != torch.float32
+            or combined_grad_route_output.shape != topk_weights.shape
+            or not combined_grad_route_output.is_contiguous()
+        ):
+            raise ValueError(
+                "combined_grad_route_output must be contiguous FP32 with "
+                "the same shape as topk_weights"
+            )
 
     _C.fp8_fp4_mega_moe_backward_dgrad_swiglu_v2(
         gate_up_output,
@@ -924,6 +1235,7 @@ def fp8_fp4_mega_moe_backward_dgrad_swiglu(
         direct_remote_grad_x,
         write_grad_x_pool,
         clear_wgrad_padding,
+        clear_empty_wgrad_expert_outputs,
         backward_grad_y,
         backward_topk_weights,
         backward_grad_route,
@@ -936,7 +1248,39 @@ def fp8_fp4_mega_moe_backward_dgrad_swiglu(
         grad_y_unweighted_output,
         down_unweighted_output,
         grad_route_output,
+        activation,
+        situ_beta,
+        situ_linear_beta,
+        inline_weight_dequant,
+        inline_residual_mxfp8_dgrad,
+        False,
+        w2_dgrad_weights,
+        w2_dgrad_weights_sf,
+        w13_dgrad_weights,
+        w13_dgrad_weights_sf,
+        backward_x,
+        kernel_trace,
+        inline_wgrad,
+        accumulate_wgrad,
+        combined_grad_x_output,
+        gate_up_prepared,
+        w2_wgrad_output,
+        w13_wgrad_output,
+        [] if backward_range_sizes is None else list(backward_range_sizes),
+        mxfp8_three_term_wgrad,
     )
+    if combined_grad_route_output is not None:
+        assert backward_grad_route is not None
+        if len(backward_ranges) > 1:
+            _gather_backward_ranges(
+                combined_grad_route_output,
+                backward_grad_route,
+                backward_ranges,
+            )
+        else:
+            combined_grad_route_output.copy_(
+                backward_grad_route[: combined_grad_route_output.shape[0]]
+            )
 
 
 def bf16_mega_moe_backward_w2(
@@ -946,6 +1290,7 @@ def bf16_mega_moe_backward_w2(
     padded_expert_counts: torch.Tensor,
     pool_block_m: int,
     route_weight_mode: RouteWeightMode = RouteWeightMode.PRE_DOWN,
+    with_accumulation: bool = False,
 ) -> None:
     """Run standalone single-CTA BF16 W2 wgrad for local experts."""
     route_weight_mode = RouteWeightMode(route_weight_mode)
@@ -956,6 +1301,7 @@ def bf16_mega_moe_backward_w2(
         padded_expert_counts,
         pool_block_m,
         route_weight_mode.value,
+        with_accumulation,
     )
 
 
@@ -965,6 +1311,7 @@ def bf16_mega_moe_backward_w13(
     x_pool: torch.Tensor,
     padded_expert_counts: torch.Tensor,
     pool_block_m: int,
+    with_accumulation: bool = False,
 ) -> None:
     """Run standalone single-CTA BF16 combined W1/W3 wgrad."""
     _C.bf16_mega_moe_backward_w13(
@@ -973,6 +1320,7 @@ def bf16_mega_moe_backward_w13(
         x_pool,
         padded_expert_counts,
         pool_block_m,
+        with_accumulation,
     )
 
 
@@ -1022,6 +1370,7 @@ def bf16_mega_moe_backward_w2_combine(
     grad_x_output: torch.Tensor,
     sym_buffer: Any,
     route_weight_mode: RouteWeightMode = RouteWeightMode.PRE_DOWN,
+    with_accumulation: bool = False,
 ) -> None:
     """Run W2 wgrad while protecting the direct-write receive planes."""
     route_weight_mode = RouteWeightMode(route_weight_mode)
@@ -1038,6 +1387,7 @@ def bf16_mega_moe_backward_w2_combine(
         sym_buffer.num_max_tokens_per_rank,
         sym_buffer.num_topk,
         route_weight_mode.value,
+        with_accumulation,
     )
 
 
@@ -1050,6 +1400,7 @@ def bf16_mega_moe_backward_w13_combine(
     grad_x_output: torch.Tensor,
     sym_buffer: Any,
     combine_order_mode: CombineOrderMode = CombineOrderMode.FIXED_TOPK,
+    with_accumulation: bool = False,
 ) -> None:
     """Run W13 wgrad while reducing direct-write grad-x planes."""
     combine_order_mode = CombineOrderMode(combine_order_mode)
@@ -1063,6 +1414,7 @@ def bf16_mega_moe_backward_w13_combine(
             x_pool,
             padded_expert_counts,
             pool_block_m,
+            with_accumulation,
         )
         mega_moe_backward_combine_grad_x(
             grad_x_output,
@@ -1084,4 +1436,5 @@ def bf16_mega_moe_backward_w13_combine(
         sym_buffer.num_topk,
         sym_buffer.topk_idx,
         combine_order_mode.value,
+        with_accumulation,
     )

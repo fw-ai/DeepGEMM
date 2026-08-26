@@ -26,7 +26,9 @@ sm100_store_cd_swap_ab(const utils::PatternVisitor<pattern_cd_t>& smem_cd, uint3
                        const uint32_t& effective_m,
                        const uint32_t& epilogue_warp_idx, const uint32_t& lane_idx,
                        const cutlass::arch::ClusterTransactionBarrier* tmem_empty_barrier,
-                       const cute::TmaDescriptor& tensor_map_cd) {
+                       const cute::TmaDescriptor& tensor_map_cd,
+                       const cutlass::arch::ClusterTransactionBarrier*
+                           tmem_prefix_empty_barrier = nullptr) {
     // NOTES: The epilogue requires a full warpgroup to read all 128 TMEM rows,
     //          implying STORE_BLOCK_N must be 128.
     DG_STATIC_ASSERT(STORE_BLOCK_N == 128, "STORE_BLOCK_N must be 128 to match TMEM rows");
@@ -105,6 +107,16 @@ sm100_store_cd_swap_ab(const utils::PatternVisitor<pattern_cd_t>& smem_cd, uint3
                                                   math::cast_into_bf16_and_pack(values[6], values[7]),
                                                   smem_ptr);
             }
+        }
+
+        // An optional consumer may recycle the TMEM columns covered by the
+        // first store slice before this epilogue drains the rest of the tile.
+        // Order every participating thread's TMEM loads before its barrier
+        // arrival, exactly as for the full-tile retirement below.  Passing a
+        // compile-time null pointer preserves the original epilogue contract.
+        if (s == 0 && tmem_prefix_empty_barrier != nullptr) {
+            ptx::tcgen05_before_thread_sync();
+            tmem_prefix_empty_barrier->arrive(0u);
         }
 
         // Notify tensor memory empty (only at the leader CTA) arrival ASAP

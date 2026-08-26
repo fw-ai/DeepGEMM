@@ -125,6 +125,9 @@ static torch::Tensor transform_k_grouped_sf_into_required_layout(const torch::Te
 #endif
 
 static void register_apis(pybind11::module_& m) {
+    // Fail closed in trainer images: older DeepGEMM builds expose the same
+    // grouped-GEMM signature but reject DeepEP's column-major PSUM scales.
+    m.attr("supports_noncontiguous_psum_sfa") = py::bool_(true);
 #if DG_TENSORMAP_COMPATIBLE
     m.def("transform_sf_into_required_layout", &transform_sf_into_required_layout,
       py::arg("sf"), py::arg("mn"), py::arg("k"), py::arg("recipe"),

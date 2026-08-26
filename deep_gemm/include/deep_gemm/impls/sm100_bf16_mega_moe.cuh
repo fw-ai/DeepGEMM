@@ -140,7 +140,7 @@ sm100_bf16_mega_moe_impl(void* y,
     // Combine inputs
     const auto combine_token_buffer = layout::Buffer(
         bf16_token_layout, kNumTopk, kNumMaxTokensPerRank,
-        l2_token_buffer.get_end_ptr()
+        layout::align_buffer_base(l2_token_buffer.get_end_ptr(), 128u)
     );
 
     // Data types

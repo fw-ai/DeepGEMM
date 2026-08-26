@@ -5,13 +5,19 @@ import json
 import os
 import random
 import sys
+import pytest
 import torch
 import torch.distributed as dist
 from types import SimpleNamespace
 from typing import Tuple
 
 import deep_gemm
-from deep_gemm.mega.backward import _direct_grad_x_planes
+from deep_gemm.mega.backward import (
+    _direct_grad_x_planes,
+    _gather_backward_ranges,
+    _normalize_backward_ranges,
+    _stage_backward_ranges,
+)
 from deep_gemm.utils import (
     per_token_cast_to_fp4, per_token_cast_to_fp8,
     cast_back_from_fp4, unpack_ue8m0_from_int,
@@ -42,6 +48,18 @@ def test_fp8_backward_canonicalizes_block_m_and_clears_padding(
     def fake_backward(*args):
         captured["block_m"] = args[20]
         captured["clear_wgrad_padding"] = args[23]
+        captured["activation"] = args[37:41]
+        captured["build_residual_mxfp8_weights"] = args[42]
+        captured["inline_wgrad"] = args[49:52]
+        captured["gate_up_prepared"] = args[52]
+        captured["wgrad_outputs"] = tuple(
+            tensor.data_ptr() for tensor in args[53:55]
+        )
+        captured["backward_range_sizes"] = args[55]
+        captured["mxfp8_three_term_wgrad"] = args[56]
+        captured["staged_topk_weights"] = args[26].clone()
+        args[27][0, 0] = 3.0
+        args[27][1, 0] = 7.0
 
     monkeypatch.setattr(dist, "all_reduce", fake_all_reduce)
     monkeypatch.setattr(
@@ -49,28 +67,37 @@ def test_fp8_backward_canonicalizes_block_m_and_clears_padding(
         "fp8_fp4_mega_moe_backward_dgrad_swiglu_v2",
         fake_backward,
     )
+    monkeypatch.setattr(deep_gemm._C, "get_num_sms", lambda: 148)
 
     rows, hidden, intermediate = 2, 4, 4
     grad_y = torch.zeros(rows, hidden)
     topk_weights = torch.ones(rows, 1)
+    symmetric_capacity = 4
     backward_grad_x_storage = torch.zeros(
-        2 * rows, hidden, dtype=torch.bfloat16)
+        2 * symmetric_capacity, hidden, dtype=torch.bfloat16)
     sym_buffer = SimpleNamespace(
         group=FakeGroup(),
-        backward_grad_y=backward_grad_x_storage[:rows],
-        topk_weights=torch.zeros(rows, 1),
-        backward_grad_route=torch.zeros(rows, 1),
+        backward_grad_y=backward_grad_x_storage[:symmetric_capacity],
+        topk_weights=torch.zeros(symmetric_capacity, 1),
+        backward_grad_route=torch.zeros(symmetric_capacity, 1),
         handle=SimpleNamespace(buffer_ptrs=[1, 2]),
-        num_max_tokens_per_rank=rows,
+        num_max_tokens_per_rank=symmetric_capacity,
         num_topk=2,
         hidden=hidden,
     )
     direct_planes = _direct_grad_x_planes(sym_buffer)
-    assert direct_planes.shape == (2 * rows, hidden)
+    assert direct_planes.shape == (2 * symmetric_capacity, hidden)
     assert direct_planes.data_ptr() == sym_buffer.backward_grad_y.data_ptr()
     pool_hidden = torch.zeros(rows, hidden, dtype=torch.bfloat16)
     pool_intermediate = torch.zeros(
         rows, intermediate, dtype=torch.bfloat16)
+    w2_wgrad_output = torch.zeros(
+        1, hidden, intermediate, dtype=torch.bfloat16
+    )
+    w13_wgrad_output = torch.zeros(
+        1, 2 * intermediate, hidden, dtype=torch.bfloat16
+    )
+    combined_grad_route_output = torch.empty_like(topk_weights)
 
     deep_gemm.fp8_fp4_mega_moe_backward_dgrad_swiglu(
         gate_up_output=torch.zeros(
@@ -111,12 +138,160 @@ def test_fp8_backward_canonicalizes_block_m_and_clears_padding(
         grad_y=grad_y,
         topk_weights=topk_weights,
         token_src_metadata=torch.zeros(rows, 3, dtype=torch.int32),
+        activation="situ",
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+        inline_wgrad=True,
+        accumulate_wgrad=True,
+        combined_grad_route_output=combined_grad_route_output,
+        wgrad_outputs=(w2_wgrad_output, w13_wgrad_output),
+        gate_up_prepared=True,
+        backward_range_sizes=(2, 2, 2, 2, 1, 0, 2, 0, 0, 0),
+        mxfp8_three_term_wgrad=True,
     )
 
+    staged_topk_weights = captured.pop("staged_topk_weights")
+    assert torch.equal(
+        staged_topk_weights,
+        torch.tensor([[1.0], [1.0], [0.0], [0.0]]),
+    )
     assert captured == {
         "block_m": 96,
         "clear_wgrad_padding": True,
+        "activation": ("situ", 4.0, 25.0, False),
+        "build_residual_mxfp8_weights": False,
+        "inline_wgrad": (True, True, None),
+        "gate_up_prepared": True,
+        "wgrad_outputs": (
+            w2_wgrad_output.data_ptr(),
+            w13_wgrad_output.data_ptr(),
+        ),
+        "backward_range_sizes": [2, 2, 2, 2, 1, 0, 2, 0, 0, 0],
+        "mxfp8_three_term_wgrad": True,
     }
+    assert combined_grad_route_output[:, 0].tolist() == [3.0, 7.0]
+
+
+def test_multirange_backward_rejects_non_sm148_before_staging(monkeypatch):
+    binding_called = False
+
+    def unexpected_binding(*_args):
+        nonlocal binding_called
+        binding_called = True
+
+    monkeypatch.setattr(deep_gemm._C, "get_num_sms", lambda: 132)
+    monkeypatch.setattr(
+        deep_gemm._C,
+        "fp8_fp4_mega_moe_backward_dgrad_swiglu_v2",
+        unexpected_binding,
+    )
+
+    # Deliberately omit every symmetric staging tensor. Reaching staging would
+    # therefore raise AttributeError instead of the required fail-closed error.
+    sym_buffer = SimpleNamespace(num_max_tokens_per_rank=4)
+    with pytest.raises(ValueError, match="runtime num_sms=148"):
+        deep_gemm.fp8_fp4_mega_moe_backward_dgrad_swiglu(
+            gate_up_output=None,
+            grad_h_output=None,
+            grad_gate_up_output=None,
+            h_act_output=None,
+            h_weighted_output=None,
+            x_pool_output=None,
+            grad_x_pool_output=None,
+            l1_acts=None,
+            l1_acts_sf=None,
+            l1_weights=(None, None),
+            grad_ye=torch.zeros(2, 1),
+            route_weights=None,
+            w2_weights=(None, None),
+            w2_dequant_scratch=None,
+            w13_weights=(None, None),
+            w13_dequant_scratch=None,
+            expert_counts=None,
+            grid_sync_counter=None,
+            activation_limit=0.0,
+            block_m=192,
+            sym_buffer=sym_buffer,
+            grad_y=torch.zeros(2, 1),
+            topk_weights=torch.ones(2, 1),
+            token_src_metadata=torch.zeros(2, 3, dtype=torch.int32),
+            backward_range_sizes=(
+                1, 2, 1, 1, 1,
+                1, 2, 1, 1, 1,
+            ),
+        )
+
+    assert not binding_called
+
+
+def test_backward_range_staging_and_gather_unequal_active_counts():
+    ranges = _normalize_backward_ranges(
+        (3, 4, 8, 8, 2, 1, 3, 4, 4, 1),
+        num_active_tokens=4,
+        symmetric_token_capacity=7,
+    )
+    source = torch.tensor([[10], [11], [12], [20]], dtype=torch.int32)
+    physical = torch.full((7, 1), -1, dtype=torch.int32)
+
+    _stage_backward_ranges(physical, source, ranges)
+
+    assert physical[:, 0].tolist() == [10, 11, 12, -1, 20, -1, -1]
+    physical_route = torch.tensor(
+        [[1.0], [2.0], [3.0], [-9.0], [4.0], [-9.0], [-9.0]]
+    )
+    logical_route = torch.empty(4, 1)
+    _gather_backward_ranges(logical_route, physical_route, ranges)
+    assert logical_route[:, 0].tolist() == [1.0, 2.0, 3.0, 4.0]
+
+
+def test_backward_range_normalizer_accepts_three_and_rejects_four_ranges():
+    three = _normalize_backward_ranges(
+        (
+            2, 3, 8, 8, 2,
+            1, 2, 4, 4, 1,
+            1, 2, 4, 4, 1,
+        ),
+        num_active_tokens=4,
+        symmetric_token_capacity=7,
+    )
+    assert len(three) == 3
+    assert tuple(record[0] for record in three) == (2, 1, 1)
+
+    with pytest.raises(ValueError, match="at most 3 physical ranges"):
+        _normalize_backward_ranges(
+            (
+                1, 1, 1, 1, 1,
+                1, 1, 1, 1, 1,
+                1, 1, 1, 1, 1,
+                1, 1, 1, 1, 1,
+            ),
+            num_active_tokens=4,
+            symmetric_token_capacity=4,
+        )
+
+    assert _normalize_backward_ranges(
+        None, num_active_tokens=0, symmetric_token_capacity=0
+    ) == ()
+    assert _normalize_backward_ranges(
+        (), num_active_tokens=0, symmetric_token_capacity=0
+    ) == ()
+
+
+@pytest.mark.parametrize(
+    ("sizes", "message"),
+    (
+        ((3, 2, 8, 8, 2), "cannot exceed"),
+        ((2, 4, 8, 8, 2), "active-token total"),
+        ((4, 5, 8, 8, 2), "exactly cover"),
+    ),
+)
+def test_backward_range_layout_rejects_invalid_totals(sizes, message):
+    with pytest.raises(ValueError, match=message):
+        _normalize_backward_ranges(
+            sizes,
+            num_active_tokens=4,
+            symmetric_token_capacity=7,
+        )
 
 
 def import_baseline():
@@ -318,6 +493,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         activation=args.activation,
         num_ring_tokens=args.num_ring_tokens,
     )
+    assert buffer.backward_grad_y.data_ptr() % 128 == 0, (
+        'MegaMoE combine storage must satisfy the K3 ring/TMA base ABI'
+    )
     legacy_num_bytes, legacy_slicer = (
         deep_gemm._C.get_symm_buffer_size_for_mega_moe(
             num_ranks, num_experts,
@@ -371,7 +549,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     # Create inputs
     # noinspection PyGlobalUndefined
     def create_inputs():
-        global x, topk_idx, topk_weights, l1_weights, l2_weights, transformed_l1_weights, transformed_l2_weights
+        global x, source_x_bf16, topk_idx, topk_weights, l1_weights, l2_weights, transformed_l1_weights, transformed_l2_weights
         global l1_weights_bf16, l2_weights_bf16
         global saved_l1_preact, saved_h_unweighted
         global saved_h_weighted, saved_down_unweighted
@@ -382,6 +560,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         global local_padded_pool_rows, destination_counts
         global route_count_mismatch, num_config_tokens
         x = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+        source_x_bf16 = x
         l1_weights = torch.randn(
             (num_experts_per_rank, intermediate_hidden * 2, hidden), dtype=torch.bfloat16, device='cuda')
         l2_weights = torch.randn(
@@ -591,8 +770,15 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             (1, 1, 32),
             args.activation,
             args.activation_clamp,
+            None,
+            None,
             bool(args.fast_math),
-            buffer.num_ring_tokens)
+            buffer.num_ring_tokens,
+            None,
+            deep_gemm.RouteWeightMode.PRE_DOWN.value,
+            None,
+            num_config_tokens,
+            32)
         return y
 
     def active_pool_route_rows(
@@ -728,14 +914,13 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                     first_down[local_padded_pool_rows:].float()).all()
         metadata = buffer.token_src_metadata[active_rows].long()
 
-        def expected_output(
+        def source_down_planes(
             down_pool: torch.Tensor,
-            weights: torch.Tensor,
         ) -> torch.Tensor:
+            """Canonicalize a nondeterministically ordered expert pool."""
             if num_ranks == 1:
                 all_down = [down_pool]
                 all_metadata = [buffer.token_src_metadata]
-                all_weights = weights.unsqueeze(0)
             else:
                 all_down = [torch.empty_like(down_pool)
                             for _ in range(num_ranks)]
@@ -745,9 +930,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 dist.all_gather(all_down, down_pool, group=group)
                 dist.all_gather(
                     all_metadata, buffer.token_src_metadata, group=group)
-                all_weights = gather_rank_padded(weights, 0.0)
-            route_planes = torch.zeros(
-                (num_topk, num_tokens, hidden),
+            source_planes = torch.zeros(
+                (num_tokens, num_topk, hidden),
                 dtype=torch.bfloat16, device='cuda')
             for destination_rank in range(num_ranks):
                 destination_rows = active_pool_route_rows(
@@ -757,28 +941,34 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 local_mask = (
                     destination_metadata[:, 0] == rank_idx)
                 local_metadata = destination_metadata[local_mask]
-                route_planes[
-                    local_metadata[:, 2],
-                    local_metadata[:, 1]] = (
-                    all_down[destination_rank][
-                        destination_rows[local_mask]].float() *
-                    all_weights[
-                        local_metadata[:, 0],
-                        local_metadata[:, 1],
-                        local_metadata[:, 2]].float().unsqueeze(1)
-                ).to(torch.bfloat16)
-            # The production combine accumulates BF16 route planes in
-            # top-k-slot order in FP32, then rounds once.
+                source_planes[
+                    local_metadata[:, 1],
+                    local_metadata[:, 2]] = all_down[destination_rank][
+                        destination_rows[local_mask]]
+            return source_planes
+
+        def expected_output(
+            source_planes: torch.Tensor,
+            weights: torch.Tensor,
+        ) -> torch.Tensor:
+            # The production combine applies the FP32 route score to the BF16
+            # W2 boundary with one FMA per slot, accumulates slots in order,
+            # then rounds the combined token once. This is also K3's native
+            # non-DeepEP combine contract.
             expected = torch.zeros(
                 (num_tokens, hidden),
                 dtype=torch.float32, device='cuda')
             for slot in range(num_topk):
-                expected += route_planes[slot].float()
+                expected = torch.addcmul(
+                    expected,
+                    source_planes[:, slot].float(),
+                    weights[:, slot].float().unsqueeze(1))
             return expected.to(torch.bfloat16)
 
+        first_source_down = source_down_planes(first_down)
         assert torch.equal(
             fused_y,
-            expected_output(first_down, topk_weights)), (
+            expected_output(first_source_down, topk_weights)), (
                 'POST_DOWN must multiply the BF16 down output at '
                 'the remote combine write')
 
@@ -812,13 +1002,16 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             saved_down_unweighted=second_down)
         assert torch.isfinite(
             second_down[active_rows].float()).all()
-        assert torch.equal(
-            second_down[active_rows],
-            first_down[active_rows]), (
-                'POST_DOWN W2 quantization must not depend on route scores')
+        second_source_down = source_down_planes(second_down)
+        down_delta = second_source_down.float() - first_source_down.float()
+        assert torch.equal(second_source_down, first_source_down), (
+            'POST_DOWN W2 quantization must not depend on route scores: '
+            f'max_abs={down_delta.abs().max().item():.6g}, '
+            f'changed={down_delta.ne(0).sum().item()}/{down_delta.numel()}, '
+            f'cosine={torch.nn.functional.cosine_similarity(second_source_down.float().flatten(), first_source_down.float().flatten(), dim=0).item():.9f}')
         assert torch.equal(
             changed_y,
-            expected_output(second_down, changed_weights)), (
+            expected_output(second_source_down, changed_weights)), (
                 'changed route scores must be applied after the '
                 'saved BF16 down boundary')
         assert torch.equal(
@@ -2512,15 +2705,19 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                     ),
                 ).fill_(7)
             deep_gemm.fp8_fp4_mega_moe_backward_dgrad_swiglu(
-                gate_up_output=saved_l1_preact,
+                gate_up_output=outputs.get(
+                    'gate_up_input', saved_l1_preact),
                 grad_h_output=outputs['grad_h'],
                 grad_gate_up_output=outputs['grad_gate_up'],
                 h_act_output=outputs['h_act'],
                 h_weighted_output=outputs['h_weighted'],
                 x_pool_output=outputs['x_pool'],
                 grad_x_pool_output=outputs['grad_x_pool'],
-                l1_acts=buffer.l1_acts,
-                l1_acts_sf=buffer.l1_acts_sf,
+                l1_acts=buffer.l1_acts[:pool_rows],
+                l1_acts_sf=buffer.l1_acts_sf[
+                    : (pool_rows // block_m) *
+                    ((block_m + 127) // 128 * 128)
+                ],
                 l1_weights=transformed_l1_weights,
                 grad_ye=outputs['grad_ye'],
                 route_weights=route_weights,
@@ -2575,6 +2772,98 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 grad_y_unweighted_output=grad_y_unweighted,
                 down_unweighted_output=saved_down_unweighted,
                 grad_route_output=grad_route)
+            prepared_outputs = allocate_outputs()
+            prepared_grad_route = torch.zeros_like(grad_route)
+            run_backward(
+                prepared_outputs,
+                route_weight_mode=deep_gemm.RouteWeightMode.POST_DOWN,
+                grad_y_unweighted_output=grad_y_unweighted,
+                down_unweighted_output=saved_down_unweighted,
+                grad_route_output=prepared_grad_route,
+                gate_up_prepared=True)
+            for name in (
+                'grad_h', 'grad_gate_up', 'h_act', 'h_weighted',
+                'x_pool', 'grad_x_pool', 'grad_ye',
+                'w2_scratch', 'w13_scratch',
+            ):
+                torch.testing.assert_close(
+                    prepared_outputs[name], outputs[name], rtol=0, atol=0)
+            torch.testing.assert_close(
+                prepared_grad_route, grad_route, rtol=0, atol=0)
+            dist_print(
+                ' > Prepared gate/up backward matches replay bitwise',
+                once_in_node=True)
+
+            # Regression: prepared gate/up and dGate/dUp may share storage.
+            # Kernel A must not publish conventional gradient columns until
+            # every N-tile CTA has retired its interleaved preactivation reads.
+            aliased_outputs = allocate_outputs()
+            aliased_gate_up = saved_l1_preact.clone()
+            aliased_outputs['gate_up_input'] = aliased_gate_up
+            aliased_outputs['grad_gate_up'] = aliased_gate_up
+            aliased_grad_route = torch.zeros_like(grad_route)
+            run_backward(
+                aliased_outputs,
+                route_weight_mode=deep_gemm.RouteWeightMode.POST_DOWN,
+                grad_y_unweighted_output=grad_y_unweighted,
+                down_unweighted_output=saved_down_unweighted,
+                grad_route_output=aliased_grad_route,
+                gate_up_prepared=True)
+            observable_pool_rows = int(
+                (((expert_counts + block_m - 1) // block_m) * block_m)
+                .sum().item()
+            )
+            for name in (
+                'grad_h', 'grad_gate_up', 'h_act', 'h_weighted',
+                'x_pool', 'grad_x_pool', 'grad_ye',
+                'w2_scratch', 'w13_scratch',
+            ):
+                actual = aliased_outputs[name]
+                expected = prepared_outputs[name]
+                if name == 'grad_gate_up':
+                    # W13 consumes only expert-block-padded rows. The shared
+                    # rank-uniform capacity tail remains dead forward scratch.
+                    actual = actual[:observable_pool_rows]
+                    expected = expected[:observable_pool_rows]
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            torch.testing.assert_close(
+                aliased_grad_route, prepared_grad_route,
+                rtol=0, atol=0)
+            dist_print(
+                ' > In-place prepared gate/up gradient reuse matches '
+                'separate pools bitwise',
+                once_in_node=True)
+
+            # POST_DOWN never reads grad_h after the activation epilogue: its
+            # route dot uses grad-y and saved down. Verify that SiTU output and
+            # W2-wgrad input can overwrite the retired dgrad pool exactly.
+            h_aliased_outputs = allocate_outputs()
+            h_aliased_outputs['h_act'] = h_aliased_outputs['grad_h']
+            h_aliased_outputs['h_weighted'] = (
+                h_aliased_outputs['grad_h']
+            )
+            h_aliased_grad_route = torch.zeros_like(grad_route)
+            run_backward(
+                h_aliased_outputs,
+                route_weight_mode=deep_gemm.RouteWeightMode.POST_DOWN,
+                grad_y_unweighted_output=grad_y_unweighted,
+                down_unweighted_output=saved_down_unweighted,
+                grad_route_output=h_aliased_grad_route,
+                gate_up_prepared=True)
+            for name in (
+                'grad_gate_up', 'h_act', 'h_weighted', 'x_pool',
+                'grad_x_pool', 'grad_ye', 'w2_scratch', 'w13_scratch',
+            ):
+                torch.testing.assert_close(
+                    h_aliased_outputs[name], prepared_outputs[name],
+                    rtol=0, atol=0)
+            torch.testing.assert_close(
+                h_aliased_grad_route, prepared_grad_route,
+                rtol=0, atol=0)
+            dist_print(
+                ' > In-place POST_DOWN grad-h/SiTU reuse matches separate '
+                'pools bitwise',
+                once_in_node=True)
             assert torch.equal(
                 route_weights[active_rows], exact_route_weights), (
                     'MXFP4 backward must preserve FP32 route scores exactly')
@@ -2628,6 +2917,244 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             assert_direct_route_plane(expected_grad_route)
             combine_outputs = explicit_outputs
 
+        # K3 training keeps W2/W13 wgrad in Kernel A so its UMMA work can
+        # overlap the cross-rank receive-plane reduction.  Compare that
+        # persistent phase against the standalone wgrad kernels before using
+        # it in FireTitan's full-parameter path.
+        padded_expert_counts = (
+            (expert_counts + block_m - 1) // block_m * block_m
+        )
+        expected_w2 = torch.zeros_like(
+            combine_outputs['w2_scratch'])
+        expected_w13 = torch.zeros_like(
+            combine_outputs['w13_scratch'])
+        expected_combined = None
+        if num_ranks > 1:
+            expected_combined = torch.empty(
+                (num_tokens, hidden),
+                dtype=torch.bfloat16,
+                device='cuda')
+            deep_gemm.bf16_mega_moe_backward_w2_combine(
+                expected_w2,
+                combine_outputs['grad_ye'],
+                combine_outputs['h_weighted'],
+                padded_expert_counts,
+                block_m,
+                expected_combined,
+                buffer,
+                route_weight_mode=deep_gemm.RouteWeightMode(
+                    args.route_weight_mode))
+            deep_gemm.bf16_mega_moe_backward_w13_combine(
+                expected_w13,
+                combine_outputs['grad_gate_up'],
+                combine_outputs['x_pool'],
+                padded_expert_counts,
+                block_m,
+                expected_combined,
+                buffer,
+                combine_order_mode=deep_gemm.CombineOrderMode(
+                    args.combine_order_mode))
+        else:
+            deep_gemm.bf16_mega_moe_backward_w2(
+                expected_w2,
+                combine_outputs['grad_ye'],
+                combine_outputs['h_weighted'],
+                padded_expert_counts,
+                block_m,
+                route_weight_mode=deep_gemm.RouteWeightMode(
+                    args.route_weight_mode))
+            deep_gemm.bf16_mega_moe_backward_w13(
+                expected_w13,
+                combine_outputs['grad_gate_up'],
+                combine_outputs['x_pool'],
+                padded_expert_counts,
+                block_m)
+
+        inline_outputs = allocate_outputs()
+        inline_combined = (
+            torch.empty_like(expected_combined)
+            if expected_combined is not None else None
+        )
+        inline_kwargs = {
+            'route_weight_mode': deep_gemm.RouteWeightMode(
+                args.route_weight_mode),
+            'inline_wgrad': True,
+            'combined_grad_x_output': inline_combined,
+            'gate_up_prepared': True,
+        }
+        if args.route_weight_mode == 'post_down':
+            inline_kwargs.update(
+                grad_y_unweighted_output=grad_y_unweighted,
+                down_unweighted_output=saved_down_unweighted,
+                grad_route_output=torch.zeros(
+                    pool_rows, dtype=torch.float32, device='cuda'))
+        run_backward(inline_outputs, **inline_kwargs)
+        for name in (
+            'grad_h', 'grad_gate_up', 'h_act', 'h_weighted',
+            'x_pool', 'grad_x_pool', 'grad_ye',
+        ):
+            torch.testing.assert_close(
+                inline_outputs[name], combine_outputs[name], rtol=0, atol=0)
+        for name, actual, expected in (
+            ('inline_w2', inline_outputs['w2_scratch'], expected_w2),
+            ('inline_w13', inline_outputs['w13_scratch'], expected_w13),
+        ):
+            cosine = torch.nn.functional.cosine_similarity(
+                actual.reshape(-1).double(),
+                expected.reshape(-1).double(),
+                dim=0)
+            assert float(cosine) > 0.99999, (
+                f'{name} cosine {float(cosine):.9f} did not clear 0.99999')
+        if expected_combined is not None:
+            assert inline_combined is not None
+            assert torch.equal(inline_combined, expected_combined)
+        dist_print(
+            ' > Inline UMMA/TMA wgrad matches standalone wgrad',
+            once_in_node=True)
+
+        if num_ranks > 1 and args.route_weight_mode == 'post_down':
+            # K3 retains the exact BF16 source rows for native W13 wgrad.
+            # Validate the memory-reuse path against the same exact-source
+            # specialization with separate grad-y and x-pool allocations.
+            exact_outputs = allocate_outputs()
+            exact_combined = torch.empty_like(expected_combined)
+            exact_grad_route = torch.zeros(
+                pool_rows, dtype=torch.float32, device='cuda')
+            exact_kwargs = {
+                'route_weight_mode': deep_gemm.RouteWeightMode.POST_DOWN,
+                'grad_y_unweighted_output': grad_y_unweighted,
+                'down_unweighted_output': saved_down_unweighted,
+                'grad_route_output': exact_grad_route,
+                'inline_wgrad': True,
+                'combined_grad_x_output': exact_combined,
+                'gate_up_prepared': True,
+                'source_x_bf16': source_x_bf16,
+            }
+            run_backward(exact_outputs, **exact_kwargs)
+            all_source_x_bf16 = gather_rank_padded(
+                source_x_bf16, 0)
+            expected_exact_x = all_source_x_bf16[
+                metadata[:, 0], metadata[:, 1]]
+            torch.testing.assert_close(
+                exact_outputs['x_pool'][active_rows],
+                expected_exact_x,
+                rtol=0,
+                atol=0,
+            )
+
+            aliased_outputs = allocate_outputs()
+            aliased_outputs['x_pool'] = torch.zeros_like(
+                grad_y_unweighted)
+            aliased_combined = torch.empty_like(expected_combined)
+            aliased_grad_route = torch.zeros_like(exact_grad_route)
+            aliased_kwargs = dict(exact_kwargs)
+            aliased_kwargs.update(
+                grad_y_unweighted_output=aliased_outputs['x_pool'],
+                grad_route_output=aliased_grad_route,
+                combined_grad_x_output=aliased_combined,
+            )
+            run_backward(aliased_outputs, **aliased_kwargs)
+
+            for name in (
+                'grad_h', 'grad_gate_up', 'h_act', 'h_weighted',
+                'x_pool', 'grad_x_pool', 'grad_ye',
+                'w2_scratch', 'w13_scratch',
+            ):
+                torch.testing.assert_close(
+                    aliased_outputs[name], exact_outputs[name],
+                    rtol=0, atol=0)
+            torch.testing.assert_close(
+                aliased_grad_route, exact_grad_route, rtol=0, atol=0)
+            torch.testing.assert_close(
+                aliased_combined, exact_combined, rtol=0, atol=0)
+            dist_print(
+                ' > Late exact-X TMA pool reuse matches separate pools bitwise',
+                once_in_node=True)
+
+        if args.benchmark_inline_wgrad:
+            baseline_kwargs = {
+                'route_weight_mode': deep_gemm.RouteWeightMode(
+                    args.route_weight_mode),
+                'gate_up_prepared': True,
+            }
+            if args.route_weight_mode == 'post_down':
+                baseline_kwargs.update(
+                    grad_y_unweighted_output=grad_y_unweighted,
+                    down_unweighted_output=saved_down_unweighted,
+                    grad_route_output=torch.zeros(
+                        pool_rows, dtype=torch.float32, device='cuda'))
+
+            def run_standalone_backward():
+                run_backward(combine_outputs, **baseline_kwargs)
+                if num_ranks > 1:
+                    deep_gemm.bf16_mega_moe_backward_w2_combine(
+                        expected_w2,
+                        combine_outputs['grad_ye'],
+                        combine_outputs['h_weighted'],
+                        padded_expert_counts,
+                        block_m,
+                        expected_combined,
+                        buffer,
+                        route_weight_mode=deep_gemm.RouteWeightMode(
+                            args.route_weight_mode))
+                    deep_gemm.bf16_mega_moe_backward_w13_combine(
+                        expected_w13,
+                        combine_outputs['grad_gate_up'],
+                        combine_outputs['x_pool'],
+                        padded_expert_counts,
+                        block_m,
+                        expected_combined,
+                        buffer,
+                        combine_order_mode=deep_gemm.CombineOrderMode(
+                            args.combine_order_mode))
+                else:
+                    deep_gemm.bf16_mega_moe_backward_w2(
+                        expected_w2,
+                        combine_outputs['grad_ye'],
+                        combine_outputs['h_weighted'],
+                        padded_expert_counts,
+                        block_m,
+                        route_weight_mode=deep_gemm.RouteWeightMode(
+                            args.route_weight_mode))
+                    deep_gemm.bf16_mega_moe_backward_w13(
+                        expected_w13,
+                        combine_outputs['grad_gate_up'],
+                        combine_outputs['x_pool'],
+                        padded_expert_counts,
+                        block_m)
+
+            def measure_backward(fn):
+                for _ in range(args.backward_warmup):
+                    fn()
+                torch.cuda.synchronize()
+                dist.barrier()
+                start = torch.cuda.Event(enable_timing=True)
+                stop = torch.cuda.Event(enable_timing=True)
+                start.record()
+                for _ in range(args.backward_iterations):
+                    fn()
+                stop.record()
+                stop.synchronize()
+                elapsed_ms = start.elapsed_time(stop) / args.backward_iterations
+                rank_max_ms = torch.tensor(
+                    elapsed_ms, dtype=torch.float64, device='cuda')
+                dist.all_reduce(rank_max_ms, op=dist.ReduceOp.MAX, group=group)
+                return float(rank_max_ms)
+
+            standalone_ms = measure_backward(run_standalone_backward)
+            inline_ms = measure_backward(
+                lambda: run_backward(inline_outputs, **inline_kwargs))
+            dist_print(
+                f' > BACKWARD standalone dgrad+wgrad: {standalone_ms:.3f} ms',
+                once_in_node=True)
+            dist_print(
+                f' > BACKWARD inline dgrad+wgrad: {inline_ms:.3f} ms',
+                once_in_node=True)
+            dist_print(
+                f' > BACKWARD inline speedup: {standalone_ms / inline_ms:.3f}x',
+                once_in_node=True)
+            return
+
         # Shared BF16/MXFP4 combine-only coverage, independent of wgrad.
         direct_planes = torch.as_strided(
             buffer.backward_grad_y,
@@ -2675,32 +3202,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             expected_grad_x_planes[rank_idx, :num_tokens])
         assert torch.equal(
             combined_grad_x, expected_combined_grad_x)
-        if num_ranks == 1:
-            fused_grad_w2 = torch.zeros_like(l2_weights_bf16)
-            fused_grad_w13 = torch.zeros_like(l1_weights_bf16)
-            fused_grad_x = torch.empty_like(combined_grad_x)
-            deep_gemm.bf16_mega_moe_backward_w2_combine(
-                fused_grad_w2, combine_outputs['grad_ye'],
-                combine_outputs['h_weighted'],
-                padded_expert_counts, block_m, fused_grad_x,
-                buffer,
-                route_weight_mode=deep_gemm.RouteWeightMode(
-                    args.route_weight_mode))
-            deep_gemm.bf16_mega_moe_backward_w13_combine(
-                fused_grad_w13, combine_outputs['grad_gate_up'],
-                combine_outputs['x_pool'],
-                padded_expert_counts, block_m, fused_grad_x,
-                buffer,
-                combine_order_mode=deep_gemm.CombineOrderMode(
-                    args.combine_order_mode))
-            assert_gradient_close(
-                fused_grad_w2, ref_grad_w2,
-                'single_rank_fused_grad_w2')
-            assert_gradient_close(
-                fused_grad_w13, ref_grad_w13,
-                'single_rank_fused_grad_w13')
-            assert torch.equal(fused_grad_x, expected_combined_grad_x)
-
         # Route-gradient production is a W2-side operation and must not force
         # W13 dgrad or a grad-x destination.
         route_only_outputs = allocate_outputs(
@@ -2816,8 +3317,14 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     # Check correctness
     num_correctness_tests = 1 if args.num_correctness_tests is None else args.num_correctness_tests
-    # The legacy tilelang baseline is bitwise-identical but only implements SwiGLU
-    use_legacy_baseline = is_legacy_loaded and args.activation == 'swiglu'
+    # The legacy TileLang baseline is bitwise-identical only for the original
+    # SwiGLU/PRE_DOWN contract. POST_DOWN deliberately moves the route multiply
+    # across W2 quantization and is validated by the self-contained reference.
+    use_legacy_baseline = (
+        is_legacy_loaded and
+        args.activation == 'swiglu' and
+        args.route_weight_mode == 'pre_down'
+    )
     # The self-contained reference models the native BF16 boundaries and the
     # quantized FP8/FP4 boundaries, but only local routing/combine.
     use_numerical_reference = is_bf16xbf16 or num_ranks == 1
@@ -2913,6 +3420,16 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                     f'#{i + 1}/{num_correctness_tests} passed',
                     once_in_node=True)
         dist_print(once_in_node=True)
+        ran_correctness = True
+
+    if (
+        args.benchmark_inline_wgrad and
+        not is_bf16xbf16 and
+        num_ranks > 1
+    ):
+        create_inputs()
+        run_fused()
+        run_fp8_fp4_route_backward_test()
         ran_correctness = True
 
     if (
@@ -3069,6 +3586,10 @@ if __name__ == '__main__':
         '--benchmark-backward',
         action='store_true',
         help='Benchmark raw BF16 dgrad and skip backward reference construction')
+    parser.add_argument(
+        '--benchmark-inline-wgrad',
+        action='store_true',
+        help='Compare complete standalone and inline FP8/FP4 backward waves')
     parser.add_argument(
         '--backward-warmup', type=int, default=3)
     parser.add_argument(
