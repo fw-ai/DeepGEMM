@@ -440,13 +440,20 @@ public:
             !args.accumulate_wgrad &&
             args.situ_beta == 4.0f &&
             args.situ_linear_beta == 25.0f;
-        // The terminal branch-major body begins only after W13 has retired,
-        // so reserving an initial consumer suffix cannot overlap dW2 there;
-        // it only removes W13 producer clusters.  Retain the reservation for
-        // the genuinely progressive scheduler and give the terminal schedule
-        // the complete persistent grid.
+        // The exact two-range branch-major kernel can now enter dW2 as soon as
+        // a cluster retires its local W13 stream.  Its bounded initial suffix
+        // therefore performs useful dW2 work from launch instead of waiting at
+        // the terminal publication edge.  Three-range and legacy terminal
+        // kernels still need the complete W13 grid.
+        const bool enable_k3_branch_major_early_dw2 =
+            args.branch_major_bf16_wgrad_tail &&
+            enable_k3_ready_wgrad &&
+            !enable_k3_mxfp8_two_range_exact &&
+            args.backward_ranges.num_ranges == 2u;
         const uint32_t ready_wgrad_initial_clusters =
-            args.branch_major_bf16_wgrad_tail ? 0u : 8u;
+            enable_k3_branch_major_early_dw2
+                ? 8u
+                : args.branch_major_bf16_wgrad_tail ? 0u : 8u;
         const std::string ready_wgrad_defines =
             enable_k3_ready_wgrad &&
                 !enable_k3_mxfp8_two_range_exact
