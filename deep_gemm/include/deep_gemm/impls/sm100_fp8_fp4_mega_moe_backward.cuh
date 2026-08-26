@@ -5215,6 +5215,12 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
     constexpr uint32_t kEarlyDW2WgradStages = 5;
     constexpr uint32_t kWgradRoleThreads = 128;
     constexpr uint32_t kWgradTensorUtil = 100;
+    // The terminal dW13 body is tensor-pipe saturated while its two base
+    // non-epilogue warps reduce fixed-top-k dX. Adding two extra reduction
+    // warps contends with W13 TMA/UMMA traffic without shortening the tail.
+    // Keep the reduction order and storage unchanged while avoiding that
+    // measured EP8 bandwidth contention.
+    constexpr uint32_t kTerminalDW13ExtraCombineThreads = 0u;
     constexpr uint32_t kReadyDW2TasksPerExpert =
         math::constexpr_ceil_div(kHidden, kWgradBlockM) / 2u *
         math::constexpr_ceil_div(kIntermediateHidden, kWgradBlockN);
@@ -18600,7 +18606,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                         DynamicTwoSegmentDW13Provider,
                         DynamicDW13ReleaseResources,
                         kDirectRemoteGradX,
-                        kDirectRemoteGradX ? 64u : 0u>(
+                        kTerminalDW13ExtraCombineThreads>(
                             2u * kIntermediateHidden, kHidden,
                             tensor_map_w13_wgrad_a,
                             tensor_map_w13_wgrad_b,
