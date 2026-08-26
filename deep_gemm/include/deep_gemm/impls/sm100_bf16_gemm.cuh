@@ -21,6 +21,15 @@
 
 namespace deep_gemm {
 
+// A fused caller may isolate this large persistent body from an earlier phase
+// by supplying ``__noinline__`` before including the header. Standalone BF16
+// GEMM translation units leave it empty so their existing inlining contract is
+// unchanged.
+#ifndef DG_BF16_GEMM_BODY_ATTRIBUTE
+#define DG_BF16_GEMM_BODY_ATTRIBUTE
+#define DG_BF16_GEMM_BODY_ATTRIBUTE_DEFINED_HERE
+#endif
+
 template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
           uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
           uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K_,
@@ -36,18 +45,20 @@ template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
           uint64_t kTensorCoreUtilControl,
           uint32_t kCombineNumRanks, bool kFuseCombine,
           CombineOrderMode kCombineOrderMode,
-          uint32_t kNumExtraCombineThreads>
-CUTLASS_GLOBAL void __launch_bounds__(
-    kNumNonEpilogueThreads + kNumEpilogueThreads +
-        kNumExtraCombineThreads,
-    1)
-sm100_bf16_gemm_impl(int* grouped_layout,
+          uint32_t kNumExtraCombineThreads,
+          bool kPublishBeforeCombineReduce = false>
+CUTLASS_DEVICE DG_BF16_GEMM_BODY_ATTRIBUTE void
+sm100_bf16_gemm_body(int* grouped_layout,
                      uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
-                     const __grid_constant__ cute::TmaDescriptor tensor_map_a,
-                     const __grid_constant__ cute::TmaDescriptor tensor_map_b,
-                     const __grid_constant__ cute::TmaDescriptor tensor_map_cd,
-                     const __grid_constant__ layout::SymBuffer<kCombineNumRanks> combine_sym_buffer,
-                     const __grid_constant__ layout::Workspace combine_workspace,
+                     // Preserve the enclosing kernel's grid-constant tensor
+                     // map storage. TMA instructions require a descriptor
+                     // address; passing these 128-byte values by value can
+                     // materialize an invalid thread-local descriptor copy.
+                     const cute::TmaDescriptor& tensor_map_a,
+                     const cute::TmaDescriptor& tensor_map_b,
+                     const cute::TmaDescriptor& tensor_map_cd,
+                     const layout::SymBuffer<kCombineNumRanks>& combine_sym_buffer,
+                     const layout::Workspace& combine_workspace,
                      cutlass::bfloat16_t* grad_x_output,
                      cutlass::bfloat16_t* combine_buffer,
                      const int64_t* combine_topk_ids,
@@ -55,7 +66,9 @@ sm100_bf16_gemm_impl(int* grouped_layout,
                      uint32_t combine_num_max_tokens,
                      uint32_t combine_num_topk,
                      uint32_t combine_hidden,
-                     bool combine_reduce) {
+                     bool combine_reduce,
+                     uint8_t* smem_buffer,
+                     bool wait_for_primary_kernel) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     // Enlarge `BLOCK_K` for some cases
     // NOTES: this is for reducing the `umma_arrive()` overhead
@@ -139,9 +152,6 @@ sm100_bf16_gemm_impl(int* grouped_layout,
     shape_n = SHAPE_N != 0 ? SHAPE_N : shape_n;
     shape_k = SHAPE_K != 0 ? SHAPE_K : shape_k;
 
-    // Align to 1024 bytes for swizzle-128B
-    extern __shared__ __align__(1024) uint8_t smem_buffer[];
-
     // D/A/B shared memory
     auto smem_cd = utils::PatternVisitor([&](const uint32_t& i) {
         return reinterpret_cast<cd_dtype_t*>(smem_buffer + i * SMEM_CD_SIZE_PER_STAGE);
@@ -192,8 +202,10 @@ sm100_bf16_gemm_impl(int* grouped_layout,
     }
     kNumMulticast > 1 ? comm::cluster_sync_with_relaxed_arrive() : __syncthreads();
 
-    // Wait for primary kernel completion
-    cudaGridDependencySynchronize();
+    // Standalone launches may be programmatically dependent on a primary
+    // kernel. An in-kernel caller has already established operand readiness.
+    if (wait_for_primary_kernel)
+        cudaGridDependencySynchronize();
 
     // Block scheduler
     uint32_t m_block_idx, n_block_idx;
@@ -437,6 +449,10 @@ sm100_bf16_gemm_impl(int* grouped_layout,
                 kNumCombineThreads == 64 or
                     kNumCombineThreads == 128,
                 "Fused combine requires two or four warps");
+            DG_STATIC_ASSERT(
+                !kPublishBeforeCombineReduce ||
+                    kCombineNumRanks > 1,
+                "Remote publication requires multiple ranks");
             constexpr uint32_t kCombineNamedBarrierIdx = 15;
             constexpr uint32_t kBeforeCombineReuseGridSyncIdx = 2;
             constexpr uint32_t kBeforeCombineReuseTag = 7;
@@ -474,12 +490,33 @@ sm100_bf16_gemm_impl(int* grouped_layout,
                     combine_workspace, combine_sym_buffer,
                     blockIdx.x, combine_thread_idx,
                     combine_sync,
-                    /* Kernel launch order publishes Kernel A locally. */ false,
-                    /* Kernel completion joins SM 0 after cross-rank sync. */ false);
+                    /* Inline callers need a device-wide publication edge;
+                       standalone launch order already provides one. */
+                    !wait_for_primary_kernel,
+                    /* Inline callers need the post-NVLink grid join before
+                       receive-plane reduction.  Keep that join on the idle
+                       combine warps so it remains hidden under W2 UMMA. */
+                    !wait_for_primary_kernel);
             } else {
                 // Kernel A has already written every remote top-k plane.
-                // W13's combine warps reduce those planes while the
-                // independent W13 tensor-core work runs.
+                // In an early-W2 schedule those stores become ready only
+                // after W13 dgrad. Publish them here on the otherwise-idle
+                // combine warps so NVLink synchronization overlaps W13
+                // wgrad UMMA, then reduce the received planes in place.
+                if constexpr (kPublishBeforeCombineReduce) {
+                    comm::nvlink_barrier<
+                        kCombineNumRanks, kNumSMs,
+                        kNumCombineThreads,
+                        kBeforeCombineReuseGridSyncIdx,
+                        kBeforeCombineReuseTag>(
+                            combine_workspace,
+                            combine_sym_buffer,
+                            blockIdx.x,
+                            combine_thread_idx,
+                            combine_sync,
+                            !wait_for_primary_kernel,
+                            !wait_for_primary_kernel);
+                }
                 constexpr uint32_t kReduceValuesPerVec =
                     2 * kValuesPerVec;
                 const uint64_t num_output_vecs =
@@ -717,7 +754,20 @@ sm100_bf16_gemm_impl(int* grouped_layout,
         // NOTES: tensor memory addresses are simplified, as the hardware will ignore the warp index bits,
         // i.e., no need for `tmem_ptr |= (epilogue_warp_idx * 32) << 16`.
         // NOTES: we also forbid two CTAs to share the same SM and its tensor memory
-        DG_TRAP_ONLY_DEVICE_ASSERT(ptx::ld_shared(tmem_ptr_in_smem) == 0);
+        const uint32_t allocated_tmem =
+            ptx::ld_shared(tmem_ptr_in_smem);
+        if (allocated_tmem != 0) {
+            if (lane_idx == 0) {
+                printf(
+                    "K3 wgrad TMEM allocation mismatch rank=%u sm=%u "
+                    "reduce=%u ptr=%u\n",
+                    combine_sym_buffer.rank_idx,
+                    blockIdx.x,
+                    static_cast<uint32_t>(combine_reduce),
+                    allocated_tmem);
+            }
+            asm volatile("trap;");
+        }
 
         // Share store pipeline between blocks
         uint32_t tma_stage_idx = 0;
@@ -758,13 +808,51 @@ sm100_bf16_gemm_impl(int* grouped_layout,
                  base_m_idx, base_n_idx, scheduler.current_group_idx,
                  epilogue_warp_idx, lane_idx,
                  tmem_empty_barriers[accum_stage_idx],
-                 tensor_map_cd);
+                tensor_map_cd);
             }
         }
+        // The store helper pipelines two output stages and may leave the
+        // final group outstanding after the scheduler is exhausted. An
+        // embedded caller immediately aliases this shared-memory region for
+        // another UMMA/TMA phase, so drain the issuing warp's stores before
+        // participating in the body-wide handoff.
+        if (epilogue_warp_idx == 0)
+            cute::tma_store_wait<0>();
+        __syncwarp();
     }
 
     // TODO: Remove redundant synchronization
     kNumMulticast > 1 ? comm::cluster_sync_with_relaxed_arrive() : __syncthreads();
+
+    // An in-kernel caller may immediately reuse this dynamic shared-memory
+    // region for a different UMMA/TMA pipeline. Explicitly retire every
+    // transaction barrier before returning; reinitializing a still-valid
+    // mbarrier through an aliased layout is undefined on SM100.
+    if (warp_idx == 1 and cute::elect_one_sync()) {
+        #pragma unroll
+        for (uint32_t i = 0; i < kNumStages; ++i) {
+            Barrier::invalidate(
+                reinterpret_cast<Barrier::ValueType const*>(
+                    full_barriers[i]));
+            Barrier::invalidate(
+                reinterpret_cast<Barrier::ValueType const*>(
+                    empty_barriers[i]));
+        }
+        #pragma unroll
+        for (uint32_t i = 0; i < kNumEpilogueStages; ++i) {
+            Barrier::invalidate(
+                reinterpret_cast<Barrier::ValueType const*>(
+                    tmem_full_barriers[i]));
+            Barrier::invalidate(
+                reinterpret_cast<Barrier::ValueType const*>(
+                    tmem_empty_barriers[i]));
+        }
+        if constexpr (kTensorCoreUtilControl < 100) {
+            Barrier::invalidate(
+                reinterpret_cast<Barrier::ValueType const*>(
+                    tensor_core_full_barrier));
+        }
+    }
 
     // Deallocate tensor memory
     if (warp_idx == 0)
@@ -776,6 +864,71 @@ sm100_bf16_gemm_impl(int* grouped_layout,
 #endif
 }
 
+template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
+          uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
+          uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K_,
+          uint32_t kNumGroups,
+          uint32_t kSwizzleAMode, uint32_t kSwizzleBMode,
+          uint32_t kSwizzleCDMode, uint32_t kNumStages_,
+          uint32_t kNumNonEpilogueThreads, uint32_t kNumEpilogueThreads,
+          uint32_t kNumMulticast, bool kIsMulticastOnA,
+          uint32_t kNumSMs, uint32_t kKAlignment,
+          bool kSwapAB, bool kEnsureZeroPadding,
+          GemmType kGemmType, bool kWithAccumulation, typename cd_dtype_t,
+          uint64_t kTensorCoreUtilControl,
+          uint32_t kCombineNumRanks, bool kFuseCombine,
+          CombineOrderMode kCombineOrderMode,
+          uint32_t kNumExtraCombineThreads>
+CUTLASS_GLOBAL void __launch_bounds__(
+    kNumNonEpilogueThreads + kNumEpilogueThreads +
+        kNumExtraCombineThreads,
+    1)
+sm100_bf16_gemm_impl(int* grouped_layout,
+                     uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
+                     const __grid_constant__ cute::TmaDescriptor tensor_map_a,
+                     const __grid_constant__ cute::TmaDescriptor tensor_map_b,
+                     const __grid_constant__ cute::TmaDescriptor tensor_map_cd,
+                     const __grid_constant__ layout::SymBuffer<kCombineNumRanks> combine_sym_buffer,
+                     const __grid_constant__ layout::Workspace combine_workspace,
+                     cutlass::bfloat16_t* grad_x_output,
+                     cutlass::bfloat16_t* combine_buffer,
+                     const int64_t* combine_topk_ids,
+                     uint32_t combine_num_tokens,
+                     uint32_t combine_num_max_tokens,
+                     uint32_t combine_num_topk,
+                     uint32_t combine_hidden,
+                     bool combine_reduce) {
+    extern __shared__ __align__(1024) uint8_t smem_buffer[];
+    sm100_bf16_gemm_body<
+        kMajorA, kMajorB,
+        SHAPE_M, SHAPE_N, SHAPE_K,
+        BLOCK_M, BLOCK_N, BLOCK_K_,
+        kNumGroups,
+        kSwizzleAMode, kSwizzleBMode, kSwizzleCDMode,
+        kNumStages_,
+        kNumNonEpilogueThreads, kNumEpilogueThreads,
+        kNumMulticast, kIsMulticastOnA,
+        kNumSMs, kKAlignment,
+        kSwapAB, kEnsureZeroPadding,
+        kGemmType, kWithAccumulation, cd_dtype_t,
+        kTensorCoreUtilControl,
+        kCombineNumRanks, kFuseCombine,
+        kCombineOrderMode, kNumExtraCombineThreads>(
+            grouped_layout,
+            shape_m, shape_n, shape_k,
+            tensor_map_a, tensor_map_b, tensor_map_cd,
+            combine_sym_buffer, combine_workspace,
+            grad_x_output, combine_buffer, combine_topk_ids,
+            combine_num_tokens, combine_num_max_tokens,
+            combine_num_topk, combine_hidden, combine_reduce,
+            smem_buffer, true);
+}
+
 };  // namespace deep_gemm
+
+#ifdef DG_BF16_GEMM_BODY_ATTRIBUTE_DEFINED_HERE
+#undef DG_BF16_GEMM_BODY_ATTRIBUTE_DEFINED_HERE
+#undef DG_BF16_GEMM_BODY_ATTRIBUTE
+#endif
 
 #pragma clang diagnostic pop

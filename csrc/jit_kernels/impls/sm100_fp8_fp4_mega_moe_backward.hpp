@@ -2,9 +2,9 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <cstdint>
 #include <functional>
+#include <limits>
 
 #include <torch/python.h>
 
@@ -28,6 +28,17 @@ static std::string get_backward_route_weight_mode_name(
     if (route_weight_mode == "post_down")
         return "RouteWeightMode::PostDown";
     DG_HOST_UNREACHABLE("Unsupported route weight mode");
+}
+
+static std::string get_backward_activation_type_name(
+    const std::string& activation) {
+    if (activation == "swiglu")
+        return "ActivationType::SwiGLU";
+    if (activation == "geglu")
+        return "ActivationType::GeGLU";
+    if (activation == "situ")
+        return "ActivationType::SiTU";
+    DG_HOST_UNREACHABLE("Unsupported backward activation");
 }
 
 static std::string get_backward_combine_order_mode_name(
@@ -132,6 +143,8 @@ public:
 
 using namespace deep_gemm;
 
+// K3 in-kernel on-demand residual-weight cache revision 199.
+
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(
         &sm100_bf16_mega_moe_backward_post_down_prelude<
@@ -198,7 +211,17 @@ public:
         int num_sms;
         int num_ranks;
         bool bf16_mode = false;
+        bool inline_weight_dequant = false;
+        bool phase_ordered_weight_dequant = false;
+        bool inline_residual_mxfp8_dgrad = false;
+        bool residual_mxfp8_dgrad = false;
+        bool build_residual_mxfp8_weights = false;
+        bool exact_source_x = false;
+        bool gate_up_prepared = false;
         std::string activation = "swiglu";
+        float situ_beta = 1.0f;
+        float situ_linear_beta =
+            std::numeric_limits<float>::infinity();
         bool fast_math = false;
         std::string route_weight_mode = "pre_down";
         std::string combine_order_mode = "fixed_topk";
@@ -210,6 +233,8 @@ public:
         const cutlass::bfloat16_t* backward_x;
         const float* backward_topk_weights;
         float* backward_grad_route;
+        cutlass::bfloat16_t* backward_grad_x_output = nullptr;
+        uint32_t num_backward_tokens = 0;
         const layout::TokenSrcMetadata* token_src_metadata;
         uint32_t num_topk;
         uint32_t acts_sf_stride;
@@ -220,12 +245,22 @@ public:
         CUtensorMap tensor_map_output;
         CUtensorMap tensor_map_grad_ye;
         CUtensorMap tensor_map_w2_dequant;
+        CUtensorMap tensor_map_w2_dgrad_weights;
+        CUtensorMap tensor_map_w2_dgrad_weights_sf;
         CUtensorMap tensor_map_w2_weights;
         CUtensorMap tensor_map_w2_scales;
         CUtensorMap tensor_map_w13_dequant;
+        CUtensorMap tensor_map_w13_dgrad_weights;
+        CUtensorMap tensor_map_w13_dgrad_weights_sf;
         CUtensorMap tensor_map_w13_weights;
         CUtensorMap tensor_map_w13_scales;
         CUtensorMap tensor_map_grad_gate_up;
+        CUtensorMap tensor_map_w2_wgrad_a{};
+        CUtensorMap tensor_map_w2_wgrad_b{};
+        CUtensorMap tensor_map_w2_wgrad_d{};
+        CUtensorMap tensor_map_w13_wgrad_a{};
+        CUtensorMap tensor_map_w13_wgrad_b{};
+        CUtensorMap tensor_map_w13_wgrad_d{};
         const cutlass::float_e4m3_t* acts_ptr;
         const uint32_t* acts_sf_ptr;
         const int8_t* w2_weights;
@@ -248,12 +283,14 @@ public:
         const cutlass::bfloat16_t* down_unweighted_output;
         float* grad_route_output;
         uint32_t* grid_sync_counter;
-        uint32_t launch_epoch;
         float activation_limit;
         bool compute_w13_dgrad;
         bool direct_remote_grad_x;
         bool write_grad_x_pool;
         bool clear_wgrad_padding;
+        bool clear_empty_wgrad_expert_outputs;
+        bool inline_wgrad = false;
+        bool accumulate_wgrad = false;
         bool compute_route_grad = false;
         bool trace_kernel = false;
         bool vectorized_grad_x_store = false;
@@ -270,31 +307,43 @@ public:
 
 using namespace deep_gemm;
 
+// K3 in-kernel on-demand residual-weight cache revision 249.
+
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(
         &sm100_fp8_fp4_mega_moe_backward_wave_impl<
-            {}, {},
-            {},
-            {}, {}, {},
-            {}, {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {},
-            {}
+            {}, {},                 // hidden, intermediate hidden
+            {},                     // experts
+            {}, {}, {},             // M, N, K
+            {}, {},                 // scale M, N
+            {},                     // stages
+            {},                     // SMs
+            {},                     // ranks
+            {},                     // compile W13 dgrad
+            {},                     // BF16 mode
+            {},                     // inline weight dequant
+            {},                     // phase-ordered weight dequant
+            {},                     // inline residual MXFP8 dgrad
+            {},                     // residual MXFP8 dgrad
+            {},                     // build residual MXFP8 weights
+            {},                     // exact source x
+            {},                     // prepared gate/up
+            {},                     // activation
+            {}, {},                 // SiTU beta, linear beta
+            {},                     // fast math
+            {},                     // route-weight mode
+            {},                     // combine-order mode
+            {},                     // inputs prepared
+            {},                     // dispatch inputs prepared
+            {},                     // direct remote grad-x
+            {},                     // write grad-x pool
+            {},                     // clear wgrad padding
+            {},                     // inline wgrad
+            {},                     // accumulate wgrad
+            {},                     // compute route grad
+            {},                     // trace
+            {},                     // vectorized grad-x store
+            {}                      // wide grad-x store
         >);
 }};
 )",
@@ -307,9 +356,16 @@ static void __instantiate_kernel() {{
             args.num_ranks,
             args.compute_w13_dgrad ? "true" : "false",
             args.bf16_mode ? "true" : "false",
-            args.activation == "geglu"
-                ? "ActivationType::GeGLU"
-                : "ActivationType::SwiGLU",
+            args.inline_weight_dequant ? "true" : "false",
+            args.phase_ordered_weight_dequant ? "true" : "false",
+            args.inline_residual_mxfp8_dgrad ? "true" : "false",
+            args.residual_mxfp8_dgrad ? "true" : "false",
+            args.build_residual_mxfp8_weights ? "true" : "false",
+            args.exact_source_x ? "true" : "false",
+            args.gate_up_prepared ? "true" : "false",
+            get_backward_activation_type_name(args.activation),
+            to_string(args.situ_beta),
+            to_string(args.situ_linear_beta),
             args.fast_math ? "true" : "false",
             get_backward_route_weight_mode_name(
                 args.route_weight_mode),
@@ -320,6 +376,8 @@ static void __instantiate_kernel() {{
             args.direct_remote_grad_x ? "true" : "false",
             args.write_grad_x_pool ? "true" : "false",
             args.clear_wgrad_padding ? "true" : "false",
+            args.inline_wgrad ? "true" : "false",
+            args.accumulate_wgrad ? "true" : "false",
             args.compute_route_grad ? "true" : "false",
             args.trace_kernel ? "true" : "false",
             args.vectorized_grad_x_store ? "true" : "false",
@@ -339,6 +397,8 @@ static void __instantiate_kernel() {{
             args.backward_x,
             args.backward_topk_weights,
             args.backward_grad_route,
+            args.backward_grad_x_output,
+            args.num_backward_tokens,
             args.token_src_metadata,
             args.num_topk,
             args.num_pool_rows,
@@ -351,12 +411,22 @@ static void __instantiate_kernel() {{
             args.tensor_map_output,
             args.tensor_map_grad_ye,
             args.tensor_map_w2_dequant,
+            args.tensor_map_w2_dgrad_weights,
+            args.tensor_map_w2_dgrad_weights_sf,
             args.tensor_map_w2_weights,
             args.tensor_map_w2_scales,
             args.tensor_map_w13_dequant,
+            args.tensor_map_w13_dgrad_weights,
+            args.tensor_map_w13_dgrad_weights_sf,
             args.tensor_map_w13_weights,
             args.tensor_map_w13_scales,
             args.tensor_map_grad_gate_up,
+            args.tensor_map_w2_wgrad_a,
+            args.tensor_map_w2_wgrad_b,
+            args.tensor_map_w2_wgrad_d,
+            args.tensor_map_w13_wgrad_a,
+            args.tensor_map_w13_wgrad_b,
+            args.tensor_map_w13_wgrad_d,
             args.acts_ptr,
             args.acts_sf_ptr,
             args.w2_weights,
@@ -379,7 +449,7 @@ static void __instantiate_kernel() {{
             args.down_unweighted_output,
             args.grad_route_output,
             args.grid_sync_counter,
-            args.launch_epoch,
+            args.clear_empty_wgrad_expert_outputs,
             args.activation_limit,
             args.kernel_trace));
     }
@@ -412,6 +482,7 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
     const bool& direct_remote_grad_x,
     const bool& write_grad_x_pool,
     const bool& clear_wgrad_padding,
+    const bool& clear_empty_wgrad_expert_outputs,
     const int& block_m,
     const std::vector<int64_t>& backward_sym_buffer_ptrs = {},
     const int& backward_rank = 0,
@@ -427,15 +498,89 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
     const std::optional<torch::Tensor>& down_unweighted_output =
         std::nullopt,
     const std::optional<torch::Tensor>& grad_route_output =
+        std::nullopt,
+    const std::string& activation = "swiglu",
+    const std::optional<float>& situ_beta_opt = std::nullopt,
+    const std::optional<float>& situ_linear_beta_opt =
+        std::nullopt,
+    const bool& inline_weight_dequant = false,
+    const bool& inline_residual_mxfp8_dgrad = false,
+    const bool& build_residual_mxfp8_weights = false,
+    const std::optional<torch::Tensor>& w2_dgrad_weights =
+        std::nullopt,
+    const std::optional<torch::Tensor>& w2_dgrad_weights_sf =
+        std::nullopt,
+    const std::optional<torch::Tensor>& w13_dgrad_weights =
+        std::nullopt,
+    const std::optional<torch::Tensor>& w13_dgrad_weights_sf =
+        std::nullopt,
+    const std::optional<torch::Tensor>& backward_x =
+        std::nullopt,
+    const std::optional<torch::Tensor>& kernel_trace =
+        std::nullopt,
+    const bool& inline_wgrad = false,
+    const bool& accumulate_wgrad = false,
+    const std::optional<torch::Tensor>& combined_grad_x_output =
+        std::nullopt,
+    const bool& gate_up_prepared = false,
+    const std::optional<torch::Tensor>& w2_wgrad_output =
+        std::nullopt,
+    const std::optional<torch::Tensor>& w13_wgrad_output =
         std::nullopt) {
     constexpr int block_n = 128;
     constexpr int block_k = 128;
-    constexpr int dgrad_block_k = 64;
+    const int residual_mxfp8_operand_count =
+        static_cast<int>(w2_dgrad_weights.has_value()) +
+        static_cast<int>(w2_dgrad_weights_sf.has_value()) +
+        static_cast<int>(w13_dgrad_weights.has_value()) +
+        static_cast<int>(w13_dgrad_weights_sf.has_value());
+    DG_HOST_ASSERT(
+        residual_mxfp8_operand_count == 0 ||
+        residual_mxfp8_operand_count == 4);
+    const bool external_residual_mxfp8_weights =
+        w2_dgrad_weights.has_value() &&
+        w2_dgrad_weights_sf.has_value() &&
+        w13_dgrad_weights.has_value() &&
+        w13_dgrad_weights_sf.has_value();
+    const bool residual_mxfp8_dgrad =
+        inline_residual_mxfp8_dgrad ||
+        external_residual_mxfp8_weights;
+    const bool early_w2_wgrad =
+        compute_w13_dgrad && inline_wgrad &&
+        build_residual_mxfp8_weights &&
+        route_weight_mode == "post_down";
+    // This selector also binds the once-quantized activation descriptors.
+    // External compact dgrad weights do not need the on-demand conversion
+    // path, but they still require the prepared gate/up source and aliases.
+    DG_HOST_ASSERT(
+        !build_residual_mxfp8_weights ||
+        (external_residual_mxfp8_weights && gate_up_prepared));
+    DG_HOST_ASSERT(
+        !residual_mxfp8_dgrad || !inline_weight_dequant);
+    const int dgrad_block_k = residual_mxfp8_dgrad ? 128 : 64;
     constexpr int store_block_m = 16;
     constexpr int gran_k = 32;
     constexpr int smem_capacity = 232448;
     constexpr int num_epilogue_stages = 2;
     constexpr int num_tma_store_stages = 2;
+    constexpr int wgrad_block_m = 128;
+    constexpr int wgrad_block_n = 256;
+    // Inline Wgrad runs as a 2-CTA cluster with multicast on A. Each CTA
+    // therefore owns half of the B/N tile, and its TMA descriptor must encode
+    // that 128-column load box rather than the cluster-wide 256-column tile.
+    constexpr int wgrad_load_block_n = wgrad_block_n / 2;
+    constexpr int wgrad_store_block_n = 64;
+    constexpr int wgrad_num_stages = 4;
+    const int wgrad_block_k =
+        block_m % 64 == 0 ? 64 : block_m % 32 == 0 ? 32 : 16;
+    const int wgrad_swizzle =
+        wgrad_block_k * sizeof(cutlass::bfloat16_t);
+    const int wgrad_smem_size =
+        2 * wgrad_block_m * wgrad_store_block_n *
+            sizeof(cutlass::bfloat16_t) +
+        wgrad_num_stages * (wgrad_block_m + wgrad_block_n) *
+            wgrad_block_k * sizeof(cutlass::bfloat16_t) +
+        1024;
 
     const auto [num_experts, intermediate_hidden_2, hidden] =
         check_grouped_ab_fp8_fp4(
@@ -453,9 +598,29 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
         ? 1
         : static_cast<int>(backward_sym_buffer_ptrs.size());
     const int num_dispatch_warps = num_ranks > 1 ? 4 : 0;
+    const float situ_beta = situ_beta_opt.value_or(1.0f);
+    const float situ_linear_beta = situ_linear_beta_opt.value_or(
+        std::numeric_limits<float>::infinity());
 
     DG_HOST_ASSERT(device_runtime->get_arch_major() == 10);
     DG_HOST_ASSERT(num_ranks >= 1);
+    DG_HOST_ASSERT(!accumulate_wgrad || inline_wgrad);
+    DG_HOST_ASSERT(
+        w2_wgrad_output.has_value() ==
+        w13_wgrad_output.has_value());
+    DG_HOST_ASSERT(
+        !accumulate_wgrad || w2_wgrad_output.has_value());
+    DG_HOST_ASSERT(
+        !inline_wgrad ||
+        (hidden % wgrad_block_n == 0 &&
+         intermediate_hidden % wgrad_block_n == 0 &&
+         block_m % 16 == 0));
+    DG_HOST_ASSERT(
+        activation == "swiglu" || activation == "geglu" ||
+        activation == "situ");
+    DG_HOST_ASSERT(activation != "situ" || situ_beta > 0.0f);
+    DG_HOST_ASSERT(
+        activation != "situ" || situ_linear_beta > 0.0f);
     DG_HOST_ASSERT(
         route_weight_mode == "pre_down" ||
         route_weight_mode == "post_down");
@@ -473,11 +638,17 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
     DG_HOST_ASSERT(grad_ye.size(1) == hidden);
     DG_HOST_ASSERT(grad_ye.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(grad_ye.is_contiguous());
+    DG_HOST_ASSERT(gate_up_output.dim() == 2);
     DG_HOST_ASSERT(
-        gate_up_output.sizes() ==
+        gate_up_output.size(1) == intermediate_hidden_2);
+    DG_HOST_ASSERT(
+        gate_up_prepared
+            ? (gate_up_output.size(0) >= num_acts_rows &&
+               gate_up_output.size(0) <= num_pool_rows)
+            : gate_up_output.size(0) == num_pool_rows);
+    DG_HOST_ASSERT(
+        grad_gate_up_output.sizes() ==
         torch::IntArrayRef({num_pool_rows, intermediate_hidden_2}));
-    DG_HOST_ASSERT(grad_gate_up_output.sizes() ==
-                   gate_up_output.sizes());
     DG_HOST_ASSERT(grad_h_output.sizes() ==
                    torch::IntArrayRef({num_pool_rows, intermediate_hidden}));
     DG_HOST_ASSERT(h_act_output.sizes() == grad_h_output.sizes());
@@ -572,6 +743,15 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
         w2_dequant_scratch.scalar_type() ==
         torch::kBFloat16);
     DG_HOST_ASSERT(w2_dequant_scratch.is_contiguous());
+    if (w2_wgrad_output.has_value()) {
+        DG_HOST_ASSERT(
+            w2_wgrad_output->sizes() ==
+            w2_dequant_scratch.sizes());
+        DG_HOST_ASSERT(
+            w2_wgrad_output->scalar_type() ==
+            torch::kBFloat16);
+        DG_HOST_ASSERT(w2_wgrad_output->is_contiguous());
+    }
     DG_HOST_ASSERT(
         w13_weights.scalar_type() ==
         torch::kFloat8_e4m3fn);
@@ -594,6 +774,40 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
         w13_dequant_scratch.scalar_type() ==
         torch::kBFloat16);
     DG_HOST_ASSERT(w13_dequant_scratch.is_contiguous());
+    if (w13_wgrad_output.has_value()) {
+        DG_HOST_ASSERT(
+            w13_wgrad_output->sizes() ==
+            w13_dequant_scratch.sizes());
+        DG_HOST_ASSERT(
+            w13_wgrad_output->scalar_type() ==
+            torch::kBFloat16);
+        DG_HOST_ASSERT(w13_wgrad_output->is_contiguous());
+    }
+    if (external_residual_mxfp8_weights) {
+        DG_HOST_ASSERT(!inline_weight_dequant);
+        DG_HOST_ASSERT(
+            w2_dgrad_weights->scalar_type() ==
+            torch::kFloat8_e4m3fn);
+        DG_HOST_ASSERT(
+            w2_dgrad_weights->sizes() ==
+            torch::IntArrayRef(
+                {num_experts, intermediate_hidden, hidden}));
+        DG_HOST_ASSERT(w2_dgrad_weights->is_contiguous());
+        check_sf_layout(
+            *w2_dgrad_weights_sf, intermediate_hidden, hidden,
+            1, gran_k, num_experts, true, false, torch::kInt);
+        DG_HOST_ASSERT(
+            w13_dgrad_weights->scalar_type() ==
+            torch::kFloat8_e4m3fn);
+        DG_HOST_ASSERT(
+            w13_dgrad_weights->sizes() ==
+            torch::IntArrayRef(
+                {num_experts, hidden, intermediate_hidden_2}));
+        DG_HOST_ASSERT(w13_dgrad_weights->is_contiguous());
+        check_sf_layout(
+            *w13_dgrad_weights_sf, hidden, intermediate_hidden_2,
+            1, gran_k, num_experts, true, false, torch::kInt);
+    }
     DG_HOST_ASSERT(expert_counts.scalar_type() == torch::kInt);
     DG_HOST_ASSERT(expert_counts.numel() == num_experts);
     DG_HOST_ASSERT(expert_counts.is_contiguous());
@@ -615,6 +829,21 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
         DG_HOST_ASSERT(compute_w13_dgrad);
         DG_HOST_ASSERT(num_ranks > 1);
     }
+    if (combined_grad_x_output.has_value()) {
+        DG_HOST_ASSERT(inline_wgrad && direct_remote_grad_x);
+        DG_HOST_ASSERT(
+            combined_grad_x_output->scalar_type() ==
+            torch::kBFloat16);
+        DG_HOST_ASSERT(combined_grad_x_output->is_contiguous());
+        DG_HOST_ASSERT(combined_grad_x_output->dim() == 2);
+        DG_HOST_ASSERT(combined_grad_x_output->size(1) == hidden);
+        DG_HOST_ASSERT(
+            combined_grad_x_output->size(0) <=
+            num_max_tokens_per_rank);
+    }
+    DG_HOST_ASSERT(
+        !inline_wgrad || !direct_remote_grad_x ||
+        combined_grad_x_output.has_value());
     if (!backward_sym_buffer_ptrs.empty()) {
         DG_HOST_ASSERT(backward_grad_y.has_value());
         DG_HOST_ASSERT(backward_topk_weights.has_value());
@@ -627,6 +856,15 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
         DG_HOST_ASSERT(backward_grad_y->size(0) >= num_max_tokens_per_rank);
         DG_HOST_ASSERT(backward_grad_y->size(1) == hidden);
         DG_HOST_ASSERT(backward_grad_y->is_contiguous());
+        if (backward_x.has_value()) {
+            DG_HOST_ASSERT(
+                backward_x->scalar_type() == torch::kBFloat16);
+            DG_HOST_ASSERT(backward_x->dim() == 2);
+            DG_HOST_ASSERT(
+                backward_x->size(0) >= num_max_tokens_per_rank);
+            DG_HOST_ASSERT(backward_x->size(1) == hidden);
+            DG_HOST_ASSERT(backward_x->is_contiguous());
+        }
         DG_HOST_ASSERT(
             backward_topk_weights->scalar_type() == torch::kFloat);
         DG_HOST_ASSERT(backward_topk_weights->dim() == 2);
@@ -667,6 +905,10 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
         load_block_n * block_k +
         sf_block_m * static_cast<int>(sizeof(uint32_t)) +
         sf_block_n * static_cast<int>(sizeof(uint32_t)) +
+        (residual_mxfp8_dgrad
+             ? load_block_m * block_k +
+                   sf_block_m * static_cast<int>(sizeof(uint32_t))
+             : 0) +
         2 * static_cast<int>(sizeof(uint64_t));
     const int smem_fixed =
         num_dispatch_warps * hidden *
@@ -674,83 +916,301 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
         smem_cd +
         2 * num_epilogue_stages *
             static_cast<int>(sizeof(uint64_t)) +
-        num_dispatch_warps *
+        2 * num_dispatch_warps *
             static_cast<int>(sizeof(uint64_t)) +
+        2 * static_cast<int>(sizeof(uint64_t)) +
+        (residual_mxfp8_dgrad
+             ? dgrad_block_k * (load_block_n / 2) *
+                       static_cast<int>(sizeof(int8_t)) +
+                   dgrad_block_k * (load_block_n / gran_k) *
+                       static_cast<int>(sizeof(float)) +
+                   2 * static_cast<int>(sizeof(uint64_t))
+             : 0) +
         static_cast<int>(sizeof(uint32_t));
     const int num_stages =
         std::min(32, (smem_capacity - smem_fixed) / smem_per_stage);
-    const int smem_size =
-        align(smem_fixed + num_stages * smem_per_stage, 1024);
+    const int smem_size = std::max(
+        align(smem_fixed + num_stages * smem_per_stage, 1024),
+        inline_wgrad ? wgrad_smem_size : 0);
     DG_HOST_ASSERT(num_stages >= 2);
 
-    const auto tensor_map_acts = make_tma_2d_desc(
+    auto tensor_map_acts = make_tma_2d_desc(
         acts, hidden, num_acts_rows,
         block_k, load_block_m,
         static_cast<int>(acts.stride(-2)), 128);
-    const auto tensor_map_acts_sf = make_tma_sf_desc(
+    auto tensor_map_acts_sf = make_tma_sf_desc(
         cute::UMMA::Major::MN, acts_sf,
         num_sf_pool_rows, hidden,
         sf_block_m, gran_k, 1, 0);
-    const auto tensor_map_l1_weights = make_tma_2d_desc(
+    auto tensor_map_l1_weights = make_tma_2d_desc(
         l1_weights, hidden, num_experts * intermediate_hidden_2,
         block_k, load_block_n,
         static_cast<int>(l1_weights.stride(-2)), 128);
-    const auto tensor_map_l1_weights_sf = make_tma_sf_desc(
+    auto tensor_map_l1_weights_sf = make_tma_sf_desc(
         cute::UMMA::Major::MN, l1_weights_sf,
         intermediate_hidden_2, hidden,
         block_n, gran_k, num_experts, 0);
-    const auto tensor_map_gate_up = make_tma_2d_desc(
-        gate_up_output, intermediate_hidden_2, num_pool_rows,
+    auto tensor_map_gate_up = make_tma_2d_desc(
+        gate_up_output, intermediate_hidden_2,
+        static_cast<int>(gate_up_output.size(0)),
         block_n, store_block_m,
         static_cast<int>(gate_up_output.stride(-2)), 128);
     const auto tensor_map_grad_ye = make_tma_2d_desc(
         grad_ye, hidden, num_pool_rows,
         dgrad_block_k, load_block_m,
         static_cast<int>(grad_ye.stride(-2)), 128);
+    if (build_residual_mxfp8_weights) {
+        DG_HOST_ASSERT(num_acts_rows % block_m == 0);
+        const int residual_sf_rows =
+            num_acts_rows / block_m * sf_block_m;
+
+        const auto w2_act_storage =
+            grad_x_pool_output.view(torch::kUInt8).reshape({-1});
+        const int64_t w2_act_values =
+            static_cast<int64_t>(num_acts_rows) * hidden;
+        DG_HOST_ASSERT(w2_act_storage.numel() >= 2 * w2_act_values);
+        const auto w2_acts =
+            w2_act_storage.narrow(0, 0, 2 * w2_act_values)
+                .view(torch::kFloat8_e4m3fn)
+                .view({2 * num_acts_rows, hidden});
+        // W13 dequant/output storage is dead until W13 wgrad. Unlike
+        // grad_gate_up, it cannot be overwritten by W2's SiTU epilogue while
+        // later W2 tiles still consume their activation scales. Keep those
+        // scales after the exact W13-weight alias so both operands can coexist
+        // until W2 dgrad retires.
+        const auto w13_output_storage =
+            w13_dequant_scratch.view(torch::kUInt8).reshape({-1});
+        const int64_t w13_weight_alias_values =
+            static_cast<int64_t>(num_experts) * hidden *
+            intermediate_hidden_2;
+        const int64_t w13_weight_alias_bytes =
+            w13_weight_alias_values + w13_weight_alias_values / gran_k;
+        const int64_t w2_sf_bytes =
+            static_cast<int64_t>(residual_sf_rows) * hidden / gran_k;
+        DG_HOST_ASSERT(
+            w13_output_storage.numel() >=
+            w13_weight_alias_bytes + 2 * w2_sf_bytes);
+        const auto w2_sfs =
+            w13_output_storage.narrow(
+                0, w13_weight_alias_bytes, 2 * w2_sf_bytes)
+                .view(torch::kInt32);
+
+        const int64_t w13_act_values =
+            static_cast<int64_t>(num_acts_rows) *
+            intermediate_hidden_2;
+        const int64_t w13_sf_bytes =
+            static_cast<int64_t>(residual_sf_rows) *
+            intermediate_hidden_2 / gran_k;
+
+        // Prepared gate/up eliminates replay, so its four descriptor slots
+        // can carry both primary+residual activation pairs without growing
+        // the CUDA kernel-parameter footprint.
+        tensor_map_acts = make_tma_2d_desc(
+            w2_acts, hidden, 2 * num_acts_rows,
+            dgrad_block_k, load_block_m, hidden, 128);
+        tensor_map_acts_sf = make_tma_sf_desc(
+            cute::UMMA::Major::MN, w2_sfs,
+            residual_sf_rows, hidden,
+            sf_block_m, gran_k, 2, 0);
+        if (early_w2_wgrad) {
+            // W2 wgrad retires both BF16 operands before W13 dgrad begins.
+            // Reuse those now-dead, row-scaled buffers for W13's primary and
+            // residual MXFP8 activation planes.  This avoids both the fixed
+            // dW2-sized cache ceiling and any additional allocation.
+            const auto grad_ye_storage =
+                grad_ye.view(torch::kUInt8).reshape({-1});
+            const auto grad_h_storage =
+                grad_h_output.view(torch::kUInt8).reshape({-1});
+            DG_HOST_ASSERT(
+                grad_ye_storage.numel() >=
+                w13_act_values + 2 * w13_sf_bytes);
+            DG_HOST_ASSERT(
+                grad_h_storage.numel() >= w13_act_values);
+            const auto w13_primary =
+                grad_ye_storage.narrow(0, 0, w13_act_values)
+                    .view(torch::kFloat8_e4m3fn)
+                    .view({num_acts_rows, intermediate_hidden_2});
+            const auto w13_residual =
+                grad_h_storage.narrow(0, 0, w13_act_values)
+                    .view(torch::kFloat8_e4m3fn)
+                    .view({num_acts_rows, intermediate_hidden_2});
+            const auto w13_sfs =
+                grad_ye_storage
+                    .narrow(
+                        0, w13_act_values,
+                        2 * w13_sf_bytes)
+                    .view(torch::kInt32);
+            tensor_map_l1_weights = make_tma_2d_desc(
+                w13_primary, intermediate_hidden_2,
+                num_acts_rows, dgrad_block_k, load_block_m,
+                intermediate_hidden_2, 128);
+            tensor_map_gate_up = make_tma_2d_desc(
+                w13_residual, intermediate_hidden_2,
+                num_acts_rows, dgrad_block_k, load_block_m,
+                intermediate_hidden_2, 128);
+            tensor_map_l1_weights_sf = make_tma_sf_desc(
+                cute::UMMA::Major::MN, w13_sfs,
+                residual_sf_rows, intermediate_hidden_2,
+                sf_block_m, gran_k, 2, 0);
+        } else {
+            const auto w13_storage =
+                w2_dequant_scratch.view(torch::kUInt8).reshape({-1});
+            DG_HOST_ASSERT(
+                w13_storage.numel() >=
+                2 * w13_act_values + 2 * w13_sf_bytes);
+            const auto w13_acts =
+                w13_storage.narrow(0, 0, 2 * w13_act_values)
+                    .view(torch::kFloat8_e4m3fn)
+                    .view({2 * num_acts_rows, intermediate_hidden_2});
+            const auto w13_sfs =
+                w13_storage
+                    .narrow(
+                        0, 2 * w13_act_values,
+                        2 * w13_sf_bytes)
+                    .view(torch::kInt32);
+            tensor_map_l1_weights = make_tma_2d_desc(
+                w13_acts, intermediate_hidden_2,
+                2 * num_acts_rows, dgrad_block_k, load_block_m,
+                intermediate_hidden_2, 128);
+            tensor_map_l1_weights_sf = make_tma_sf_desc(
+                cute::UMMA::Major::MN, w13_sfs,
+                residual_sf_rows, intermediate_hidden_2,
+                sf_block_m, gran_k, 2, 0);
+        }
+    }
     const auto tensor_map_w2_dequant = make_tma_2d_desc(
         w2_dequant_scratch, intermediate_hidden,
         num_experts * hidden,
         load_block_n, dgrad_block_k,
         intermediate_hidden, 128);
+    const auto tensor_map_w2_dgrad_weights =
+        external_residual_mxfp8_weights
+        ? make_tma_2d_desc(
+              *w2_dgrad_weights, hidden,
+              num_experts * intermediate_hidden,
+              block_k, load_block_n,
+              static_cast<int>(w2_dgrad_weights->stride(-2)), 128)
+        : tensor_map_w2_dequant;
+    const auto tensor_map_w2_dgrad_weights_sf =
+        external_residual_mxfp8_weights
+        ? make_tma_sf_desc(
+              cute::UMMA::Major::MN, *w2_dgrad_weights_sf,
+              intermediate_hidden, hidden,
+              block_n, gran_k, num_experts, 0)
+        : tensor_map_w2_dequant;
+    const int native_weight_tma_n = load_block_n;
     const auto tensor_map_w2_weights = make_tma_2d_desc(
         w2_weights, intermediate_hidden / 2,
         num_experts * hidden,
-        load_block_n / 2, 256,
+        native_weight_tma_n / 2,
+        residual_mxfp8_dgrad ? dgrad_block_k : 256,
         intermediate_hidden / 2, 0);
     const auto tensor_map_w2_scales = make_tma_2d_desc(
         w2_scales, intermediate_hidden / gran_k,
         num_experts * hidden,
-        load_block_n / gran_k, 256,
+        native_weight_tma_n / gran_k,
+        residual_mxfp8_dgrad ? dgrad_block_k : 256,
         intermediate_hidden / gran_k, 0);
     const auto tensor_map_w13_dequant = make_tma_2d_desc(
         w13_dequant_scratch, hidden,
         num_experts * intermediate_hidden_2,
         load_block_n, dgrad_block_k,
         hidden, 128);
+    const auto tensor_map_w13_dgrad_weights =
+        external_residual_mxfp8_weights
+        ? make_tma_2d_desc(
+              *w13_dgrad_weights, intermediate_hidden_2,
+              num_experts * hidden,
+              block_k, load_block_n,
+              static_cast<int>(w13_dgrad_weights->stride(-2)), 128)
+        : tensor_map_w13_dequant;
+    const auto tensor_map_w13_dgrad_weights_sf =
+        external_residual_mxfp8_weights
+        ? make_tma_sf_desc(
+              cute::UMMA::Major::MN, *w13_dgrad_weights_sf,
+              hidden, intermediate_hidden_2,
+              block_n, gran_k, num_experts, 0)
+        : tensor_map_w13_dequant;
     const auto tensor_map_w13_weights = make_tma_2d_desc(
         w13_weights, hidden / 2,
         num_experts * intermediate_hidden_2,
-        load_block_n / 2, 256,
+        native_weight_tma_n / 2,
+        residual_mxfp8_dgrad ? dgrad_block_k : 256,
         hidden / 2, 0);
     const auto tensor_map_w13_scales = make_tma_2d_desc(
         w13_scales, hidden / gran_k,
         num_experts * intermediate_hidden_2,
-        load_block_n / gran_k, 256,
+        native_weight_tma_n / gran_k,
+        residual_mxfp8_dgrad ? dgrad_block_k : 256,
         hidden / gran_k, 0);
     const auto tensor_map_grad_gate_up = make_tma_2d_desc(
         grad_gate_up_output, intermediate_hidden_2,
         num_pool_rows,
         dgrad_block_k, load_block_m,
         static_cast<int>(grad_gate_up_output.stride(-2)), 128);
-    // Each launch gets a unique readiness epoch; no host memset is required.
+    const auto tensor_map_w2_wgrad_a = inline_wgrad
+        ? make_tma_a_desc(
+              cute::UMMA::Major::MN, grad_ye, hidden, num_pool_rows,
+              wgrad_block_m, wgrad_block_k,
+              static_cast<int>(grad_ye.stride(0)), 1, wgrad_swizzle)
+        : tensor_map_grad_ye;
+    const auto tensor_map_w2_wgrad_b = inline_wgrad
+        ? make_tma_b_desc(
+              cute::UMMA::Major::MN, h_weighted_output,
+              intermediate_hidden, num_pool_rows,
+              wgrad_load_block_n, wgrad_block_k,
+              static_cast<int>(h_weighted_output.stride(0)), 1,
+              wgrad_swizzle)
+        : tensor_map_grad_ye;
+    const auto tensor_map_w2_wgrad_d = inline_wgrad
+        ? make_tma_cd_desc(
+              w2_wgrad_output.value_or(w2_dequant_scratch),
+              hidden, intermediate_hidden,
+              wgrad_block_m, wgrad_store_block_n,
+              static_cast<int>(
+                  w2_wgrad_output
+                      .value_or(w2_dequant_scratch)
+                      .stride(1)),
+              num_experts, wgrad_swizzle)
+        : tensor_map_w2_dequant;
+    const auto tensor_map_w13_wgrad_a = inline_wgrad
+        ? make_tma_a_desc(
+              cute::UMMA::Major::MN, grad_gate_up_output,
+              intermediate_hidden_2, num_pool_rows,
+              wgrad_block_m, wgrad_block_k,
+              static_cast<int>(grad_gate_up_output.stride(0)), 1,
+              wgrad_swizzle)
+        : tensor_map_grad_gate_up;
+    const auto tensor_map_w13_wgrad_b = inline_wgrad
+        ? make_tma_b_desc(
+              cute::UMMA::Major::MN, x_pool_output, hidden, num_pool_rows,
+              wgrad_load_block_n, wgrad_block_k,
+              static_cast<int>(x_pool_output.stride(0)), 1, wgrad_swizzle)
+        : tensor_map_grad_gate_up;
+    const auto tensor_map_w13_wgrad_d = inline_wgrad
+        ? make_tma_cd_desc(
+              w13_wgrad_output.value_or(w13_dequant_scratch),
+              intermediate_hidden_2, hidden,
+              wgrad_block_m, wgrad_store_block_n,
+              static_cast<int>(
+                  w13_wgrad_output
+                      .value_or(w13_dequant_scratch)
+                      .stride(1)),
+              num_experts, wgrad_swizzle)
+        : tensor_map_w13_dequant;
     const int num_sms = device_runtime->get_num_sms();
     DG_HOST_ASSERT(num_sms % 2 == 0);
-    static std::atomic<uint32_t> next_launch_epoch{1};
-    uint32_t launch_epoch =
-        next_launch_epoch.fetch_add(1, std::memory_order_relaxed);
-    if (launch_epoch == 0)
-        launch_epoch =
-            next_launch_epoch.fetch_add(1, std::memory_order_relaxed);
+    constexpr int num_trace_sites = 22;
+    constexpr int num_trace_values = 5;
+    if (kernel_trace.has_value()) {
+        DG_HOST_ASSERT(
+            kernel_trace->scalar_type() == torch::kInt64 &&
+            kernel_trace->is_contiguous() &&
+            kernel_trace->dim() == 3 &&
+            kernel_trace->size(0) == num_trace_sites &&
+            kernel_trace->size(1) == num_sms &&
+            kernel_trace->size(2) == num_trace_values);
+    }
     layout::SymBuffer<> backward_sym_buffer{};
     void* backward_workspace_base = nullptr;
     if (!backward_sym_buffer_ptrs.empty()) {
@@ -767,6 +1227,16 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
         std::max(num_max_tokens_per_rank, 1),
         std::max(num_topk, 1),
         layout::kMinCandidateBlockM);
+    const bool aliases_w2_dequant =
+        down_unweighted_output.has_value() &&
+        w2_dequant_scratch.data_ptr() ==
+            down_unweighted_output->data_ptr();
+    const bool aliases_w13_dequant =
+        w13_dequant_scratch.data_ptr() ==
+        gate_up_output.data_ptr();
+    DG_HOST_ASSERT(aliases_w2_dequant == aliases_w13_dequant);
+    const bool phase_ordered_weight_dequant =
+        !inline_weight_dequant && aliases_w2_dequant;
     const SM100FP8FP4MegaMoEBackwardWaveRuntime::Args args = {
         .hidden = hidden,
         .intermediate_hidden = intermediate_hidden,
@@ -782,6 +1252,19 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
         .num_stages = num_stages,
         .num_sms = num_sms,
         .num_ranks = num_ranks,
+        .inline_weight_dequant = inline_weight_dequant,
+        .phase_ordered_weight_dequant =
+            phase_ordered_weight_dequant,
+        .inline_residual_mxfp8_dgrad =
+            inline_residual_mxfp8_dgrad,
+        .residual_mxfp8_dgrad = residual_mxfp8_dgrad,
+        .build_residual_mxfp8_weights =
+            build_residual_mxfp8_weights,
+        .exact_source_x = backward_x.has_value(),
+        .gate_up_prepared = gate_up_prepared,
+        .activation = activation,
+        .situ_beta = situ_beta,
+        .situ_linear_beta = situ_linear_beta,
         .route_weight_mode = route_weight_mode,
         .expert_counts = expert_counts.data_ptr<int>(),
         .backward_sym_buffer = backward_sym_buffer,
@@ -790,7 +1273,10 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
             ? reinterpret_cast<const cutlass::bfloat16_t*>(
                   backward_grad_y->data_ptr<at::BFloat16>())
             : nullptr,
-        .backward_x = nullptr,
+        .backward_x = backward_x.has_value()
+            ? reinterpret_cast<const cutlass::bfloat16_t*>(
+                  backward_x->data_ptr<at::BFloat16>())
+            : nullptr,
         .backward_topk_weights = num_ranks > 1
             ? backward_topk_weights->data_ptr<float>()
             : nullptr,
@@ -798,6 +1284,16 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
             backward_grad_route.has_value()
             ? backward_grad_route->data_ptr<float>()
             : nullptr,
+        .backward_grad_x_output =
+            combined_grad_x_output.has_value()
+            ? reinterpret_cast<cutlass::bfloat16_t*>(
+                  combined_grad_x_output->data_ptr<at::BFloat16>())
+            : nullptr,
+        .num_backward_tokens =
+            combined_grad_x_output.has_value()
+            ? static_cast<uint32_t>(
+                  combined_grad_x_output->size(0))
+            : 0,
         .token_src_metadata = !backward_sym_buffer_ptrs.empty()
             ? reinterpret_cast<const layout::TokenSrcMetadata*>(
                   token_src_metadata->data_ptr<int>())
@@ -812,12 +1308,26 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
         .tensor_map_output = tensor_map_gate_up,
         .tensor_map_grad_ye = tensor_map_grad_ye,
         .tensor_map_w2_dequant = tensor_map_w2_dequant,
+        .tensor_map_w2_dgrad_weights =
+            tensor_map_w2_dgrad_weights,
+        .tensor_map_w2_dgrad_weights_sf =
+            tensor_map_w2_dgrad_weights_sf,
         .tensor_map_w2_weights = tensor_map_w2_weights,
         .tensor_map_w2_scales = tensor_map_w2_scales,
         .tensor_map_w13_dequant = tensor_map_w13_dequant,
+        .tensor_map_w13_dgrad_weights =
+            tensor_map_w13_dgrad_weights,
+        .tensor_map_w13_dgrad_weights_sf =
+            tensor_map_w13_dgrad_weights_sf,
         .tensor_map_w13_weights = tensor_map_w13_weights,
         .tensor_map_w13_scales = tensor_map_w13_scales,
         .tensor_map_grad_gate_up = tensor_map_grad_gate_up,
+        .tensor_map_w2_wgrad_a = tensor_map_w2_wgrad_a,
+        .tensor_map_w2_wgrad_b = tensor_map_w2_wgrad_b,
+        .tensor_map_w2_wgrad_d = tensor_map_w2_wgrad_d,
+        .tensor_map_w13_wgrad_a = tensor_map_w13_wgrad_a,
+        .tensor_map_w13_wgrad_b = tensor_map_w13_wgrad_b,
+        .tensor_map_w13_wgrad_d = tensor_map_w13_wgrad_d,
         .acts_ptr =
             reinterpret_cast<const cutlass::float_e4m3_t*>(
                 acts.data_ptr()),
@@ -890,23 +1400,36 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
         .grid_sync_counter =
             reinterpret_cast<uint32_t*>(
                 grid_sync_counter.data_ptr<int>()),
-        .launch_epoch = launch_epoch,
         .activation_limit = activation_limit,
         .compute_w13_dgrad = compute_w13_dgrad,
         .direct_remote_grad_x = direct_remote_grad_x,
         .write_grad_x_pool = write_grad_x_pool,
         .clear_wgrad_padding = clear_wgrad_padding,
+        .clear_empty_wgrad_expert_outputs =
+            clear_empty_wgrad_expert_outputs,
+        .inline_wgrad = inline_wgrad,
+        .accumulate_wgrad = accumulate_wgrad,
         .compute_route_grad =
             grad_route_output.has_value(),
+        .trace_kernel = kernel_trace.has_value(),
+        .kernel_trace =
+            kernel_trace.has_value()
+            ? reinterpret_cast<uint64_t*>(
+                  kernel_trace->data_ptr<int64_t>())
+            : nullptr,
         .launch_args = LaunchArgs(
             num_sms, 1024, smem_size, 2),
     };
     const auto code =
         SM100FP8FP4MegaMoEBackwardWaveRuntime::generate(args);
     const auto runtime = compiler->build(fmt::format(
-        "sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu_{}_r{}",
-        route_weight_mode,
-        grad_route_output.has_value()), code);
+        "sm100_fp8_fp4_mega_moe_backward_dgrad_{}_{}_r{}_inline{}_phase{}_residual{}_build{}_x{}_gate{}_wgrad{}_accum{}_trace{}",
+        activation, route_weight_mode,
+        grad_route_output.has_value(), inline_weight_dequant,
+        phase_ordered_weight_dequant, residual_mxfp8_dgrad,
+        build_residual_mxfp8_weights, backward_x.has_value(),
+        gate_up_prepared, inline_wgrad, accumulate_wgrad,
+        kernel_trace.has_value()), code);
     SM100FP8FP4MegaMoEBackwardWaveRuntime::launch(runtime, args);
 }
 
@@ -1440,9 +1963,9 @@ static void sm100_bf16_mega_moe_backward_dgrad(
             grad_h_output, h_act_output, h_weighted_output,
             x_pool_output, grad_x_pool_output, grad_ye,
             grad_y_unweighted_output, down_unweighted_output};
-    const auto allowed_overlap = [&](const int lhs, const int rhs) {
+    const auto allowed_overlap = [&](const std::size_t lhs, const std::size_t rhs) {
         const auto pair_is = [=](
-            const int first, const int second) {
+            const std::size_t first, const std::size_t second) {
             return (lhs == first && rhs == second) ||
                    (lhs == second && rhs == first);
         };
@@ -1496,8 +2019,8 @@ static void sm100_bf16_mega_moe_backward_dgrad(
         }
         return false;
     };
-    for (int lhs = 0; lhs < alias_tensors.size(); ++lhs) {
-        for (int rhs = lhs + 1;
+    for (std::size_t lhs = 0; lhs < alias_tensors.size(); ++lhs) {
+        for (std::size_t rhs = lhs + 1;
              rhs < alias_tensors.size(); ++rhs) {
             DG_HOST_ASSERT(
                 !overlaps(
@@ -1558,6 +2081,7 @@ static void sm100_bf16_mega_moe_backward_dgrad(
             static_cast<int>(sizeof(uint64_t)) +
         num_dispatch_warps *
             static_cast<int>(sizeof(uint64_t)) +
+        2 * static_cast<int>(sizeof(uint64_t)) +
         static_cast<int>(sizeof(uint32_t));
     const int num_stages =
         std::min(
@@ -1616,16 +2140,6 @@ static void sm100_bf16_mega_moe_backward_dgrad(
             kernel_trace->size(1) == num_sms &&
             kernel_trace->size(2) == num_trace_values);
     }
-    static std::atomic<uint32_t> next_launch_epoch{1};
-    uint32_t launch_epoch =
-        next_launch_epoch.fetch_add(
-            1, std::memory_order_relaxed);
-    if (launch_epoch == 0) {
-        launch_epoch =
-            next_launch_epoch.fetch_add(
-                1, std::memory_order_relaxed);
-    }
-
     const auto backward_sym_buffer =
         layout::SymBuffer<>(
             backward_sym_buffer_ptrs, backward_rank);
@@ -1743,12 +2257,12 @@ static void sm100_bf16_mega_moe_backward_dgrad(
         .grid_sync_counter =
             reinterpret_cast<uint32_t*>(
                 grid_sync_counter.data_ptr<int>()),
-        .launch_epoch = launch_epoch,
         .activation_limit = activation_limit,
         .compute_w13_dgrad = true,
         .direct_remote_grad_x = direct_remote_grad_x,
         .write_grad_x_pool = write_grad_x_pool,
         .clear_wgrad_padding = clear_wgrad_padding,
+        .clear_empty_wgrad_expert_outputs = true,
         .compute_route_grad = true,
         .trace_kernel = kernel_trace.has_value(),
         .vectorized_grad_x_store = get_env<int>(

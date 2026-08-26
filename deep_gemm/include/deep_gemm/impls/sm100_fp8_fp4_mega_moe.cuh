@@ -19,6 +19,19 @@
 
 namespace deep_gemm {
 
+// Store one rowwise reduction value into the corresponding shared-memory
+// address on the peer CTA. MegaMoE schedules adjacent L1 N tiles as a two-CTA
+// cluster, so the peer owns the other 64 values of the same Q128 group.
+CUTLASS_DEVICE void store_cluster_float2(
+    float2* ptr, const uint32_t& cta_rank, const float2& value) {
+    const uint32_t remote_addr = cute::set_block_rank(
+        cute::cast_smem_ptr_to_uint(ptr), cta_rank);
+    asm volatile(
+        "st.shared::cluster.v2.f32 [%0], {%1, %2};\n"
+        :: "r"(remote_addr), "f"(value.x), "f"(value.y)
+        : "memory");
+}
+
 template <
     uint32_t kNumMaxTokensPerRank,
     uint32_t kHidden, uint32_t kIntermediateHidden,
@@ -37,9 +50,12 @@ template <
     float kActivationClamp,
     bool kFastMath,
     ActivationType kActivationType,
+    float kSituBeta,
+    float kSituLinearBeta,
     bool kSaveL1Preact,
     RouteWeightMode kRouteWeightMode = RouteWeightMode::PreDown,
     bool kSaveDownUnweighted = false,
+    bool kL2ActivationGroup128 = false,
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
     uint32_t L2_SHAPE_N = kHidden,
@@ -145,15 +161,22 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     };
 
     // L1 inputs
-    const auto l1_token_buffer = layout::Buffer(
+    const auto symmetric_l1_token_buffer = layout::Buffer(
         fp8_token_layout, 1, kNumRingTokens,
         input_topk_weights_buffer.get_end_ptr());
-    const auto l1_sf_buffer = layout::Buffer(
+    const auto symmetric_l1_sf_buffer = layout::Buffer(
         fp8_sf_layout, 1, kNumSFRingTokens,
-        l1_token_buffer.get_end_ptr());
+        symmetric_l1_token_buffer.get_end_ptr());
     const auto l1_topk_weights_buffer = layout::Buffer(
         l1_topk_weights_layout, 1, kNumRingTokens,
-        l1_sf_buffer.get_end_ptr());
+        symmetric_l1_sf_buffer.get_end_ptr());
+    const auto l1_token_buffer = layout::Buffer(
+        fp8_token_layout, 1, kNumRingTokens,
+        symmetric_l1_token_buffer.get_base_ptr());
+    const auto l1_sf_buffer = layout::Buffer(
+        fp8_sf_layout, 1, kNumSFRingTokens,
+        symmetric_l1_sf_buffer.get_base_ptr());
+    auto* const token_src_metadata = workspace.get_token_src_metadata_ptr(0);
 
     // L2 inputs
     const auto l2_token_buffer = layout::Buffer(
@@ -219,12 +242,19 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         uint32_t smem_sfa[kNumStages][SF_BLOCK_M * (BLOCK_K / 128)];
         uint32_t smem_sfb[kNumStages][SF_BLOCK_N * (BLOCK_K / 128)];
         float2 amax_reduction[kNumEpilogueWarps][AMAX_REDUCTION_WARP_BUFFER_SIZE];
+        // Each CTA owns 64 adjacent activation columns. For Q128, the peer CTA
+        // publishes its local rowwise maximum here before quantization.
+        float2 l1_peer_amax
+            [kL2ActivationGroup128 ? kNumEpilogueWarpgroups : 1]
+            [kL2ActivationGroup128 ? AMAX_REDUCTION_WARP_BUFFER_SIZE : 1];
         Barrier dispatch_barriers[kNumDispatchWarps];
         Barrier full_barriers[kNumStages];
         Barrier empty_barriers[kNumStages];
         Barrier tmem_full_barriers[kNumEpilogueStages];
         Barrier tmem_empty_barriers[kNumEpilogueStages];
         Barrier combine_barriers[kNumEpilogueWarps * 2];
+        Barrier l1_scale_barriers
+            [kL2ActivationGroup128 ? kNumEpilogueWarpgroups : 1];
         uint32_t tmem_ptr_in_smem;
     };
     constexpr uint32_t kNumReusableSmemBytes = offsetof(SharedStorage, dispatch_barriers);
@@ -283,6 +313,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             #pragma unroll
             for (uint32_t i = 0; i < kNumEpilogueWarps * 2; ++ i)
                 shared_storage.combine_barriers[i].init(1);
+            if constexpr (kL2ActivationGroup128) {
+                #pragma unroll
+                for (uint32_t i = 0;
+                     i < kNumEpilogueWarpgroups; ++ i)
+                    shared_storage.l1_scale_barriers[i].init(1);
+            }
         }
         cutlass::arch::fence_barrier_init();
     } else if (warp_idx == 3) {
@@ -597,7 +633,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 *l1_topk_weights_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).template get_base_ptr<float>() = weight;
 
                 // Write source metadata for combine write-back (logical pool token)
-                *workspace.get_token_src_metadata_ptr(pool_token_idx) =
+                token_src_metadata[pool_token_idx] =
                     {current_rank_in_expert_idx, src_token_idx, src_topk_idx};
 
                 // Complete last chunk's store
@@ -927,6 +963,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         // Persistently schedule over blocks
         uint32_t current_iter_idx = 0;
+        uint32_t l1_scale_phase = 0;
         scheduler.for_each_block([&](const sched::BlockPhase& block_phase,
                                      const uint32_t& local_expert_idx,
                                      const uint32_t& num_k_blocks,
@@ -1002,7 +1039,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             shared_storage.tmem_empty_barriers[accum_stage_idx].arrive(0u);
                         }
 
-                        // Apply gated activation: act(gate) * up (SwiGLU or GeGLU)
+                        // Apply gated activation: act(gate) * up (SwiGLU, GeGLU, or SiTU)
                         auto fp32_values = reinterpret_cast<float2*>(raw_values);
                         #pragma unroll
                         for (uint32_t k = 0; k < 2; ++ k) {
@@ -1055,6 +1092,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                         row_base + r;
                                     if (m_out <
                                         pool_m_idx + valid_m) {
+                                        DG_DEVICE_ASSERT(
+                                            m_out <
+                                            num_saved_pool_tokens);
                                         auto* dst =
                                             reinterpret_cast<
                                                 uint16_t*>(
@@ -1089,11 +1129,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             const auto gate = __bfloat1622float2(bf16_gate);
                             const auto up = __bfloat1622float2(bf16_up);
 
-                            // Gated activation, applied to the gate projection. Both variants
-                            // reduce to `gate * sigmoid(z) * up` for an activation-specific `z`:
+                            // SwiGLU and GeGLU reduce to `gate * sigmoid(z) * up`
+                            // for an activation-specific `z`:
                             //  - SwiGLU: SiLU(gate)         => z = gate
                             //  - GeGLU:  GELU(gate) (tanh)  => z = alpha * (gate + beta * gate^3)
-                            //    since 0.5 * (1 + tanh(t)) == sigmoid(2t)
+                            //    since 0.5 * (1 + tanh(t)) == sigmoid(2t).
+                            // SiTU instead bounds both branches before the product.
                             float2 z;
                             if constexpr (kActivationType == ActivationType::GeGLU) {
                                 constexpr float kAlpha = 1.5957691216057308f;  // 2 * sqrt(2 / pi)
@@ -1106,25 +1147,100 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                 z = gate;
                             }
 
-                            const auto neg_exp = make_float2(
-                                kFastMath ? __expf(-z.x) : expf(-z.x),
-                                kFastMath ? __expf(-z.y) : expf(-z.y));
-                            const auto denom = __fadd2_rn({1.0f, 1.0f}, neg_exp);
+                            auto gate_numerator = gate;
+                            auto activated_up = up;
+                            float2 situ_sigmoid = {0.0f, 0.0f};
+                            if constexpr (kActivationType == ActivationType::SiTU) {
+                                const auto gate_tanh = make_float2(
+                                    kFastMath ? __tanhf(gate.x / kSituBeta) : tanhf(gate.x / kSituBeta),
+                                    kFastMath ? __tanhf(gate.y / kSituBeta) : tanhf(gate.y / kSituBeta));
+                                gate_numerator = __fmul2_rn(
+                                    {kSituBeta, kSituBeta}, gate_tanh);
+                                if constexpr (!kFastMath && kSituBeta == 4.0f) {
+                                    // sigmoid(g) = (1 + tanh(g / 2)) / 2 and
+                                    // tanh(g / 2) follows from the double-angle
+                                    // identity using the accurate tanh(g / 4)
+                                    // already required by K3 SiTU. This removes
+                                    // one accurate expf per element without
+                                    // enabling the inference fast-math path.
+                                    const auto gate_tanh_sq =
+                                        __fmul2_rn(gate_tanh, gate_tanh);
+                                    const auto tanh_gate_half = make_float2(
+                                        __fdiv_rn(
+                                            __fmul_rn(2.0f, gate_tanh.x),
+                                            __fadd_rn(1.0f, gate_tanh_sq.x)),
+                                        __fdiv_rn(
+                                            __fmul_rn(2.0f, gate_tanh.y),
+                                            __fadd_rn(1.0f, gate_tanh_sq.y)));
+                                    situ_sigmoid = __fmul2_rn(
+                                        {0.5f, 0.5f},
+                                        __fadd2_rn(
+                                            {1.0f, 1.0f},
+                                            tanh_gate_half));
+                                }
+                                if constexpr (
+                                    kSituLinearBeta !=
+                                    cute::numeric_limits<float>::infinity()) {
+                                    const auto up_tanh = make_float2(
+                                        kFastMath ? __tanhf(up.x / kSituLinearBeta) : tanhf(up.x / kSituLinearBeta),
+                                        kFastMath ? __tanhf(up.y / kSituLinearBeta) : tanhf(up.y / kSituLinearBeta));
+                                    activated_up = __fmul2_rn(
+                                        {kSituLinearBeta, kSituLinearBeta},
+                                        up_tanh);
+                                }
+                            }
+
                             float2 activated;
-                            if constexpr (kFastMath) {
-                                activated = __fmul2_rn(gate, {math::fast_rcp(denom.x), math::fast_rcp(denom.y)});
+                            if constexpr (
+                                kActivationType == ActivationType::SiTU &&
+                                !kFastMath && kSituBeta == 4.0f) {
+                                activated = __fmul2_rn(
+                                    gate_numerator, situ_sigmoid);
                             } else {
-                                activated = {gate.x / denom.x, gate.y / denom.y};
+                                const auto neg_exp = make_float2(
+                                    kFastMath ? __expf(-z.x) : expf(-z.x),
+                                    kFastMath ? __expf(-z.y) : expf(-z.y));
+                                const auto denom = __fadd2_rn(
+                                    {1.0f, 1.0f}, neg_exp);
+                                if constexpr (kFastMath) {
+                                    activated = __fmul2_rn(
+                                        gate_numerator,
+                                        {math::fast_rcp(denom.x),
+                                         math::fast_rcp(denom.y)});
+                                } else {
+                                    activated = {
+                                        gate_numerator.x / denom.x,
+                                        gate_numerator.y / denom.y};
+                                }
                             }
                             if constexpr (
                                 kRouteWeightMode ==
                                 RouteWeightMode::PreDown) {
                                 // Keep the legacy expression intact: PRE_DOWN
                                 // must remain bitwise identical.
-                                activation_values[i][k] = __fmul2_rn(__fmul2_rn(activated, up), weights);
+                                activation_values[i][k] =
+                                    __fmul2_rn(
+                                        __fmul2_rn(
+                                            activated, activated_up),
+                                        weights);
                             } else {
                                 activation_values[i][k] =
-                                    __fmul2_rn(activated, up);
+                                    __fmul2_rn(
+                                        activated, activated_up);
+                            }
+                            if constexpr (
+                                kActivationType == ActivationType::SiTU &&
+                                kRouteWeightMode ==
+                                    RouteWeightMode::PostDown) {
+                                // Kimi-K3 native_mxfp4 materializes the SiTU
+                                // boundary in BF16 before Q128 activation
+                                // quantization. Preserve that rounding point;
+                                // the inference SiTU path intentionally omits
+                                // it and is therefore a different contract.
+                                activation_values[i][k] =
+                                    __bfloat1622float2(
+                                        __float22bfloat162_rn(
+                                            activation_values[i][k]));
                             }
                         }
 
@@ -1154,14 +1270,90 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     ptx::tma_store_wait<kNumTMAStoreStages - 1>();
                     ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
 
+                    // A two-CTA MegaMoE cluster owns adjacent L1 N blocks.
+                    // After the gated activation, each CTA therefore owns one
+                    // 64-value half of a native_mxfp4 Q128 group. Reduce the
+                    // four local warp fragments, publish that half's maximum
+                    // through distributed shared memory, then combine it with
+                    // the peer maximum. This preserves the fused persistent
+                    // pipeline and requires no intermediate BF16 round-trip.
+                    if constexpr (kL2ActivationGroup128) {
+                        float2 local_amax[kNumAtomsPerStore];
+                        #pragma unroll
+                        for (uint32_t i = 0;
+                             i < kNumAtomsPerStore; ++ i) {
+                            local_amax[i] = {0.0f, 0.0f};
+                            #pragma unroll
+                            for (uint32_t local_warp = 0;
+                                 local_warp < 4; ++ local_warp) {
+                                const float2 value =
+                                    shared_storage.amax_reduction
+                                        [epilogue_wg_idx * 4 + local_warp]
+                                        [i * (ATOM_M / 2) + lane_idx % 4];
+                                local_amax[i].x = cute::max(
+                                    local_amax[i].x, value.x);
+                                local_amax[i].y = cute::max(
+                                    local_amax[i].y, value.y);
+                            }
+                        }
+
+                        if (warp_idx_in_wg == 0 && lane_idx < 4) {
+                            #pragma unroll
+                            for (uint32_t i = 0;
+                                 i < kNumAtomsPerStore; ++ i) {
+                                store_cluster_float2(
+                                    &shared_storage.l1_peer_amax
+                                        [epilogue_wg_idx]
+                                        [i * (ATOM_M / 2) + lane_idx],
+                                    cute::block_rank_in_cluster() ^ 1u,
+                                    local_amax[i]);
+                            }
+                        }
+                        // Four lanes issue the peer writes and one lane
+                        // publishes the remote mbarrier arrival. Cluster-scope
+                        // release ordering prevents the peer from observing a
+                        // partially published row maximum.
+                        if (warp_idx_in_wg == 0)
+                            __threadfence_cluster();
+                        __syncwarp();
+                        if (warp_idx_in_wg == 0 &&
+                            cute::elect_one_sync()) {
+                            shared_storage.l1_scale_barriers
+                                [epilogue_wg_idx].arrive(
+                                    cute::block_rank_in_cluster() ^ 1u);
+                        }
+                        shared_storage.l1_scale_barriers
+                            [epilogue_wg_idx].wait(l1_scale_phase);
+
+                        #pragma unroll
+                        for (uint32_t i = 0;
+                             i < kNumAtomsPerStore; ++ i) {
+                            const float2 peer_amax = ptx::ld_shared(
+                                &shared_storage.l1_peer_amax
+                                    [epilogue_wg_idx]
+                                    [i * (ATOM_M / 2) + lane_idx % 4]);
+                            amax_values[i].x = cute::max(
+                                local_amax[i].x, peer_amax.x);
+                            amax_values[i].y = cute::max(
+                                local_amax[i].y, peer_amax.y);
+                        }
+                        l1_scale_phase ^= 1u;
+                    }
+
                     // Cast to FP8 E4M3 and store into shared memory
                     #pragma unroll
                     for (uint32_t i = 0; i < kNumAtomsPerStore; ++ i) {
                         // Reduce amax (warp-pair-level)
-                        const float2 wp_amax =
-                            shared_storage.amax_reduction[epilogue_warp_idx ^ 1][i * (ATOM_M / 2) + lane_idx % 4];
-                        amax_values[i].x = cute::max(amax_values[i].x, wp_amax.x);
-                        amax_values[i].y = cute::max(amax_values[i].y, wp_amax.y);
+                        if constexpr (!kL2ActivationGroup128) {
+                            const float2 wp_amax =
+                                shared_storage.amax_reduction
+                                    [epilogue_warp_idx ^ 1]
+                                    [i * (ATOM_M / 2) + lane_idx % 4];
+                            amax_values[i].x = cute::max(
+                                amax_values[i].x, wp_amax.x);
+                            amax_values[i].y = cute::max(
+                                amax_values[i].y, wp_amax.y);
+                        }
 
                         // Calculate SF
                         float2 sf, sf_inv;
@@ -1359,7 +1551,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         if (m_idx_in_block >= valid_m)
                             break;
 
-                        const auto src_metadata = *workspace.get_token_src_metadata_ptr(pool_m_idx + m_idx_in_block);
+                        const auto src_metadata =
+                            token_src_metadata[pool_m_idx + m_idx_in_block];
                         const uint32_t dst_rank_idx = src_metadata.rank_idx;
                         const uint32_t dst_token_idx = src_metadata.token_idx;
                         const uint32_t dst_topk_idx = src_metadata.topk_idx;
@@ -1370,36 +1563,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             row_in_store * kSwizzleCDMode +
                             (bank_group_idx ^ row_in_atom) * kNumBankGroupBytes;
                         auto packed = ptx::ld_shared(reinterpret_cast<float4*>(smem_ptr));
-                        if constexpr (
-                            kRouteWeightMode ==
-                            RouteWeightMode::PostDown) {
-                            // The route score remains in its immutable source
-                            // token/slot plane. Loading it from metadata avoids
-                            // adding a full-pool field to the forward layout.
-                            const float route_weight =
-                                *sym_buffer.map(
-                                    input_topk_weights_buffer
-                                            .get_base_ptr<float>() +
-                                        static_cast<uint64_t>(
-                                            src_metadata.token_idx) *
-                                            kNumTopk +
-                                        src_metadata.topk_idx,
-                                    src_metadata.rank_idx);
-                            auto* values =
-                                reinterpret_cast<
-                                    nv_bfloat16*>(&packed);
-                            #pragma unroll
-                            for (uint32_t value_idx = 0;
-                                 value_idx < 8;
-                                 ++value_idx) {
-                                values[value_idx] =
-                                    __float2bfloat16_rn(
-                                        __bfloat162float(
-                                            values[value_idx]) *
-                                        route_weight);
-                            }
-                        }
-
+                        // Post-down routing is deliberately deferred to the
+                        // FP32 combine accumulator below.  K3 native training
+                        // computes FP32(BF16(W2)) * FP32(route_score), sums
+                        // top-k in FP32, and rounds only the combined token.
+                        // Rounding every weighted route here is not equivalent.
                         // Write into remote
                         const auto dst_token = combine_token_buffer.get_rank_buffer(dst_topk_idx)
                                                .get_data_buffer(dst_token_idx);
@@ -1486,12 +1654,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
                 // Move mask and load
                 uint32_t mask = total_mask;
+                uint32_t loaded_slot_idx[2] = {};
                 const auto move_mask_and_load = [&](const uint32_t& i) {
                     if (mask) {
                         // Move
                         const uint32_t slot_idx = __ffs(mask) - 1;
                         mask ^= 1 << slot_idx;
-
+                        loaded_slot_idx[i] = slot_idx;
                         // Load
                         if (cute::elect_one_sync()) {
                             const auto src_ptr = math::advance_ptr<uint8_t>(
@@ -1518,13 +1687,36 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
                     // Accumulate
                     combine_load_barriers[load_stage_idx]->wait(combine_phase);
+                    float route_weight = 1.0f;
+                    if constexpr (
+                        kRouteWeightMode ==
+                        RouteWeightMode::PostDown) {
+                        route_weight = __ldg(
+                            input_topk_weights_buffer.get_base_ptr<float>() +
+                            static_cast<uint64_t>(token_idx) * kNumTopk +
+                            loaded_slot_idx[load_stage_idx]);
+                    }
                     #pragma unroll
                     for (uint32_t j = 0; j < kNumUint4PerLane; ++ j) {
                         const auto uint4_values = combine_load_buffer[load_stage_idx][j * 32 + lane_idx];
                         const auto bf16_values = reinterpret_cast<const nv_bfloat162*>(&uint4_values);
                         #pragma unroll
-                        for (uint32_t l = 0; l < kNumElemsPerUint4; ++ l)
-                            ptx::accumulate(reduced[j * kNumElemsPerUint4 + l], bf16_values[l]);
+                        for (uint32_t l = 0; l < kNumElemsPerUint4; ++ l) {
+                            auto& accumulator =
+                                reduced[j * kNumElemsPerUint4 + l];
+                            if constexpr (
+                                kRouteWeightMode ==
+                                RouteWeightMode::PostDown) {
+                                const auto values =
+                                    __bfloat1622float2(bf16_values[l]);
+                                accumulator.x = fmaf(
+                                    values.x, route_weight, accumulator.x);
+                                accumulator.y = fmaf(
+                                    values.y, route_weight, accumulator.y);
+                            } else {
+                                ptx::accumulate(accumulator, bf16_values[l]);
+                            }
+                        }
                     }
                     combine_phase ^= load_stage_idx;
                     load_stage_idx ^= 1;
