@@ -5,6 +5,11 @@ ROOT = Path(__file__).resolve().parents[1]
 BODY = ROOT / "deep_gemm/include/deep_gemm/impls/sm100_bf16_gemm.cuh"
 SCHEDULER = ROOT / "deep_gemm/include/deep_gemm/scheduler/gemm.cuh"
 DECODER = ROOT / "deep_gemm/include/deep_gemm/scheduler/external_k_grouped_range.hpp"
+K3_BACKWARD = (
+    ROOT
+    / "deep_gemm/include/deep_gemm/impls/"
+    / "sm100_fp8_fp4_mega_moe_backward.cuh"
+)
 
 
 def _cluster_tasks(shape_m: int, shape_n: int, paired: bool) -> list[tuple[int, int]]:
@@ -193,6 +198,13 @@ def test_paired_protocol_reduces_only_a_tma_traffic() -> None:
     assert paired["a_tma"] * 2 == baseline["a_tma"]
     for operation in ("b_tma", "umma", "stores"):
         assert paired[operation] == baseline[operation]
+
+
+def test_terminal_dw13_uses_only_base_combine_warps() -> None:
+    """The EP8 dW13 tail must not add memory contention to saturated UMMA."""
+    source = K3_BACKWARD.read_text()
+    assert "kTerminalDW13ExtraCombineThreads = 0u" in source
+    assert "kTerminalDW13ExtraCombineThreads>(" in source
 
 
 def _windowed_producer_events(
