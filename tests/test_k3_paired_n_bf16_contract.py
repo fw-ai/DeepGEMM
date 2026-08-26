@@ -121,6 +121,71 @@ def test_four_task_claims_remain_expert_local_and_phase_neutral() -> None:
         assert (batch_tasks * k_blocks_per_pool_block) % (2 * stages) == 0
 
 
+def _decode_terminal_two_segment_tile(
+    logical_task: int,
+    tasks_per_expert: int,
+    shape_m: int,
+    shape_n: int,
+    cluster_rank: int,
+) -> tuple[int, int]:
+    """Model the tile-only portion of the terminal two-segment decoder."""
+    block_m = 128
+    block_n = 256
+    multicast = 2
+    one_d_blocks = 16
+    m_blocks = shape_m // block_m
+    n_blocks = shape_n // block_n
+    assert tasks_per_expert == m_blocks * n_blocks // multicast
+
+    cta_task = (logical_task % tasks_per_expert) * multicast + cluster_rank
+    blocks_per_swizzle_group = n_blocks * one_d_blocks
+    swizzle_group = cta_task // blocks_per_swizzle_group
+    first_m_block = swizzle_group * one_d_blocks
+    in_group = cta_task % blocks_per_swizzle_group
+    m_blocks_in_group = min(one_d_blocks, m_blocks - first_m_block)
+    return (
+        first_m_block + in_group % m_blocks_in_group,
+        in_group // m_blocks_in_group,
+    )
+
+
+def test_cached_terminal_two_segment_decode_preserves_full_contract() -> None:
+    """Claims keep expert metadata fixed and cover the full K3 tile grid."""
+    batch_tasks = 4
+    experts = 896
+    for shape_m, shape_n, tasks_per_expert in (
+        (3584, 3072, 168),
+        (6144, 3584, 336),
+    ):
+        for expert in range(experts):
+            expert_first = expert * tasks_per_expert
+            decoded_tiles: set[tuple[int, int]] = set()
+            for batch_first in range(
+                expert_first,
+                expert_first + tasks_per_expert,
+                batch_tasks,
+            ):
+                assert batch_first // tasks_per_expert == (
+                    batch_first + batch_tasks - 1
+                ) // tasks_per_expert
+                for offset in range(batch_tasks):
+                    logical_task = batch_first + offset
+                    assert logical_task // tasks_per_expert == expert
+                    for cluster_rank in range(2):
+                        decoded_tiles.add(_decode_terminal_two_segment_tile(
+                            logical_task, tasks_per_expert,
+                            shape_m, shape_n, cluster_rank))
+            assert decoded_tiles == {
+                (m_block, n_block)
+                for m_block in range(shape_m // 128)
+                for n_block in range(shape_n // 256)
+            }
+
+    scheduler = SCHEDULER.read_text()
+    assert "decode_cached_batch_task" in scheduler
+    assert "batch_offset++ == 0u" in scheduler
+
+
 def test_paired_protocol_reduces_only_a_tma_traffic() -> None:
     """For two outputs, pair one A with two B loads and two UMMA/stores."""
     baseline = {"a_tma": 2, "b_tma": 2, "umma": 2, "stores": 2}
