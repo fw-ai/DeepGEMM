@@ -29,6 +29,7 @@ static void sm100_bf16_mega_moe_wgrad_1sm(
     const torch::Tensor& d,
     const torch::Tensor& padded_expert_counts,
     const int pool_block_m,
+    const bool with_accumulation = false,
     const MegaMoEBackwardCombineArgs& combine = {}) {
     const auto [num_groups, m, n] = get_shape<3>(d);
     const auto [pool_rows_a, m_] = get_shape<2>(a);
@@ -98,7 +99,7 @@ static void sm100_bf16_mega_moe_wgrad_1sm(
         .cd_dtype = d.scalar_type(),
         .major_a = cute::UMMA::Major::MN,
         .major_b = cute::UMMA::Major::MN,
-        .with_accumulation = false,
+        .with_accumulation = with_accumulation,
         .num_sms = num_sms,
         .tc_util = 100,
         .compiled_dims = "mn",
@@ -181,7 +182,11 @@ static void sm100_bf16_mega_moe_wgrad_1sm(
     };
     const auto code = SM100BF16GemmRuntime::generate(args);
     const auto runtime =
-        compiler->build("sm100_bf16_mega_moe_wgrad_1sm", code);
+        compiler->build(
+            with_accumulation
+                ? "sm100_bf16_mega_moe_wgrad_1sm_accumulate"
+                : "sm100_bf16_mega_moe_wgrad_1sm",
+            code);
     SM100BF16GemmRuntime::launch(runtime, args);
 }
 

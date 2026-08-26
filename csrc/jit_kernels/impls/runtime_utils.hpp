@@ -251,7 +251,8 @@ static CUtensorMap make_tma_sf_desc(const cute::UMMA::Major& major,
                                     const int& num_groups,
                                     const int& swizzle_mode, const int& swizzle_base = 0,
                                     const bool& allow_tf32 = false,
-                                    const int& smem_outer_dim = 1) {
+                                    const int& smem_outer_dim = 1,
+                                    const int& outer_stride = 0) {
     DG_HOST_ASSERT(major == cute::UMMA::Major::MN);
 
     // TODO: maybe swizzle SF as well
@@ -261,7 +262,7 @@ static CUtensorMap make_tma_sf_desc(const cute::UMMA::Major& major,
     return make_tma_2d_desc(t,
                             shape_mn, ceil_div(shape_k, gran_k * (t.scalar_type() == torch::kFloat ? 1 : 4)) * num_groups,
                             block_mn, smem_outer_dim,
-                            shape_mn,
+                            outer_stride > 0 ? outer_stride : shape_mn,
                             swizzle_mode, swizzle_base,
                             allow_tf32);
 }
