@@ -46,7 +46,7 @@ get_symm_buffer_size_for_mega_moe_v2(
     const std::string& mma_type, const std::string& activation,
     const int& num_ring_tokens) {
     DG_HOST_ASSERT(num_experts % num_ranks == 0);
-    DG_HOST_ASSERT(activation == "swiglu" or activation == "geglu");
+    DG_HOST_ASSERT(activation == "swiglu" or activation == "geglu" or activation == "situ");
 
     // Pool capacity must fit at least one full wave (one expert per wave) and aligned to block size
     const auto num_experts_per_rank = num_experts / num_ranks;
@@ -119,7 +119,10 @@ get_symm_buffer_size_for_mega_moe_v2(
     // Combine input buffer: BF16 tokens for cross-rank combine
     const auto combine_token_buffer = layout::Buffer(
         bf16_token_layout, num_topk, num_max_tokens_per_rank,
-        with_sf ? l2_sf_buffer.get_end_ptr() : l2_token_buffer.get_end_ptr());
+        layout::align_buffer_base(
+            with_sf ? l2_sf_buffer.get_end_ptr()
+                    : l2_token_buffer.get_end_ptr(),
+            128u));
     // Backward-only source-route gradients. Append this plane after every
     // forward buffer so no forward offset or physical layout changes.
     const auto backward_route_grad_buffer = layout::Buffer(
@@ -259,12 +262,15 @@ static void fp8_fp4_mega_moe(
     const std::tuple<int, int, int>& recipe,
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
+    const std::optional<float>& situ_beta_opt,
+    const std::optional<float>& situ_linear_beta_opt,
     const bool& fast_math,
     const int& num_ring_tokens,
     const std::optional<torch::Tensor>& saved_l1_preact,
     const std::string& route_weight_mode,
     const std::optional<torch::Tensor>& saved_down_unweighted,
-    const std::optional<int>& num_config_tokens_opt
+    const std::optional<int>& num_config_tokens_opt,
+    const int& l2_activation_group_size
 ) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
@@ -275,15 +281,23 @@ static void fp8_fp4_mega_moe(
         num_config_tokens_opt.value_or(num_tokens);
     const auto [rm, rn, rk] = recipe;
     DG_HOST_ASSERT(rm == 1 and rn == 1 and rk == 32);
-    DG_HOST_ASSERT(activation == "swiglu" or activation == "geglu");
+    DG_HOST_ASSERT(activation == "swiglu" or activation == "geglu" or activation == "situ");
     DG_HOST_ASSERT(
         route_weight_mode == "pre_down" ||
         route_weight_mode == "post_down");
+    DG_HOST_ASSERT(
+        l2_activation_group_size == 32 ||
+        l2_activation_group_size == 128);
 
     // Activation checks
     const auto activation_clamp =
         activation_clamp_opt.value_or(std::numeric_limits<float>::infinity());
+    const auto situ_beta = situ_beta_opt.value_or(1.0f);
+    const auto situ_linear_beta =
+        situ_linear_beta_opt.value_or(std::numeric_limits<float>::infinity());
     DG_HOST_ASSERT(activation_clamp >= 0);
+    DG_HOST_ASSERT(situ_beta > 0);
+    DG_HOST_ASSERT(situ_linear_beta > 0);
 
     // Tensor checks
     DG_HOST_ASSERT(get_major_type_ab(l1_weights) == cute::UMMA::Major::K);
@@ -365,9 +379,11 @@ static void fp8_fp4_mega_moe(
                                num_experts_per_rank,
                                num_tokens, num_config_tokens, num_topk,
                                hidden, intermediate_hidden,
-                               activation, activation_clamp, fast_math,
+                               activation, activation_clamp,
+                               situ_beta, situ_linear_beta, fast_math,
                                route_weight_mode,
-                               saved_down_unweighted);
+                               saved_down_unweighted,
+                               l2_activation_group_size);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -539,12 +555,15 @@ static void register_apis(pybind11::module_& m) {
         py::arg("recipe"),
         py::arg("activation"),
         py::arg("activation_clamp_opt"),
+        py::arg("situ_beta_opt"),
+        py::arg("situ_linear_beta_opt"),
         py::arg("fast_math"),
         py::arg("num_ring_tokens"),
         py::arg("saved_l1_preact") = py::none(),
         py::arg("route_weight_mode") = "pre_down",
         py::arg("saved_down_unweighted") = py::none(),
-        py::arg("num_config_tokens") = py::none());
+        py::arg("num_config_tokens") = py::none(),
+        py::arg("l2_activation_group_size") = 32);
     m.def("bf16_mega_moe", &bf16_mega_moe);
 #endif
 }

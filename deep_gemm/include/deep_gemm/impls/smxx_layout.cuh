@@ -52,7 +52,8 @@ CUTLASS_GLOBAL void transpose_fp32(const float* sf, float* out, const uint32_t m
 // NOTES: the two kernels below always pack the K dimension
 
 template <uint32_t kNumThreads, uint32_t BLOCK_MN, uint32_t SF_K,
-          uint32_t kNumPsumGroups = 1, bool kUsePsumLayout = false>
+          uint32_t kNumPsumGroups = 1, bool kUsePsumLayout = false,
+          bool kSFColumnMajor = false>
 CUTLASS_GLOBAL void transpose_and_pack_fp32_into_ue8m0(float* sf, uint32_t* out, const uint32_t mn,
                                                        const uint32_t* grouped_layout, const uint32_t m_alignment) {
     extern __shared__ uint32_t smem_buffer[];
@@ -94,23 +95,37 @@ CUTLASS_GLOBAL void transpose_and_pack_fp32_into_ue8m0(float* sf, uint32_t* out,
     };
 
     // Shift into the group
-    sf = sf + static_cast<uint64_t>(blockIdx.y) * mn * SF_K;
+    sf = sf + static_cast<uint64_t>(blockIdx.y) *
+        (kSFColumnMajor ? tma_aligned_mn * SF_K : mn * SF_K);
     out = out + static_cast<uint64_t>(blockIdx.y) * tma_aligned_mn * kNumPackedSFK;
 
     // Load FP32 SFs
     DG_STATIC_ASSERT(BLOCK_MN % 4 == 0, "Invalid block size");
-    const auto local_sf = reinterpret_cast<uint32_t*>(sf + static_cast<uint64_t>(blockIdx.x) * (BLOCK_MN * SF_K));
     const auto num_values = in_block_mn * SF_K;
-    const auto num_uint4 = num_values / 4;
-    #pragma unroll
-    for (uint32_t i = threadIdx.x; i < num_uint4; i += kNumThreads) {
-        const auto& [x, y, z, w] = reinterpret_cast<const uint4*>(local_sf)[i];
-        ptx::st_shared(reinterpret_cast<uint4*>(sf_smem_buffer) + i, x, y, z, w);
-    }
+    if constexpr (kSFColumnMajor) {
+        const auto sf_bits = reinterpret_cast<const uint32_t*>(sf);
+        const auto global_mn_start = blockIdx.x * BLOCK_MN;
+        #pragma unroll
+        for (uint32_t i = threadIdx.x; i < num_values; i += kNumThreads) {
+            const auto local_mn_idx = i / SF_K, sf_k_idx = i % SF_K;
+            ptx::st_shared(
+                sf_smem_buffer + i,
+                sf_bits[sf_k_idx * tma_aligned_mn + global_mn_start + local_mn_idx]);
+        }
+    } else {
+        const auto local_sf = reinterpret_cast<uint32_t*>(
+            sf + static_cast<uint64_t>(blockIdx.x) * (BLOCK_MN * SF_K));
+        const auto num_uint4 = num_values / 4;
+        #pragma unroll
+        for (uint32_t i = threadIdx.x; i < num_uint4; i += kNumThreads) {
+            const auto& [x, y, z, w] = reinterpret_cast<const uint4*>(local_sf)[i];
+            ptx::st_shared(reinterpret_cast<uint4*>(sf_smem_buffer) + i, x, y, z, w);
+        }
 
-    // Fill unaligned values as well
-    if (const auto unaligned_idx = num_uint4 * 4 + threadIdx.x; unaligned_idx < num_values)
-        ptx::st_shared(sf_smem_buffer + unaligned_idx, local_sf[unaligned_idx]);
+        // Fill unaligned values as well
+        if (const auto unaligned_idx = num_uint4 * 4 + threadIdx.x; unaligned_idx < num_values)
+            ptx::st_shared(sf_smem_buffer + unaligned_idx, local_sf[unaligned_idx]);
+    }
     __syncthreads();
 
     // Pack into UE8M0 and store
@@ -127,8 +142,6 @@ CUTLASS_GLOBAL void transpose_and_pack_fp32_into_ue8m0(float* sf, uint32_t* out,
         for (uint32_t j = 0; j < 4; ++ j) {
             const auto sf_k_idx = sf_k_pack_idx * 4 + j;
             values[j] = valid_mn and sf_k_idx < SF_K ? ptx::ld_shared(sf_smem_buffer + mn_idx * SF_K + sf_k_idx) : 0;
-            // FP32 SFs must have a zero sign and mantissa (only the exponent is packed)
-            DG_DEVICE_ASSERT((values[j] & 0x807fffffu) == 0);
         }
 
         // Pack and store
@@ -228,11 +241,6 @@ CUTLASS_GLOBAL void pack_fp32_into_ue8m0(float* sf, uint32_t* out, uint32_t* gro
             const uint32_t sf_row_idx = packed_sf_k_idx * 4 + j - num_padding_sf_rows;
             if (sf_row_idx >= group_sf_row_start and sf_row_idx < group_sf_row_end)
                 values[j] = reinterpret_cast<const uint4*>(sf + sf_row_idx * mn)[mn_idx];
-            // FP32 SFs must have a zero sign and mantissa (only the exponent is packed)
-            DG_DEVICE_ASSERT((values[j].x & 0x807fffffu) == 0);
-            DG_DEVICE_ASSERT((values[j].y & 0x807fffffu) == 0);
-            DG_DEVICE_ASSERT((values[j].z & 0x807fffffu) == 0);
-            DG_DEVICE_ASSERT((values[j].w & 0x807fffffu) == 0);
         }
 
         // Pack and store

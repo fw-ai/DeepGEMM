@@ -21,6 +21,45 @@
 
 namespace deep_gemm {
 
+// A fused caller may isolate this large persistent body from an earlier phase
+// by supplying ``__noinline__`` before including the header. Standalone BF16
+// GEMM translation units leave it empty so their existing inlining contract is
+// unchanged.
+#ifndef DG_BF16_GEMM_BODY_ATTRIBUTE
+#define DG_BF16_GEMM_BODY_ATTRIBUTE
+#define DG_BF16_GEMM_BODY_ATTRIBUTE_DEFINED_HERE
+#endif
+
+// Compile-time ownership hooks for one BF16 GEMM task batch.  The default
+// keeps the historical setup/teardown path.  An embedded persistent caller may
+// select either boundary independently and request a post-release join.  It
+// owns any omitted boundary's cluster synchronization, exact mbarrier layout
+// and phases, and 1-SM/2-SM TMEM allocation lifetime.
+template <bool kInitializeBatchResources_, bool kReleaseBatchResources_,
+          bool kSynchronizeAfterRelease_ =
+              (kReleaseBatchResources_ and
+               not kInitializeBatchResources_)>
+struct Sm100Bf16GemmBatchResourceHooks {
+    static constexpr bool kInitializeBatchResources =
+        kInitializeBatchResources_;
+    static constexpr bool kReleaseBatchResources =
+        kReleaseBatchResources_;
+    static constexpr bool kSynchronizeAfterRelease =
+        kSynchronizeAfterRelease_;
+    static_assert(
+        not kSynchronizeAfterRelease or kReleaseBatchResources,
+        "A post-release join requires resource release");
+};
+
+using Sm100Bf16GemmDefaultBatchResourceHooks =
+    Sm100Bf16GemmBatchResourceHooks<true, true>;
+using Sm100Bf16GemmCallerManagedBatchResourceHooks =
+    Sm100Bf16GemmBatchResourceHooks<false, false>;
+template <bool kInitializeBatchResources = false>
+using Sm100Bf16GemmEmbeddedReleaseBatchResourceHooks =
+    Sm100Bf16GemmBatchResourceHooks<
+        kInitializeBatchResources, true, true>;
+
 template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
           uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
           uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K_,
@@ -36,27 +75,70 @@ template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
           uint64_t kTensorCoreUtilControl,
           uint32_t kCombineNumRanks, bool kFuseCombine,
           CombineOrderMode kCombineOrderMode,
-          uint32_t kNumExtraCombineThreads>
-CUTLASS_GLOBAL void __launch_bounds__(
-    kNumNonEpilogueThreads + kNumEpilogueThreads +
-        kNumExtraCombineThreads,
-    1)
-sm100_bf16_gemm_impl(int* grouped_layout,
+          uint32_t kNumExtraCombineThreads,
+          bool kPublishBeforeCombineReduce = false,
+          typename TaskProvider = sched::Scheduler<
+              kGemmType, BLOCK_M, BLOCK_N, kNumGroups,
+              kNumMulticast, kIsMulticastOnA, kNumSMs,
+              kEnsureZeroPadding, kKAlignment, kKAlignment>,
+          typename BatchResourceHooks =
+              Sm100Bf16GemmDefaultBatchResourceHooks,
+          typename InputTileRetiredCallback,
+          typename BackgroundWorkCallback>
+CUTLASS_DEVICE DG_BF16_GEMM_BODY_ATTRIBUTE void
+sm100_bf16_gemm_body(int* grouped_layout,
                      uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
-                     const __grid_constant__ cute::TmaDescriptor tensor_map_a,
-                     const __grid_constant__ cute::TmaDescriptor tensor_map_b,
-                     const __grid_constant__ cute::TmaDescriptor tensor_map_cd,
-                     const __grid_constant__ layout::SymBuffer<kCombineNumRanks> combine_sym_buffer,
-                     const __grid_constant__ layout::Workspace combine_workspace,
+                     // Preserve the enclosing kernel's grid-constant tensor
+                     // map storage. TMA instructions require a descriptor
+                     // address; passing these 128-byte values by value can
+                     // materialize an invalid thread-local descriptor copy.
+                     const cute::TmaDescriptor& tensor_map_a,
+                     const cute::TmaDescriptor& tensor_map_b,
+                     const cute::TmaDescriptor& tensor_map_cd,
+                     const layout::SymBuffer<kCombineNumRanks>& combine_sym_buffer,
+                     const layout::Workspace& combine_workspace,
                      cutlass::bfloat16_t* grad_x_output,
                      cutlass::bfloat16_t* combine_buffer,
                      const int64_t* combine_topk_ids,
+                     const int* combine_ready_counts,
                      uint32_t combine_num_tokens,
+                     uint32_t combine_first_range_tokens,
+                     uint32_t combine_second_range_begin,
                      uint32_t combine_num_max_tokens,
                      uint32_t combine_num_topk,
                      uint32_t combine_hidden,
-                     bool combine_reduce) {
+                     bool combine_reduce,
+                     uint8_t* smem_buffer,
+                     bool wait_for_primary_kernel,
+                     InputTileRetiredCallback input_tile_retired,
+                     BackgroundWorkCallback background_work,
+                     const cute::TmaDescriptor* phase_one_tensor_map_a =
+                         nullptr,
+                     const cute::TmaDescriptor* phase_one_tensor_map_b =
+                         nullptr,
+                     const cute::TmaDescriptor* phase_one_tensor_map_cd =
+                         nullptr) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
+    // A phase-tagged provider lets one persistent UMMA/TMA body consume two
+    // output geometries.  Ordinary providers do not need to expose this
+    // member; the requires-expression keeps their generated code and ABI
+    // unchanged.
+    constexpr bool kTaskPhaseTagged = []() constexpr {
+        if constexpr (requires { TaskProvider::kTaskPhaseTagged; })
+            return TaskProvider::kTaskPhaseTagged;
+        return false;
+    }();
+    constexpr bool kTaskPairedN = []() constexpr {
+        if constexpr (requires { TaskProvider::kTaskPairedN; })
+            return TaskProvider::kTaskPairedN;
+        return false;
+    }();
+    if constexpr (kTaskPhaseTagged) {
+        DG_DEVICE_ASSERT(phase_one_tensor_map_a != nullptr);
+        DG_DEVICE_ASSERT(phase_one_tensor_map_b != nullptr);
+        DG_DEVICE_ASSERT(phase_one_tensor_map_cd != nullptr);
+    }
+
     // Enlarge `BLOCK_K` for some cases
     // NOTES: this is for reducing the `umma_arrive()` overhead
     constexpr bool kDoMergeStages =
@@ -87,6 +169,28 @@ sm100_bf16_gemm_impl(int* grouped_layout,
     DG_STATIC_ASSERT(BLOCK_K % UMMA_K == 0, "Block K must be divisible by UMMA K");
     DG_STATIC_ASSERT(kKAlignment % UMMA_K == 0, "K alignment must be divisible by UMMA K");
     DG_STATIC_ASSERT(kNumMulticast == 1 or kNumMulticast == 2, "Only support 1/2 multicast");
+    DG_STATIC_ASSERT(TaskProvider::kTaskGemmType == kGemmType,
+                     "Task provider GEMM type does not match the body");
+    DG_STATIC_ASSERT(TaskProvider::kTaskBlockM == BLOCK_M and
+                     TaskProvider::kTaskBlockN == BLOCK_N,
+                     "Task provider tile shape does not match the body");
+    DG_STATIC_ASSERT(TaskProvider::kTaskNumMulticast == kNumMulticast and
+                     TaskProvider::kTaskIsMulticastOnA == kIsMulticastOnA,
+                     "Task provider cluster shape does not match the body");
+    DG_STATIC_ASSERT(TaskProvider::kTaskKAlignment == kKAlignment,
+                     "Task provider K alignment does not match the body");
+    DG_STATIC_ASSERT(TaskProvider::kTaskNumSMs == 0 or
+                     TaskProvider::kTaskNumSMs == kNumSMs,
+                     "Task provider SM geometry does not match the body");
+    DG_STATIC_ASSERT(
+        (TaskProvider::kTaskShapeM == 0 and
+         TaskProvider::kTaskShapeN == 0) or
+        (TaskProvider::kTaskShapeM == SHAPE_M and
+         TaskProvider::kTaskShapeN == SHAPE_N),
+        "Task provider static output shape does not match the body");
+    DG_STATIC_ASSERT(TaskProvider::kTaskPoolBlockRows == 0 or
+                     TaskProvider::kTaskPoolBlockRows % kKAlignment == 0,
+                     "Task provider K rows violate the body alignment");
     DG_STATIC_ASSERT((kSwapAB and BLOCK_N == LAYOUT_AD_M) or
                      (not kSwapAB and (BLOCK_M == 32 or BLOCK_M == 64 or BLOCK_M == LAYOUT_AD_M)), "Invalid block size");
 
@@ -118,9 +222,19 @@ sm100_bf16_gemm_impl(int* grouped_layout,
     constexpr uint32_t kNumAccumTmemCols = kNumEpilogueStages * UMMA_N;
     constexpr uint32_t kNumTmemCols = utils::get_num_aligned_tmem_cols<kNumAccumTmemCols>();
     DG_STATIC_ASSERT(32 <= kNumTmemCols and kNumTmemCols <= 512, "Invalid tensor memory columns");
+    DG_STATIC_ASSERT(
+        !kTaskPairedN ||
+            (!kSwapAB && !kTaskPhaseTagged &&
+             kMajorA == cute::UMMA::Major::MN &&
+             kMajorB == cute::UMMA::Major::MN &&
+             kNumMulticast == 2u && UMMA_N == 256u &&
+             kNumEpilogueStages == 2u && kNumTmemCols == 512u),
+        "Paired-N BF16 requires the K3 256x256 cluster output geometry");
 
-    // Synchronize the cluster before 2-CTA TMEM allocation
-    kNumMulticast > 1 ? comm::cluster_sync_with_relaxed_arrive() : void();
+    if constexpr (BatchResourceHooks::kInitializeBatchResources) {
+        // Synchronize the cluster before 2-CTA TMEM allocation
+        kNumMulticast > 1 ? comm::cluster_sync_with_relaxed_arrive() : void();
+    }
 
     // Utils
     bool is_leader_cta = cute::block_rank_in_cluster() == 0;
@@ -132,15 +246,17 @@ sm100_bf16_gemm_impl(int* grouped_layout,
         cute::prefetch_tma_descriptor(&tensor_map_a);
         cute::prefetch_tma_descriptor(&tensor_map_b);
         cute::prefetch_tma_descriptor(&tensor_map_cd);
+        if constexpr (kTaskPhaseTagged) {
+            cute::prefetch_tma_descriptor(phase_one_tensor_map_a);
+            cute::prefetch_tma_descriptor(phase_one_tensor_map_b);
+            cute::prefetch_tma_descriptor(phase_one_tensor_map_cd);
+        }
     }
 
     // Overwrite shape constants if the compiler gives
     shape_m = SHAPE_M != 0 ? SHAPE_M : shape_m;
     shape_n = SHAPE_N != 0 ? SHAPE_N : shape_n;
     shape_k = SHAPE_K != 0 ? SHAPE_K : shape_k;
-
-    // Align to 1024 bytes for swizzle-128B
-    extern __shared__ __align__(1024) uint8_t smem_buffer[];
 
     // D/A/B shared memory
     auto smem_cd = utils::PatternVisitor([&](const uint32_t& i) {
@@ -159,46 +275,60 @@ sm100_bf16_gemm_impl(int* grouped_layout,
     auto empty_barriers             = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumStages + i); });
     auto tmem_full_barriers         = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumStages * 2 + i); });
     auto tmem_empty_barriers        = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumStages * 2 + kNumEpilogueStages + i); });
+    // The historical BF16 layout reserves a third stage-indexed barrier
+    // array between the two TMEM arrays and tensor-core throttle barrier.
+    // Paired-N reuses it as the B-half release edge, so the specialization
+    // adds neither shared memory nor a launch-time allocation.
+    auto paired_b_empty_barriers    = utils::PatternVisitor([=](const uint32_t& i) {
+        return barrier_start_ptr +
+            (kNumStages * 2 + kNumEpilogueStages * 2 + i);
+    });
     auto tensor_core_full_barrier   = barrier_start_ptr + kNumStages * 3 + kNumEpilogueStages * 2;
 
     // Fill the tensor memory pointer
     auto tmem_ptr_in_smem = reinterpret_cast<uint32_t*>(barrier_start_ptr + kNumStages * 3 + kNumEpilogueStages * 2 + 1);
     DG_STATIC_ASSERT(32 <= kNumTmemCols and kNumTmemCols <= 512, "Invalid tensor memory columns");
 
-    // Initialize barriers
-    if (warp_idx == 1 and cute::elect_one_sync()) {
-        #pragma unroll
-        for (uint32_t i = 0; i < kNumStages; ++ i) {
-            // Arrive only at the leader CTA
-            full_barriers[i]->init(kNumMulticast);
-            // Arrive at all CTAs
-            empty_barriers[i]->init(1);
-        }
-        #pragma unroll
-        for (uint32_t i = 0; i < kNumEpilogueStages; ++ i) {
-            // Arrive at all CTAs
-            tmem_full_barriers[i]->init(1);
-            // Arrive only at the leader CTA
-            tmem_empty_barriers[i]->init(kNumMulticast * kNumUMMAStoreThreads);
-        }
-        if constexpr (kTensorCoreUtilControl < 100)
-            tensor_core_full_barrier->init(1);
+    if constexpr (BatchResourceHooks::kInitializeBatchResources) {
+        // Initialize barriers
+        if (warp_idx == 1 and cute::elect_one_sync()) {
+            #pragma unroll
+            for (uint32_t i = 0; i < kNumStages; ++ i) {
+                // Arrive only at the leader CTA
+                full_barriers[i]->init(kNumMulticast);
+                // Arrive at all CTAs
+                empty_barriers[i]->init(1);
+                if constexpr (kTaskPairedN)
+                    paired_b_empty_barriers[i]->init(1);
+            }
+            #pragma unroll
+            for (uint32_t i = 0; i < kNumEpilogueStages; ++ i) {
+                // Arrive at all CTAs
+                tmem_full_barriers[i]->init(1);
+                // Arrive only at the leader CTA
+                tmem_empty_barriers[i]->init(kNumMulticast * kNumUMMAStoreThreads);
+            }
+            if constexpr (kTensorCoreUtilControl < 100)
+                tensor_core_full_barrier->init(1);
 
-        // Make initialized barrier visible in async proxy
-        cutlass::arch::fence_barrier_init();
-    } else if (warp_idx == 2) {
-        // Allocate tensor memory
-        Allocator().allocate(kNumTmemCols, tmem_ptr_in_smem);
+            // Make initialized barrier visible in async proxy
+            cutlass::arch::fence_barrier_init();
+        } else if (warp_idx == 2) {
+            // Allocate tensor memory
+            Allocator().allocate(kNumTmemCols, tmem_ptr_in_smem);
+        }
+        kNumMulticast > 1 ? comm::cluster_sync_with_relaxed_arrive() : __syncthreads();
     }
-    kNumMulticast > 1 ? comm::cluster_sync_with_relaxed_arrive() : __syncthreads();
 
-    // Wait for primary kernel completion
-    cudaGridDependencySynchronize();
+    // Standalone launches may be programmatically dependent on a primary
+    // kernel. An in-kernel caller has already established operand readiness.
+    if (wait_for_primary_kernel)
+        cudaGridDependencySynchronize();
 
     // Block scheduler
     uint32_t m_block_idx, n_block_idx;
     // NOTES: BF16 has no SF, so `kSFKSpan` is unused here; pass `kKAlignment` explicitly to avoid relying on the default.
-    auto scheduler = sched::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumMulticast, kIsMulticastOnA, kNumSMs, kEnsureZeroPadding, kKAlignment, kKAlignment>(
+    auto scheduler = TaskProvider(
         shape_m, shape_n, shape_k, grouped_layout);
 
     // Pipeline and TMA phases
@@ -216,60 +346,193 @@ sm100_bf16_gemm_impl(int* grouped_layout,
         // TMA load warp
         // Persistently schedule over blocks
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+            const uint32_t current_wgrad_phase = [&]() {
+                if constexpr (kTaskPhaseTagged)
+                    return scheduler.current_wgrad_phase;
+                return 0u;
+            }();
+            const auto* const active_tensor_map_a =
+                current_wgrad_phase != 0u
+                ? phase_one_tensor_map_a : &tensor_map_a;
+            const auto* const active_tensor_map_b =
+                current_wgrad_phase != 0u
+                ? phase_one_tensor_map_b : &tensor_map_b;
             // Use dynamic load block M, when swap-AB is enabled
             const auto load_block_m = kSwapAB ? scheduler.get_aligned_effective_m_in_block(m_block_idx) / kNumMulticast : LOAD_BLOCK_M;
 
             // For k-grouped layout, the number of block K is variable
             const auto num_total_k_blocks = math::ceil_div(scheduler.current_shape_k, BLOCK_K);
-            for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
-                // Wait consumer release
-                empty_barriers[stage_idx]->wait(phase ^ 1);
+            constexpr bool kIsBatchedMM =
+                kGemmType == GemmType::Batched;
+            const uint32_t batch_idx = kIsBatchedMM
+                ? scheduler.current_group_idx : 0u;
+            DG_STATIC_ASSERT(
+                kGemmType == GemmType::Normal ||
+                is_k_grouped_contiguous(kGemmType) ||
+                kGemmType == GemmType::Batched ||
+                kMajorA == cute::UMMA::Major::K,
+                "Invalid major");
 
-                // Compute offsets
-                // NOTES: the group is always concatenated with the outer dimension
-                uint32_t m_idx = scheduler.template get_global_idx<(kGemmType == GemmType::MGroupedMasked), sched::IndexType::MN> (
-                    shape_m, BLOCK_M, m_block_idx);
-                uint32_t n_idx = scheduler.template get_global_idx<(kMajorB == cute::UMMA::Major::K), sched::IndexType::MN> (
-                    shape_n, BLOCK_N, n_block_idx, m_block_idx);
-
-                // NOTES: `k_idx` is actually the k index default for K-major, while `k_b_idx` may be MN-major
-                // And for all m-grouped GEMMs, A must be K-majored
-                DG_STATIC_ASSERT(kGemmType == GemmType::Normal or is_k_grouped_contiguous(kGemmType) or kGemmType == GemmType::Batched or
-                                 kMajorA == cute::UMMA::Major::K, "Invalid major");
-                uint32_t k_idx = k_block_idx * BLOCK_K;
-                uint32_t k_a_idx = scheduler.template get_global_idx<(kMajorA == cute::UMMA::Major::MN), sched::IndexType::K> (
-                    shape_k, BLOCK_K, k_block_idx, m_block_idx);
-                uint32_t k_b_idx = scheduler.template get_global_idx<(kMajorB == cute::UMMA::Major::MN), sched::IndexType::K> (
-                    shape_k, BLOCK_K, k_block_idx, m_block_idx);
-
-                // Add 2 CTA offsets
+            const auto issue_a_b0 = [&] (
+                    const uint32_t k_block_idx,
+                    const uint32_t target_stage,
+                    const uint32_t target_phase) {
+                empty_barriers[target_stage]->wait(target_phase ^ 1u);
+                uint32_t m_idx = scheduler.template get_global_idx<
+                    (kGemmType == GemmType::MGroupedMasked),
+                    sched::IndexType::MN>(
+                        shape_m, BLOCK_M, m_block_idx);
+                uint32_t n_idx = scheduler.template get_global_idx<
+                    (kMajorB == cute::UMMA::Major::K),
+                    sched::IndexType::MN>(
+                        shape_n, BLOCK_N, n_block_idx, m_block_idx);
+                const uint32_t k_a_idx = scheduler.template get_global_idx<
+                    (kMajorA == cute::UMMA::Major::MN),
+                    sched::IndexType::K>(
+                        shape_k, BLOCK_K, k_block_idx, m_block_idx);
+                const uint32_t k_b_idx = scheduler.template get_global_idx<
+                    (kMajorB == cute::UMMA::Major::MN),
+                    sched::IndexType::K>(
+                        shape_k, BLOCK_K, k_block_idx, m_block_idx);
                 if constexpr (kNumMulticast > 1) {
-                    m_idx += kIsMulticastOnA ? (cute::block_rank_in_cluster() * load_block_m) : 0;
-                    n_idx += kIsMulticastOnA ? 0 : (cute::block_rank_in_cluster() * LOAD_BLOCK_N);
+                    m_idx += kIsMulticastOnA
+                        ? cute::block_rank_in_cluster() * load_block_m : 0u;
+                    n_idx += kIsMulticastOnA
+                        ? 0u : cute::block_rank_in_cluster() * LOAD_BLOCK_N;
                 }
-
-                // Issue TMAs
-                constexpr bool kIsBatchedMM = (kGemmType == GemmType::Batched);
-                const uint32_t batch_idx = (kIsBatchedMM ? scheduler.current_group_idx : 0);
                 if constexpr (kMajorA == cute::UMMA::Major::K)
-                    tma::copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, cutlass::bfloat16_t, kIsBatchedMM>(
-                        &tensor_map_a, full_barriers[stage_idx], smem_a[stage_idx], k_a_idx, m_idx, kNumMulticast, batch_idx);
+                    tma::copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode,
+                              cutlass::bfloat16_t, kIsBatchedMM>(
+                        active_tensor_map_a, full_barriers[target_stage],
+                        smem_a[target_stage], k_a_idx, m_idx,
+                        kNumMulticast, batch_idx);
                 if constexpr (kMajorA == cute::UMMA::Major::MN)
-                    tma::copy<LOAD_BLOCK_M, BLOCK_K, kSwizzleAMode, cutlass::bfloat16_t, kIsBatchedMM>(
-                        &tensor_map_a, full_barriers[stage_idx], smem_a[stage_idx], m_idx, k_a_idx, kNumMulticast, batch_idx);
+                    tma::copy<LOAD_BLOCK_M, BLOCK_K, kSwizzleAMode,
+                              cutlass::bfloat16_t, kIsBatchedMM>(
+                        active_tensor_map_a, full_barriers[target_stage],
+                        smem_a[target_stage], m_idx, k_a_idx,
+                        kNumMulticast, batch_idx);
                 if constexpr (kMajorB == cute::UMMA::Major::K)
-                    tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, cutlass::bfloat16_t, kIsBatchedMM>(
-                        &tensor_map_b, full_barriers[stage_idx], smem_b[stage_idx], k_b_idx, n_idx, kNumMulticast, batch_idx);
+                    tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode,
+                              cutlass::bfloat16_t, kIsBatchedMM>(
+                        active_tensor_map_b, full_barriers[target_stage],
+                        smem_b[target_stage], k_b_idx, n_idx,
+                        kNumMulticast, batch_idx);
                 if constexpr (kMajorB == cute::UMMA::Major::MN)
-                    tma::copy<LOAD_BLOCK_N, BLOCK_K, kSwizzleBMode, cutlass::bfloat16_t, kIsBatchedMM>(
-                        &tensor_map_b, full_barriers[stage_idx], smem_b[stage_idx], n_idx, k_b_idx, kNumMulticast, batch_idx);
-
-                // Arrive at full barriers
-                constexpr uint32_t kNumArrivalBytes = SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE;
+                    tma::copy<LOAD_BLOCK_N, BLOCK_K, kSwizzleBMode,
+                              cutlass::bfloat16_t, kIsBatchedMM>(
+                        active_tensor_map_b, full_barriers[target_stage],
+                        smem_b[target_stage], n_idx, k_b_idx,
+                        kNumMulticast, batch_idx);
+                constexpr uint32_t kNumArrivalBytes =
+                    SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE;
                 if (is_leader_cta) {
-                    full_barriers[stage_idx]->arrive_and_expect_tx(kNumArrivalBytes * kNumMulticast);
+                    full_barriers[target_stage]->arrive_and_expect_tx(
+                        kNumArrivalBytes * kNumMulticast);
                 } else {
-                    full_barriers[stage_idx]->arrive(0u);
+                    full_barriers[target_stage]->arrive(0u);
+                }
+            };
+
+            const auto issue_b1 = [&] (
+                    const uint32_t k_block_idx,
+                    const uint32_t target_stage,
+                    const uint32_t target_phase) {
+                paired_b_empty_barriers[target_stage]->wait(
+                    target_phase);
+                uint32_t n_idx = scheduler.template get_global_idx<
+                    (kMajorB == cute::UMMA::Major::K),
+                    sched::IndexType::MN>(
+                        shape_n, BLOCK_N, n_block_idx, m_block_idx);
+                const uint32_t k_b_idx = scheduler.template get_global_idx<
+                    (kMajorB == cute::UMMA::Major::MN),
+                    sched::IndexType::K>(
+                        shape_k, BLOCK_K, k_block_idx, m_block_idx);
+                if constexpr (kNumMulticast > 1) {
+                    n_idx += kIsMulticastOnA
+                        ? 0u : cute::block_rank_in_cluster() * LOAD_BLOCK_N;
+                }
+                n_idx += BLOCK_N;
+                if constexpr (kMajorB == cute::UMMA::Major::K)
+                    tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode,
+                              cutlass::bfloat16_t, kIsBatchedMM>(
+                        active_tensor_map_b, full_barriers[target_stage],
+                        smem_b[target_stage], k_b_idx, n_idx,
+                        kNumMulticast, batch_idx);
+                if constexpr (kMajorB == cute::UMMA::Major::MN)
+                    tma::copy<LOAD_BLOCK_N, BLOCK_K, kSwizzleBMode,
+                              cutlass::bfloat16_t, kIsBatchedMM>(
+                        active_tensor_map_b, full_barriers[target_stage],
+                        smem_b[target_stage], n_idx, k_b_idx,
+                        kNumMulticast, batch_idx);
+                if (is_leader_cta) {
+                    full_barriers[target_stage]->arrive_and_expect_tx(
+                        SMEM_B_SIZE_PER_STAGE * kNumMulticast);
+                } else {
+                    full_barriers[target_stage]->arrive(0u);
+                }
+            };
+
+            if constexpr (kTaskPairedN) {
+                // Prime all distinct stages with A+B0.  Queue B1 for every
+                // resident stage before refilling any stage with the next
+                // A+B0 window.  Refilling immediately after B1(k) would wait
+                // for UMMA1(k), serializing the TMA producer before B1(k+1)
+                // through B1(k+5) can be queued.  The windowed order keeps A
+                // resident through UMMA1, retires B0 before replacing B, and
+                // preserves each output accumulator's exact K order.
+                const uint32_t task_start_stage = stage_idx;
+                const uint32_t task_start_phase = phase;
+                const auto stage_for = [=] (const uint32_t k_block_idx) {
+                    return (task_start_stage + k_block_idx) % kNumStages;
+                };
+                const auto phase_for = [=] (const uint32_t k_block_idx) {
+                    return task_start_phase ^
+                        (((task_start_stage + k_block_idx) / kNumStages) & 1u);
+                };
+                const uint32_t prefill = cute::min(
+                    num_total_k_blocks, kNumStages);
+                for (uint32_t k_block_idx = 0u;
+                     k_block_idx < prefill; ++k_block_idx) {
+                    issue_a_b0(
+                        k_block_idx, stage_for(k_block_idx),
+                        phase_for(k_block_idx));
+                }
+                for (uint32_t window_begin = 0u;
+                     window_begin < num_total_k_blocks;
+                     window_begin += kNumStages) {
+                    const uint32_t window_end = cute::min(
+                        window_begin + kNumStages,
+                        num_total_k_blocks);
+                    for (uint32_t k_block_idx = window_begin;
+                         k_block_idx < window_end; ++k_block_idx) {
+                        issue_b1(
+                            k_block_idx, stage_for(k_block_idx),
+                            phase_for(k_block_idx));
+                    }
+
+                    const uint32_t refill_begin =
+                        window_begin + kNumStages;
+                    const uint32_t refill_end = cute::min(
+                        refill_begin + kNumStages,
+                        num_total_k_blocks);
+                    for (uint32_t refill_k = refill_begin;
+                         refill_k < refill_end; ++refill_k) {
+                        issue_a_b0(
+                            refill_k, stage_for(refill_k),
+                            phase_for(refill_k));
+                    }
+                }
+                const uint32_t final_linear_stage =
+                    task_start_stage + num_total_k_blocks;
+                stage_idx = final_linear_stage % kNumStages;
+                phase = task_start_phase ^
+                    ((final_linear_stage / kNumStages) & 1u);
+            } else {
+                for (uint32_t k_block_idx = 0;
+                     k_block_idx < num_total_k_blocks;
+                     advance_pipeline(k_block_idx)) {
+                    issue_a_b0(k_block_idx, stage_idx, phase);
                 }
             }
         }
@@ -302,7 +565,17 @@ sm100_bf16_gemm_impl(int* grouped_layout,
             // Wait tensor memory empty barrier arrival
             auto accum_stage_idx = scheduler.current_iter % kNumEpilogueStages;
             auto accum_phase_idx = (scheduler.current_iter / kNumEpilogueStages) & 1;
-            tmem_empty_barriers[accum_stage_idx]->wait(accum_phase_idx ^ 1);
+            const uint32_t paired_task_phase =
+                static_cast<uint32_t>(scheduler.current_iter) & 1u;
+            if constexpr (kTaskPairedN) {
+                // The paired epilogue retires output zero before output one.
+                // Start UMMA0 as soon as its TMEM half is free; output one's
+                // independent wait is deferred to its first UMMA below.
+                tmem_empty_barriers[0]->wait(paired_task_phase ^ 1u);
+            } else {
+                tmem_empty_barriers[accum_stage_idx]->wait(
+                    accum_phase_idx ^ 1u);
+            }
             ptx::tcgen05_after_thread_sync();
 
             // UMMA and empty barrier arrival alias
@@ -314,12 +587,17 @@ sm100_bf16_gemm_impl(int* grouped_layout,
                     cutlass::arch::umma_arrive_multicast_2x1SM(barrier, kCTAMask);
                 }
             };
-            auto empty_barrier_arrive = [&](const bool& do_tmem_full_arrive) {
-                umma_arrive(reinterpret_cast<uint64_t*>(empty_barriers[stage_idx]));
+            auto output_barrier_arrive = [&] (
+                    Barrier* input_empty_barrier,
+                    const uint32_t output_idx,
+                    const bool do_tmem_full_arrive) {
+                umma_arrive(
+                    reinterpret_cast<uint64_t*>(input_empty_barrier));
 
                 // NOTES: the tensor memory accumulator pipeline has nothing to do with multicasting
                 if (do_tmem_full_arrive)
-                    umma_arrive(reinterpret_cast<uint64_t*>(tmem_full_barriers[accum_stage_idx]));
+                    umma_arrive(reinterpret_cast<uint64_t*>(
+                        tmem_full_barriers[output_idx]));
                 __syncwarp();
             };
 
@@ -332,62 +610,164 @@ sm100_bf16_gemm_impl(int* grouped_layout,
             // Launch MMAs
             const auto num_total_k_blocks = math::ceil_div(scheduler.current_shape_k, BLOCK_K);
             constexpr bool kMayHaveTailKBlock = is_k_grouped_contiguous(kGemmType) ? (kKAlignment % BLOCK_K != 0) : (SHAPE_K == 0 or SHAPE_K % BLOCK_K != 0);
-            for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
-                // Wait TMA arrival
-                full_barriers[stage_idx]->wait(phase);
-                ptx::tcgen05_after_thread_sync();
+            const auto issue_output_k_block = [&] (
+                    const uint32_t k_block_idx,
+                    const uint32_t target_stage,
+                    const uint32_t output_in_task) {
+                    // A paired stage has two consecutive full generations:
+                    // A+B0 is phase zero and B1 is phase one. Two generations
+                    // return the full barrier to phase zero before reuse.
+                    const uint32_t full_phase = kTaskPairedN
+                        ? output_in_task : phase;
+                    full_barriers[target_stage]->wait(full_phase);
+                    ptx::tcgen05_after_thread_sync();
 
-                // Issue UMMA in the leader CTA
-                using mma_t = cute::conditional_t<kNumMulticast == 1, ptx::SM100_MMA_F16BF16_SS, ptx::SM100_MMA_F16BF16_2x1SM_SS>;
-                const auto runtime_instr_desc = cute::UMMA::make_runtime_instr_desc(instr_desc);
-                const auto a_desc_base_lo = __shfl_sync(0xffffffff, a_desc_lo, static_cast<int>(stage_idx));
-                const auto b_desc_base_lo = __shfl_sync(0xffffffff, b_desc_lo, static_cast<int>(stage_idx));
-                if (cute::elect_one_sync()) {
-                    auto issue_umma = [&]<uint32_t kUMMAKIdx>() {
-                        constexpr uint32_t kAtomKIdx = kUMMAKIdx * UMMA_K / BLOCK_ATOM_K;
-                        constexpr uint32_t kInnerKIdx = kUMMAKIdx * UMMA_K % BLOCK_ATOM_K;
-                        a_desc.lo = mma::sm100::advance_umma_desc_lo<kMajorA, LOAD_BLOCK_M, kSwizzleAMode, cutlass::bfloat16_t>(
-                                        a_desc_base_lo, kAtomKIdx * LOAD_BLOCK_M * BLOCK_ATOM_K, kInnerKIdx);
-                        b_desc.lo = mma::sm100::advance_umma_desc_lo<kMajorB, LOAD_BLOCK_N, kSwizzleBMode, cutlass::bfloat16_t>(
-                                        b_desc_base_lo, kAtomKIdx * LOAD_BLOCK_N * BLOCK_ATOM_K, kInnerKIdx);
-                        if (kSwapAB) {
-                            mma_t::fma(b_desc, a_desc, accum_stage_idx * UMMA_N,
-                                       kUMMAKIdx > 0 or k_block_idx > 0, runtime_instr_desc);
-                        } else {
-                            mma_t::fma(a_desc, b_desc, accum_stage_idx * UMMA_N,
-                                       kUMMAKIdx > 0 or k_block_idx > 0, runtime_instr_desc);
-                        }
-                    };
-                    auto issue_full_k_block = [&]() {
-                        utils::for_each_static_until<BLOCK_K / UMMA_K>(std::make_integer_sequence<uint32_t, BLOCK_K / UMMA_K>(), issue_umma);
-                    };
-
-                    if constexpr (kMayHaveTailKBlock) {
-                        auto issue_tail_k_block = [&](const uint32_t& remaining_k) {
-                            const auto num_valid_umma_k = math::ceil_div(remaining_k, UMMA_K);
-                            // Prefix expansion uses switch only for small cases to avoid long SASS.
-                            utils::for_each_static_prefix(std::make_integer_sequence<uint32_t, BLOCK_K / UMMA_K>(), num_valid_umma_k, issue_umma);
+                    // The paired callback fires only after B1's TMA has
+                    // completed. Report both original output tiles so the
+                    // pre-existing feature retirement counters retain their
+                    // exact consumer cardinality.
+                    if (k_block_idx + 1u == num_total_k_blocks &&
+                        (!kTaskPairedN || output_in_task == 1u)) {
+                        const auto retire_output = [&] (
+                                const uint32_t retired_n_block) {
+                            if constexpr (requires {
+                                input_tile_retired(
+                                    scheduler.current_wgrad_phase,
+                                    scheduler.current_group_idx,
+                                    m_block_idx, retired_n_block);
+                            }) {
+                                input_tile_retired(
+                                    scheduler.current_wgrad_phase,
+                                    scheduler.current_group_idx,
+                                    m_block_idx, retired_n_block);
+                            } else if constexpr (requires {
+                                input_tile_retired(
+                                    scheduler.current_group_idx,
+                                    m_block_idx, retired_n_block);
+                            }) {
+                                input_tile_retired(
+                                    scheduler.current_group_idx,
+                                    m_block_idx, retired_n_block);
+                            }
                         };
-                        const auto is_last_k_block = k_block_idx == num_total_k_blocks - 1;
-                        if (is_last_k_block) {
-                            const auto remaining_k = scheduler.current_shape_k - k_block_idx * BLOCK_K;
-                            if (remaining_k < BLOCK_K)
-                                issue_tail_k_block(remaining_k);
-                            else
+                        if constexpr (requires {
+                            input_tile_retired(
+                                scheduler.current_group_idx,
+                                m_block_idx, n_block_idx);
+                        } || requires {
+                            input_tile_retired(
+                                scheduler.current_wgrad_phase,
+                                scheduler.current_group_idx,
+                                m_block_idx, n_block_idx);
+                        }) {
+                            retire_output(n_block_idx);
+                            if constexpr (kTaskPairedN)
+                                retire_output(n_block_idx + 1u);
+                        } else {
+                            input_tile_retired(scheduler.current_group_idx);
+                            if constexpr (kTaskPairedN)
+                                input_tile_retired(
+                                    scheduler.current_group_idx);
+                        }
+                    }
+
+                    // Each accumulator observes K0,K1,... in exactly the
+                    // historical order. A paired specialization may move the
+                    // independent output-one work later within a six-stage
+                    // window, but never changes either FP32 reduction order.
+                    using mma_t = cute::conditional_t<
+                        kNumMulticast == 1,
+                        ptx::SM100_MMA_F16BF16_SS,
+                        ptx::SM100_MMA_F16BF16_2x1SM_SS>;
+                    const auto runtime_instr_desc =
+                        cute::UMMA::make_runtime_instr_desc(instr_desc);
+                    const auto a_desc_base_lo = __shfl_sync(
+                        0xffffffff, a_desc_lo,
+                        static_cast<int>(target_stage));
+                    const auto b_desc_base_lo = __shfl_sync(
+                        0xffffffff, b_desc_lo,
+                        static_cast<int>(target_stage));
+                    const uint32_t output_tmem_idx = kTaskPairedN
+                        ? output_in_task : accum_stage_idx;
+                    if (cute::elect_one_sync()) {
+                        auto issue_umma = [&]<uint32_t kUMMAKIdx>() {
+                            constexpr uint32_t kAtomKIdx =
+                                kUMMAKIdx * UMMA_K / BLOCK_ATOM_K;
+                            constexpr uint32_t kInnerKIdx =
+                                kUMMAKIdx * UMMA_K % BLOCK_ATOM_K;
+                            a_desc.lo = mma::sm100::advance_umma_desc_lo<
+                                kMajorA, LOAD_BLOCK_M, kSwizzleAMode,
+                                cutlass::bfloat16_t>(
+                                    a_desc_base_lo,
+                                    kAtomKIdx * LOAD_BLOCK_M * BLOCK_ATOM_K,
+                                    kInnerKIdx);
+                            b_desc.lo = mma::sm100::advance_umma_desc_lo<
+                                kMajorB, LOAD_BLOCK_N, kSwizzleBMode,
+                                cutlass::bfloat16_t>(
+                                    b_desc_base_lo,
+                                    kAtomKIdx * LOAD_BLOCK_N * BLOCK_ATOM_K,
+                                    kInnerKIdx);
+                            if (kSwapAB) {
+                                mma_t::fma(
+                                    b_desc, a_desc,
+                                    output_tmem_idx * UMMA_N,
+                                    kUMMAKIdx > 0u || k_block_idx > 0u,
+                                    runtime_instr_desc);
+                            } else {
+                                mma_t::fma(
+                                    a_desc, b_desc,
+                                    output_tmem_idx * UMMA_N,
+                                    kUMMAKIdx > 0u || k_block_idx > 0u,
+                                    runtime_instr_desc);
+                            }
+                        };
+                        auto issue_full_k_block = [&]() {
+                            utils::for_each_static_until<
+                                BLOCK_K / UMMA_K>(
+                                    std::make_integer_sequence<
+                                        uint32_t, BLOCK_K / UMMA_K>(),
+                                    issue_umma);
+                        };
+
+                        if constexpr (kMayHaveTailKBlock) {
+                            auto issue_tail_k_block = [&] (
+                                    const uint32_t remaining_k) {
+                                const auto num_valid_umma_k =
+                                    math::ceil_div(remaining_k, UMMA_K);
+                                utils::for_each_static_prefix(
+                                    std::make_integer_sequence<
+                                        uint32_t, BLOCK_K / UMMA_K>(),
+                                    num_valid_umma_k, issue_umma);
+                            };
+                            const auto is_last_k_block =
+                                k_block_idx == num_total_k_blocks - 1u;
+                            if (is_last_k_block) {
+                                const auto remaining_k =
+                                    scheduler.current_shape_k -
+                                    k_block_idx * BLOCK_K;
+                                if (remaining_k < BLOCK_K)
+                                    issue_tail_k_block(remaining_k);
+                                else
+                                    issue_full_k_block();
+                            } else {
                                 issue_full_k_block();
+                            }
                         } else {
                             issue_full_k_block();
                         }
-                    } else {
-                        issue_full_k_block();
                     }
-                }
-                __syncwarp();
+                    __syncwarp();
 
-                // Commit to the mbarrier object
-                // No explicit `tcgen05.fence::before_thread_sync` is needed, as this is implicitly performed by `tcgen05.commit`
-                empty_barrier_arrive(k_block_idx == num_total_k_blocks - 1);
+                    Barrier* const input_empty_barrier =
+                        kTaskPairedN && output_in_task == 0u
+                        ? paired_b_empty_barriers[target_stage]
+                        : empty_barriers[target_stage];
+                    output_barrier_arrive(
+                        input_empty_barrier, output_tmem_idx,
+                        k_block_idx == num_total_k_blocks - 1u);
+            };
 
+            const auto throttle_tensor_cores = [&] () {
                 // Let tensor cores relax for lower possibility of frequency drop
                 DG_STATIC_ASSERT(kTensorCoreUtilControl > 0, "Invalid tensor utilization control");
                 if constexpr (kTensorCoreUtilControl < 100) {
@@ -407,14 +787,82 @@ sm100_bf16_gemm_impl(int* grouped_layout,
                         while (clock64() - start_clock < kNumDummyCycles) {}
                     __syncwarp();
                 }
+            };
+
+            if constexpr (kTaskPairedN) {
+                // Match the TMA producer's six-stage wavefront. Consuming all
+                // resident B0 tiles first lets it queue every B1 tile without
+                // waiting behind UMMA1(k), then consuming the B1 window lets
+                // the producer refill the next A+B0 window stage by stage.
+                // Both accumulators still see globally increasing K indices.
+                DG_STATIC_ASSERT(
+                    kTensorCoreUtilControl == 100,
+                    "Paired-N window-major issue requires unthrottled UMMA");
+                const uint32_t task_start_stage = stage_idx;
+                const uint32_t task_start_phase = phase;
+                const auto stage_for = [=] (const uint32_t k_block_idx) {
+                    return (task_start_stage + k_block_idx) % kNumStages;
+                };
+                for (uint32_t window_begin = 0u;
+                     window_begin < num_total_k_blocks;
+                     window_begin += kNumStages) {
+                    const uint32_t window_end = cute::min(
+                        window_begin + kNumStages,
+                        num_total_k_blocks);
+                    #pragma unroll
+                    for (uint32_t output_in_task = 0u;
+                         output_in_task < 2u;
+                         ++output_in_task) {
+                        if (output_in_task == 1u &&
+                            window_begin == 0u) {
+                            // Output zero may execute a complete resident
+                            // window while the preceding task drains TMEM1.
+                            // This wait remains before this task's first write
+                            // to the second accumulator half.
+                            tmem_empty_barriers[1]->wait(
+                                paired_task_phase ^ 1u);
+                            ptx::tcgen05_after_thread_sync();
+                        }
+                        for (uint32_t k_block_idx = window_begin;
+                             k_block_idx < window_end;
+                             ++k_block_idx) {
+                            issue_output_k_block(
+                                k_block_idx,
+                                stage_for(k_block_idx),
+                                output_in_task);
+                        }
+                    }
+                }
+                const uint32_t final_linear_stage =
+                    task_start_stage + num_total_k_blocks;
+                stage_idx = final_linear_stage % kNumStages;
+                phase = task_start_phase ^
+                    ((final_linear_stage / kNumStages) & 1u);
+            } else {
+                for (uint32_t k_block_idx = 0u;
+                     k_block_idx < num_total_k_blocks;
+                     advance_pipeline(k_block_idx)) {
+                    issue_output_k_block(
+                        k_block_idx, stage_idx, 0u);
+                    throttle_tensor_cores();
+                }
             }
         }
 
         // To safely deconstruct barriers, we need another round of waits
         const auto iter_idx = scheduler.current_iter - 1;
         if (kNumMulticast > 1 and iter_idx >= 0) {
-            const auto accum_phase_idx = (iter_idx / kNumEpilogueStages) & 1;
-            tmem_empty_barriers[iter_idx % kNumEpilogueStages]->wait(accum_phase_idx);
+            if constexpr (kTaskPairedN) {
+                const uint32_t paired_task_phase =
+                    static_cast<uint32_t>(iter_idx) & 1u;
+                tmem_empty_barriers[0]->wait(paired_task_phase);
+                tmem_empty_barriers[1]->wait(paired_task_phase);
+            } else {
+                const auto accum_phase_idx =
+                    (iter_idx / kNumEpilogueStages) & 1;
+                tmem_empty_barriers[
+                    iter_idx % kNumEpilogueStages]->wait(accum_phase_idx);
+            }
         }
     } else if (
         kFuseCombine and
@@ -437,6 +885,10 @@ sm100_bf16_gemm_impl(int* grouped_layout,
                 kNumCombineThreads == 64 or
                     kNumCombineThreads == 128,
                 "Fused combine requires two or four warps");
+            DG_STATIC_ASSERT(
+                !kPublishBeforeCombineReduce ||
+                    kCombineNumRanks > 1,
+                "Remote publication requires multiple ranks");
             constexpr uint32_t kCombineNamedBarrierIdx = 15;
             constexpr uint32_t kBeforeCombineReuseGridSyncIdx = 2;
             constexpr uint32_t kBeforeCombineReuseTag = 7;
@@ -474,35 +926,94 @@ sm100_bf16_gemm_impl(int* grouped_layout,
                     combine_workspace, combine_sym_buffer,
                     blockIdx.x, combine_thread_idx,
                     combine_sync,
-                    /* Kernel launch order publishes Kernel A locally. */ false,
-                    /* Kernel completion joins SM 0 after cross-rank sync. */ false);
+                    /* Inline callers need a device-wide publication edge;
+                       standalone launch order already provides one. */
+                    !wait_for_primary_kernel,
+                    /* Inline callers need the post-NVLink grid join before
+                       receive-plane reduction.  Keep that join on the idle
+                       combine warps so it remains hidden under W2 UMMA. */
+                    !wait_for_primary_kernel);
             } else {
                 // Kernel A has already written every remote top-k plane.
-                // W13's combine warps reduce those planes while the
-                // independent W13 tensor-core work runs.
+                // In an early-W2 schedule those stores become ready only
+                // after W13 dgrad. Publish them here on the otherwise-idle
+                // combine warps so NVLink synchronization overlaps W13
+                // wgrad UMMA, then reduce the received planes in place.
+                if constexpr (kPublishBeforeCombineReduce) {
+                    // A non-null readiness plane replaces the whole-grid
+                    // NVLink rendezvous with one system-scope release/acquire
+                    // edge per source token. W13 may then publish and
+                    // reduce completed token blocks while other clusters are
+                    // still executing UMMA/TMA work.
+                    if (combine_ready_counts == nullptr) {
+                        comm::nvlink_barrier<
+                            kCombineNumRanks, kNumSMs,
+                            kNumCombineThreads,
+                            kBeforeCombineReuseGridSyncIdx,
+                            kBeforeCombineReuseTag>(
+                                combine_workspace,
+                                combine_sym_buffer,
+                                blockIdx.x,
+                                combine_thread_idx,
+                                combine_sync,
+                                !wait_for_primary_kernel,
+                                !wait_for_primary_kernel);
+                    }
+                }
                 constexpr uint32_t kReduceValuesPerVec =
                     2 * kValuesPerVec;
-                const uint64_t num_output_vecs =
-                    static_cast<uint64_t>(
-                        combine_num_tokens) *
+                constexpr uint32_t kWarpSize = 32u;
+                constexpr uint32_t kNumCombineWarps =
+                    kNumCombineThreads / kWarpSize;
+                DG_STATIC_ASSERT(
+                    kNumCombineThreads % kWarpSize == 0,
+                    "Combine threads must form complete warps");
+                const uint32_t combine_warp_idx =
+                    combine_thread_idx / kWarpSize;
+                const uint32_t num_vecs_per_token =
                     combine_hidden / kReduceValuesPerVec;
-                for (uint64_t linear =
-                         static_cast<uint64_t>(blockIdx.x) *
-                             kNumCombineThreads +
-                         combine_thread_idx;
-                     linear < num_output_vecs;
-                     linear +=
-                         static_cast<uint64_t>(kNumSMs) *
-                         kNumCombineThreads) {
-                    const uint32_t num_vecs_per_token =
-                        combine_hidden /
-                        kReduceValuesPerVec;
-                    const uint32_t token_idx =
-                        linear / num_vecs_per_token;
-                    const uint32_t vec_idx =
-                        linear -
+                DG_DEVICE_ASSERT(
+                    combine_hidden % kReduceValuesPerVec == 0);
+
+                // Assign whole tokens to physical combine warps. The leader
+                // performs the sole system-scope readiness acquire, and the
+                // warp rendezvous carries that publication edge to lanes that
+                // subsequently read disjoint vectors from the symmetric
+                // planes. Besides eliminating 224 duplicate polls for K3, the
+                // token-major walk removes a 64-bit div/mod from every output
+                // vector without changing any top-k reduction order.
+                for (uint32_t token_idx =
+                         blockIdx.x * kNumCombineWarps +
+                         combine_warp_idx;
+                     token_idx < combine_num_tokens;
+                     token_idx += kNumSMs * kNumCombineWarps) {
+                    const uint32_t physical_token_idx =
+                        token_idx < combine_first_range_tokens
+                        ? token_idx
+                        : combine_second_range_begin +
+                              token_idx - combine_first_range_tokens;
+                    DG_DEVICE_ASSERT(
+                        physical_token_idx <
+                        combine_num_max_tokens);
+                    if constexpr (kPublishBeforeCombineReduce) {
+                        if (combine_ready_counts != nullptr) {
+                            const auto* ready =
+                                combine_ready_counts +
+                                physical_token_idx;
+                            if (lane_idx == 0u) {
+                                while (ptx::ld_acq_sys(ready) != 0)
+                                    __nanosleep(64);
+                            }
+                            __syncwarp();
+                        }
+                    }
+                    for (uint32_t vec_idx = lane_idx;
+                         vec_idx < num_vecs_per_token;
+                         vec_idx += kWarpSize) {
+                    const uint64_t linear =
                         static_cast<uint64_t>(token_idx) *
-                            num_vecs_per_token;
+                            num_vecs_per_token +
+                        vec_idx;
                     float values[kReduceValuesPerVec] = {
                         0.0f};
                     const auto accumulate_slot =
@@ -510,9 +1021,9 @@ sm100_bf16_gemm_impl(int* grouped_layout,
                             const uint32_t topk_idx) {
                             const uint64_t packed_idx =
                                 ((static_cast<uint64_t>(
-                                      topk_idx) *
+                                  topk_idx) *
                                   combine_num_max_tokens +
-                                  token_idx) *
+                                  physical_token_idx) *
                                      num_vecs_per_token +
                                  vec_idx) *
                                 2;
@@ -707,6 +1218,7 @@ sm100_bf16_gemm_impl(int* grouped_layout,
                         linear * 2;
                     output[0] = packed_output[0];
                     output[1] = packed_output[1];
+                    }
                 }
             }
         }
@@ -717,27 +1229,70 @@ sm100_bf16_gemm_impl(int* grouped_layout,
         // NOTES: tensor memory addresses are simplified, as the hardware will ignore the warp index bits,
         // i.e., no need for `tmem_ptr |= (epilogue_warp_idx * 32) << 16`.
         // NOTES: we also forbid two CTAs to share the same SM and its tensor memory
-        DG_TRAP_ONLY_DEVICE_ASSERT(ptx::ld_shared(tmem_ptr_in_smem) == 0);
+        const uint32_t allocated_tmem =
+            ptx::ld_shared(tmem_ptr_in_smem);
+        if (allocated_tmem != 0) {
+            if (lane_idx == 0) {
+                printf(
+                    "K3 wgrad TMEM allocation mismatch rank=%u sm=%u "
+                    "reduce=%u ptr=%u\n",
+                    combine_sym_buffer.rank_idx,
+                    blockIdx.x,
+                    static_cast<uint32_t>(combine_reduce),
+                    allocated_tmem);
+            }
+            asm volatile("trap;");
+        }
 
         // Share store pipeline between blocks
         uint32_t tma_stage_idx = 0;
 
         // Persistently schedule over blocks
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+            const uint32_t current_wgrad_phase = [&]() {
+                if constexpr (kTaskPhaseTagged)
+                    return scheduler.current_wgrad_phase;
+                return 0u;
+            }();
+            const auto* const active_tensor_map_cd =
+                current_wgrad_phase != 0u
+                ? phase_one_tensor_map_cd : &tensor_map_cd;
             auto accum_stage_idx = scheduler.current_iter % kNumEpilogueStages;
             auto accum_phase_idx = (scheduler.current_iter / kNumEpilogueStages) & 1;
-
-            // Wait UMMA arrival
-            tmem_full_barriers[accum_stage_idx]->wait(accum_phase_idx);
-            ptx::tcgen05_after_thread_sync();
-
-            // Load from tensor memory into registers, and write shared memory with STSM
-            const auto tmem_base_addr = accum_stage_idx * UMMA_N;
             const auto base_m_idx = scheduler.template get_global_idx<
                 (not is_m_grouped_contiguous(kGemmType)), sched::IndexType::MN>(shape_m, BLOCK_M, m_block_idx);
             const auto base_n_idx = n_block_idx * BLOCK_N;
 
-            if constexpr (kSwapAB) {
+            if constexpr (kTaskPairedN) {
+                const uint32_t paired_task_phase =
+                    static_cast<uint32_t>(scheduler.current_iter) & 1u;
+                #pragma unroll
+                for (uint32_t output_in_task = 0u;
+                     output_in_task < 2u; ++output_in_task) {
+                    tmem_full_barriers[output_in_task]->wait(
+                        paired_task_phase);
+                    ptx::tcgen05_after_thread_sync();
+                    epilogue::sm100_store_cd<
+                        BLOCK_M, BLOCK_N, STORE_BLOCK_M, STORE_BLOCK_N,
+                        kSwizzleCDMode, kNumTMAStoreStages,
+                        kNumUMMAStoreThreads, kGemmType,
+                        kWithAccumulation, cd_dtype_t,
+                        epilogue::transform::EpilogueIdentity>(
+                            smem_cd, tma_stage_idx,
+                            output_in_task * UMMA_N,
+                            base_m_idx,
+                            base_n_idx + output_in_task * BLOCK_N,
+                            scheduler.current_group_idx,
+                            epilogue_warp_idx, lane_idx,
+                            tmem_empty_barriers[output_in_task],
+                            *active_tensor_map_cd);
+                }
+            } else if constexpr (kSwapAB) {
+                // Load from tensor memory into registers, and write shared
+                // memory with STSM.
+                tmem_full_barriers[accum_stage_idx]->wait(accum_phase_idx);
+                ptx::tcgen05_after_thread_sync();
+                const auto tmem_base_addr = accum_stage_idx * UMMA_N;
                 const auto effective_m = scheduler.get_aligned_effective_m_in_block(m_block_idx);
                 epilogue::sm100_store_cd_swap_ab<BLOCK_M, BLOCK_N, STORE_BLOCK_M, STORE_BLOCK_N,
                     kSwizzleCDMode, kNumTMAStoreStages, kNumUMMAStoreThreads,
@@ -748,8 +1303,11 @@ sm100_bf16_gemm_impl(int* grouped_layout,
                  effective_m,
                  epilogue_warp_idx, lane_idx,
                  tmem_empty_barriers[accum_stage_idx],
-                 tensor_map_cd);
+                 *active_tensor_map_cd);
             } else {
+                tmem_full_barriers[accum_stage_idx]->wait(accum_phase_idx);
+                ptx::tcgen05_after_thread_sync();
+                const auto tmem_base_addr = accum_stage_idx * UMMA_N;
                 epilogue::sm100_store_cd<BLOCK_M, BLOCK_N, STORE_BLOCK_M, STORE_BLOCK_N,
                     kSwizzleCDMode, kNumTMAStoreStages, kNumUMMAStoreThreads,
                     kGemmType, kWithAccumulation,
@@ -758,17 +1316,79 @@ sm100_bf16_gemm_impl(int* grouped_layout,
                  base_m_idx, base_n_idx, scheduler.current_group_idx,
                  epilogue_warp_idx, lane_idx,
                  tmem_empty_barriers[accum_stage_idx],
-                 tensor_map_cd);
+                *active_tensor_map_cd);
             }
         }
+        // The store helper pipelines two output stages and may leave the
+        // final group outstanding after the scheduler is exhausted. An
+        // embedded caller immediately aliases this shared-memory region for
+        // another UMMA/TMA phase, so drain the issuing warp's stores before
+        // participating in the body-wide handoff.
+        if (epilogue_warp_idx == 0)
+            cute::tma_store_wait<0>();
+        __syncwarp();
+    } else {
+        // Embedded persistent kernels can have warps beyond this GEMM body's
+        // fixed producer/consumer roles.  Give those warps independent
+        // register/global-memory work while TMA and UMMA advance.  The body-wide
+        // synchronization below remains the local completion join.
+        background_work(warp_idx, lane_idx);
     }
 
     // TODO: Remove redundant synchronization
     kNumMulticast > 1 ? comm::cluster_sync_with_relaxed_arrive() : __syncthreads();
 
-    // Deallocate tensor memory
-    if (warp_idx == 0)
-        Allocator().free(0, kNumTmemCols);
+    if constexpr (BatchResourceHooks::kReleaseBatchResources) {
+        // Explicitly retire every transaction barrier before returning;
+        // reinitializing a still-valid mbarrier through an aliased layout is
+        // undefined on SM100. Embedded-release policies perform a post-cleanup
+        // join below. A custom release policy that disables that join requires
+        // an equivalent caller-side handoff before any warp aliases this region
+        // or begins another TMEM allocation.
+        if (warp_idx == 1 and cute::elect_one_sync()) {
+            #pragma unroll
+            for (uint32_t i = 0; i < kNumStages; ++i) {
+                Barrier::invalidate(
+                    reinterpret_cast<Barrier::ValueType const*>(
+                        full_barriers[i]));
+                Barrier::invalidate(
+                    reinterpret_cast<Barrier::ValueType const*>(
+                        empty_barriers[i]));
+                if constexpr (kTaskPairedN) {
+                    Barrier::invalidate(
+                        reinterpret_cast<Barrier::ValueType const*>(
+                            paired_b_empty_barriers[i]));
+                }
+            }
+            #pragma unroll
+            for (uint32_t i = 0; i < kNumEpilogueStages; ++i) {
+                Barrier::invalidate(
+                    reinterpret_cast<Barrier::ValueType const*>(
+                        tmem_full_barriers[i]));
+                Barrier::invalidate(
+                    reinterpret_cast<Barrier::ValueType const*>(
+                        tmem_empty_barriers[i]));
+            }
+            if constexpr (kTensorCoreUtilControl < 100) {
+                Barrier::invalidate(
+                    reinterpret_cast<Barrier::ValueType const*>(
+                        tensor_core_full_barrier));
+            }
+        }
+
+        // Deallocate tensor memory
+        if (warp_idx == 0)
+            Allocator().free(0, kNumTmemCols);
+
+        if constexpr (BatchResourceHooks::kSynchronizeAfterRelease) {
+            // Embedded callers may reuse shared memory or begin another TMEM
+            // allocation as soon as this function returns. Join after both
+            // owner warps have completed invalidation/deallocation so no other
+            // warp can race ahead into the next phase.
+            kNumMulticast > 1 ?
+                comm::cluster_sync_with_relaxed_arrive() : __syncthreads();
+        }
+    }
 
 #else
     if (blockIdx.x == 0 and threadIdx.x == 0)
@@ -776,6 +1396,76 @@ sm100_bf16_gemm_impl(int* grouped_layout,
 #endif
 }
 
+template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
+          uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
+          uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K_,
+          uint32_t kNumGroups,
+          uint32_t kSwizzleAMode, uint32_t kSwizzleBMode,
+          uint32_t kSwizzleCDMode, uint32_t kNumStages_,
+          uint32_t kNumNonEpilogueThreads, uint32_t kNumEpilogueThreads,
+          uint32_t kNumMulticast, bool kIsMulticastOnA,
+          uint32_t kNumSMs, uint32_t kKAlignment,
+          bool kSwapAB, bool kEnsureZeroPadding,
+          GemmType kGemmType, bool kWithAccumulation, typename cd_dtype_t,
+          uint64_t kTensorCoreUtilControl,
+          uint32_t kCombineNumRanks, bool kFuseCombine,
+          CombineOrderMode kCombineOrderMode,
+          uint32_t kNumExtraCombineThreads>
+CUTLASS_GLOBAL void __launch_bounds__(
+    kNumNonEpilogueThreads + kNumEpilogueThreads +
+        kNumExtraCombineThreads,
+    1)
+sm100_bf16_gemm_impl(int* grouped_layout,
+                     uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
+                     const __grid_constant__ cute::TmaDescriptor tensor_map_a,
+                     const __grid_constant__ cute::TmaDescriptor tensor_map_b,
+                     const __grid_constant__ cute::TmaDescriptor tensor_map_cd,
+                     const __grid_constant__ layout::SymBuffer<kCombineNumRanks> combine_sym_buffer,
+                     const __grid_constant__ layout::Workspace combine_workspace,
+                     cutlass::bfloat16_t* grad_x_output,
+                     cutlass::bfloat16_t* combine_buffer,
+                     const int64_t* combine_topk_ids,
+                     uint32_t combine_num_tokens,
+                     uint32_t combine_num_max_tokens,
+                     uint32_t combine_num_topk,
+                     uint32_t combine_hidden,
+                     bool combine_reduce) {
+    extern __shared__ __align__(1024) uint8_t smem_buffer[];
+    sm100_bf16_gemm_body<
+        kMajorA, kMajorB,
+        SHAPE_M, SHAPE_N, SHAPE_K,
+        BLOCK_M, BLOCK_N, BLOCK_K_,
+        kNumGroups,
+        kSwizzleAMode, kSwizzleBMode, kSwizzleCDMode,
+        kNumStages_,
+        kNumNonEpilogueThreads, kNumEpilogueThreads,
+        kNumMulticast, kIsMulticastOnA,
+        kNumSMs, kKAlignment,
+        kSwapAB, kEnsureZeroPadding,
+        kGemmType, kWithAccumulation, cd_dtype_t,
+        kTensorCoreUtilControl,
+        kCombineNumRanks, kFuseCombine,
+        kCombineOrderMode, kNumExtraCombineThreads>(
+            grouped_layout,
+            shape_m, shape_n, shape_k,
+            tensor_map_a, tensor_map_b, tensor_map_cd,
+            combine_sym_buffer, combine_workspace,
+            grad_x_output, combine_buffer, combine_topk_ids,
+            nullptr,
+            combine_num_tokens,
+            combine_num_tokens, combine_num_tokens,
+            combine_num_max_tokens,
+            combine_num_topk, combine_hidden, combine_reduce,
+            smem_buffer, true,
+            [] (uint32_t) {},
+            [] (uint32_t, uint32_t) {});
+}
+
 };  // namespace deep_gemm
+
+#ifdef DG_BF16_GEMM_BODY_ATTRIBUTE_DEFINED_HERE
+#undef DG_BF16_GEMM_BODY_ATTRIBUTE_DEFINED_HERE
+#undef DG_BF16_GEMM_BODY_ATTRIBUTE
+#endif
 
 #pragma clang diagnostic pop

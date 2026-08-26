@@ -282,4 +282,19 @@ struct Buffer {
     }
 };
 
+/** Return the next MegaMoE buffer address satisfying an explicit byte ABI.
+ *
+ * MegaMoE represents layouts both with real device pointers and with
+ * nullptr-relative byte offsets while sizing the symmetric allocation.  Do
+ * the alignment in the integer address domain so those two representations
+ * produce identical padding.  In particular, the fixed-top-k combine arena
+ * is also the K3 backward ring's TMA base and therefore requires 128-byte
+ * alignment on every rank.
+ */
+CUTLASS_HOST_DEVICE
+void* align_buffer_base(void* base, uint64_t alignment) {
+    return reinterpret_cast<void*>(math::align<uint64_t>(
+        reinterpret_cast<uint64_t>(base), alignment));
+}
+
 } // namespace deep_gemm::layout

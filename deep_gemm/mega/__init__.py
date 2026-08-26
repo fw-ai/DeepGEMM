@@ -37,7 +37,7 @@ class SymmBuffer:
                  num_ring_tokens: int,
                  mma_type: str = 'fp8xfp4',
                  activation: str = 'swiglu'):
-        assert activation in ('swiglu', 'geglu'), f'Unsupported activation: `{activation}`'
+        assert activation in ('swiglu', 'geglu', 'situ'), f'Unsupported activation: `{activation}`'
         self.group = group
         self.num_experts = num_experts
         self.num_max_tokens_per_rank = num_max_tokens_per_rank
@@ -181,7 +181,7 @@ def transform_weights_for_mega_moe(
 ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
              Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]:
     # Gate/up interleaving is independent of the gated-activation variant
-    assert activation in ('swiglu', 'geglu'), f'Unsupported activation: `{activation}`'
+    assert activation in ('swiglu', 'geglu', 'situ'), f'Unsupported activation: `{activation}`'
     if isinstance(l1_weights, tuple):
         # FP8: interleave gate/up for weight and SF, then transpose L1 SF for UTCCP
         l1_w = _interleave_weights(l1_weights[0])
@@ -206,10 +206,13 @@ def fp8_fp4_mega_moe(
     activation: str = "swiglu",
     activation_clamp: Optional[float] = None,
     fast_math: bool = True,
+    situ_beta: Optional[float] = None,
+    situ_linear_beta: Optional[float] = None,
     saved_l1_preact: Optional[torch.Tensor] = None,
     route_weight_mode: RouteWeightMode = RouteWeightMode.PRE_DOWN,
     saved_down_unweighted: Optional[torch.Tensor] = None,
     num_config_tokens: Optional[int] = None,
+    l2_activation_group_size: int = 32,
 ):
     """Run MXFP8/FP4 MegaMoE with an explicit route-weight boundary.
 
@@ -218,6 +221,10 @@ def fp8_fp4_mega_moe(
     score at the remote combine write.
     """
     route_weight_mode = RouteWeightMode(route_weight_mode)
+    if l2_activation_group_size not in (32, 128):
+        raise ValueError(
+            "l2_activation_group_size must be 32 or 128, got "
+            f"{l2_activation_group_size}")
     has_explicit_config_tokens = num_config_tokens is not None
     if num_config_tokens is None:
         num_config_tokens = y.size(0)
@@ -249,12 +256,14 @@ def fp8_fp4_mega_moe(
         sym_buffer.num_topk,
         recipe,
         activation, activation_clamp,
+        situ_beta, situ_linear_beta,
         fast_math,
         sym_buffer.num_ring_tokens,
         saved_l1_preact,
         route_weight_mode.value,
         saved_down_unweighted,
         num_config_tokens,
+        l2_activation_group_size,
     )
 
 def bf16_mega_moe(y: torch.Tensor,

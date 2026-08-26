@@ -46,7 +46,7 @@ public:
     struct Args {
         int mn, sf_k;
         int num_psum_groups, m_alignment;
-        bool use_psum_layout;
+        bool use_psum_layout, sf_column_major;
         int block_mn;
         void *sf, *out, *grouped_layout;
 
@@ -61,11 +61,12 @@ using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&transpose_and_pack_fp32_into_ue8m0<
-        {}, {}, {}, {}, {}
+        {}, {}, {}, {}, {}, {}
     >);
 }};
 )", args.launch_args.num_threads, args.block_mn, args.sf_k,
-    args.num_psum_groups, args.use_psum_layout ? "true" : "false");
+    args.num_psum_groups, args.use_psum_layout ? "true" : "false",
+    args.sf_column_major ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -185,10 +186,15 @@ static torch::Tensor get_mn_major_tma_aligned_packed_ue8m0_tensor(const torch::T
                                           {packed_sf_k * tma_aligned_mn, 1, tma_aligned_mn},
                                           at::TensorOptions().device(batched_sf.device()).dtype(torch::kInt));
 
-    // PSUM layout (always 2D contiguous) lets the pack kernel skip uninitialized MN gap rows
+    // PSUM layout lets the pack kernel skip uninitialized MN gap rows. Expanded
+    // DeepEP may supply its 2D SF matrix in an already TMA-aligned column-major
+    // layout, which the pack kernel consumes directly without an intermediate copy.
     const auto use_psum_layout = psum_layout.has_value();
+    const auto sf_is_contiguous = batched_sf.is_contiguous();
+    const auto sf_is_column_major = num_sf_batches == 1 and
+        batched_sf.stride(1) == 1 and batched_sf.stride(2) == tma_aligned_mn;
     if (use_psum_layout) {
-        DG_HOST_ASSERT(num_sf_batches == 1 and batched_sf.is_contiguous());
+        DG_HOST_ASSERT(num_sf_batches == 1 and (sf_is_contiguous or sf_is_column_major));
         DG_HOST_ASSERT(psum_layout->scalar_type() == torch::kInt and psum_layout->is_contiguous());
         DG_HOST_ASSERT(psum_layout->numel() > 0);
     }
@@ -196,7 +202,7 @@ static torch::Tensor get_mn_major_tma_aligned_packed_ue8m0_tensor(const torch::T
     const auto num_psum_groups = use_psum_layout ? static_cast<int>(psum_layout->numel()) : 1;
 
     // Launch the kernel
-    if (batched_sf.is_contiguous()) {
+    if (sf_is_contiguous or (use_psum_layout and sf_is_column_major)) {
         if ((mn * sf_k) % 4 != 0 and num_sf_batches > 1)
             return get_mn_major_tma_aligned_packed_ue8m0_tensor_torch(sf);
 
@@ -210,6 +216,7 @@ static torch::Tensor get_mn_major_tma_aligned_packed_ue8m0_tensor(const torch::T
             .num_psum_groups = num_psum_groups,
             .m_alignment = m_alignment,
             .use_psum_layout = use_psum_layout,
+            .sf_column_major = not sf_is_contiguous,
             .block_mn = block_mn,
             .sf = batched_sf.data_ptr(),
             .out = out.data_ptr(),

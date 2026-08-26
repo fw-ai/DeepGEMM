@@ -54,6 +54,9 @@ enum class ActivationType {
     SwiGLU = 0,
     // tanh-approximated GELU(gate) * up
     GeGLU  = 1,
+    // beta * tanh(gate / beta) * sigmoid(gate) *
+    // linear_beta * tanh(up / linear_beta)
+    SiTU   = 2,
 };
 
 enum class RouteWeightMode {
