@@ -440,12 +440,21 @@ public:
             !args.accumulate_wgrad &&
             args.situ_beta == 4.0f &&
             args.situ_linear_beta == 25.0f;
+        // The terminal branch-major body begins only after W13 has retired,
+        // so reserving an initial consumer suffix cannot overlap dW2 there;
+        // it only removes W13 producer clusters.  Retain the reservation for
+        // the genuinely progressive scheduler and give the terminal schedule
+        // the complete persistent grid.
+        const uint32_t ready_wgrad_initial_clusters =
+            args.branch_major_bf16_wgrad_tail ? 0u : 8u;
         const std::string ready_wgrad_defines =
             enable_k3_ready_wgrad &&
                 !enable_k3_mxfp8_two_range_exact
-            ? "#define DG_EXPERIMENTAL_K3_READY_WGRAD 1\n"
-              "#define DG_EXPERIMENTAL_K3_READY_WGRAD_INITIAL_CLUSTERS 8\n"
-              "#define DG_EXPERIMENTAL_K3_READY_WGRAD_BATCH_TASKS 32\n"
+            ? fmt::format(
+                  "#define DG_EXPERIMENTAL_K3_READY_WGRAD 1\n"
+                  "#define DG_EXPERIMENTAL_K3_READY_WGRAD_INITIAL_CLUSTERS {}\n"
+                  "#define DG_EXPERIMENTAL_K3_READY_WGRAD_BATCH_TASKS 32\n",
+                  ready_wgrad_initial_clusters)
             : "";
         const std::string mxfp8_three_term_wgrad_define =
             args.mxfp8_three_term_wgrad &&
