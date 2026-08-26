@@ -2314,6 +2314,7 @@ struct ExternalKGroupedTerminalTwoSegmentDynamicRangeProvider {
         kPoolPrefixWord, kActiveExpertWord,
         kPoolPrefixWord, kPoolPrefixWord, false,
         kPairAdjacentN>;
+    using FirstSegmentDecoder = typename Decoder::FirstSegmentDecoder;
 
     // Two TMA roles, the leader-CTA MMA role, and four epilogue roles in
     // each CTA consume each published batch.
@@ -2453,6 +2454,72 @@ struct ExternalKGroupedTerminalTwoSegmentDynamicRangeProvider {
         return !terminal;
     }
 
+    /** Decode a later task in the current expert-local claim.
+     *
+     * The first task in every claim acquires the immutable active-expert and
+     * two physical-prefix records. Claims cannot cross experts, so the
+     * remaining tasks need only recompute output-tile coordinates. Reusing the
+     * provider's existing K metadata removes three redundant global prefix
+     * reads per four-task BF16 phase quantum without changing task order.
+     */
+    CUTLASS_DEVICE ExternalKGroupedTwoSegmentRangeDecodedTask
+    decode_cached_batch_task(
+            const uint32_t logical_task,
+            const uint32_t cluster_rank) const {
+        const uint32_t task_in_group =
+            logical_task % kTasksPerExpert;
+        const uint32_t cta_task =
+            task_in_group * kNumMulticast + cluster_rank;
+        const uint32_t swizzle_group_idx =
+            cta_task /
+            FirstSegmentDecoder::kNumBlocksPerSwizzleGroup;
+        const uint32_t first_block_idx =
+            swizzle_group_idx * kNum1DBlocksPerGroup;
+        const uint32_t in_group_idx =
+            cta_task %
+            FirstSegmentDecoder::kNumBlocksPerSwizzleGroup;
+        const uint32_t remaining_primary_blocks =
+            FirstSegmentDecoder::kPrimaryNumBlocks - first_block_idx;
+        const uint32_t num_blocks_in_swizzle_group =
+            remaining_primary_blocks < kNum1DBlocksPerGroup
+                ? remaining_primary_blocks
+                : kNum1DBlocksPerGroup;
+
+        uint32_t m_block_idx;
+        uint32_t n_block_idx;
+        if constexpr (kIsMulticastOnA) {
+            m_block_idx =
+                in_group_idx / num_blocks_in_swizzle_group;
+            n_block_idx = first_block_idx +
+                in_group_idx % num_blocks_in_swizzle_group;
+        } else {
+            m_block_idx = first_block_idx +
+                in_group_idx % num_blocks_in_swizzle_group;
+            n_block_idx =
+                in_group_idx / num_blocks_in_swizzle_group;
+        }
+
+        const uint32_t second_segment_shape_k =
+            current_shape_k - current_first_segment_shape_k;
+        return {
+            {
+                current_group_idx,
+                m_block_idx,
+                n_block_idx * (kPairAdjacentN ? 2u : 1u),
+                current_shape_k,
+                current_k_cumsum,
+                0u,
+                num_blocks_in_swizzle_group,
+            },
+            current_first_segment_shape_k,
+            second_segment_shape_k,
+            current_first_segment_shape_k / kSFKSpan,
+            second_segment_shape_k / kSFKSpan,
+            current_second_segment_k_cumsum,
+            0u,
+        };
+    }
+
     CUTLASS_DEVICE bool get_next_block(
             uint32_t& m_block_idx, uint32_t& n_block_idx) {
         ++current_iter;
@@ -2463,9 +2530,12 @@ struct ExternalKGroupedTerminalTwoSegmentDynamicRangeProvider {
 
         const uint32_t cluster_rank =
             static_cast<uint32_t>(blockIdx.x) % kNumMulticast;
-        const auto decoded = Decoder::decode_range_task(
-            first_segment_state_words, second_segment_state_words,
-            batch_first, batch_offset++, cluster_rank);
+        const uint32_t logical_task = batch_first + batch_offset;
+        const auto decoded = batch_offset++ == 0u
+            ? Decoder::decode_range_task(
+                  first_segment_state_words, second_segment_state_words,
+                  batch_first, 0u, cluster_rank)
+            : decode_cached_batch_task(logical_task, cluster_rank);
         const auto& task = decoded.output_task;
         current_group_idx = task.group_idx;
         current_shape_k = task.shape_k;
