@@ -54,6 +54,17 @@ enum class ActivationType {
     SwiGLU = 0,
     // tanh-approximated GELU(gate) * up
     GeGLU  = 1,
+    // beta * tanh(gate / beta) * sigmoid(gate) * linear_beta * tanh(up / linear_beta)
+    SiTU   = 2,
+};
+
+// LoRA work is compile-time specialized so the baseline kernel does not carry
+// payload pointers, descriptors, or sidecar state.
+enum class MegaMoELoraMode {
+    Disabled = 0,
+    PayloadOnly = 1,
+    FC1 = 2,
+    FC1Down = 3,
 };
 
 } // namespace deep_gemm

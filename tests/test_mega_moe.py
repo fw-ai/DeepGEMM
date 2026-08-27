@@ -85,6 +85,12 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     hidden, intermediate_hidden = args.hidden, args.intermediate_hidden
     num_experts, num_topk = args.num_experts, args.num_topk
     num_experts_per_rank = num_experts // num_ranks
+    use_lora_payload = args.lora_mode != 'disabled'
+    num_lora_slots = (
+        num_tokens + 1 if args.lora_mode == 'payload_only'
+        else args.num_lora_slots
+        if args.lora_mode in ('fc1', 'fc1_down')
+        else 0)
     assert num_tokens <= num_max_tokens_per_rank
 
     # Allocate symmetric memory
@@ -93,7 +99,10 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
         mma_type=args.mma_type,
-        activation=args.activation
+        activation=args.activation,
+        lora_rank=128 if use_lora_payload else 0,
+        num_lora_slots=num_lora_slots,
+        enable_lora_down=args.lora_mode == 'fc1_down'
     )
 
     # Cast weights into FP4
@@ -111,6 +120,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     def create_inputs():
         global x, topk_idx, topk_weights, l1_weights, l2_weights, transformed_l1_weights, transformed_l2_weights
         global l1_weights_bf16, l2_weights_bf16
+        global lora_gate_up_acts, lora_adapter_slots, lora_gate_b, lora_up_b
+        global lora_down_a, lora_scaling
         global cumulative_local_expert_recv_stats_fused
         global cumulative_local_expert_recv_stats_baseline
         x = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
@@ -122,9 +133,46 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         l1_weights_bf16, l2_weights_bf16 = l1_weights, l2_weights
         scores = torch.randn((num_tokens, num_experts), dtype=torch.float, device='cuda')
         topk_weights, topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=False)
+        if args.expert_pattern == 'single_expert':
+            topk_idx.zero_()
         cumulative_local_expert_recv_stats_fused = torch.randint(
             0, 100, (num_experts_per_rank, ), dtype=torch.int, device='cuda')
         cumulative_local_expert_recv_stats_baseline = cumulative_local_expert_recv_stats_fused.clone()
+        if use_lora_payload:
+            lora_gate_up_acts = torch.randn(
+                (num_tokens, 2, 128), dtype=torch.bfloat16, device='cuda')
+            if args.lora_mode == 'payload_only':
+                # Unique IDs make the expert-major dispatch permutation directly
+                # observable; the final token exercises the reserved sentinel slot.
+                lora_adapter_slots = torch.arange(num_tokens, dtype=torch.int32, device='cuda')
+                if num_tokens:
+                    lora_adapter_slots[-1] = buffer.lora_sentinel_slot
+            else:
+                # Deterministically mix every active slot and the sentinel
+                # across source tokens; routing then distributes those rows
+                # independently into expert-major ring blocks.
+                if args.lora_slot_pattern == 'all_active':
+                    lora_adapter_slots = torch.zeros(
+                        num_tokens, dtype=torch.int32, device='cuda')
+                else:
+                    lora_adapter_slots = (
+                        torch.arange(
+                            num_tokens, dtype=torch.int32, device='cuda') *
+                        7) % num_lora_slots
+                lora_gate_b = torch.zeros(
+                    (num_lora_slots, num_experts_per_rank,
+                     intermediate_hidden, 128),
+                    dtype=torch.bfloat16, device='cuda')
+                lora_up_b = torch.zeros_like(lora_gate_b)
+                lora_gate_b[:-1].normal_(std=0.05)
+                lora_up_b[:-1].normal_(std=0.05)
+                if args.lora_mode == 'fc1_down':
+                    lora_down_a = torch.zeros(
+                        (num_lora_slots, num_experts_per_rank,
+                         128, intermediate_hidden),
+                        dtype=torch.bfloat16, device='cuda')
+                    lora_down_a[:-1].normal_(std=0.05)
+                    lora_scaling = 0.25
         if args.masked_ratio > 0:
             rand_mask = torch.rand_like(topk_idx, dtype=torch.float)
             topk_idx.masked_fill_(rand_mask < args.masked_ratio, -1)
@@ -142,7 +190,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     # Run fused mega MoE
     # NOTES: copy x into buffer before each call because debug mode zeros the entire buffer
-    def run_fused():
+    def run_fused(lora_mode=None, scaling=None):
         if is_bf16xbf16:
             buffer.x[:num_tokens].copy_(x)
         else:
@@ -150,6 +198,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             buffer.x_sf[:num_tokens].copy_(x[1])
         buffer.topk_idx[:num_tokens].copy_(topk_idx)
         buffer.topk_weights[:num_tokens].copy_(topk_weights)
+        if use_lora_payload:
+            buffer.set_lora_payload(lora_gate_up_acts, lora_adapter_slots)
 
         y = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
         kernel_kwargs = dict(
@@ -159,24 +209,118 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             activation=args.activation,
             activation_clamp=args.activation_clamp,
             fast_math=bool(args.fast_math))
+        if not is_bf16xbf16:
+            kernel_kwargs['lora_mode'] = args.lora_mode if lora_mode is None else lora_mode
+            if kernel_kwargs['lora_mode'] in ('fc1', 'fc1_down'):
+                kernel_kwargs['lora_gate_b'] = lora_gate_b
+                kernel_kwargs['lora_up_b'] = lora_up_b
+            if kernel_kwargs['lora_mode'] == 'fc1_down':
+                kernel_kwargs['lora_down_a'] = lora_down_a
+                kernel_kwargs['lora_scaling'] = (
+                    lora_scaling if scaling is None else scaling)
         (deep_gemm.bf16_mega_moe if is_bf16xbf16 else deep_gemm.fp8_fp4_mega_moe)(**kernel_kwargs)
         return y, cumulative_local_expert_recv_stats_fused
 
-    # Self-contained PyTorch reference (single-rank only: routing/combine is local)
+    def assert_fc1_subgroup_layout():
+        """Check device prefixes and physical expert/adapter ring ordering."""
+        assert args.lora_mode in ('fc1', 'fc1_down')
+        gathered_topk_idx = uneven_all_gather(topk_idx, group=group)
+        gathered_slots = uneven_all_gather(lora_adapter_slots, group=group)
+        routed_slots = gathered_slots[:, None].expand(-1, num_topk)
+        if not hasattr(buffer, 'lora_subgroup_offsets'):
+            raise AssertionError(
+                f'missing subgroup view on {type(buffer)}: '
+                f'{sorted(buffer.__dict__)}')
+        subgroup_offsets = buffer.lora_subgroup_offsets.cpu()
+
+        expected_tokens_per_expert = (
+            num_tokens * num_ranks * num_topk / num_experts)
+        if expected_tokens_per_expert <= 8.5:
+            block_m = 16
+        elif expected_tokens_per_expert <= 16.5:
+            block_m = 32
+        elif expected_tokens_per_expert <= 32.5:
+            block_m = 64
+        elif expected_tokens_per_expert <= 64.5:
+            block_m = 96
+        elif expected_tokens_per_expert <= 96.5:
+            block_m = 128
+        else:
+            block_m = 192
+
+        pool_block_offset = 0
+        for local_expert_idx in range(num_experts_per_rank):
+            global_expert_idx = rank_idx * num_experts_per_rank + local_expert_idx
+            slots = routed_slots[gathered_topk_idx == global_expert_idx]
+            slots = slots.clamp(0, buffer.lora_sentinel_slot)
+            counts = torch.bincount(
+                slots.long(), minlength=num_lora_slots).cpu()
+            expected_offsets = torch.cat((
+                torch.zeros(1, dtype=torch.long, device='cpu'),
+                counts.cumsum(0)))
+            assert torch.equal(
+                subgroup_offsets[local_expert_idx].long(),
+                expected_offsets), (
+                    f'subgroup offsets mismatch for local expert '
+                    f'{local_expert_idx}')
+
+            num_rows = int(expected_offsets[-1])
+            if num_rows:
+                ring_row = (
+                    pool_block_offset * block_m +
+                    torch.arange(num_rows, device='cuda')
+                ) % buffer.num_ring_tokens
+                actual_slots = buffer.dispatched_lora_adapter_slots[ring_row]
+                expected_slots = torch.repeat_interleave(
+                    torch.arange(
+                        num_lora_slots, dtype=torch.int32, device='cuda'),
+                    counts.to(device='cuda'))
+                assert torch.equal(actual_slots, expected_slots), (
+                    f'non-contiguous adapter rows for local expert '
+                    f'{local_expert_idx}')
+            pool_block_offset += (num_rows + block_m - 1) // block_m
+
+    # Self-contained PyTorch reference.  Gather expert-owned parameters across
+    # ranks while keeping source-token activations local, matching routed
+    # execution followed by the return-to-source combine.
     # Mirrors the fused pipeline: L1 GEMM -> gated activation (* topk weight) ->
     # per-32 UE8M0 FP8 requantization -> L2 GEMM -> top-k combine (plain sum).
     def run_reference():
-        assert num_ranks == 1, 'Reference only supports a single rank'
+        def gather_expert_tensor(tensor):
+            gathered = [torch.empty_like(tensor) for _ in range(num_ranks)]
+            dist.all_gather(gathered, tensor, group=group)
+            return torch.cat(gathered, dim=0)
+
+        def gather_lora_tensor(tensor):
+            gathered = [torch.empty_like(tensor) for _ in range(num_ranks)]
+            dist.all_gather(gathered, tensor, group=group)
+            # [rank, slot, local_expert, ...] ->
+            # [slot, global_expert, ...]
+            ranked = torch.stack(gathered, dim=0)
+            trailing_dims = tuple(ranked.shape[3:])
+            return ranked.permute(
+                1, 0, 2, *range(3, ranked.dim())
+            ).reshape(num_lora_slots, num_experts, *trailing_dims)
+
         clamp = float(args.activation_clamp)
         x_deq = _dequant_x_fp8(x[0][:num_tokens], x[1][:num_tokens])
-        l1_w = _dequant_weight_fp4(l1_weights_bf16)
-        l2_w = _dequant_weight_fp4(l2_weights_bf16)
+        l1_w = _dequant_weight_fp4(
+            gather_expert_tensor(l1_weights_bf16))
+        l2_w = _dequant_weight_fp4(
+            gather_expert_tensor(l2_weights_bf16))
+        if args.lora_mode in ('fc1', 'fc1_down'):
+            global_lora_gate_b = gather_lora_tensor(lora_gate_b)
+            global_lora_up_b = gather_lora_tensor(lora_up_b)
+        if args.lora_mode == 'fc1_down':
+            global_lora_down_a = gather_lora_tensor(lora_down_a)
 
         y = torch.zeros((num_tokens, hidden), dtype=torch.float32, device='cuda')
+        rank_y = torch.zeros(
+            (num_tokens, 128), dtype=torch.float32, device='cuda')
         for slot in range(num_topk):
             expert_idx = topk_idx[:num_tokens, slot]
             weight = topk_weights[:num_tokens, slot].float()
-            for e in range(num_experts_per_rank):
+            for e in range(num_experts):
                 mask = expert_idx == e
                 if not bool(mask.any()):
                     continue
@@ -184,8 +328,22 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
                 # L1 GEMM then split into gate/up (first/second half of the output)
                 acc1 = xt @ l1_w[e].t()
-                gate = acc1[:, :intermediate_hidden].to(torch.bfloat16)
-                up = acc1[:, intermediate_hidden:].to(torch.bfloat16)
+                gate = acc1[:, :intermediate_hidden]
+                up = acc1[:, intermediate_hidden:]
+                if args.lora_mode in ('fc1', 'fc1_down'):
+                    adapter_slots = lora_adapter_slots[mask].long()
+                    gate_delta = torch.einsum(
+                        'tr,tir->ti',
+                        lora_gate_up_acts[mask, 0].float(),
+                        global_lora_gate_b[adapter_slots, e].float())
+                    up_delta = torch.einsum(
+                        'tr,tir->ti',
+                        lora_gate_up_acts[mask, 1].float(),
+                        global_lora_up_b[adapter_slots, e].float())
+                    gate = gate + gate_delta
+                    up = up + up_delta
+                gate = gate.to(torch.bfloat16)
+                up = up.to(torch.bfloat16)
                 if clamp != float('inf'):
                     gate = torch.clamp(gate, max=clamp)
                     up = torch.clamp(up, min=-clamp, max=clamp)
@@ -202,7 +360,15 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
                 # L2 GEMM, accumulate across the top-k experts
                 y[mask] += act_deq @ l2_w[e].t()
-        return y.to(torch.bfloat16)
+                if args.lora_mode == 'fc1_down':
+                    adapter_slots = lora_adapter_slots[mask].long()
+                    rank_y[mask] += torch.einsum(
+                        'ti,tri->tr',
+                        act_deq,
+                        global_lora_down_a[adapter_slots, e].float())
+        if args.lora_mode == 'fc1_down':
+            rank_y *= lora_scaling
+        return y.to(torch.bfloat16), rank_y.to(torch.bfloat16)
 
     dist_print('Config:', once_in_node=True)
     dist_print(f' > MMA: {args.mma_type}', once_in_node=True)
@@ -210,6 +376,10 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     dist_print(f' > Hidden: {hidden}', once_in_node=True)
     dist_print(f' > Intermediate: {intermediate_hidden}', once_in_node=True)
     dist_print(f' > Experts: {num_topk}/{num_experts}', once_in_node=True)
+    if args.lora_mode in ('fc1', 'fc1_down'):
+        dist_print(
+            f' > LoRA slots: {num_lora_slots - 1} active + sentinel',
+            once_in_node=True)
     dist_print(f' > Buffer: {buffer.buffer.nbytes / 2 ** 30:.3f} GiB', once_in_node=True)
     dist_print(once_in_node=True)
 
@@ -298,6 +468,115 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     use_numerical_reference = num_ranks == 1 and not is_bf16xbf16
     ran_correctness = False
 
+    if use_lora_payload and num_correctness_tests > 0:
+        assert not is_bf16xbf16, 'LoRA payload transport is only supported by fp8xfp4'
+        if args.lora_mode == 'payload_only':
+            dist_print('Running LoRA payload-only transport test:', once_in_node=True)
+            create_inputs()
+            baseline_y, _ = run_fused(lora_mode='disabled')
+            payload_y, _ = run_fused(lora_mode='payload_only')
+            assert torch.equal(payload_y, baseline_y), 'payload-only mode changed MegaMoE output'
+
+            # A single rank/expert/top-k has one contiguous expert-major segment.
+            # Sort by the unique transported slots to undo dispatch's atomic order.
+            if num_ranks == num_experts == num_topk == 1:
+                dispatched_slots = buffer.dispatched_lora_adapter_slots[:num_tokens]
+                dispatched_acts = buffer.dispatched_lora_gate_up_acts[:num_tokens]
+                dispatched_order = torch.argsort(dispatched_slots)
+                source_order = torch.argsort(lora_adapter_slots)
+                assert torch.equal(dispatched_slots[dispatched_order], lora_adapter_slots[source_order])
+                assert torch.equal(dispatched_acts[dispatched_order], lora_gate_up_acts[source_order])
+            dist_print(' > Payload transport and exact no-add output passed', once_in_node=True)
+            dist_print(once_in_node=True)
+        elif args.lora_mode == 'fc1':
+            dist_print('Running FC1 zero-delta exactness test:', once_in_node=True)
+            create_inputs()
+            baseline_y, _ = run_fused(lora_mode='disabled')
+            lora_gate_b.zero_()
+            lora_up_b.zero_()
+            zero_delta_y, _ = run_fused(lora_mode='fc1')
+            assert torch.equal(zero_delta_y, baseline_y), 'zero FC1-B changed MegaMoE output'
+
+            create_inputs()
+            baseline_y, _ = run_fused(lora_mode='disabled')
+            mixed_y, _ = run_fused(lora_mode='fc1')
+            assert not torch.equal(
+                mixed_y, baseline_y), 'mixed active adapters produced no output delta'
+            assert_fc1_subgroup_layout()
+            lora_adapter_slots.fill_(buffer.lora_sentinel_slot)
+            sentinel_y, _ = run_fused(lora_mode='fc1')
+            assert torch.equal(
+                sentinel_y, baseline_y), 'all-sentinel FC1 payload changed output'
+            assert_fc1_subgroup_layout()
+            dist_print(
+                ' > Zero-B and all-sentinel paths preserved exact output; '
+                'mixed active slots changed output; subgroup layout passed',
+                once_in_node=True)
+            dist_print(once_in_node=True)
+        else:
+            dist_print(
+                'Running FC1 + down-A rank-sideband tests:',
+                once_in_node=True)
+            create_inputs()
+            fc1_y, _ = run_fused(lora_mode='fc1')
+
+            lora_down_a.zero_()
+            zero_down_y, _ = run_fused(lora_mode='fc1_down')
+            zero_rank = buffer.combined_lora_rank_acts[:num_tokens].clone()
+            zero_base_diff = calc_diff(zero_down_y, fc1_y)
+            assert zero_base_diff < 1e-3, (
+                    'zero down-A changed the FC1/base MegaMoE output: '
+                    f'diff={zero_base_diff:.5f}, '
+                    f'max_abs={(zero_down_y.float() - fc1_y.float()).abs().max().item():.5f}, '
+                    f'count={torch.count_nonzero(zero_down_y != fc1_y).item()}')
+            assert torch.count_nonzero(zero_rank).item() == 0, (
+                'zero down-A produced a nonzero combined rank')
+
+            create_inputs()
+            fc1_y, _ = run_fused(lora_mode='fc1')
+            down_y, _ = run_fused(lora_mode='fc1_down')
+            actual_rank = buffer.combined_lora_rank_acts[:num_tokens].clone()
+            ref_y, ref_rank = run_reference()
+            down_base_diff = calc_diff(down_y, fc1_y)
+            assert down_base_diff < 1e-3, (
+                    'down-A sideband changed the base FC1 output: '
+                    f'diff={down_base_diff:.5f}')
+            rank_diff = calc_diff(actual_rank, ref_rank)
+            assert rank_diff < 5e-3, (
+                f'down rank intermediate mismatch: diff={rank_diff:.5f}, '
+                f'max_abs={(actual_rank.float() - ref_rank.float()).abs().max().item():.5f}')
+            assert_fc1_subgroup_layout()
+
+            half_y, _ = run_fused(
+                lora_mode='fc1_down', scaling=lora_scaling * 0.5)
+            half_rank = buffer.combined_lora_rank_acts[:num_tokens].clone()
+            half_base_diff = calc_diff(half_y, fc1_y)
+            assert half_base_diff < 1e-3, (
+                'scaled down sideband changed the base FC1 output: '
+                f'diff={half_base_diff:.5f}')
+            half_scale_diff = calc_diff(
+                half_rank, actual_rank * 0.5)
+            assert half_scale_diff < 5e-3, (
+                'LoRA scaling was not applied exactly once: '
+                f'diff={half_scale_diff:.5f}')
+
+            lora_adapter_slots.fill_(buffer.lora_sentinel_slot)
+            sentinel_y, _ = run_fused(lora_mode='fc1_down')
+            sentinel_rank = buffer.combined_lora_rank_acts[:num_tokens]
+            baseline_y, _ = run_fused(lora_mode='disabled')
+            assert torch.equal(
+                sentinel_y, baseline_y), (
+                    'all-sentinel FC1+down payload changed base output')
+            assert torch.count_nonzero(sentinel_rank).item() == 0, (
+                'all-sentinel routes produced a nonzero combined rank')
+            assert_fc1_subgroup_layout()
+            dist_print(
+                ' > Zero-A/sentinel exactness, mixed adapters, subgroup '
+                f'boundaries, rank oracle (diff {rank_diff:.5f}), and '
+                'single scaling passed',
+                once_in_node=True)
+            dist_print(once_in_node=True)
+
     # noinspection PyBroadException
     if use_legacy_baseline and num_correctness_tests > 0:
         dist_print('Running correctness tests (bitwise vs legacy baseline):', once_in_node=True)
@@ -317,7 +596,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         for i in range(num_correctness_tests):
             create_inputs()
             fused_y, _ = run_fused()
-            ref_y = run_reference()
+            ref_y, _ = run_reference()
             diff = calc_diff(fused_y, ref_y)
             assert diff < max_diff, f'{args.activation} diff too large: {diff:.5f} >= {max_diff}'
             if (i + 1) % 100 == 0 or i == num_correctness_tests - 1:
@@ -334,11 +613,71 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                       (gathered_topk_idx >= (rank_idx + 1) * num_experts_per_rank)] = -1
     num_recv_tokens = (gathered_topk_idx != -1).sum().item()
 
-    # Benchmark
+    # Benchmark before inspecting the dispatched payload so the physical ring
+    # contains the current route/slot assignment.
     t_fused = bench_kineto(
         run_fused, 'mega_moe',
         barrier=lambda: ep_buffer.barrier(use_comm_stream=False) if ep_buffer else dist.barrier(),
         trace_path=None if not args.dump_profile_traces else f'{args.dump_profile_traces}/mega_moe_rank{rank_idx}.json')
+    if args.lora_mode in ('fc1', 'fc1_down'):
+        expected_tokens_per_expert = (
+            num_tokens * num_ranks * num_topk / num_experts)
+        if expected_tokens_per_expert <= 8.5:
+            lora_block_m = 16
+        elif expected_tokens_per_expert <= 16.5:
+            lora_block_m = 32
+        elif expected_tokens_per_expert <= 32.5:
+            lora_block_m = 64
+        elif expected_tokens_per_expert <= 64.5:
+            lora_block_m = 96
+        elif expected_tokens_per_expert <= 96.5:
+            lora_block_m = 128
+        else:
+            lora_block_m = 192
+
+        local_expert_idx = (
+            gathered_topk_idx[gathered_topk_idx >= 0] -
+            rank_idx * num_experts_per_rank)
+        local_counts = torch.bincount(
+            local_expert_idx, minlength=num_experts_per_rank).cpu().tolist()
+        masked_mma_rows = compact_mma_rows = routed_mma_rows = 0
+        useful_mma_rows = 0
+        pool_block_offset = 0
+        num_ring_blocks = buffer.num_ring_tokens // lora_block_m
+        for expert_count in local_counts:
+            for block_start in range(0, expert_count, lora_block_m):
+                valid = min(lora_block_m, expert_count - block_start)
+                ring_block = (
+                    pool_block_offset + block_start // lora_block_m
+                ) % num_ring_blocks
+                slots = buffer.dispatched_lora_adapter_slots[
+                    ring_block * lora_block_m:
+                    ring_block * lora_block_m + valid]
+                active = slots[slots < buffer.lora_sentinel_slot]
+                distinct = torch.unique(active)
+                # The replaced masked implementation always ran slot zero to
+                # initialize its full-M TMEM delta tile.
+                masked_slots = (
+                    int(distinct.numel()) +
+                    int(not bool((distinct == 0).any())))
+                masked_mma_rows += masked_slots * lora_block_m
+                for slot in distinct.tolist():
+                    slot_rows = (slots == slot).nonzero().flatten()
+                    count = int(slot_rows.numel())
+                    compact_mma_rows += ((count + 15) // 16) * 16
+                    segment_start = int(slot_rows[0])
+                    routed_mma_rows += (
+                        (segment_start % 16 + count + 15) // 16) * 16
+                    useful_mma_rows += count
+            pool_block_offset += (
+                (expert_count + lora_block_m - 1) // lora_block_m)
+        dist_print(
+            f' > LoRA MMA M rows/N-tile: masked={masked_mma_rows}, '
+            f'compact={compact_mma_rows}, routed={routed_mma_rows}, '
+            f'useful={useful_mma_rows}, '
+            f'routed_padding={routed_mma_rows - useful_mma_rows}',
+            once_in_node=False)
+
     t_baseline = tilelang_bench(run_baseline, _n_warmup=5, _n_repeat=1, backend='cudagraph', return_mode='median') / 1e3 if is_legacy_loaded else 0
 
     # TFLOPS: 3 matmuls (L1 left, L1 right, L2), each 2 * M * N * K
@@ -405,12 +744,29 @@ if __name__ == '__main__':
     parser.add_argument('--masked-ratio', type=float, default=0.0, help='Mask some expert selections')
     parser.add_argument('--fast-math', type=int, default=1, help='Enable fast math (0 or 1, default: 1)')
     parser.add_argument('--mma-type', type=str, default='fp8xfp4', help='MMA type: fp8xfp4 or bf16xbf16')
+    parser.add_argument('--lora-mode', type=str, default='disabled',
+                        choices=['disabled', 'payload_only', 'fc1', 'fc1_down'],
+                        help='Optional rank-128 MegaMoE LoRA transport mode')
+    parser.add_argument('--num-lora-slots', type=int, default=2,
+                        help='FC1 LoRA slots including the final sentinel (2..32)')
+    parser.add_argument('--lora-slot-pattern', type=str, default='round_robin',
+                        choices=['round_robin', 'all_active'],
+                        help='FC1 adapter-slot test pattern')
+    parser.add_argument('--expert-pattern', type=str, default='random',
+                        choices=['random', 'single_expert'],
+                        help='Expert route pattern for dispatch stress tests')
 
     # Test settings
     parser.add_argument('--num-correctness-tests', type=int, default=None, help='Pressure test')
     parser.add_argument('--dump-profile-traces', type=str, default='', help='Dump profiling trace JSONs')
     parser.add_argument('--local-rank-idx', type=int, default=None, help='Run as single process with this local rank (e.g. for NCU prof)')
     args = parser.parse_args()
+    if (args.lora_mode in ('fc1', 'fc1_down') and
+            not 2 <= args.num_lora_slots <= 32):
+        parser.error(
+            '--num-lora-slots must be in [2, 32] for fc1/fc1_down mode')
+    if args.expert_pattern == 'single_expert' and args.num_topk != 1:
+        parser.error('--expert-pattern single_expert requires --num-topk 1')
 
     # Create dump trace directories
     if args.dump_profile_traces:

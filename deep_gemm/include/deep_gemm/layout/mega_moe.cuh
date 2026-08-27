@@ -1,9 +1,13 @@
 #pragma once
 
+#include <cstdint>
+#include <cuda_bf16.h>
+#include <cute/arch/copy_sm90_desc.hpp>
 #include <cute/numeric/math.hpp>
 
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/exception.cuh>
+#include <deep_gemm/common/types.cuh>
 
 namespace deep_gemm::layout {
 
@@ -221,6 +225,200 @@ struct Data {
     CUTLASS_HOST_DEVICE void set_base_ptr(void* ptr) {
         base = ptr;
     }
+};
+
+// Optional per-source-token LoRA payload transported by MegaMoE dispatch.
+//
+// Keep these buffers as a suffix of the normal MegaMoE allocation.  That
+// invariant lets a buffer provisioned for LoRA still run the compile-time
+// no-LoRA kernel: every pre-existing workspace/ring offset remains unchanged.
+struct MegaMoELoraPayload {
+    uint32_t rank;
+
+    CUTLASS_HOST_DEVICE
+    constexpr explicit MegaMoELoraPayload(const uint32_t& rank): rank(rank) {}
+
+    CUTLASS_HOST_DEVICE
+    constexpr bool enabled() const {
+        return rank != 0;
+    }
+
+    // Two BF16 shrink results, in gate/up order, for each source token.
+    CUTLASS_HOST_DEVICE
+    constexpr Data get_gate_up_acts_layout() const {
+        return Data(enabled() ? 2 * rank * sizeof(nv_bfloat16) : 0);
+    }
+
+    // Adapter pool slot.  The final pool slot is reserved as the zero sentinel.
+    CUTLASS_HOST_DEVICE
+    constexpr Data get_adapter_slot_layout() const {
+        return Data(enabled() ? sizeof(int32_t) : 0, false);
+    }
+};
+
+// Rank-128 down-projection sideband.  Both the per-route transport buffer and
+// the source-local combined output use this row layout.  Callers append those
+// buffers after `MegaMoELoraSubgroups`, so every pre-existing LoRA address is
+// stable when the down sidecar is disabled.
+struct MegaMoEDownLoraSideband {
+    uint32_t rank;
+
+    CUTLASS_HOST_DEVICE
+    constexpr explicit MegaMoEDownLoraSideband(const uint32_t& rank):
+        rank(rank) {}
+
+    CUTLASS_HOST_DEVICE
+    constexpr Data get_rank_acts_layout() const {
+        return Data(rank * sizeof(nv_bfloat16));
+    }
+};
+
+// Fixed-address symmetric metadata used to dispatch FC1 LoRA rows in
+// (local expert, adapter slot) order.  This is appended after all baseline and
+// payload buffers, so Disabled and PayloadOnly retain their original layouts.
+struct MegaMoELoraSubgroups {
+    void* base;
+    uint32_t num_ranks;
+    uint32_t num_experts;
+    uint32_t num_experts_per_rank;
+    uint32_t num_slots;
+
+    CUTLASS_HOST_DEVICE
+    constexpr MegaMoELoraSubgroups(
+        void* base,
+        const uint32_t& num_ranks,
+        const uint32_t& num_experts,
+        const uint32_t& num_slots):
+        base(base),
+        num_ranks(num_ranks),
+        num_experts(num_experts),
+        num_experts_per_rank(num_experts / num_ranks),
+        num_slots(num_slots) {}
+
+    CUTLASS_HOST_DEVICE
+    constexpr bool enabled() const {
+        return num_slots != 0;
+    }
+
+    CUTLASS_HOST_DEVICE
+    uint64_t get_num_bytes() const {
+        if (not enabled())
+            return 0;
+
+        uint64_t num_bytes = 0;
+        // Per-source-rank count and write cursor.  Low 32 bits are the count;
+        // high 32 bits are reused as the device-side write cursor.
+        num_bytes +=
+            static_cast<uint64_t>(num_experts) * num_slots * sizeof(uint64_t);
+        // Counts received from every source rank.
+        num_bytes +=
+            static_cast<uint64_t>(num_experts_per_rank) * num_ranks *
+            num_slots * sizeof(uint32_t);
+        // Exclusive subgroup offsets within each expert.  The final entry is
+        // the expert's total row count.
+        num_bytes +=
+            static_cast<uint64_t>(num_experts_per_rank) *
+            (num_slots + 1) * sizeof(uint32_t);
+        return math::align<uint64_t>(num_bytes, 16);
+    }
+
+    CUTLASS_HOST_DEVICE
+    void* get_end_ptr() const {
+        return math::advance_ptr(base, get_num_bytes());
+    }
+
+    CUTLASS_DEVICE
+    uint64_t* get_send_count_ptr(
+        const uint32_t& expert_idx = 0,
+        const uint32_t& slot_idx = 0) const {
+        return static_cast<uint64_t*>(base) +
+            expert_idx * num_slots + slot_idx;
+    }
+
+    CUTLASS_DEVICE
+    uint32_t* get_recv_count_ptr(
+        const uint32_t& source_rank_idx = 0,
+        const uint32_t& local_expert_idx = 0,
+        const uint32_t& slot_idx = 0) const {
+        const auto recv_base = reinterpret_cast<uint32_t*>(
+            get_send_count_ptr(num_experts));
+        return recv_base +
+            (local_expert_idx * num_ranks + source_rank_idx) * num_slots +
+            slot_idx;
+    }
+
+    CUTLASS_HOST_DEVICE
+    uint32_t* get_offset_ptr(
+        const uint32_t& local_expert_idx = 0,
+        const uint32_t& slot_idx = 0) const {
+        const auto offset_base = reinterpret_cast<uint32_t*>(
+            math::advance_ptr(
+                base,
+                static_cast<uint64_t>(num_experts) * num_slots *
+                sizeof(uint64_t) +
+                static_cast<uint64_t>(num_experts_per_rank) * num_ranks *
+                num_slots * sizeof(uint32_t)));
+        return offset_base +
+            local_expert_idx * (num_slots + 1) + slot_idx;
+    }
+};
+
+// Ring generation counters for routed rank payload arrival.  This is a LoRA
+// suffix so the baseline workspace layout and counters remain unchanged.
+struct MegaMoELoraReadiness {
+    void* base;
+    uint32_t num_ring_blocks;
+
+    CUTLASS_HOST_DEVICE
+    constexpr MegaMoELoraReadiness(
+        void* base,
+        const uint32_t& num_ring_blocks):
+        base(base), num_ring_blocks(num_ring_blocks) {}
+
+    CUTLASS_HOST_DEVICE
+    uint64_t get_num_bytes() const {
+        return math::align<uint64_t>(
+            static_cast<uint64_t>(num_ring_blocks) * sizeof(uint32_t), 16);
+    }
+
+    CUTLASS_HOST_DEVICE
+    void* get_end_ptr() const {
+        return math::advance_ptr(base, get_num_bytes());
+    }
+
+    CUTLASS_DEVICE
+    uint32_t* get_full_count_ptr(
+        const uint32_t& ring_block_idx = 0) const {
+        return static_cast<uint32_t*>(base) + ring_block_idx;
+    }
+};
+
+// Kernel launch payload is empty for disabled/payload-only specializations.
+// FC1 descriptors are grouped into one typed argument so their lifetime and
+// register impact are compile-time absent from those specializations.
+template <MegaMoELoraMode kMode>
+struct MegaMoELoraTensorMaps {};
+
+struct alignas(64) TmaDescriptorStorage {
+    uint8_t bytes[128];
+};
+
+template <>
+struct MegaMoELoraTensorMaps<MegaMoELoraMode::FC1> {
+    TmaDescriptorStorage gate_a;
+    TmaDescriptorStorage up_a;
+    TmaDescriptorStorage gate_b;
+    TmaDescriptorStorage up_b;
+};
+
+template <>
+struct MegaMoELoraTensorMaps<MegaMoELoraMode::FC1Down> {
+    TmaDescriptorStorage gate_a;
+    TmaDescriptorStorage up_a;
+    TmaDescriptorStorage gate_b;
+    TmaDescriptorStorage up_b;
+    TmaDescriptorStorage down_a;
+    float scaling;
 };
 
 struct Buffer {

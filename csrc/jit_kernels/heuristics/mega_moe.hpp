@@ -191,7 +191,9 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     const int& num_bytes_per_pull, const int& store_block_m,
     const int& sf_block_m, const int& sf_block_n, const int& gran_k,
     const int& num_dispatch_warps, const int& num_epilogue_warps,
-    const MmaKind& mma_kind) {
+    const MmaKind& mma_kind,
+    const bool& enable_fc1_lora,
+    const bool& enable_down_lora) {
     constexpr int kSmemAlignment = 1024;
     constexpr int kNumEpilogueStages = 2;
     constexpr int kNumTMAStoreStages = 2;
@@ -215,7 +217,9 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     const int smem_cd = align(std::max(smem_cd_l1, smem_cd_l2), kSmemAlignment);
 
     // Barriers (stage-independent): dispatch + tensor memory full/empty + combine (2 per epilogue warp)
-    const int smem_barriers = (num_dispatch_warps + kNumEpilogueStages * 2 + num_epilogue_warps * 2) * 8;
+    const int smem_barriers =
+        (num_dispatch_warps + kNumEpilogueStages * 2 +
+         num_epilogue_warps * 2 + (enable_down_lora ? 2 : 0)) * 8;
 
     // Amax warp-pair reduction buffer for SwiGLU's cross-warp amax exchange.
     const int smem_amax_reduction = is_mma_with_sf(mma_kind) ?
@@ -233,8 +237,20 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     const int smem_b_size_per_stage = block_n * block_k * num_mma_elem_bytes;
     const int smem_size_per_stage = smem_a_size_per_stage + smem_b_size_per_stage + smem_sfa_per_stage + smem_sfb_per_stage + 2 * 8;
 
+    // The FC1 sidecar serially reuses one contiguous BF16 A/B stage.
+    // BLOCK_M=192 uses 112-row chunks to reduce shared-memory pressure;
+    // each chunk accumulates directly into its matching base TMEM columns.
+    const int lora_block_m = block_m == 192 ? 112 : block_m;
+    const int lora_load_block_m = lora_block_m / 2;
+    const int smem_lora = enable_fc1_lora ? align(
+        lora_load_block_m * 128 * static_cast<int>(sizeof(nv_bfloat16)) +
+        block_n * 128 * static_cast<int>(sizeof(nv_bfloat16)) +
+        4 * 8, kSmemAlignment) : 0;
+
     // Fixed total
-    const int smem_fixed = smem_dispatch_size + smem_cd + smem_amax_reduction + smem_barriers + smem_tmem_ptr;
+    const int smem_fixed =
+        smem_dispatch_size + smem_cd + smem_amax_reduction +
+        smem_barriers + smem_tmem_ptr + smem_lora;
 
     // Select maximum number of stages
     const int num_stages = (smem_capacity - smem_fixed) / smem_size_per_stage;
@@ -249,7 +265,9 @@ static MegaMoEConfig get_mega_moe_config(
     const int& hidden, const int& intermediate_hidden,
     const int& num_ring_tokens,
     const int& num_sf_ring_tokens,
-    const MmaKind& mma_kind) {
+    const MmaKind& mma_kind,
+    const bool& enable_fc1_lora = false,
+    const bool& enable_down_lora = false) {
 
     // Block config
     const auto [cluster_size, block_m, store_block_m, block_k, num_epilogue_threads] =
@@ -291,7 +309,7 @@ static MegaMoEConfig get_mega_moe_config(
         block_m, block_n, block_k, num_bytes_per_pull, store_block_m,
         sf_block_m, sf_block_n, gran_k,
         num_dispatch_threads / 32, num_epilogue_threads / 32,
-        mma_kind);
+        mma_kind, enable_fc1_lora, enable_down_lora);
 
     const auto config = MegaMoEConfig {
         block_m, block_n, block_k,

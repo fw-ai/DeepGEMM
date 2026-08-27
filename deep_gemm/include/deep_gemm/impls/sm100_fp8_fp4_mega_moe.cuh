@@ -19,6 +19,34 @@
 
 namespace deep_gemm {
 
+template <bool kEnabled, uint32_t kLoadBlockM, uint32_t kBlockN,
+          uint32_t kRank, bool kDownEnabled>
+struct MegaMoEFC1LoraSharedStorage {};
+
+template <uint32_t kLoadBlockM, uint32_t kBlockN, uint32_t kRank>
+struct MegaMoEFC1LoraSharedStorage<
+    true, kLoadBlockM, kBlockN, kRank, false> {
+    alignas(1024) nv_bfloat16 smem_lora_a[kLoadBlockM * kRank];
+    alignas(1024) nv_bfloat16 smem_lora_b[kBlockN * kRank];
+    cutlass::arch::ClusterTransactionBarrier lora_a_load_barrier;
+    cutlass::arch::ClusterTransactionBarrier lora_b_load_barrier;
+    cutlass::arch::ClusterTransactionBarrier lora_full_barrier;
+    cutlass::arch::ClusterTransactionBarrier lora_empty_barrier;
+};
+
+template <uint32_t kLoadBlockM, uint32_t kBlockN, uint32_t kRank>
+struct MegaMoEFC1LoraSharedStorage<
+    true, kLoadBlockM, kBlockN, kRank, true> {
+    alignas(1024) nv_bfloat16 smem_lora_a[kLoadBlockM * kRank];
+    alignas(1024) nv_bfloat16 smem_lora_b[kBlockN * kRank];
+    cutlass::arch::ClusterTransactionBarrier lora_a_load_barrier;
+    cutlass::arch::ClusterTransactionBarrier lora_b_load_barrier;
+    cutlass::arch::ClusterTransactionBarrier lora_full_barrier;
+    cutlass::arch::ClusterTransactionBarrier lora_empty_barrier;
+    cutlass::arch::ClusterTransactionBarrier down_tmem_full_barrier;
+    cutlass::arch::ClusterTransactionBarrier down_tmem_empty_barrier;
+};
+
 template <
     uint32_t kNumMaxTokensPerRank,
     uint32_t kHidden, uint32_t kIntermediateHidden,
@@ -37,6 +65,11 @@ template <
     float kActivationClamp,
     bool kFastMath,
     ActivationType kActivationType,
+    float kSituBeta,
+    float kSituLinearBeta,
+    MegaMoELoraMode kLoraMode,
+    uint32_t kLoraRank,
+    uint32_t kNumLoraSlots,
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
     uint32_t L2_SHAPE_N = kHidden,
@@ -63,7 +96,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts_sf,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights,
-                            const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights_sf) {
+                            const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights_sf,
+                            const __grid_constant__ layout::MegaMoELoraTensorMaps<kLoraMode> lora_tensor_maps) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::TMEM::Allocator2Sm;
@@ -73,6 +107,17 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(kNumNonEpilogueThreads == 128, "Invalid number of MMA non-epilogue threads");
     DG_STATIC_ASSERT(kNumEpilogueThreads % 128 == 0, "Invalid number of MMA epilogue and combine threads");
     DG_STATIC_ASSERT(kNumExperts % kNumRanks == 0, "Invalid number of experts or ranks");
+    constexpr bool kHasLora = kLoraMode != MegaMoELoraMode::Disabled;
+    constexpr bool kDoFC1Lora =
+        kLoraMode == MegaMoELoraMode::FC1 or
+        kLoraMode == MegaMoELoraMode::FC1Down;
+    constexpr bool kDoDownLora =
+        kLoraMode == MegaMoELoraMode::FC1Down;
+    DG_STATIC_ASSERT(kHasLora == (kLoraRank != 0), "LoRA mode/rank mismatch");
+    DG_STATIC_ASSERT(not kHasLora or kLoraRank == 128, "Only rank-128 MegaMoE LoRA is supported");
+    DG_STATIC_ASSERT(not kHasLora or kNumLoraSlots > 0, "LoRA requires a sentinel slot");
+    DG_STATIC_ASSERT(not kDoFC1Lora or (2 <= kNumLoraSlots and kNumLoraSlots <= 32),
+                     "FC1 LoRA supports 1..31 active slots plus one sentinel");
 
     // Thread indices
     const bool is_leader_cta = cute::block_rank_in_cluster() == 0;
@@ -80,6 +125,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     const uint32_t thread_idx = threadIdx.x;
     const uint32_t warp_idx = cutlass::canonical_warp_idx_sync();
     const uint32_t lane_idx = ptx::get_lane_idx();
+    const auto get_lora_tensor_map = [](
+        const layout::TmaDescriptorStorage& storage) {
+        return reinterpret_cast<const cute::TmaDescriptor*>(&storage);
+    };
 
     // Prefetch TMA descriptors at the very beginning
     if (warp_idx == 0) {
@@ -92,6 +141,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         cute::prefetch_tma_descriptor(&tensor_map_l2_acts_sf);
         cute::prefetch_tma_descriptor(&tensor_map_l2_weights);
         cute::prefetch_tma_descriptor(&tensor_map_l2_weights_sf);
+        if constexpr (kDoFC1Lora) {
+            cute::prefetch_tma_descriptor(get_lora_tensor_map(lora_tensor_maps.gate_a));
+            cute::prefetch_tma_descriptor(get_lora_tensor_map(lora_tensor_maps.up_a));
+            cute::prefetch_tma_descriptor(get_lora_tensor_map(lora_tensor_maps.gate_b));
+            cute::prefetch_tma_descriptor(get_lora_tensor_map(lora_tensor_maps.up_b));
+            if constexpr (kDoDownLora)
+                cute::prefetch_tma_descriptor(
+                    get_lora_tensor_map(lora_tensor_maps.down_a));
+        }
     }
 
     // Workspaces
@@ -162,6 +220,63 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         l2_sf_buffer.get_end_ptr()
     );
 
+    // Optional LoRA data is a suffix so the disabled specialization retains
+    // the exact baseline workspace and ring addresses.
+    constexpr auto lora_payload_layout = layout::MegaMoELoraPayload(kHasLora ? kLoraRank : 0);
+    const auto input_lora_gate_up_acts_buffer = layout::Buffer(
+        lora_payload_layout.get_gate_up_acts_layout(), 1, kNumMaxTokensPerRank,
+        combine_token_buffer.get_end_ptr());
+    const auto ring_lora_gate_up_acts_buffer = layout::Buffer(
+        lora_payload_layout.get_gate_up_acts_layout(), 1, kNumRingTokens,
+        input_lora_gate_up_acts_buffer.get_end_ptr());
+    const auto input_lora_adapter_slot_buffer = layout::Buffer(
+        lora_payload_layout.get_adapter_slot_layout(), 1, kNumMaxTokensPerRank,
+        ring_lora_gate_up_acts_buffer.get_end_ptr());
+    const auto ring_lora_adapter_slot_buffer = layout::Buffer(
+        lora_payload_layout.get_adapter_slot_layout(), 1, kNumRingTokens,
+        input_lora_adapter_slot_buffer.get_end_ptr());
+    const auto lora_subgroups = layout::MegaMoELoraSubgroups(
+        ring_lora_adapter_slot_buffer.get_end_ptr(),
+        kNumRanks, kNumExperts, kDoFC1Lora ? kNumLoraSlots : 0);
+    const auto lora_readiness = layout::MegaMoELoraReadiness(
+        lora_subgroups.get_end_ptr(),
+        kDoFC1Lora
+            ? kNumRingTokens / layout::kMinCandidateBlockM
+            : 0);
+    constexpr auto down_sideband = layout::MegaMoEDownLoraSideband(
+        kDoDownLora ? kLoraRank : 0);
+    const auto routed_lora_rank_buffer = layout::Buffer(
+        down_sideband.get_rank_acts_layout(), kNumTopk,
+        kNumMaxTokensPerRank, lora_readiness.get_end_ptr());
+    const auto combined_lora_rank_buffer = layout::Buffer(
+        down_sideband.get_rank_acts_layout(), 1,
+        kNumMaxTokensPerRank, routed_lora_rank_buffer.get_end_ptr());
+    const auto get_lora_segment = [&](
+        const uint32_t& local_expert_idx,
+        const uint32_t& m_block_idx,
+        const uint32_t& adapter_slot) {
+        uint32_t segment_start = 0, segment_size = 0;
+        if constexpr (kDoFC1Lora) {
+            const auto tile_start = m_block_idx * BLOCK_M;
+            const auto tile_end = tile_start + BLOCK_M;
+            const auto subgroup_start =
+                *lora_subgroups.get_offset_ptr(
+                    local_expert_idx, adapter_slot);
+            const auto subgroup_end =
+                *lora_subgroups.get_offset_ptr(
+                    local_expert_idx, adapter_slot + 1);
+            const auto intersection_start =
+                cute::max(tile_start, subgroup_start);
+            const auto intersection_end =
+                cute::min(tile_end, subgroup_end);
+            if (intersection_start < intersection_end) {
+                segment_start = intersection_start - tile_start;
+                segment_size = intersection_end - intersection_start;
+            }
+        }
+        return cute::make_tuple(segment_start, segment_size);
+    };
+
     // Data types
     // NOTES: activations are FP8 (e4m3), weights are FP4 (e2m1)
     using a_dtype_t = cutlass::float_e4m3_t;
@@ -176,8 +291,19 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t UMMA_K = 32;
     constexpr uint32_t LOAD_BLOCK_M = BLOCK_M / 2;  // Multicast on A
     constexpr uint32_t LOAD_BLOCK_N = BLOCK_N;
+    // Keep the BLOCK_M=192 sidecar stage smaller to limit shared-memory
+    // pressure; longer contiguous subgroup intersections are split.
+    constexpr uint32_t LORA_BLOCK_M =
+        BLOCK_M == 192 ? 112 : BLOCK_M;
+    constexpr uint32_t LORA_LOAD_BLOCK_M = LORA_BLOCK_M / 2;
+    constexpr uint32_t DOWN_BLOCK_K = 64;
     DG_STATIC_ASSERT(BLOCK_M % 16 == 0, "Invalid block M");
     DG_STATIC_ASSERT(BLOCK_N == LAYOUT_AD_M, "Invalid block N");
+    DG_STATIC_ASSERT(LORA_BLOCK_M % 16 == 0 and LORA_BLOCK_M <= 128,
+                     "Invalid compact LoRA block M");
+    DG_STATIC_ASSERT(not kDoDownLora or
+                     kIntermediateHidden % DOWN_BLOCK_K == 0,
+                     "Down LoRA intermediate dimension must be 64-aligned");
 
     // Swizzle configs
     constexpr uint32_t kSwizzleAMode = 128;
@@ -186,7 +312,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(BLOCK_N % kSwizzleCDMode == 0, "Invalid block N");
 
     // Epilogue configs
-    constexpr uint32_t kNumEpilogueStages = 2;
+    // The down specialization dedicates the second accumulator-sized TMEM
+    // region to rank output.  Existing modes retain the two-stage base
+    // accumulator pipeline and therefore have identical TMEM usage.
+    constexpr uint32_t kNumEpilogueStages = kDoDownLora ? 1 : 2;
     constexpr uint32_t kNumTMAStoreStages = 2;
 
     // Shared memory
@@ -198,7 +327,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t L1_OUT_BLOCK_N = BLOCK_N / 2;
     constexpr uint32_t AMAX_REDUCTION_WARP_BUFFER_SIZE = STORE_BLOCK_M / 2; // float2
 
-    struct SharedStorage {
+    struct SharedStorage :
+        MegaMoEFC1LoraSharedStorage<
+            kDoFC1Lora, LORA_LOAD_BLOCK_M, BLOCK_N, kLoraRank,
+            kDoDownLora> {
         alignas(kSharedMemoryAlignment) uint32_t expert_token_count[kNumExperts];
         alignas(kSharedMemoryAlignment) uint8_t dispatch_send_buffer[kNumDispatchWarps][kNumBytesPerPull];
         union {
@@ -218,7 +350,40 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         Barrier combine_barriers[kNumEpilogueWarps * 2];
         uint32_t tmem_ptr_in_smem;
     };
-    constexpr uint32_t kNumReusableSmemBytes = offsetof(SharedStorage, dispatch_barriers);
+    // Bytes before the barriers are reused by combine.  Compute the offset
+    // explicitly because the optional FC1 empty-base optimization makes
+    // `SharedStorage` non-standard-layout, for which `offsetof` is undefined.
+    constexpr uint32_t kLoraStorageBytes = kDoFC1Lora
+        ? sizeof(MegaMoEFC1LoraSharedStorage<
+            true, LORA_LOAD_BLOCK_M, BLOCK_N, kLoraRank,
+            kDoDownLora>)
+        : 0;
+    constexpr uint32_t kExpertCountEnd =
+        math::constexpr_align(kLoraStorageBytes, kSharedMemoryAlignment) +
+        kNumExperts * sizeof(uint32_t);
+    constexpr uint32_t kDispatchBufferEnd =
+        math::constexpr_align(kExpertCountEnd, kSharedMemoryAlignment) +
+        kNumDispatchWarps * kNumBytesPerPull;
+    constexpr uint32_t kSmemDL1Bytes =
+        kNumEpilogueWarpgroups * kNumTMAStoreStages *
+        STORE_BLOCK_M * L1_OUT_BLOCK_N * sizeof(cutlass::float_e4m3_t);
+    constexpr uint32_t kSmemDL2Bytes =
+        kNumEpilogueWarpgroups * STORE_BLOCK_M * BLOCK_N * sizeof(nv_bfloat16);
+    constexpr uint32_t kSmemDBytes =
+        kSmemDL1Bytes > kSmemDL2Bytes ? kSmemDL1Bytes : kSmemDL2Bytes;
+    constexpr uint32_t kSmemDEnd =
+        math::constexpr_align(kDispatchBufferEnd, kSharedMemoryAlignment) + kSmemDBytes;
+    constexpr uint32_t kSmemAEnd =
+        math::constexpr_align(kSmemDEnd, kSharedMemoryAlignment) +
+        kNumStages * LOAD_BLOCK_M * BLOCK_K * sizeof(a_dtype_t);
+    constexpr uint32_t kSmemBEnd =
+        math::constexpr_align(kSmemAEnd, kSharedMemoryAlignment) +
+        kNumStages * LOAD_BLOCK_N * BLOCK_K * sizeof(b_dtype_t);
+    constexpr uint32_t kNumReusableSmemBytes =
+        kSmemBEnd +
+        kNumStages * SF_BLOCK_M * (BLOCK_K / 128) * sizeof(uint32_t) +
+        kNumStages * SF_BLOCK_N * (BLOCK_K / 128) * sizeof(uint32_t) +
+        kNumEpilogueWarps * AMAX_REDUCTION_WARP_BUFFER_SIZE * sizeof(float2);
     SharedStorage &shared_storage = *reinterpret_cast<SharedStorage*>(smem_buffer);
 
     // Send buffers
@@ -229,11 +394,17 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
     // Tensor memory size
     constexpr uint32_t kNumAccumTmemCols = UMMA_N * kNumEpilogueStages;
+    constexpr uint32_t kNumDownTmemCols = kDoDownLora ? UMMA_N : 0;
     constexpr uint32_t kNumSFATmemCols = SF_BLOCK_M / 32;
     constexpr uint32_t kNumSFBTmemCols = SF_BLOCK_N / 32;
-    constexpr uint32_t kNumTmemCols = utils::get_num_aligned_tmem_cols<kNumAccumTmemCols + kNumSFATmemCols + kNumSFBTmemCols>();
-    constexpr uint32_t kTmemStartColOfSFA = kNumAccumTmemCols;
-    constexpr uint32_t kTmemStartColOfSFB = kNumAccumTmemCols + kNumSFATmemCols;
+    constexpr uint32_t kNumTmemCols = utils::get_num_aligned_tmem_cols<
+        kNumAccumTmemCols + kNumDownTmemCols +
+        kNumSFATmemCols + kNumSFBTmemCols>();
+    constexpr uint32_t kTmemStartColOfDown = kNumAccumTmemCols;
+    constexpr uint32_t kTmemStartColOfSFA =
+        kNumAccumTmemCols + kNumDownTmemCols;
+    constexpr uint32_t kTmemStartColOfSFB =
+        kNumAccumTmemCols + kNumDownTmemCols + kNumSFATmemCols;
     DG_STATIC_ASSERT(32 <= kNumTmemCols and kNumTmemCols <= 512, "Invalid tensor memory columns");
 
     // A cluster sync is essential for 2CTA tensor memory allocation
@@ -274,6 +445,17 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             #pragma unroll
             for (uint32_t i = 0; i < kNumEpilogueWarps * 2; ++ i)
                 shared_storage.combine_barriers[i].init(1);
+            if constexpr (kDoFC1Lora) {
+                shared_storage.lora_a_load_barrier.init(1);
+                shared_storage.lora_b_load_barrier.init(1);
+                shared_storage.lora_full_barrier.init(2 * 2);
+                shared_storage.lora_empty_barrier.init(1);
+                if constexpr (kDoDownLora) {
+                    shared_storage.down_tmem_full_barrier.init(1);
+                    shared_storage.down_tmem_empty_barrier.init(
+                        2 * kNumEpilogueThreads);
+                }
+            }
         }
         cutlass::arch::fence_barrier_init();
     } else if (warp_idx == 3) {
@@ -359,6 +541,23 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         // Count experts' tokens
         read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
            atomicAdd_block(shared_storage.expert_token_count + expert_idx, 1);
+           if constexpr (kDoFC1Lora) {
+               const auto source_token_idx = token_topk_idx / kNumTopk;
+               const auto raw_adapter_slot =
+                   input_lora_adapter_slot_buffer
+                       .get_data_buffer(source_token_idx)
+                       .template get_base_ptr<int32_t>()[0];
+               const auto adapter_slot =
+                   0 <= raw_adapter_slot and
+                   raw_adapter_slot <
+                       static_cast<int32_t>(kNumLoraSlots - 1)
+                   ? static_cast<uint32_t>(raw_adapter_slot)
+                   : kNumLoraSlots - 1;
+               ptx::atomic_add(
+                   lora_subgroups.get_send_count_ptr(
+                       expert_idx, adapter_slot),
+                   1ull);
+           }
         });
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
@@ -371,10 +570,48 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         }
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
+        // FC1 source-list offsets depend on finalized per-adapter counts.
+        if constexpr (kDoFC1Lora) {
+            comm::grid_sync<kNumSMs, 2>(
+                workspace, sm_idx, thread_idx,
+                [=]() {
+                    ptx::sync_aligned(
+                        kNumDispatchThreads, kDispatchBarrierIdx);
+                });
+        }
+
         // Write source indices (~2 us with 512 tokens)
         read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
             const auto dst_rank_idx = expert_idx / kNumExpertsPerRank;
-            const auto dst_slot_idx = atomicAdd_block(shared_storage.expert_token_count + expert_idx, 1);
+            uint32_t dst_slot_idx;
+            if constexpr (kDoFC1Lora) {
+                const auto source_token_idx = token_topk_idx / kNumTopk;
+                const auto raw_adapter_slot =
+                    input_lora_adapter_slot_buffer
+                        .get_data_buffer(source_token_idx)
+                        .template get_base_ptr<int32_t>()[0];
+                const auto adapter_slot =
+                    0 <= raw_adapter_slot and
+                    raw_adapter_slot <
+                        static_cast<int32_t>(kNumLoraSlots - 1)
+                    ? static_cast<uint32_t>(raw_adapter_slot)
+                    : kNumLoraSlots - 1;
+                uint32_t subgroup_offset = 0;
+                for (uint32_t slot = 0; slot < adapter_slot; ++ slot) {
+                    subgroup_offset += static_cast<uint32_t>(
+                        *lora_subgroups.get_send_count_ptr(
+                            expert_idx, slot));
+                }
+                const auto old_value = ptx::atomic_add(
+                    lora_subgroups.get_send_count_ptr(
+                        expert_idx, adapter_slot),
+                    1ull << 32);
+                dst_slot_idx =
+                    subgroup_offset + static_cast<uint32_t>(old_value >> 32);
+            } else {
+                dst_slot_idx = atomicAdd_block(
+                    shared_storage.expert_token_count + expert_idx, 1);
+            }
             const auto dst_ptr = workspace.get_src_token_topk_idx_ptr(
                 expert_idx % kNumExpertsPerRank, sym_buffer.rank_idx, dst_slot_idx);
             *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;
@@ -400,6 +637,29 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx), dst_rank_idx),
                     expert_status);
             }
+            if constexpr (kDoFC1Lora) {
+                const auto num_subgroups = kNumExperts * kNumLoraSlots;
+                #pragma unroll
+                for (uint32_t i = thread_idx;
+                     i < num_subgroups;
+                     i += kNumDispatchThreads) {
+                    const auto expert_idx = i / kNumLoraSlots;
+                    const auto adapter_slot = i % kNumLoraSlots;
+                    const auto dst_rank_idx =
+                        expert_idx / kNumExpertsPerRank;
+                    const auto dst_local_expert_idx =
+                        expert_idx % kNumExpertsPerRank;
+                    const auto count = static_cast<uint32_t>(
+                        *lora_subgroups.get_send_count_ptr(
+                            expert_idx, adapter_slot));
+                    *sym_buffer.map(
+                        lora_subgroups.get_recv_count_ptr(
+                            sym_buffer.rank_idx,
+                            dst_local_expert_idx,
+                            adapter_slot),
+                        dst_rank_idx) = count;
+                }
+            }
         }
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
@@ -411,6 +671,44 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             /* After the grid sync above, there is no more writes by other SMs (except 0) */ false,
             /* After the NVLink barrier, there is a grid sync */ true
         );
+
+        if constexpr (kDoFC1Lora) {
+            // Build destination-local exclusive subgroup offsets on device.
+            // One thread owns an expert, so the slot order is deterministic
+            // and no global sort or host synchronization is required.
+            if (sm_idx == 0) {
+                for (uint32_t local_expert_idx = thread_idx;
+                     local_expert_idx < kNumExpertsPerRank;
+                     local_expert_idx += kNumDispatchThreads) {
+                    uint32_t offset = 0;
+                    *lora_subgroups.get_offset_ptr(
+                        local_expert_idx, 0) = 0;
+                    #pragma unroll
+                    for (uint32_t adapter_slot = 0;
+                         adapter_slot < kNumLoraSlots;
+                         ++ adapter_slot) {
+                        #pragma unroll
+                        for (uint32_t source_rank_idx = 0;
+                             source_rank_idx < kNumRanks;
+                             ++ source_rank_idx) {
+                            offset += *lora_subgroups.get_recv_count_ptr(
+                                source_rank_idx,
+                                local_expert_idx,
+                                adapter_slot);
+                        }
+                        *lora_subgroups.get_offset_ptr(
+                            local_expert_idx,
+                            adapter_slot + 1) = offset;
+                    }
+                }
+            }
+            comm::grid_sync<kNumSMs, 2>(
+                workspace, sm_idx, thread_idx,
+                [=]() {
+                    ptx::sync_aligned(
+                        kNumDispatchThreads, kDispatchBarrierIdx);
+                });
+        }
 
         // Ensure the epilogue barrier cannot run with the pull barrier
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
@@ -450,8 +748,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             if (current_expert_idx >= kNumExpertsPerRank)
                 break;
 
-            // Load per-rank counts when expert changes
-            if (old_expert_idx != current_expert_idx) {
+            const uint32_t token_idx_in_expert =
+                token_idx - expert_start_idx;
+
+            // Load per-rank counts when expert changes.  FC1 subgroup counts
+            // are loaded below after identifying this row's adapter.
+            if (old_expert_idx != current_expert_idx and not kDoFC1Lora) {
                 old_expert_idx = current_expert_idx;
                 #pragma unroll
                 for (uint32_t i = 0; i < kNumRanksPerLane; ++ i) {
@@ -462,6 +764,40 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 }
             }
 
+            uint32_t adapter_slot = 0;
+            uint32_t subgroup_start = 0;
+            if constexpr (kDoFC1Lora) {
+                adapter_slot = kNumLoraSlots - 1;
+                #pragma unroll
+                for (uint32_t slot = 0;
+                     slot < kNumLoraSlots;
+                     ++ slot) {
+                    const auto start =
+                        *lora_subgroups.get_offset_ptr(
+                            current_expert_idx, slot);
+                    const auto end =
+                        *lora_subgroups.get_offset_ptr(
+                            current_expert_idx, slot + 1);
+                    if (start <= token_idx_in_expert and
+                        token_idx_in_expert < end) {
+                        adapter_slot = slot;
+                        subgroup_start = start;
+                    }
+                }
+                #pragma unroll
+                for (uint32_t i = 0; i < kNumRanksPerLane; ++ i) {
+                    const uint32_t source_rank_idx =
+                        i * 32 + lane_idx;
+                    stored_rank_count[i] =
+                        source_rank_idx < kNumRanks
+                        ? *lora_subgroups.get_recv_count_ptr(
+                              source_rank_idx,
+                              current_expert_idx,
+                              adapter_slot)
+                        : 0;
+                }
+            }
+
             // Round-robin rank selection via iterative min-peeling
             uint32_t current_rank_in_expert_idx;
             uint32_t remaining[kNumRanksPerLane];
@@ -469,8 +805,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             for (uint32_t i = 0; i < kNumRanksPerLane; ++ i)
                 remaining[i] = stored_rank_count[i];
             uint32_t offset = 0;
-            uint32_t token_idx_in_expert = token_idx - expert_start_idx;
-            uint32_t slot_idx = token_idx_in_expert;
+            uint32_t slot_idx = kDoFC1Lora
+                ? token_idx_in_expert - subgroup_start
+                : token_idx_in_expert;
             uint32_t token_idx_in_rank;
             while (true) {
                 // Compute active count and min across all ranks
@@ -510,6 +847,19 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 #pragma unroll
                 for (uint32_t i = 0; i < kNumRanksPerLane; ++ i)
                     remaining[i] -= cute::min(remaining[i], length);
+            }
+
+            if constexpr (kDoFC1Lora) {
+                #pragma unroll
+                for (uint32_t slot = 0; slot < kNumLoraSlots; ++ slot) {
+                    if (slot < adapter_slot) {
+                        token_idx_in_rank +=
+                            *lora_subgroups.get_recv_count_ptr(
+                                current_rank_in_expert_idx,
+                                current_expert_idx,
+                                slot);
+                    }
+                }
             }
 
             // Read source token-topk index (written by remote dispatch via NVLink)
@@ -579,25 +929,128 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
             __syncwarp();
 
-            // Store weights and metadata
-            if (cute::elect_one_sync()) {
-                // Load weights
-                const auto weight = *sym_buffer.map(
-                    input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
-                    current_rank_in_expert_idx);
-                *l1_topk_weights_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).template get_base_ptr<float>() = weight;
-
-                // Write source metadata for combine write-back (logical pool token)
-                *workspace.get_token_src_metadata_ptr(pool_token_idx) =
-                    {current_rank_in_expert_idx, src_token_idx, src_topk_idx};
-
-                // Complete last chunk's store
+            // Complete the overlapped final base-token store before reusing
+            // this warp's pull buffer for the optional LoRA payload.
+            if (cute::elect_one_sync())
                 issue_and_wait_pull_store(kNumChunks - 1);
+            __syncwarp();
+
+            // Base compute also consumes the routing weight during the L1
+            // epilogue, so publish base readiness only after both the row and
+            // its non-LoRA metadata are visible.  It can still overlap the
+            // routed rank-payload pull below.
+            if (cute::elect_one_sync()) {
+                const auto weight = *sym_buffer.map(
+                    input_topk_weights_buffer.get_base_ptr<float>() +
+                        src_token_topk_idx,
+                    current_rank_in_expert_idx);
+                *l1_topk_weights_buffer
+                     .get_data_buffer(pool_token_idx % kNumRingTokens)
+                     .template get_base_ptr<float>() = weight;
+                *workspace.get_token_src_metadata_ptr(pool_token_idx) =
+                    {current_rank_in_expert_idx, src_token_idx,
+                     src_topk_idx};
+
+                if constexpr (kDoFC1Lora) {
+                    const bool is_last_token =
+                        token_idx == expert_end_idx - 1;
+                    ptx::red_add_rel(
+                        workspace.get_l1_full_count_ptr(
+                            pool_block_idx % kNumRingBlocks),
+                        is_last_token
+                            ? BLOCK_M - (token_idx_in_expert % BLOCK_M)
+                            : 1u);
+                }
+            }
+            __syncwarp();
+
+            if constexpr (kHasLora) {
+                constexpr uint32_t kNumLoraPayloadBytes =
+                    2 * kLoraRank * sizeof(nv_bfloat16);
+                constexpr uint32_t kNumLoraPullChunks =
+                    math::constexpr_ceil_div(kNumLoraPayloadBytes, kNumBytesPerPull);
+                DG_STATIC_ASSERT(kNumLoraPayloadBytes % 16 == 0, "LoRA payload must be TMA aligned");
+
+                const auto src_lora_ptr = sym_buffer.map(
+                    input_lora_gate_up_acts_buffer.get_data_buffer(src_token_idx).get_base_ptr(),
+                    current_rank_in_expert_idx);
+                const auto dst_lora_ptr = ring_lora_gate_up_acts_buffer
+                    .get_data_buffer(pool_token_idx % kNumRingTokens).get_base_ptr();
+                const auto src_slot_ptr = sym_buffer.map(
+                    input_lora_adapter_slot_buffer.get_data_buffer(src_token_idx)
+                        .template get_base_ptr<int32_t>(),
+                    current_rank_in_expert_idx);
+                const int32_t adapter_slot = *src_slot_ptr;
+
+                // Reuse the established remote-pull mbarrier and shared-memory
+                // staging buffer.  Payload-only mode intentionally performs no
+                // arithmetic, making transport correctness independently testable.
+                if (cute::elect_one_sync()) {
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kNumLoraPullChunks; ++ i) {
+                        constexpr uint32_t kFinalChunkBytes =
+                            kNumLoraPayloadBytes -
+                            (kNumLoraPullChunks - 1) * kNumBytesPerPull;
+                        const uint32_t num_bytes =
+                            i == kNumLoraPullChunks - 1 ? kFinalChunkBytes : kNumBytesPerPull;
+                        if constexpr (kDoFC1Lora) {
+                            if (adapter_slot < 0 or
+                                adapter_slot >= static_cast<int32_t>(kNumLoraSlots - 1)) {
+                                // Invalid slots and the final sentinel carry
+                                // exact-zero activations into the ring.
+                                ptx::st_shared_bulk(pull_buffer.get_base_ptr(), num_bytes);
+                            } else {
+                                ptx::tma_load_1d(
+                                    pull_buffer.get_base_ptr(),
+                                    math::advance_ptr(src_lora_ptr, i * kNumBytesPerPull),
+                                    pull_mbarrier, num_bytes);
+                                ptx::mbarrier_arrive_and_set_tx(pull_mbarrier, num_bytes);
+                                ptx::mbarrier_wait_and_flip_phase(
+                                    pull_mbarrier, pull_mbarrier_phase);
+                            }
+                        } else {
+                            ptx::tma_load_1d(
+                                pull_buffer.get_base_ptr(),
+                                math::advance_ptr(src_lora_ptr, i * kNumBytesPerPull),
+                                pull_mbarrier, num_bytes);
+                            ptx::mbarrier_arrive_and_set_tx(pull_mbarrier, num_bytes);
+                            ptx::mbarrier_wait_and_flip_phase(
+                                pull_mbarrier, pull_mbarrier_phase);
+                        }
+                        ptx::tma_store_1d(
+                            math::advance_ptr(dst_lora_ptr, i * kNumBytesPerPull),
+                            pull_buffer.get_base_ptr(), num_bytes);
+                        cute::tma_store_arrive();
+                        ptx::tma_store_wait<0>();
+                    }
+
+                    *ring_lora_adapter_slot_buffer
+                         .get_data_buffer(pool_token_idx % kNumRingTokens)
+                         .template get_base_ptr<int32_t>() = adapter_slot;
+                }
+                __syncwarp();
+            }
+
+            // Publish the final readiness dependency.  FC1 modes use the
+            // separate LoRA counter; disabled/payload-only retain the original
+            // single readiness signal.
+            if (cute::elect_one_sync()) {
                 const bool is_last_token = (token_idx == expert_end_idx - 1);
-                ptx::red_add_rel(
-                    workspace.get_l1_full_count_ptr(pool_block_idx % kNumRingBlocks), 
-                    is_last_token ? BLOCK_M - (token_idx_in_expert % BLOCK_M) : 1u
-                );
+                if constexpr (kDoFC1Lora) {
+                    ptx::red_add_rel(
+                        lora_readiness.get_full_count_ptr(
+                            pool_block_idx % kNumRingBlocks),
+                        is_last_token
+                            ? BLOCK_M - (token_idx_in_expert % BLOCK_M)
+                            : 1u);
+                } else {
+                    ptx::red_add_rel(
+                        workspace.get_l1_full_count_ptr(
+                            pool_block_idx % kNumRingBlocks),
+                        is_last_token
+                            ? BLOCK_M - (token_idx_in_expert % BLOCK_M)
+                            : 1u);
+                }
             }
             __syncwarp();
         }
@@ -612,6 +1065,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             #pragma unroll
             for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads)
                 *workspace.get_expert_send_count_ptr(i) = 0;
+            if constexpr (kDoFC1Lora) {
+                for (uint32_t i = thread_idx;
+                     i < kNumExperts * kNumLoraSlots;
+                     i += kNumDispatchThreads) {
+                    *lora_subgroups.get_send_count_ptr(
+                        i / kNumLoraSlots,
+                        i % kNumLoraSlots) = 0;
+                }
+            }
         } else {
             // Other SMs: clean blocks
             for (uint32_t i = sm_idx - 1; i < kNumExpertsPerRank; i += kNumSMs - 1) {
@@ -647,6 +1109,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     *workspace.get_l1_empty_count_ptr((expert_pool_block_offset + j) % kNumRingBlocks) = 0;
                     *workspace.get_l2_full_count_ptr((expert_pool_block_offset + j) % kNumRingBlocks) = 0;
                     *workspace.get_l2_empty_count_ptr((expert_pool_block_offset + j) % kNumRingBlocks) = 0;
+                    if constexpr (kDoFC1Lora) {
+                        *lora_readiness.get_full_count_ptr(
+                            (expert_pool_block_offset + j) %
+                            kNumRingBlocks) = 0;
+                    }
                 }
                 __syncwarp();
             }
@@ -665,6 +1132,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
 
         // GEMM TMA load warp for tokens with SFA
+        uint32_t lora_phase = 0;
         scheduler.for_each_block([&](const sched::BlockPhase& block_phase,
                                      const uint32_t& local_expert_idx,
                                      const uint32_t& num_k_blocks,
@@ -720,12 +1188,311 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 }
                 __syncwarp();
             }
+
+            if constexpr (kDoFC1Lora) {
+                if (block_phase == sched::BlockPhase::Linear1) {
+                    const auto lora_full_ptr =
+                        lora_readiness.get_full_count_ptr(ring_block_idx);
+                    const auto num_expected_tokens =
+                        BLOCK_M *
+                        (pool_block_idx / kNumRingBlocks + 1);
+                    while (ptx::ld_acq(lora_full_ptr) !=
+                           num_expected_tokens);
+                    for (uint32_t adapter_slot = 0;
+                         adapter_slot < kNumLoraSlots - 1; ++ adapter_slot) {
+                        CUTE_TIE_DECL(
+                            get_lora_segment(
+                                local_expert_idx,
+                                m_block_idx,
+                                adapter_slot),
+                            segment_start,
+                            segment_size);
+                        if (segment_size == 0)
+                            continue;
+
+                        for (uint32_t chunk_start = 0;
+                             chunk_start < segment_size;) {
+                            const auto output_start =
+                                segment_start + chunk_start;
+                            const auto aligned_output_start =
+                                output_start & ~15u;
+                            const auto leading_padding =
+                                output_start - aligned_output_start;
+                            const auto chunk_size = cute::min(
+                                segment_size - chunk_start,
+                                LORA_BLOCK_M - leading_padding);
+                            const auto aligned_chunk_size =
+                                math::align(
+                                    leading_padding + chunk_size, 16u);
+                            const auto cta_chunk_offset = is_leader_cta
+                                ? 0u : aligned_chunk_size / 2;
+                            const auto local_chunk_size =
+                                aligned_chunk_size / 2;
+                            const auto source_row =
+                                ring_block_idx * BLOCK_M +
+                                aligned_output_start +
+                                cta_chunk_offset;
+
+                            #pragma unroll
+                            for (uint32_t projection = 0;
+                                 projection < 2; ++ projection) {
+                                shared_storage.lora_empty_barrier.wait(
+                                    lora_phase ^ 1);
+                                if (cute::elect_one_sync()) {
+                                    ptx::st_shared_bulk(
+                                        shared_storage.smem_lora_a,
+                                        sizeof(shared_storage.smem_lora_a));
+                                    const auto lora_a_map =
+                                        projection == 0
+                                        ? get_lora_tensor_map(
+                                              lora_tensor_maps.gate_a)
+                                        : get_lora_tensor_map(
+                                              lora_tensor_maps.up_a);
+                                    uint32_t loaded_bytes = 0;
+                                    #pragma unroll
+                                    for (uint32_t k_block_idx = 0;
+                                         k_block_idx < kLoraRank / 64;
+                                         ++ k_block_idx) {
+                                        for (uint32_t row = 0;
+                                             row < local_chunk_size;
+                                             row += 8) {
+                                            tma::copy<
+                                                64, 8, 128, nv_bfloat16>(
+                                                lora_a_map,
+                                                &shared_storage
+                                                     .lora_a_load_barrier,
+                                                shared_storage.smem_lora_a +
+                                                    k_block_idx *
+                                                        LORA_LOAD_BLOCK_M *
+                                                        64 +
+                                                    row * 64,
+                                                k_block_idx * 64,
+                                                source_row + row);
+                                            loaded_bytes +=
+                                                64 * 8 *
+                                                sizeof(nv_bfloat16);
+                                        }
+                                    }
+                                    if (loaded_bytes > 0) {
+                                        shared_storage.lora_a_load_barrier
+                                            .arrive_and_expect_tx(
+                                                loaded_bytes);
+                                    } else {
+                                        shared_storage.lora_a_load_barrier
+                                            .arrive(0u);
+                                    }
+                                }
+                                shared_storage.lora_a_load_barrier.wait(
+                                    lora_phase);
+
+                                // TMA requires its swizzled shared-memory box
+                                // to start on an 8-row boundary.  Load the
+                                // aligned contiguous ring window, then mask
+                                // rows belonging to adjacent subgroups.
+                                constexpr uint32_t kNumRankGroups =
+                                    kLoraRank *
+                                    sizeof(nv_bfloat16) / 16;
+                                for (uint32_t copy_idx = lane_idx;
+                                     copy_idx <
+                                         local_chunk_size * kNumRankGroups;
+                                     copy_idx += 32) {
+                                    const auto local_row =
+                                        copy_idx / kNumRankGroups;
+                                    const auto chunk_row =
+                                        cta_chunk_offset + local_row;
+                                    if (leading_padding <= chunk_row and
+                                        chunk_row <
+                                            leading_padding + chunk_size)
+                                        continue;
+                                    const auto rank_group =
+                                        copy_idx % kNumRankGroups;
+                                    const auto k_block_idx =
+                                        rank_group / 8;
+                                    const auto swizzled_group =
+                                        (rank_group % 8) ^
+                                        (local_row & 7u);
+                                    auto destination_ptr =
+                                        reinterpret_cast<uint8_t*>(
+                                            shared_storage.smem_lora_a) +
+                                        k_block_idx *
+                                            LORA_LOAD_BLOCK_M * 64 *
+                                            sizeof(nv_bfloat16) +
+                                        local_row * 64 *
+                                            sizeof(nv_bfloat16) +
+                                        swizzled_group * 16;
+                                    ptx::st_shared(
+                                        destination_ptr, 0u, 0u, 0u, 0u);
+                                }
+                                __syncwarp();
+                                cutlass::arch::fence_view_async_shared();
+                                if (cute::elect_one_sync())
+                                    Barrier::arrive(
+                                        reinterpret_cast<const uint64_t*>(
+                                            &shared_storage
+                                                 .lora_full_barrier),
+                                        0, 1);
+                                __syncwarp();
+                                lora_phase ^= 1;
+                            }
+                            chunk_start += chunk_size;
+                        }
+                    }
+                }
+            }
+            if constexpr (kDoDownLora) {
+                // The n=0/1 CTA pair owns the one rank-128 shrink for this
+                // expert M tile.  Reuse the FC1 A stage after the wave's
+                // Linear1 phase and dequantize the weighted FP8 L2 ring into
+                // BF16 K-major, 128B-swizzled shared memory.
+                if (block_phase == sched::BlockPhase::Linear2 and
+                    n_block_idx < 2) {
+                    for (uint32_t adapter_slot = 0;
+                         adapter_slot < kNumLoraSlots - 1; ++ adapter_slot) {
+                        CUTE_TIE_DECL(
+                            get_lora_segment(
+                                local_expert_idx, m_block_idx, adapter_slot),
+                            segment_start,
+                            segment_size);
+                        if (segment_size == 0)
+                            continue;
+
+                        for (uint32_t chunk_start = 0;
+                             chunk_start < segment_size;) {
+                            const auto output_start =
+                                segment_start + chunk_start;
+                            const auto aligned_output_start =
+                                output_start & ~15u;
+                            const auto leading_padding =
+                                output_start - aligned_output_start;
+                            const auto chunk_size = cute::min(
+                                segment_size - chunk_start,
+                                LORA_BLOCK_M - leading_padding);
+                            const auto aligned_chunk_size = math::align(
+                                leading_padding + chunk_size, 16u);
+                            const auto cta_chunk_offset = is_leader_cta
+                                ? 0u : aligned_chunk_size / 2;
+                            const auto local_chunk_size =
+                                aligned_chunk_size / 2;
+
+                            for (uint32_t down_k_block_idx = 0;
+                                 down_k_block_idx <
+                                     kIntermediateHidden / DOWN_BLOCK_K;
+                                 ++ down_k_block_idx) {
+                                shared_storage.lora_empty_barrier.wait(
+                                    lora_phase ^ 1);
+
+                                constexpr uint32_t kNumGroupsPerDownK =
+                                    DOWN_BLOCK_K *
+                                    sizeof(nv_bfloat16) / 16;
+                                for (uint32_t copy_idx = lane_idx;
+                                     copy_idx <
+                                         local_chunk_size *
+                                             kNumGroupsPerDownK;
+                                     copy_idx += 32) {
+                                    const auto local_row =
+                                        copy_idx / kNumGroupsPerDownK;
+                                    const auto group_idx =
+                                        copy_idx % kNumGroupsPerDownK;
+                                    const auto chunk_row =
+                                        cta_chunk_offset + local_row;
+                                    uint32_t packed[4] = {};
+                                    if (leading_padding <= chunk_row and
+                                        chunk_row <
+                                            leading_padding + chunk_size) {
+                                        const auto ring_row =
+                                            ring_block_idx * BLOCK_M +
+                                            aligned_output_start +
+                                            chunk_row;
+                                        const auto k_start =
+                                            down_k_block_idx * DOWN_BLOCK_K +
+                                            group_idx * 8;
+                                        const auto sf_group = k_start / 32;
+                                        const auto sf_uint_idx =
+                                            sf_group / 4;
+                                        const auto sf_byte_idx =
+                                            sf_group % 4;
+                                        const auto sf_ring_row =
+                                            ring_block_idx * SF_BLOCK_M +
+                                            transform_sf_token_idx(
+                                                aligned_output_start +
+                                                chunk_row);
+                                        const auto sf_addr =
+                                            sf_uint_idx *
+                                                kNumSFRingTokens *
+                                                sizeof(uint32_t) +
+                                            sf_ring_row *
+                                                sizeof(uint32_t) +
+                                            sf_byte_idx;
+                                        const auto sf_code =
+                                            l2_sf_buffer
+                                                .get_base_ptr<uint8_t>()[sf_addr];
+                                        const float scale =
+                                            static_cast<float>(
+                                                cutlass::float_ue8m0_t::
+                                                    bitcast(sf_code));
+                                        const auto src =
+                                            l2_token_buffer
+                                                .get_data_buffer(ring_row)
+                                                .template get_base_ptr<
+                                                    a_dtype_t>() +
+                                            k_start;
+                                        #pragma unroll
+                                        for (uint32_t elem = 0;
+                                             elem < 8; ++ elem) {
+                                            const auto bf16 =
+                                                __float2bfloat16_rn(
+                                                    static_cast<float>(
+                                                        src[elem]) *
+                                                    scale);
+                                            const auto bits =
+                                                *reinterpret_cast<
+                                                    const uint16_t*>(
+                                                    &bf16);
+                                            packed[elem / 2] |=
+                                                static_cast<uint32_t>(bits)
+                                                << ((elem % 2) * 16);
+                                        }
+                                    }
+                                    const auto swizzled_group =
+                                        group_idx ^ (local_row & 7u);
+                                    auto dst =
+                                        reinterpret_cast<uint8_t*>(
+                                            shared_storage.smem_lora_a) +
+                                        local_row * DOWN_BLOCK_K *
+                                            sizeof(nv_bfloat16) +
+                                        swizzled_group * 16;
+                                    ptx::st_shared(
+                                        dst, packed[0], packed[1],
+                                        packed[2], packed[3]);
+                                }
+                                __syncwarp();
+                                cutlass::arch::fence_view_async_shared();
+                                if (cute::elect_one_sync())
+                                    shared_storage.lora_a_load_barrier
+                                        .arrive();
+                                shared_storage.lora_a_load_barrier.wait(
+                                    lora_phase);
+                                if (cute::elect_one_sync())
+                                    Barrier::arrive(
+                                        reinterpret_cast<const uint64_t*>(
+                                            &shared_storage
+                                                 .lora_full_barrier),
+                                        0, 1);
+                                __syncwarp();
+                                lora_phase ^= 1;
+                            }
+                            chunk_start += chunk_size;
+                        }
+                    }
+                }
+            }
         });
     } else if (warp_idx == kNumDispatchWarps + 1) {
         // Adjust registers
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
 
         // GEMM TMA load warp for weights with SF
+        uint32_t lora_phase = 0;
         scheduler.for_each_block([&](const sched::BlockPhase& block_phase,
                                      const uint32_t& local_expert_idx,
                                      const uint32_t& num_k_blocks,
@@ -763,6 +1530,213 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 }
                 __syncwarp();
             }
+
+            if constexpr (kDoFC1Lora) {
+                if (block_phase == sched::BlockPhase::Linear1) {
+                    const uint32_t pool_block_idx =
+                        scheduler.get_current_pool_block_offset() + m_block_idx;
+                    const uint32_t ring_block_idx =
+                        pool_block_idx % kNumRingBlocks;
+                    // Unlike the A producer, the base B producer does not
+                    // otherwise depend on token arrival.  Acquire the routed
+                    // LoRA readiness counter before consuming adapter slots so
+                    // every sidecar role observes the completed payload pull.
+                    const auto lora_full_ptr =
+                        lora_readiness.get_full_count_ptr(ring_block_idx);
+                    const auto num_expected_tokens =
+                        BLOCK_M * (pool_block_idx / kNumRingBlocks + 1);
+                    while (ptx::ld_acq(lora_full_ptr) !=
+                           num_expected_tokens);
+                    for (uint32_t adapter_slot = 0;
+                         adapter_slot < kNumLoraSlots - 1; ++ adapter_slot) {
+                        CUTE_TIE_DECL(
+                            get_lora_segment(
+                                local_expert_idx,
+                                m_block_idx,
+                                adapter_slot),
+                            segment_start,
+                            segment_size);
+                        if (segment_size == 0)
+                            continue;
+
+                        for (uint32_t chunk_start = 0;
+                             chunk_start < segment_size;) {
+                            const auto output_start =
+                                segment_start + chunk_start;
+                            const auto leading_padding =
+                                output_start - (output_start & ~15u);
+                            const auto chunk_size = cute::min(
+                                segment_size - chunk_start,
+                                LORA_BLOCK_M - leading_padding);
+                            #pragma unroll
+                            for (uint32_t projection = 0;
+                                 projection < 2; ++ projection) {
+                                shared_storage.lora_empty_barrier.wait(
+                                    lora_phase ^ 1);
+                                const auto lora_b_map = projection == 0
+                                    ? get_lora_tensor_map(
+                                          lora_tensor_maps.gate_b)
+                                    : get_lora_tensor_map(
+                                          lora_tensor_maps.up_b);
+                                if (cute::elect_one_sync()) {
+                                    // Populate alternating groups of eight
+                                    // columns for the projection-specific A.
+                                    ptx::st_shared_bulk(
+                                        shared_storage.smem_lora_b,
+                                        sizeof(shared_storage.smem_lora_b));
+                                    cutlass::arch::fence_view_async_shared();
+                                    #pragma unroll
+                                    for (uint32_t k_block_idx = 0;
+                                         k_block_idx < kLoraRank / 64;
+                                         ++ k_block_idx) {
+                                        #pragma unroll
+                                        for (uint32_t output_chunk = 0;
+                                             output_chunk < BLOCK_N / 16;
+                                             ++ output_chunk) {
+                                            const uint32_t src_n_idx =
+                                                adapter_slot *
+                                                    kNumExpertsPerRank *
+                                                    kIntermediateHidden +
+                                                local_expert_idx *
+                                                    kIntermediateHidden +
+                                                n_block_idx *
+                                                    (BLOCK_N / 2) +
+                                                output_chunk * 8;
+                                            const uint32_t dst_n_idx =
+                                                output_chunk * 16 +
+                                                projection * 8;
+                                            tma::copy<
+                                                64, 8, 128, nv_bfloat16>(
+                                                lora_b_map,
+                                                &shared_storage
+                                                     .lora_b_load_barrier,
+                                                shared_storage.smem_lora_b +
+                                                    k_block_idx * BLOCK_N * 64 +
+                                                    dst_n_idx * 64,
+                                                k_block_idx * 64, src_n_idx);
+                                        }
+                                    }
+                                    constexpr uint32_t kLoadedLoraBBytes =
+                                        (BLOCK_N / 2) * kLoraRank *
+                                        sizeof(nv_bfloat16);
+                                    shared_storage.lora_b_load_barrier
+                                        .arrive_and_expect_tx(
+                                            kLoadedLoraBBytes);
+                                }
+                                shared_storage.lora_b_load_barrier.wait(
+                                    lora_phase);
+                                if (cute::elect_one_sync())
+                                    Barrier::arrive(
+                                        reinterpret_cast<const uint64_t*>(
+                                            &shared_storage
+                                                 .lora_full_barrier),
+                                        0, 1);
+                                __syncwarp();
+                                lora_phase ^= 1;
+                            }
+                            chunk_start += chunk_size;
+                        }
+                    }
+                }
+            }
+            if constexpr (kDoDownLora) {
+                if (block_phase == sched::BlockPhase::Linear2 and
+                    n_block_idx < 2) {
+                    const uint32_t pool_block_idx =
+                        scheduler.get_current_pool_block_offset() +
+                        m_block_idx;
+                    const uint32_t ring_block_idx =
+                        pool_block_idx % kNumRingBlocks;
+                    // Match the A producer's acquire before consuming
+                    // finalized subgroup metadata and the L2 ring.
+                    const auto l2_full_ptr =
+                        workspace.get_l2_full_count_ptr(ring_block_idx);
+                    const auto num_expected_blocks =
+                        (L2_SHAPE_K / BLOCK_N) * 2 *
+                        (pool_block_idx / kNumRingBlocks + 1);
+                    while (ptx::ld_acq(l2_full_ptr) !=
+                           num_expected_blocks);
+
+                    for (uint32_t adapter_slot = 0;
+                         adapter_slot < kNumLoraSlots - 1; ++ adapter_slot) {
+                        CUTE_TIE_DECL(
+                            get_lora_segment(
+                                local_expert_idx, m_block_idx, adapter_slot),
+                            segment_start,
+                            segment_size);
+                        if (segment_size == 0)
+                            continue;
+
+                        for (uint32_t chunk_start = 0;
+                             chunk_start < segment_size;) {
+                            const auto output_start =
+                                segment_start + chunk_start;
+                            const auto leading_padding =
+                                output_start - (output_start & ~15u);
+                            const auto chunk_size = cute::min(
+                                segment_size - chunk_start,
+                                LORA_BLOCK_M - leading_padding);
+
+                            for (uint32_t down_k_block_idx = 0;
+                                 down_k_block_idx <
+                                     kIntermediateHidden / DOWN_BLOCK_K;
+                                 ++ down_k_block_idx) {
+                                shared_storage.lora_empty_barrier.wait(
+                                    lora_phase ^ 1);
+                                if (cute::elect_one_sync()) {
+                                    if (is_leader_cta) {
+                                        const uint32_t down_outer_idx =
+                                            (adapter_slot *
+                                                 kNumExpertsPerRank +
+                                             local_expert_idx) *
+                                            kLoraRank;
+                                        tma::copy<
+                                            DOWN_BLOCK_K, kLoraRank,
+                                            128, nv_bfloat16>(
+                                            get_lora_tensor_map(
+                                                lora_tensor_maps.down_a),
+                                            &shared_storage
+                                                 .lora_b_load_barrier,
+                                            shared_storage.smem_lora_b,
+                                            down_k_block_idx *
+                                                DOWN_BLOCK_K,
+                                            down_outer_idx);
+                                        shared_storage
+                                            .lora_b_load_barrier
+                                            .arrive_and_expect_tx(
+                                                DOWN_BLOCK_K *
+                                                kLoraRank *
+                                                sizeof(nv_bfloat16));
+                                    } else {
+                                        // Rank 128 occupies the leader CTA's
+                                        // half of the 256xM cluster MMA.
+                                        ptx::st_shared_bulk(
+                                            shared_storage.smem_lora_b,
+                                            DOWN_BLOCK_K *
+                                                kLoraRank *
+                                                sizeof(nv_bfloat16));
+                                        shared_storage
+                                            .lora_b_load_barrier
+                                            .arrive();
+                                    }
+                                }
+                                shared_storage.lora_b_load_barrier.wait(
+                                    lora_phase);
+                                cutlass::arch::fence_view_async_shared();
+                                if (cute::elect_one_sync())
+                                    Barrier::arrive(
+                                        reinterpret_cast<const uint64_t*>(
+                                            &shared_storage
+                                                 .lora_full_barrier),
+                                        0, 1);
+                                __syncwarp();
+                                lora_phase ^= 1;
+                            }
+                            chunk_start += chunk_size;
+                        }
+                    }
+                }
+            }
         });
     } else if (warp_idx == kNumDispatchWarps + 2) {
         // Adjust registers
@@ -793,6 +1767,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
             // Persistently schedule over blocks
             uint32_t current_iter_idx = 0;
+            uint32_t down_iter_idx = 0;
+            uint32_t lora_phase = 0;
             scheduler.for_each_block([&](const sched::BlockPhase& block_phase,
                                          const uint32_t& local_expert_idx,
                                          const uint32_t& num_k_blocks,
@@ -867,7 +1843,272 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
                     // Commit to the mbarrier object
                     // No explicit `tcgen05.fence::before_thread_sync` is needed, as this is implicitly performed by `tcgen05.commit`
-                    empty_barrier_arrive(k_block_idx == num_k_blocks - 1);
+                    empty_barrier_arrive(
+                        k_block_idx == num_k_blocks - 1 and
+                        (not kDoFC1Lora or block_phase != sched::BlockPhase::Linear1));
+                }
+
+                if constexpr (kDoFC1Lora) {
+                    if (block_phase == sched::BlockPhase::Linear1) {
+                        auto lora_instr_desc = cute::UMMA::make_instr_desc<
+                            cutlass::bfloat16_t, cutlass::bfloat16_t, float,
+                            UMMA_M, LORA_BLOCK_M,
+                            cute::UMMA::Major::K, cute::UMMA::Major::K>();
+                        auto lora_a_desc = mma::sm100::make_umma_desc<
+                            cute::UMMA::Major::K,
+                            LORA_LOAD_BLOCK_M, 64, 128>(
+                                shared_storage.smem_lora_a, 0, 0);
+                        auto lora_b_desc = mma::sm100::make_umma_desc<
+                            cute::UMMA::Major::K, BLOCK_N, 64, 128>(
+                                shared_storage.smem_lora_b, 0, 0);
+                        const auto lora_a_desc_base_lo = lora_a_desc.lo;
+                        const auto lora_b_desc_base_lo = lora_b_desc.lo;
+
+                        for (uint32_t adapter_slot = 0;
+                             adapter_slot < kNumLoraSlots - 1; ++ adapter_slot) {
+                            CUTE_TIE_DECL(
+                                get_lora_segment(
+                                    local_expert_idx,
+                                    m_block_idx,
+                                    adapter_slot),
+                                segment_start,
+                                segment_size);
+                            if (segment_size == 0)
+                                continue;
+
+                            for (uint32_t chunk_start = 0;
+                                 chunk_start < segment_size;) {
+                                const auto output_start =
+                                    segment_start + chunk_start;
+                                const auto aligned_output_start =
+                                    output_start & ~15u;
+                                const auto leading_padding =
+                                    output_start - aligned_output_start;
+                                const auto chunk_size = cute::min(
+                                    segment_size - chunk_start,
+                                    LORA_BLOCK_M - leading_padding);
+                                const auto aligned_chunk_size =
+                                    math::align(
+                                        leading_padding + chunk_size, 16u);
+                                mma::sm100::update_instr_desc_with_umma_n(
+                                    lora_instr_desc, aligned_chunk_size);
+
+                                #pragma unroll
+                                for (uint32_t projection = 0;
+                                     projection < 2; ++ projection) {
+                                    shared_storage.lora_full_barrier.wait(
+                                        lora_phase);
+                                    ptx::tcgen05_after_thread_sync();
+                                    if (cute::elect_one_sync()) {
+                                        #pragma unroll
+                                        for (uint32_t k_block_idx = 0;
+                                             k_block_idx < kLoraRank / 64;
+                                             ++ k_block_idx) {
+                                            #pragma unroll
+                                            for (uint32_t k = 0;
+                                                 k < 64 / 16; ++ k) {
+                                                lora_a_desc.lo =
+                                                    mma::sm100::
+                                                        advance_umma_desc_lo<
+                                                            cute::UMMA::Major::K,
+                                                            LORA_LOAD_BLOCK_M,
+                                                            128,
+                                                            nv_bfloat16>(
+                                                                lora_a_desc_base_lo,
+                                                                k_block_idx *
+                                                                    64 *
+                                                                    LORA_LOAD_BLOCK_M,
+                                                                k * 16);
+                                                lora_b_desc.lo =
+                                                    mma::sm100::
+                                                        advance_umma_desc_lo<
+                                                            cute::UMMA::Major::K,
+                                                            BLOCK_N, 128,
+                                                            nv_bfloat16>(
+                                                                lora_b_desc_base_lo,
+                                                                k_block_idx *
+                                                                    64 *
+                                                                    BLOCK_N,
+                                                                k * 16);
+                                                ptx::
+                                                    SM100_MMA_F16BF16_2x1SM_SS::
+                                                        fma(
+                                                            lora_b_desc,
+                                                            lora_a_desc,
+                                                            accum_stage_idx *
+                                                                    UMMA_N +
+                                                                aligned_output_start,
+                                                            true,
+                                                            static_cast<
+                                                                uint64_t>(
+                                                                static_cast<
+                                                                    uint32_t>(
+                                                                    lora_instr_desc)) <<
+                                                                32);
+                                            }
+                                        }
+                                    }
+                                    __syncwarp();
+
+                                    constexpr uint16_t kCTAMask =
+                                        (1 << 2) - 1;
+                                    cutlass::arch::umma_arrive_multicast_2x1SM(
+                                        reinterpret_cast<uint64_t*>(
+                                            &shared_storage
+                                                 .lora_empty_barrier),
+                                        kCTAMask);
+                                    __syncwarp();
+                                    lora_phase ^= 1;
+                                }
+                                chunk_start += chunk_size;
+                            }
+                        }
+
+                        // LoRA accumulates directly into the live base FC1
+                        // accumulator columns.  Publish the merged tile only
+                        // after every subgroup intersection has completed.
+                        constexpr uint16_t kCTAMask = (1 << 2) - 1;
+                        cutlass::arch::umma_arrive_multicast_2x1SM(
+                            reinterpret_cast<uint64_t*>(
+                                &shared_storage
+                                     .tmem_full_barriers[accum_stage_idx]),
+                            kCTAMask);
+                        __syncwarp();
+                    }
+                }
+                if constexpr (kDoDownLora) {
+                    if (block_phase == sched::BlockPhase::Linear2 and
+                        n_block_idx < 2) {
+                        const auto down_phase = down_iter_idx++ & 1u;
+                        shared_storage.down_tmem_empty_barrier.wait(
+                            down_phase);
+                        ptx::tcgen05_after_thread_sync();
+
+                        auto down_instr_desc =
+                            cute::UMMA::make_instr_desc<
+                                cutlass::bfloat16_t,
+                                cutlass::bfloat16_t, float,
+                                UMMA_M, LORA_BLOCK_M,
+                                cute::UMMA::Major::K,
+                                cute::UMMA::Major::K>();
+                        auto down_a_desc =
+                            mma::sm100::make_umma_desc<
+                                cute::UMMA::Major::K,
+                                LORA_LOAD_BLOCK_M, DOWN_BLOCK_K, 128>(
+                                    shared_storage.smem_lora_a, 0, 0);
+                        auto down_b_desc =
+                            mma::sm100::make_umma_desc<
+                                cute::UMMA::Major::K,
+                                BLOCK_N, DOWN_BLOCK_K, 128>(
+                                    shared_storage.smem_lora_b, 0, 0);
+                        const auto down_a_desc_base_lo =
+                            down_a_desc.lo;
+                        const auto down_b_desc_base_lo =
+                            down_b_desc.lo;
+
+                        for (uint32_t adapter_slot = 0;
+                             adapter_slot < kNumLoraSlots - 1;
+                             ++ adapter_slot) {
+                            CUTE_TIE_DECL(
+                                get_lora_segment(
+                                    local_expert_idx, m_block_idx,
+                                    adapter_slot),
+                                segment_start,
+                                segment_size);
+                            if (segment_size == 0)
+                                continue;
+
+                            for (uint32_t chunk_start = 0;
+                                 chunk_start < segment_size;) {
+                                const auto output_start =
+                                    segment_start + chunk_start;
+                                const auto aligned_output_start =
+                                    output_start & ~15u;
+                                const auto leading_padding =
+                                    output_start - aligned_output_start;
+                                const auto chunk_size = cute::min(
+                                    segment_size - chunk_start,
+                                    LORA_BLOCK_M - leading_padding);
+                                const auto aligned_chunk_size =
+                                    math::align(
+                                        leading_padding + chunk_size,
+                                        16u);
+                                mma::sm100::
+                                    update_instr_desc_with_umma_n(
+                                        down_instr_desc,
+                                        aligned_chunk_size);
+
+                                for (uint32_t down_k_block_idx = 0;
+                                     down_k_block_idx <
+                                         kIntermediateHidden /
+                                             DOWN_BLOCK_K;
+                                     ++ down_k_block_idx) {
+                                    shared_storage.lora_full_barrier.wait(
+                                        lora_phase);
+                                    ptx::tcgen05_after_thread_sync();
+                                    if (cute::elect_one_sync()) {
+                                        #pragma unroll
+                                        for (uint32_t k = 0;
+                                             k <
+                                                 DOWN_BLOCK_K / 16;
+                                             ++ k) {
+                                            down_a_desc.lo =
+                                                mma::sm100::
+                                                    advance_umma_desc_lo<
+                                                        cute::UMMA::Major::K,
+                                                        LORA_LOAD_BLOCK_M,
+                                                        128,
+                                                        nv_bfloat16>(
+                                                            down_a_desc_base_lo,
+                                                            0, k * 16);
+                                            down_b_desc.lo =
+                                                mma::sm100::
+                                                    advance_umma_desc_lo<
+                                                        cute::UMMA::Major::K,
+                                                        BLOCK_N, 128,
+                                                        nv_bfloat16>(
+                                                            down_b_desc_base_lo,
+                                                            0, k * 16);
+                                            ptx::
+                                                SM100_MMA_F16BF16_2x1SM_SS::
+                                                    fma(
+                                                        down_b_desc,
+                                                        down_a_desc,
+                                                        kTmemStartColOfDown +
+                                                            aligned_output_start,
+                                                        true,
+                                                        static_cast<uint64_t>(
+                                                            static_cast<
+                                                                uint32_t>(
+                                                                down_instr_desc))
+                                                            << 32);
+                                        }
+                                    }
+                                    __syncwarp();
+                                    constexpr uint16_t kCTAMask =
+                                        (1 << 2) - 1;
+                                    cutlass::arch::
+                                        umma_arrive_multicast_2x1SM(
+                                            reinterpret_cast<uint64_t*>(
+                                                &shared_storage
+                                                     .lora_empty_barrier),
+                                            kCTAMask);
+                                    __syncwarp();
+                                    lora_phase ^= 1;
+                                }
+                                chunk_start += chunk_size;
+                            }
+                        }
+
+                        constexpr uint16_t kCTAMask =
+                            (1 << 2) - 1;
+                        cutlass::arch::umma_arrive_multicast_2x1SM(
+                            reinterpret_cast<uint64_t*>(
+                                &shared_storage
+                                     .down_tmem_full_barrier),
+                            kCTAMask);
+                        __syncwarp();
+                    }
                 }
             });
 
@@ -875,6 +2116,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             if (current_iter_idx > 0) {
                 const auto accum_phase_idx = ((current_iter_idx - 1) / kNumEpilogueStages) & 1;
                 shared_storage.tmem_empty_barriers[(current_iter_idx - 1) % kNumEpilogueStages].wait(accum_phase_idx);
+            }
+            if constexpr (kDoDownLora) {
+                if (down_iter_idx > 0)
+                    shared_storage.down_tmem_empty_barrier.wait(
+                        (down_iter_idx - 1) & 1u);
             }
         }
     } else if (warp_idx == kNumDispatchWarps + 3) {
@@ -918,21 +2164,27 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         // Persistently schedule over blocks
         uint32_t current_iter_idx = 0;
+        uint32_t down_iter_idx = 0;
         scheduler.for_each_block([&](const sched::BlockPhase& block_phase,
                                      const uint32_t& local_expert_idx,
                                      const uint32_t& num_k_blocks,
                                      const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
+            const auto accum_stage_idx =
+                current_iter_idx % kNumEpilogueStages;
+            const auto accum_phase =
+                (current_iter_idx ++ / kNumEpilogueStages) & 1;
+            const uint32_t pool_block_idx =
+                scheduler.get_current_pool_block_offset() + m_block_idx;
+            const uint32_t ring_block_idx =
+                pool_block_idx % kNumRingBlocks;
+
             // Wait UMMA arrival
-            const auto accum_stage_idx = current_iter_idx % kNumEpilogueStages;
-            const auto accum_phase = (current_iter_idx ++ / kNumEpilogueStages) & 1;
             shared_storage.tmem_full_barriers[accum_stage_idx].wait(accum_phase);
             ptx::tcgen05_after_thread_sync();
 
             // Compute offsets
             // NOTES: use shuffle here to let NVCC know warp divergence won't happen
             const uint32_t valid_m = ptx::exchange(scheduler.template get_valid_m<false>(), 0);
-            const uint32_t pool_block_idx = scheduler.get_current_pool_block_offset() + m_block_idx;
-            const uint32_t ring_block_idx = pool_block_idx % kNumRingBlocks;
             const uint32_t ring_m_idx = ring_block_idx * BLOCK_M;  // Ring-buffer offset for reusable data buffers
             const uint32_t pool_m_idx = pool_block_idx * BLOCK_M;       // Full-pool offset for non-ring metadata
             uint32_t n_idx = n_block_idx * BLOCK_N;
@@ -940,7 +2192,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             if (block_phase == sched::BlockPhase::Linear1) {
                 // Wait L2 block empty
                 const auto l2_empty_ptr = workspace.get_l2_empty_count_ptr(ring_block_idx);
-                const auto num_expected_blocks = (L2_SHAPE_N / BLOCK_N) * (pool_block_idx / kNumRingBlocks);
+                const auto num_expected_blocks =
+                    ((L2_SHAPE_N / BLOCK_N) +
+                     (kDoDownLora ? 1u : 0u)) *
+                    (pool_block_idx / kNumRingBlocks);
                 while (ptx::ld_acq(l2_empty_ptr) != num_expected_blocks);
 
                 // Unified L1 epilogue: gated activation (SwiGLU/GeGLU) in-place using
@@ -993,7 +2248,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             shared_storage.tmem_empty_barriers[accum_stage_idx].arrive(0u);
                         }
 
-                        // Apply gated activation: act(gate) * up (SwiGLU or GeGLU)
+                        // Apply gated activation: act(gate) * up (SwiGLU, GeGLU, or SiTU)
                         auto fp32_values = reinterpret_cast<float2*>(raw_values);
                         #pragma unroll
                         for (uint32_t k = 0; k < 2; ++ k) {
@@ -1010,11 +2265,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             const auto gate = __bfloat1622float2(bf16_gate);
                             const auto up = __bfloat1622float2(bf16_up);
 
-                            // Gated activation, applied to the gate projection. Both variants
-                            // reduce to `gate * sigmoid(z) * up` for an activation-specific `z`:
+                            // Gated activation. SwiGLU and GeGLU reduce to
+                            // `gate * sigmoid(z) * up` for an activation-specific `z`:
                             //  - SwiGLU: SiLU(gate)         => z = gate
                             //  - GeGLU:  GELU(gate) (tanh)  => z = alpha * (gate + beta * gate^3)
                             //    since 0.5 * (1 + tanh(t)) == sigmoid(2t)
+                            // SiTU uses beta * tanh(gate / beta) in place of the gate
+                            // numerator and optionally tanh-clamps the linear branch.
                             float2 z;
                             if constexpr (kActivationType == ActivationType::GeGLU) {
                                 constexpr float kAlpha = 1.5957691216057308f;  // 2 * sqrt(2 / pi)
@@ -1027,17 +2284,35 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                 z = gate;
                             }
 
+                            auto gate_numerator = gate;
+                            auto activated_up = up;
+                            if constexpr (kActivationType == ActivationType::SiTU) {
+                                const auto gate_tanh = make_float2(
+                                    kFastMath ? __tanhf(gate.x / kSituBeta) : tanhf(gate.x / kSituBeta),
+                                    kFastMath ? __tanhf(gate.y / kSituBeta) : tanhf(gate.y / kSituBeta));
+                                gate_numerator = __fmul2_rn({kSituBeta, kSituBeta}, gate_tanh);
+                                if constexpr (kSituLinearBeta != cute::numeric_limits<float>::infinity()) {
+                                    const auto up_tanh = make_float2(
+                                        kFastMath ? __tanhf(up.x / kSituLinearBeta) : tanhf(up.x / kSituLinearBeta),
+                                        kFastMath ? __tanhf(up.y / kSituLinearBeta) : tanhf(up.y / kSituLinearBeta));
+                                    activated_up = __fmul2_rn({kSituLinearBeta, kSituLinearBeta}, up_tanh);
+                                }
+                            }
+
                             const auto neg_exp = make_float2(
                                 kFastMath ? __expf(-z.x) : expf(-z.x),
                                 kFastMath ? __expf(-z.y) : expf(-z.y));
                             const auto denom = __fadd2_rn({1.0f, 1.0f}, neg_exp);
                             float2 activated;
                             if constexpr (kFastMath) {
-                                activated = __fmul2_rn(gate, {math::fast_rcp(denom.x), math::fast_rcp(denom.y)});
+                                activated = __fmul2_rn(
+                                    gate_numerator,
+                                    {math::fast_rcp(denom.x), math::fast_rcp(denom.y)});
                             } else {
-                                activated = {gate.x / denom.x, gate.y / denom.y};
+                                activated = {gate_numerator.x / denom.x, gate_numerator.y / denom.y};
                             }
-                            activation_values[i][k] = __fmul2_rn(__fmul2_rn(activated, up), weights);
+                            activation_values[i][k] =
+                                __fmul2_rn(__fmul2_rn(activated, activated_up), weights);
                         }
 
                         // Amax reduction (thread-level)
@@ -1253,8 +2528,205 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     }
                 }
 
-                // Ensure the next epilogue safe to use shared memory
-                ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                // Down tiles rendezvous on down_tmem_empty below; all other
+                // tiles need the ordinary epilogue barrier.
+                if (not kDoDownLora or n_block_idx >= 2)
+                    ptx::sync_aligned(
+                        kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+
+                if constexpr (kDoDownLora) {
+                    if (n_block_idx < 2) {
+                        const auto down_phase = down_iter_idx++ & 1u;
+                        // Clear the dedicated rank accumulator before
+                        // releasing it to the MMA warp.  Each epilogue warp
+                        // owns the same TMEM data-path slice it later loads;
+                        // the two stores cover that slice's full rank span.
+                        if (is_leader_cta) {
+                            #pragma unroll
+                            for (uint32_t s = 0;
+                                 s < WG_BLOCK_M / STORE_BLOCK_M; ++ s) {
+                                #pragma unroll
+                                for (uint32_t i = 0;
+                                     i < STORE_BLOCK_M / ATOM_M; ++ i) {
+                                    const uint32_t tmem_addr =
+                                        kTmemStartColOfDown +
+                                        epilogue_wg_idx * WG_BLOCK_M +
+                                        s * STORE_BLOCK_M +
+                                        i * ATOM_M;
+                                    cute::SM100_TMEM_STORE_16dp256b1x::
+                                        copy(0u, 0u, 0u, 0u, tmem_addr);
+                                    cute::SM100_TMEM_STORE_16dp256b1x::
+                                        copy(
+                                            0u, 0u, 0u, 0u,
+                                            tmem_addr | 0x00100000);
+                                }
+                            }
+                            cutlass::arch::
+                                fence_view_async_tmem_store();
+                        }
+                        ptx::tcgen05_before_thread_sync();
+                        shared_storage.down_tmem_empty_barrier.arrive(0u);
+                        shared_storage.down_tmem_full_barrier.wait(
+                            down_phase);
+                        ptx::tcgen05_after_thread_sync();
+
+                        if (is_leader_cta) {
+                            #pragma unroll
+                            for (uint32_t s = 0;
+                                 s < WG_BLOCK_M / STORE_BLOCK_M; ++ s) {
+                                if (epilogue_wg_idx * WG_BLOCK_M +
+                                        s * STORE_BLOCK_M >=
+                                    valid_m)
+                                    break;
+
+                                #pragma unroll
+                                for (uint32_t i = 0;
+                                     i < STORE_BLOCK_M / ATOM_M; ++ i) {
+                                    const uint32_t tmem_addr =
+                                        kTmemStartColOfDown +
+                                        epilogue_wg_idx * WG_BLOCK_M +
+                                        s * STORE_BLOCK_M +
+                                        i * ATOM_M;
+                                    uint32_t values[ATOM_M];
+                                    cute::SM100_TMEM_LOAD_16dp256b1x::
+                                        copy(
+                                            tmem_addr,
+                                            values[0], values[1],
+                                            values[2], values[3]);
+                                    cute::SM100_TMEM_LOAD_16dp256b1x::
+                                        copy(
+                                            tmem_addr | 0x00100000,
+                                            values[4], values[5],
+                                            values[6], values[7]);
+                                    cutlass::arch::
+                                        fence_view_async_tmem_load();
+
+                                    const uint32_t row = lane_idx % 8;
+                                    const uint32_t col =
+                                        (epilogue_warp_idx % 2) * 4 +
+                                        lane_idx / 8;
+                                    const auto smem_ptr =
+                                        reinterpret_cast<uint8_t*>(
+                                            shared_storage
+                                                .smem_d
+                                                .l2[epilogue_wg_idx]) +
+                                        (warp_idx_in_wg / 2) *
+                                            STORE_BLOCK_M *
+                                            kSwizzleCDMode +
+                                        i * ATOM_M *
+                                            kSwizzleCDMode +
+                                        row *
+                                            (kNumBankGroupBytes * 8) +
+                                        (col ^ row) *
+                                            kNumBankGroupBytes;
+                                    ptx::SM90_U32x4_STSM_T<uint32_t>::
+                                        copy(
+                                            math::cast_into_bf16_and_pack(
+                                                values[0], values[1]),
+                                            math::cast_into_bf16_and_pack(
+                                                values[2], values[3]),
+                                            math::cast_into_bf16_and_pack(
+                                                values[4], values[5]),
+                                            math::cast_into_bf16_and_pack(
+                                                values[6], values[7]),
+                                            smem_ptr);
+                                }
+                                ptx::sync_aligned(
+                                    128,
+                                    kEpilogueWGBarrierStartIdx +
+                                        epilogue_wg_idx);
+
+                                const uint32_t row_in_atom =
+                                    (warp_idx_in_wg * 2 +
+                                     lane_idx / 16) %
+                                    ATOM_M;
+                                const uint32_t bank_group_idx =
+                                    lane_idx % 8;
+                                #pragma unroll
+                                for (uint32_t j = 0;
+                                     j < kNumRowsPerWarp; ++ j) {
+                                    const uint32_t row_in_store =
+                                        j * 8 +
+                                        warp_idx_in_wg * 2 +
+                                        lane_idx / 16;
+                                    const uint32_t m_idx_in_block =
+                                        epilogue_wg_idx * WG_BLOCK_M +
+                                        s * STORE_BLOCK_M +
+                                        row_in_store;
+                                    if (m_idx_in_block >= valid_m)
+                                        break;
+
+                                    const auto src_metadata =
+                                        *workspace
+                                             .get_token_src_metadata_ptr(
+                                                 pool_m_idx +
+                                                 m_idx_in_block);
+                                    const auto raw_adapter_slot =
+                                        *ring_lora_adapter_slot_buffer
+                                             .get_data_buffer(
+                                                 ring_m_idx +
+                                                 m_idx_in_block)
+                                             .template get_base_ptr<
+                                                 int32_t>();
+                                    const bool active =
+                                        0 <= raw_adapter_slot and
+                                        raw_adapter_slot <
+                                            static_cast<int32_t>(
+                                                kNumLoraSlots - 1);
+                                    const auto smem_ptr =
+                                        reinterpret_cast<uint8_t*>(
+                                            shared_storage
+                                                .smem_d
+                                                .l2[epilogue_wg_idx]) +
+                                        (lane_idx % 16 / 8) *
+                                            STORE_BLOCK_M *
+                                            kSwizzleCDMode +
+                                        row_in_store *
+                                            kSwizzleCDMode +
+                                        (bank_group_idx ^
+                                         row_in_atom) *
+                                            kNumBankGroupBytes;
+                                    const auto packed = active
+                                        ? ptx::ld_shared(
+                                              reinterpret_cast<float4*>(
+                                                  smem_ptr))
+                                        : make_float4(
+                                              0.f, 0.f, 0.f, 0.f);
+                                    const auto dst_token =
+                                        routed_lora_rank_buffer
+                                            .get_rank_buffer(
+                                                src_metadata.topk_idx)
+                                            .get_data_buffer(
+                                                src_metadata.token_idx);
+                                    const auto dst_ptr =
+                                        math::advance_ptr<float4>(
+                                            dst_token.get_base_ptr(),
+                                            (lane_idx % 16) *
+                                                static_cast<uint32_t>(
+                                                    sizeof(float4)));
+                                    *sym_buffer.map(
+                                        dst_ptr,
+                                        src_metadata.rank_idx) = packed;
+                                }
+                            }
+                        }
+
+                        ptx::sync_aligned(
+                            kNumEpilogueThreads,
+                            kEpilogueFullBarrierIdx);
+                        if (is_leader_cta and
+                            epilogue_warp_idx == 0 and
+                            cute::elect_one_sync()) {
+                            // One extra release per physical ring block
+                            // keeps post-SwiGLU data alive until the shrink's
+                            // remote rank write has completed.
+                            ptx::red_add_rel(
+                                workspace.get_l2_empty_count_ptr(
+                                    ring_block_idx),
+                                1u);
+                        }
+                    }
+                }
             }
         });
 
@@ -1401,6 +2873,77 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     cute::tma_store_arrive();
                 }
                 __syncwarp();
+            }
+        }
+
+        if constexpr (kDoDownLora) {
+            // The L2 ring already contains the routing-weighted post-activation
+            // values, so this is a plain FP32 sum over routed ranks followed
+            // by exactly one application of the LoRA scale.
+            constexpr uint32_t kNumRankBF16x2 = kLoraRank / 2;
+            constexpr uint32_t kNumRankBF16x2PerLane =
+                kNumRankBF16x2 / 32;
+            DG_STATIC_ASSERT(
+                kLoraRank == 128 and
+                kNumRankBF16x2 % 32 == 0,
+                "Down combine requires rank 128");
+            for (uint32_t token_idx =
+                     sm_idx * kNumEpilogueWarps +
+                     epilogue_warp_idx;
+                 token_idx < num_tokens;
+                 token_idx +=
+                     kNumSMs * kNumEpilogueWarps) {
+                const auto adapter_slot =
+                    *input_lora_adapter_slot_buffer
+                         .get_data_buffer(token_idx)
+                         .template get_base_ptr<int32_t>();
+                const bool active =
+                    0 <= adapter_slot and
+                    adapter_slot <
+                        static_cast<int32_t>(kNumLoraSlots - 1);
+                float2 reduced[kNumRankBF16x2PerLane] = {};
+
+                if (active) {
+                    #pragma unroll
+                    for (uint32_t topk_slot = 0;
+                         topk_slot < kNumTopk; ++ topk_slot) {
+                        const auto expert_idx =
+                            __ldg(input_topk_idx_buffer
+                                      .get_base_ptr<int64_t>() +
+                                  token_idx * kNumTopk +
+                                  topk_slot);
+                        if (expert_idx < 0)
+                            continue;
+                        const auto src =
+                            routed_lora_rank_buffer
+                                .get_rank_buffer(topk_slot)
+                                .get_data_buffer(token_idx)
+                                .template get_base_ptr<
+                                    nv_bfloat162>();
+                        #pragma unroll
+                        for (uint32_t i = 0;
+                             i < kNumRankBF16x2PerLane; ++ i) {
+                            ptx::accumulate(
+                                reduced[i],
+                                src[i * 32 + lane_idx]);
+                        }
+                    }
+                }
+
+                const auto dst =
+                    combined_lora_rank_buffer
+                        .get_data_buffer(token_idx)
+                        .template get_base_ptr<nv_bfloat162>();
+                #pragma unroll
+                for (uint32_t i = 0;
+                     i < kNumRankBF16x2PerLane; ++ i) {
+                    reduced[i] = __fmul2_rn(
+                        reduced[i],
+                        {lora_tensor_maps.scaling,
+                         lora_tensor_maps.scaling});
+                    dst[i * 32 + lane_idx] =
+                        __float22bfloat162_rn(reduced[i]);
+                }
             }
         }
     }
