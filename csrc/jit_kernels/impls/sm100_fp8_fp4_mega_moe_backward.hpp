@@ -427,14 +427,15 @@ public:
             args.compute_w13_dgrad &&
             args.direct_remote_grad_x &&
             args.inline_wgrad;
-        // Exactly two physical ranges use the same compact logical K axis as
-        // the one-range exact engine. Keep this selector narrow so three-range
-        // launches retain their separately validated hybrid handoff.
+        // Packed physical ranges use the same compact logical K axis as the
+        // one-range exact engine. The phase-tagged scheduler carries the full
+        // immutable range set, so both two- and three-range launches consume
+        // panel readiness without a terminal hybrid handoff.
         const bool enable_k3_mxfp8_two_range_exact =
             args.mxfp8_three_term_wgrad &&
             args.multi_range_backward &&
             enable_k3_ready_wgrad &&
-            args.backward_ranges.num_ranges == 2u &&
+            args.backward_ranges.num_ranges >= 2u &&
             args.num_topk == 16u &&
             args.clear_wgrad_padding &&
             !args.accumulate_wgrad &&
@@ -491,10 +492,11 @@ public:
                 args.situ_linear_beta == 25.0f
             ? "#define DG_EXPERIMENTAL_K3_TWO_SEGMENT_BF16_PROGRESSIVE_WGRAD 1\n"
             : "";
-        const bool enable_k3_mxfp8_exact_epilogue_ring =
+        const bool enable_k3_mxfp8_dw13_hybrid =
             args.mxfp8_three_term_wgrad &&
                 args.multi_range_backward &&
                 enable_k3_ready_wgrad &&
+                !enable_k3_mxfp8_two_range_exact &&
                 args.backward_ranges.num_ranges ==
                     kK3MaxBackwardRanges &&
                 args.num_topk == 16u &&
@@ -502,8 +504,9 @@ public:
                 !args.accumulate_wgrad &&
                 args.situ_beta == 4.0f &&
                 args.situ_linear_beta == 25.0f;
+        const bool enable_k3_mxfp8_exact_epilogue_ring = false;
         const std::string mxfp8_dw13_hybrid_define =
-            enable_k3_mxfp8_exact_epilogue_ring
+            enable_k3_mxfp8_dw13_hybrid
             ? "#define DG_EXPERIMENTAL_K3_MXFP8_DW13_HYBRID 1\n"
             : "";
         const std::string exact_epilogue_ring_define =
@@ -914,17 +917,21 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
     DG_HOST_ASSERT(
         !enable_k3_branch_major_bf16_wgrad_tail ||
         !enable_k3_mxfp8_three_term_wgrad);
-    // The training mode owns the full exact-ring selection. There is no
-    // process-global override: an eligible three-range invocation either
-    // emits and caches the exact specialization or leaves it unreachable.
+    const bool enable_k3_mxfp8_packed_range_exact =
+        enable_k3_mxfp8_three_term_wgrad && multi_range_backward &&
+        !inline_weight_dequant && !phase_ordered_weight_dequant &&
+        !residual_mxfp8_dgrad && num_backward_ranges >= 2 &&
+        !accumulate_wgrad;
+    // The training mode owns exact packed-range selection. The hybrid remains
+    // only as a fallback when a packed launch misses the unified exact gate.
     const bool enable_k3_mxfp8_dw13_hybrid =
         enable_k3_mxfp8_three_term_wgrad && multi_range_backward &&
+        !enable_k3_mxfp8_packed_range_exact &&
         !inline_weight_dequant && !phase_ordered_weight_dequant &&
         !residual_mxfp8_dgrad &&
         num_backward_ranges == static_cast<int>(kK3MaxBackwardRanges) &&
         !accumulate_wgrad;
-    const bool enable_k3_mxfp8_exact_epilogue_ring =
-        enable_k3_mxfp8_dw13_hybrid;
+    const bool enable_k3_mxfp8_exact_epilogue_ring = false;
 
     DG_HOST_ASSERT(device_runtime->get_arch_major() == 10);
     DG_HOST_ASSERT(num_ranks >= 1);
@@ -1702,6 +1709,9 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
         require_disjoint(h_weighted_output, x_pool_output);
         require_disjoint(h_weighted_output, acts);
         require_disjoint(grad_gate_up_output, acts);
+        // Exact dW13 streams X while writing raw and packed scales. Its scale
+        // arena must therefore be physically disjoint from the complete BF16
+        // source, including aliases that would appear safe only to dW2.
         require_disjoint(x_pool_output, acts);
 
         // D must be explicit: legacy fallback descriptors point at dequant
@@ -2137,16 +2147,19 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
     DG_HOST_ASSERT((
         !multi_range_backward ||
         backward_ranges.is_full_arena_compatible<112, 192>()));
-    // Exactly two physical ranges are compacted into one logical K axis and
+    // Packed physical ranges are compacted into one logical K axis and
     // consumed by the phase-tagged exact dW2/dW13 engine. This must match the
-    // generated-source selector above: the exact AuxSlots carry two D maps,
+    // generated-source selector above: the exact AuxSlots carry both D maps,
     // the immutable range set, and the suffix arguments.
     const bool enable_k3_mxfp8_two_range_exact =
         enable_k3_mxfp8_three_term_wgrad && multi_range_backward &&
         !inline_weight_dequant && !phase_ordered_weight_dequant &&
-        !residual_mxfp8_dgrad && backward_ranges.num_ranges == 2u &&
+        !residual_mxfp8_dgrad && backward_ranges.num_ranges >= 2u &&
         num_topk == 16 && clear_wgrad_padding && !accumulate_wgrad &&
         situ_beta == 4.0f && situ_linear_beta == 25.0f;
+    DG_HOST_ASSERT(
+        enable_k3_mxfp8_two_range_exact ==
+        enable_k3_mxfp8_packed_range_exact);
     const bool enable_k3_two_segment_bf16_progressive =
         enable_k3_mxfp8_three_term_wgrad && multi_range_backward &&
         !enable_k3_mxfp8_two_range_exact &&
