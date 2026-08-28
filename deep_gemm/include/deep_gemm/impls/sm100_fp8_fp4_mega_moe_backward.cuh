@@ -17099,7 +17099,11 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                 // plane; the body-wide completion join orders this reduction
                 // before resource release and return.
                 constexpr uint32_t kThreeRangeReduceFirstWarp = 8u;
-                constexpr uint32_t kThreeRangeReduceWarps = 4u;
+                // Two warps saturate the terminal fixed-top-k reduction at
+                // K3's 64K/rank shape.  Keeping the other two roles idle
+                // avoids competing with the concurrent dW13 UMMA/TMA stream
+                // for global-memory issue bandwidth.
+                constexpr uint32_t kThreeRangeReduceWarps = 2u;
                 const auto* const three_range_backward_ranges =
                     &backward_ranges;
                 const auto reduce_three_range_grad_x = [=](
