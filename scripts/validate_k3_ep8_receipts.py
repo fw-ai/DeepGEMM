@@ -24,6 +24,20 @@ def _benchmark_arms() -> tuple[str, str]:
     return "native_deepep_v2", "megamoe_mok"
 
 
+def _protected_phases(
+    ledger: dict[str, Any], avg_tokens_per_rank: int
+) -> dict[str, Any]:
+    """Return source-bound or historical per-length latency ceilings."""
+    key = str(avg_tokens_per_rank)
+    source_bound = ledger["phase_highwater_ms"].get(key)
+    if source_bound is not None:
+        return source_bound
+    historical = ledger["historical_regression_frontier"].get(key)
+    if historical is None:
+        raise KeyError(f"no protected latency frontier for {avg_tokens_per_rank}")
+    return historical["phases"]
+
+
 def load_tagged_json(path: Path, tag: str) -> list[dict[str, Any]]:
     """Return every JSON payload following the requested tag in a log."""
     marker = tag + " "
@@ -94,9 +108,10 @@ def validate_phase_result(
     result: dict[str, Any],
     ledger: dict[str, Any],
     failures: list[str],
+    avg_tokens_per_rank: int = 65536,
 ) -> dict[str, dict[str, float]]:
     """Validate phase speedups and reject latency above the protected high-water."""
-    protected = ledger["phase_highwater_ms"]["65536"]
+    protected = _protected_phases(ledger, avg_tokens_per_rank)
     noise = ledger["promotion"]["maximum_latency_noise_fraction"]
     arms = _benchmark_arms()
     metrics: dict[str, dict[str, float]] = {}
@@ -145,7 +160,10 @@ def validate_phase_result(
         )
         _require(
             separate_target or combined_target,
-            "64K speedup target failed for both the separate and combined gates",
+            (
+                f"{avg_tokens_per_rank}-token speedup target failed for both "
+                "the separate and combined gates"
+            ),
             failures,
         )
     return metrics

@@ -36,15 +36,20 @@ def _receipt_validator() -> dict:
     )
 
 
-def _phase_result_from_ledger() -> dict:
+def _phase_result_from_ledger(avg_tokens_per_rank: int = 65536) -> dict:
     """Build a minimal phase receipt from the immutable high-water values."""
+    ledger = _load_ledger()
+    key = str(avg_tokens_per_rank)
+    phases = ledger["phase_highwater_ms"].get(key)
+    if phases is None:
+        phases = ledger["historical_regression_frontier"][key]["phases"]
     result = {}
     for phase, result_key in {
         "forward": "forward_ms",
         "backward": "backward_ms",
         "forward_backward": "forward_backward_ms",
     }.items():
-        record = _load_ledger()["phase_highwater_ms"]["65536"][phase]
+        record = phases[phase]
         result[result_key] = {
             "median": {
                 "native_deepep_v2": record["native_deepep_v2"],
@@ -120,6 +125,34 @@ def test_numeric_qualification_covers_all_outputs_and_gradients() -> None:
     )
 
 
+def test_historical_short_length_frontier_is_immutable_and_qualified() -> None:
+    """Retain every 4K--32K GPU winner as a latency regression ceiling."""
+    ledger = _load_ledger()
+    frontier = ledger["historical_regression_frontier"]
+    expected_candidate_ms = {
+        "4096": (5.0423359870910645, 20.046367645263672, 24.013887405395508),
+        "8192": (8.091168403625488, 25.515743255615234, 32.21945571899414),
+        "16384": (13.440735816955566, 44.304447174072266, 56.119232177734375),
+        "32768": (24.800159454345703, 83.12163543701172, 106.23721313476562),
+    }
+    assert set(frontier) == {"semantics", *expected_candidate_ms}
+    for length, expected in expected_candidate_ms.items():
+        record = frontier[length]
+        phases = record["phases"]
+        observed = tuple(
+            phases[phase]["candidate"]
+            for phase in ("forward", "backward", "forward_backward")
+        )
+        assert observed == expected
+        assert all(
+            value > ledger["cosine_floor_exclusive"]
+            for value in record["qualified_cosines"].values()
+        )
+        assert all(
+            len(digest) == 64 for digest in record["receipts"].values()
+        )
+
+
 def test_replay_identity_covers_benchmark_integration_and_runtime() -> None:
     """Require every non-DeepGEMM replay component to have a pinned identity."""
     identity = _load_ledger()["replay_identity"]
@@ -171,3 +204,26 @@ def test_receipt_validator_rejects_the_slower_rollback() -> None:
     )
     assert any("backward candidate" in failure for failure in failures)
     assert any("forward_backward candidate" in failure for failure in failures)
+
+
+def test_receipt_validator_enforces_the_4k_winner() -> None:
+    """Reject a candidate that starts optimization from a slower 4K result."""
+    validator = _receipt_validator()
+    ledger = _load_ledger()
+    result = _phase_result_from_ledger(4096)
+    failures = []
+    validator["validate_phase_result"](
+        result, ledger, failures, avg_tokens_per_rank=4096
+    )
+    assert not failures
+
+    result["backward_ms"]["median"]["megamoe_mok"] = 23.51580810546875
+    result["backward_ms"]["speedup"] = (
+        result["backward_ms"]["median"]["native_deepep_v2"]
+        / result["backward_ms"]["median"]["megamoe_mok"]
+    )
+    failures = []
+    validator["validate_phase_result"](
+        result, ledger, failures, avg_tokens_per_rank=4096
+    )
+    assert any("backward candidate" in failure for failure in failures)

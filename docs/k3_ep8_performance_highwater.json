@@ -67,6 +67,142 @@
       }
     }
   },
+  "historical_regression_frontier": {
+    "semantics": "GPU-measured per-length ceilings from numerically qualified historical revisions. These entries prevent latency regression but do not prove that one current revision attains the complete frontier.",
+    "4096": {
+      "source_status": "recoverable_v249_artifacts_not_yet_git_bound",
+      "receipts": {
+        "combined_log_sha256": "d5d3e4c2a4ad7418cb4ed038f5cfee600d020195b891c1ffeace6c2e51670ad3"
+      },
+      "source_artifacts": {
+        "backward_parent_header_sha256": "76e854365046ae81171873489474773f50c67d1b43be0ed655993a46348e66af",
+        "bf16_gemm_body_sha256": "73ed398ce2cd8839e9bfcd190d8fa8636812d9ecfd4e2adb76eddde2c65a80b2",
+        "generated_cuda_sha256": "24056fcbb08c5d7a665178e3bddc3626938c3f56e4a88eef1ef51ad0fdd42f82",
+        "generated_cubin_sha256": "a5e6a5f38dcf8dc0f9da6aeadb9b933f6a4a1214787b6727a718b3d1e5bc693b"
+      },
+      "qualified_cosines": {
+        "output": 0.9999964444295277,
+        "dX": 0.9999931862628643,
+        "dRoute": 0.9999999999358906,
+        "dW1": 0.9999999981294398,
+        "dW2": 0.9999999986841197,
+        "dW3": 0.99999999791408
+      },
+      "phases": {
+        "forward": {
+          "native_deepep_v2": 8.695391654968262,
+          "candidate": 5.0423359870910645,
+          "speedup": 1.7244768451030281
+        },
+        "backward": {
+          "native_deepep_v2": 33.731807708740234,
+          "candidate": 20.046367645263672,
+          "speedup": 1.6826892684825125
+        },
+        "forward_backward": {
+          "native_deepep_v2": 42.1163215637207,
+          "candidate": 24.013887405395508,
+          "speedup": 1.753831891218824
+        }
+      }
+    },
+    "8192": {
+      "source_status": "paired_raw_receipts_without_source_commit",
+      "receipts": {
+        "performance_log_sha256": "fc0a3875db9aab1e9b16251faf59935315cd39812f74f1494f13896907996572",
+        "numerics_log_sha256": "6f61cd064d36449a3d6dad91ae2c04804bc86e041b05801423f3b61fed262dd6"
+      },
+      "qualified_cosines": {
+        "output": 0.9999964575602192,
+        "dX": 0.999993193870819,
+        "dRoute": 0.9999999999406173,
+        "dW1": 0.9999999973988547,
+        "dW2": 0.9999999977571413,
+        "dW3": 0.9999999972109247
+      },
+      "phases": {
+        "forward": {
+          "native_deepep_v2": 14.45206356048584,
+          "candidate": 8.091168403625488,
+          "speedup": 1.7861528569854217
+        },
+        "backward": {
+          "native_deepep_v2": 41.72857666015625,
+          "candidate": 25.515743255615234,
+          "speedup": 1.6354051003775116
+        },
+        "forward_backward": {
+          "native_deepep_v2": 55.90662384033203,
+          "candidate": 32.21945571899414,
+          "speedup": 1.7351821311920468
+        }
+      }
+    },
+    "16384": {
+      "source_status": "paired_raw_receipts_without_source_commit",
+      "receipts": {
+        "performance_log_sha256": "e439b59364bbf605363d92530fbc63185d2afec73782f82ddd864bbcc29a2611",
+        "numerics_log_sha256": "01aa013f749032df17e115b2506e8e85b2f114514a75d201b93164287b077171"
+      },
+      "qualified_cosines": {
+        "output": 0.9999964521332829,
+        "dX": 0.9999931997435191,
+        "dRoute": 0.9999999999386078,
+        "dW1": 0.999999995536663,
+        "dW2": 0.9999999960942362,
+        "dW3": 0.999999995337355
+      },
+      "phases": {
+        "forward": {
+          "native_deepep_v2": 26.767776489257812,
+          "candidate": 13.440735816955566,
+          "speedup": 1.991541002947927
+        },
+        "backward": {
+          "native_deepep_v2": 60.260929107666016,
+          "candidate": 44.304447174072266,
+          "speedup": 1.360155310614772
+        },
+        "forward_backward": {
+          "native_deepep_v2": 87.17318725585938,
+          "candidate": 56.119232177734375,
+          "speedup": 1.5533567348137354
+        }
+      }
+    },
+    "32768": {
+      "source_status": "paired_raw_receipts_without_source_commit",
+      "receipts": {
+        "performance_log_sha256": "aafd056f27daae3e7f5407611a6e005f019946543e4b35b74315bc6391756b24",
+        "numerics_log_sha256": "ad8c76a26f0e05859545d6b33b6a49cd638492b3bd74de383c022efea5e80aab"
+      },
+      "qualified_cosines": {
+        "output": 0.9999964538212872,
+        "dX": 0.9999931924640113,
+        "dRoute": 0.9999999999215505,
+        "dW1": 0.9999999921935944,
+        "dW2": 0.9999999928894454,
+        "dW3": 0.999999991886441
+      },
+      "phases": {
+        "forward": {
+          "native_deepep_v2": 51.264991760253906,
+          "candidate": 24.800159454345703,
+          "speedup": 2.0671234737271336
+        },
+        "backward": {
+          "native_deepep_v2": 101.20806121826172,
+          "candidate": 83.12163543701172,
+          "speedup": 1.2175898691858105
+        },
+        "forward_backward": {
+          "native_deepep_v2": 152.99594116210938,
+          "candidate": 106.23721313476562,
+          "speedup": 1.4401351150658355
+        }
+      }
+    }
+  },
   "promotion": {
     "maximum_latency_noise_fraction": 0.03,
     "require_all_six_cosines": true,
