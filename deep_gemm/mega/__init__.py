@@ -213,6 +213,7 @@ def fp8_fp4_mega_moe(
     saved_down_unweighted: Optional[torch.Tensor] = None,
     num_config_tokens: Optional[int] = None,
     l2_activation_group_size: int = 32,
+    source_token_offset: int = 0,
 ):
     """Run MXFP8/FP4 MegaMoE with an explicit route-weight boundary.
 
@@ -225,6 +226,16 @@ def fp8_fp4_mega_moe(
         raise ValueError(
             "l2_activation_group_size must be 32 or 128, got "
             f"{l2_activation_group_size}")
+    if source_token_offset < 0:
+        raise ValueError(
+            "source_token_offset must be nonnegative, got "
+            f"{source_token_offset}")
+    if source_token_offset + y.size(0) > sym_buffer.num_max_tokens_per_rank:
+        raise ValueError(
+            "source_token_offset plus local tokens exceeds the symmetric "
+            "token capacity: "
+            f"{source_token_offset=} local_tokens={y.size(0)} "
+            f"capacity={sym_buffer.num_max_tokens_per_rank}")
     has_explicit_config_tokens = num_config_tokens is not None
     if num_config_tokens is None:
         num_config_tokens = y.size(0)
@@ -264,6 +275,7 @@ def fp8_fp4_mega_moe(
         saved_down_unweighted,
         num_config_tokens,
         l2_activation_group_size,
+        source_token_offset,
     )
 
 def bf16_mega_moe(y: torch.Tensor,

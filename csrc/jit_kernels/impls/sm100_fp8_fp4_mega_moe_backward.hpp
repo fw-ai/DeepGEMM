@@ -295,6 +295,7 @@ public:
         bool phase_ordered_weight_dequant = false;
         bool branch_major_bf16_wgrad_tail = false;
         bool mxfp8_three_term_wgrad = false;
+        bool three_segment_bf16_progressive_wgrad = false;
         bool inline_residual_mxfp8_dgrad = false;
         bool residual_mxfp8_dgrad = false;
         bool build_residual_mxfp8_weights = false;
@@ -393,6 +394,7 @@ public:
         bool vectorized_grad_x_store = false;
         bool wide_grad_x_store = false;
         bool multi_range_backward = false;
+        bool source_route_retention = false;
         uint64_t* kernel_trace = nullptr;
         bool inputs_prepared = false;
         bool dispatch_inputs_prepared = false;
@@ -427,15 +429,14 @@ public:
             args.compute_w13_dgrad &&
             args.direct_remote_grad_x &&
             args.inline_wgrad;
-        // Packed physical ranges use the same compact logical K axis as the
-        // one-range exact engine. The phase-tagged scheduler carries the full
-        // immutable range set, so both two- and three-range launches consume
-        // panel readiness without a terminal hybrid handoff.
+        // The exact engine's phase-tagged packed-range contract is verified
+        // for two physical ranges. Exactly three ranges retain ready-driven
+        // BF16 dW2 and hand only terminal dW13 to the MXFP8 hybrid.
         const bool enable_k3_mxfp8_two_range_exact =
             args.mxfp8_three_term_wgrad &&
             args.multi_range_backward &&
             enable_k3_ready_wgrad &&
-            args.backward_ranges.num_ranges >= 2u &&
+            args.backward_ranges.num_ranges == 2u &&
             args.num_topk == 16u &&
             args.clear_wgrad_padding &&
             !args.accumulate_wgrad &&
@@ -492,6 +493,19 @@ public:
                 args.situ_linear_beta == 25.0f
             ? "#define DG_EXPERIMENTAL_K3_TWO_SEGMENT_BF16_PROGRESSIVE_WGRAD 1\n"
             : "";
+        const std::string three_segment_bf16_progressive_define =
+            args.three_segment_bf16_progressive_wgrad &&
+                args.multi_range_backward &&
+                enable_k3_ready_wgrad &&
+                !enable_k3_mxfp8_two_range_exact &&
+                args.backward_ranges.num_ranges == kK3MaxBackwardRanges &&
+                args.num_topk == 16u &&
+                args.clear_wgrad_padding &&
+                !args.accumulate_wgrad &&
+                args.situ_beta == 4.0f &&
+                args.situ_linear_beta == 25.0f
+            ? "#define DG_EXPERIMENTAL_K3_THREE_SEGMENT_BF16_PROGRESSIVE_WGRAD 1\n"
+            : "";
         const bool enable_k3_mxfp8_dw13_hybrid =
             args.mxfp8_three_term_wgrad &&
                 args.multi_range_backward &&
@@ -517,8 +531,12 @@ public:
             !exact_epilogue_ring_define.empty() && args.trace_kernel
             ? "#define DG_EXPERIMENTAL_K3_MXFP8_EXACT_RING_WATCHDOG 1\n"
             : "";
+        const std::string source_route_retention_define =
+            args.source_route_retention
+            ? "#define DG_EXPERIMENTAL_K3_SOURCE_ROUTE_RETENTION 1\n"
+            : "";
         return fmt::format(R"(
-{}{}{}{}{}{}{}{}
+{}{}{}{}{}{}{}{}{}{}
 #include <deep_gemm/impls/sm100_fp8_fp4_mega_moe_backward.cuh>
 
 using namespace deep_gemm;
@@ -569,9 +587,11 @@ static void __instantiate_kernel() {{
             branch_major_bf16_wgrad_tail_define,
             branch_major_bf16_dynamic_tail_define,
             two_segment_bf16_progressive_define,
+            three_segment_bf16_progressive_define,
             mxfp8_dw13_hybrid_define,
             exact_epilogue_ring_define,
             exact_epilogue_ring_watchdog_define,
+            source_route_retention_define,
             args.hidden, args.intermediate_hidden,
             args.num_experts,
             args.block_m, args.block_n, args.block_k,
@@ -758,7 +778,10 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
     const std::vector<int64_t>& backward_range_sizes = {},
     // Explicit mode-owned opt-in. The host predicate below rejects every
     // shape, topology, activation, or output contract outside exact K3 EP8.
-    const bool& mxfp8_three_term_wgrad = false) {
+    const bool& mxfp8_three_term_wgrad = false,
+    // Per-call ready-BF16 scheduling selector. Unlike the MXFP8 selector,
+    // this never changes quantization, descriptor extents, or saved storage.
+    const bool& three_segment_bf16_progressive_wgrad = false) {
     constexpr int block_n = 128;
     constexpr int block_k = 128;
     const int residual_mxfp8_operand_count =
@@ -838,6 +861,14 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
         ? 1
         : static_cast<int>(backward_range_sizes.size() / 5u);
     const bool multi_range_backward = num_backward_ranges > 1;
+    const bool source_route_retention =
+        mxfp8_three_term_wgrad &&
+        down_unweighted_output.has_value() &&
+        grad_y_unweighted_output.has_value() &&
+        x_pool_output.data_ptr<at::BFloat16>() ==
+            grad_y_unweighted_output->data_ptr<at::BFloat16>() &&
+        x_pool_output.data_ptr<at::BFloat16>() !=
+            down_unweighted_output->data_ptr<at::BFloat16>();
     // Hybrid dW13 uses the FP8 activation ring only as a compact byte arena
     // for exact scales; its logical BF16 sources live in the full captured
     // pools. Preserve the range-total descriptor extents while allowing the
@@ -863,7 +894,7 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
     const float situ_linear_beta = situ_linear_beta_opt.value_or(
         std::numeric_limits<float>::infinity());
     const bool aliases_w2_dequant =
-        down_unweighted_output.has_value() &&
+        !source_route_retention && down_unweighted_output.has_value() &&
         w2_dequant_scratch.data_ptr() ==
             down_unweighted_output->data_ptr();
     const bool aliases_w13_dequant =
@@ -896,8 +927,22 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
         w2_wgrad_output.has_value() &&
         w13_wgrad_output.has_value();
     DG_HOST_ASSERT(
+        !(mxfp8_three_term_wgrad &&
+          three_segment_bf16_progressive_wgrad));
+    DG_HOST_ASSERT(
         !mxfp8_three_term_wgrad ||
         k3_mxfp8_three_term_wgrad_eligible);
+    const bool enable_k3_three_segment_bf16_progressive_wgrad =
+        three_segment_bf16_progressive_wgrad &&
+        k3_mxfp8_three_term_wgrad_eligible &&
+        multi_range_backward &&
+        num_backward_ranges == static_cast<int>(kK3MaxBackwardRanges) &&
+        !accumulate_wgrad &&
+        !inline_weight_dequant && !phase_ordered_weight_dequant &&
+        !residual_mxfp8_dgrad;
+    DG_HOST_ASSERT(
+        !three_segment_bf16_progressive_wgrad ||
+        enable_k3_three_segment_bf16_progressive_wgrad);
     // Preserve the public mxfp8_mxfp4_megamoe mode while selecting the terminal
     // BF16 wgrad suffix internally for either one physical range or exactly two
     // immutable physical ranges. Three-range, accumulated, and aliased dequant
@@ -920,7 +965,7 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
     const bool enable_k3_mxfp8_packed_range_exact =
         enable_k3_mxfp8_three_term_wgrad && multi_range_backward &&
         !inline_weight_dequant && !phase_ordered_weight_dequant &&
-        !residual_mxfp8_dgrad && num_backward_ranges >= 2 &&
+        !residual_mxfp8_dgrad && num_backward_ranges == 2 &&
         !accumulate_wgrad;
     // The training mode owns exact packed-range selection. The hybrid remains
     // only as a fallback when a packed launch misses the unified exact gate.
@@ -977,12 +1022,25 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
         DG_HOST_ASSERT(
             h_weighted_output.data_ptr() ==
                 h_act_output.data_ptr());
-        DG_HOST_ASSERT(
-            x_pool_output.data_ptr() ==
-                down_unweighted_output->data_ptr());
-        DG_HOST_ASSERT(
-            down_unweighted_output->sizes() ==
-                x_pool_output.sizes());
+        if (source_route_retention) {
+            DG_HOST_ASSERT(grad_y_unweighted_output.has_value());
+            DG_HOST_ASSERT(
+                x_pool_output.data_ptr() ==
+                    grad_y_unweighted_output->data_ptr());
+            DG_HOST_ASSERT(
+                down_unweighted_output->sizes() ==
+                    torch::IntArrayRef({
+                        static_cast<int64_t>(num_topk) *
+                            num_max_tokens_per_rank,
+                        hidden}));
+        } else {
+            DG_HOST_ASSERT(
+                x_pool_output.data_ptr() ==
+                    down_unweighted_output->data_ptr());
+            DG_HOST_ASSERT(
+                down_unweighted_output->sizes() ==
+                    x_pool_output.sizes());
+        }
     }
     DG_HOST_ASSERT(
         activation == "swiglu" || activation == "geglu" ||
@@ -1069,8 +1127,12 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
         DG_HOST_ASSERT(
             down_unweighted_output->size(1) == hidden);
         DG_HOST_ASSERT(
-            down_unweighted_output->size(0) > 0 &&
-            down_unweighted_output->size(0) <= num_pool_rows);
+            source_route_retention
+                ? down_unweighted_output->size(0) ==
+                      static_cast<int64_t>(num_topk) *
+                          num_max_tokens_per_rank
+                : (down_unweighted_output->size(0) > 0 &&
+                   down_unweighted_output->size(0) <= num_pool_rows));
     }
     if (grad_route_output.has_value()) {
         DG_HOST_ASSERT(
@@ -1224,7 +1286,13 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
         DG_HOST_ASSERT(
             backward_grad_y->scalar_type() == torch::kBFloat16);
         DG_HOST_ASSERT(backward_grad_y->dim() == 2);
-        DG_HOST_ASSERT(backward_grad_y->size(0) >= num_max_tokens_per_rank);
+        DG_HOST_ASSERT(
+            source_route_retention
+                ? (combined_grad_x_output.has_value() &&
+                   backward_grad_y->sizes() ==
+                       combined_grad_x_output->sizes())
+                : backward_grad_y->size(0) >=
+                      num_max_tokens_per_rank);
         DG_HOST_ASSERT(backward_grad_y->size(1) == hidden);
         DG_HOST_ASSERT(backward_grad_y->is_contiguous());
         if (backward_x.has_value()) {
@@ -1232,7 +1300,12 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
                 backward_x->scalar_type() == torch::kBFloat16);
             DG_HOST_ASSERT(backward_x->dim() == 2);
             DG_HOST_ASSERT(
-                backward_x->size(0) >= num_max_tokens_per_rank);
+                source_route_retention
+                    ? (combined_grad_x_output.has_value() &&
+                       backward_x->sizes() ==
+                           combined_grad_x_output->sizes())
+                    : backward_x->size(0) >=
+                          num_max_tokens_per_rank);
             DG_HOST_ASSERT(backward_x->size(1) == hidden);
             DG_HOST_ASSERT(backward_x->is_contiguous());
         }
@@ -2147,14 +2220,14 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
     DG_HOST_ASSERT((
         !multi_range_backward ||
         backward_ranges.is_full_arena_compatible<112, 192>()));
-    // Packed physical ranges are compacted into one logical K axis and
+    // Exactly two physical ranges are compacted into one logical K axis and
     // consumed by the phase-tagged exact dW2/dW13 engine. This must match the
-    // generated-source selector above: the exact AuxSlots carry both D maps,
-    // the immutable range set, and the suffix arguments.
+    // generated-source selector above. Three ranges use the dedicated hybrid
+    // slot contract below.
     const bool enable_k3_mxfp8_two_range_exact =
         enable_k3_mxfp8_three_term_wgrad && multi_range_backward &&
         !inline_weight_dequant && !phase_ordered_weight_dequant &&
-        !residual_mxfp8_dgrad && backward_ranges.num_ranges >= 2u &&
+        !residual_mxfp8_dgrad && backward_ranges.num_ranges == 2u &&
         num_topk == 16 && clear_wgrad_padding && !accumulate_wgrad &&
         situ_beta == 4.0f && situ_linear_beta == 25.0f;
     DG_HOST_ASSERT(
@@ -2413,6 +2486,8 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
             enable_k3_branch_major_bf16_wgrad_tail,
         .mxfp8_three_term_wgrad =
             enable_k3_mxfp8_three_term_wgrad,
+        .three_segment_bf16_progressive_wgrad =
+            enable_k3_three_segment_bf16_progressive_wgrad,
         .inline_residual_mxfp8_dgrad =
             inline_residual_mxfp8_dgrad,
         .residual_mxfp8_dgrad = residual_mxfp8_dgrad,
@@ -2572,6 +2647,7 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
         .trace_kernel = kernel_trace.has_value(),
         .vectorized_grad_x_store = multi_range_backward,
         .multi_range_backward = multi_range_backward,
+        .source_route_retention = source_route_retention,
         .kernel_trace =
             kernel_trace.has_value()
             ? reinterpret_cast<uint64_t*>(
@@ -2585,17 +2661,19 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
     const auto code =
         SM100FP8FP4MegaMoEBackwardWaveRuntime::generate(args);
     const auto kernel_name = fmt::format(
-        "sm100_fp8_fp4_mega_moe_backward_dgrad_{}_{}_r{}_inline{}_phase{}_residual{}_build{}_x{}_gate{}_wgrad{}_accum{}_d4{}_mxfp8wgrad{}_exact2{}_ring{}_trace{}_ranges{}",
+        "k3_mmbwd_{}_{}_gr{}_id{}_pd{}_rd{}_br{}_bx{}_gp{}_wg{}_aw{}_d4{}_p3{}_mw{}_e2{}_er{}_tr{}_mr{}_sr{}",
         activation, route_weight_mode,
         grad_route_output.has_value(), inline_weight_dequant,
         phase_ordered_weight_dequant, residual_mxfp8_dgrad,
         build_residual_mxfp8_weights, backward_x.has_value(),
         gate_up_prepared, inline_wgrad, accumulate_wgrad,
         enable_k3_branch_major_bf16_wgrad_tail ? "t" : "f",
+        enable_k3_three_segment_bf16_progressive_wgrad,
         enable_k3_mxfp8_three_term_wgrad,
         enable_k3_mxfp8_two_range_exact,
         enable_k3_mxfp8_exact_epilogue_ring,
-        kernel_trace.has_value(), args.multi_range_backward);
+        kernel_trace.has_value(), args.multi_range_backward,
+        args.source_route_retention);
     // Compiler::build materializes `kernel.<name>.<32-hex-digest>`.  Keep the
     // complete directory component below POSIX NAME_MAX on every filesystem.
     constexpr size_t kJitCacheComponentOverhead = 7u + 1u + 32u;

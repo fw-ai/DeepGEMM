@@ -53,6 +53,7 @@ public:
         std::string route_weight_mode;
         bool save_down_unweighted;
         int l2_activation_group_size;
+        int source_token_offset;
         MegaMoEConfig config;
 
         // Runtime arguments
@@ -81,7 +82,9 @@ public:
 
     static std::string generate_impl(const Args& args) {
         return fmt::format(R"(
+#define DEEP_GEMM_MEGA_MOE_SOURCE_TOKEN_OFFSET {}
 #include <deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh>
+#undef DEEP_GEMM_MEGA_MOE_SOURCE_TOKEN_OFFSET
 
 using namespace deep_gemm;
 
@@ -106,11 +109,11 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
-        {},
         {}
     >);
 }};
-)", args.num_max_tokens_per_rank,
+)", args.source_token_offset,
+    args.num_max_tokens_per_rank,
     args.hidden, args.intermediate_hidden,
     args.num_experts, args.num_topk,
     args.config.num_experts_per_wave,
@@ -179,7 +182,8 @@ static void sm100_fp8_fp4_mega_moe(
     const bool& fast_math,
     const std::string& route_weight_mode,
     const std::optional<torch::Tensor>& saved_down_unweighted,
-    const int& l2_activation_group_size
+    const int& l2_activation_group_size,
+    const int& source_token_offset
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -216,6 +220,10 @@ static void sm100_fp8_fp4_mega_moe(
     DG_HOST_ASSERT(
         l2_activation_group_size == 32 ||
         l2_activation_group_size == 128);
+    DG_HOST_ASSERT(source_token_offset >= 0);
+    DG_HOST_ASSERT(
+        source_token_offset + num_tokens <=
+        num_max_tokens_per_rank);
     if (saved_l1_preact.has_value() &&
         saved_down_unweighted.has_value()) {
         DG_HOST_ASSERT(saved_l1_preact->size(0) ==
@@ -320,6 +328,7 @@ static void sm100_fp8_fp4_mega_moe(
         .save_down_unweighted =
             saved_down_unweighted.has_value(),
         .l2_activation_group_size = l2_activation_group_size,
+        .source_token_offset = source_token_offset,
         .config = config,
         .y = y.data_ptr(),
         .saved_l1_preact = saved_l1_preact.has_value()

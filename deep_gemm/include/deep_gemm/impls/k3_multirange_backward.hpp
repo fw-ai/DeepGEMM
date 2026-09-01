@@ -558,6 +558,43 @@ k3_multirange_physical_token_index(
     return static_cast<uint32_t>(-1);
 }
 
+// Forward retains post-W2 values in source-token/top-k order. One backward
+// warp owns one source token, consumes every top-k value needed by its router
+// adjoint, and only then repurposes plane zero for raw dY and plane one for
+// exact source X. Per-token ownership makes this a zero-spill lifetime: no
+// peer can observe either reclaimed plane before all route slots retire.
+struct K3SourceRouteRetentionContract {
+    static constexpr uint32_t kGradYPlane = 0u;
+    static constexpr uint32_t kExactSourceXPlane = 1u;
+    static constexpr uint32_t kNumSpillPlanes = 0u;
+
+    DG_K3_MULTIRANGE_HOST_DEVICE static constexpr bool needs_spill(
+        const uint32_t /* topk_slot */) {
+        return false;
+    }
+
+    DG_K3_MULTIRANGE_HOST_DEVICE static constexpr bool can_reclaim_token(
+        const uint32_t completed_route_slots,
+        const uint32_t num_topk) {
+        return completed_route_slots == num_topk;
+    }
+
+    DG_K3_MULTIRANGE_HOST_DEVICE static constexpr uint64_t source_row(
+        const uint32_t topk_slot,
+        const uint32_t physical_token_idx,
+        const uint32_t physical_token_capacity) {
+        return static_cast<uint64_t>(topk_slot) *
+            physical_token_capacity + physical_token_idx;
+    }
+};
+
+static_assert(K3SourceRouteRetentionContract::kGradYPlane == 0u);
+static_assert(K3SourceRouteRetentionContract::kExactSourceXPlane == 1u);
+static_assert(K3SourceRouteRetentionContract::kNumSpillPlanes == 0u);
+static_assert(!K3SourceRouteRetentionContract::needs_spill(0u));
+static_assert(K3SourceRouteRetentionContract::can_reclaim_token(16u, 16u));
+static_assert(!K3SourceRouteRetentionContract::can_reclaim_token(15u, 16u));
+
 #undef DG_K3_MULTIRANGE_HOST_DEVICE
 
 // Direct dX readiness is indexed by the physical symmetric-plane token, not

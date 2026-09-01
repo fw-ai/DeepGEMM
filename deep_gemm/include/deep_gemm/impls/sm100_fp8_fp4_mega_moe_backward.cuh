@@ -58,6 +58,14 @@
 #ifndef DG_EXPERIMENTAL_K3_MXFP8_THREE_TERM_WGRAD
 #define DG_EXPERIMENTAL_K3_MXFP8_THREE_TERM_WGRAD 0
 #endif
+// Packed K3 Forward leaves the exact unweighted W2 result in source-token /
+// fixed-top-k symmetric planes.  Backward computes the router adjoint there,
+// then reuses each token's retired planes for grad-Y and exact-X before the
+// existing reverse-dispatch barrier.  The host emits this gate only with the
+// explicit exact packed-training mode; it adds no runtime kernel argument.
+#ifndef DG_EXPERIMENTAL_K3_SOURCE_ROUTE_RETENTION
+#define DG_EXPERIMENTAL_K3_SOURCE_ROUTE_RETENTION 0
+#endif
 // One-way multi-range hybrid: preserve the proven ready-driven BF16 dW2
 // body, but consume dW13 with the exact three-term MXFP8 UMMA/TMA body.  This
 // gate is emitted only for the exact K3 EP=8 training specialization; keeping
@@ -80,6 +88,13 @@
 // the existing union scheduler arena.
 #ifndef DG_EXPERIMENTAL_K3_TWO_SEGMENT_BF16_PROGRESSIVE_WGRAD
 #define DG_EXPERIMENTAL_K3_TWO_SEGMENT_BF16_PROGRESSIVE_WGRAD 0
+#endif
+// Three-range peer of the two-segment progressive suffix. One phase-tagged
+// BF16 UMMA/TMA body claims ready dW13 quanta before more dW2 work, preserving
+// one FP32 accumulation across all three physical K ranges. The host emits
+// this only for the exact EP=8 K3 ready-wgrad specialization.
+#ifndef DG_EXPERIMENTAL_K3_THREE_SEGMENT_BF16_PROGRESSIVE_WGRAD
+#define DG_EXPERIMENTAL_K3_THREE_SEGMENT_BF16_PROGRESSIVE_WGRAD 0
 #endif
 // Once one exact dW13 expert is fully quantized, this many leading clusters
 // remain on BF16 dW2 until its global cursor drains. Above this floor, suffix
@@ -2714,6 +2729,136 @@ CUTLASS_DEVICE __noinline__ void k3_mxfp8_run_overlap_suffix(
 }
 #endif
 
+/** Consume source-layout W2 and reclaim two symmetric planes in place.
+ *
+ * One warp owns one logical source token for its complete lifetime.  It first
+ * reduces every fixed-top-k router dot from the exact BF16 Forward boundary;
+ * only after all slots retire does that same warp overwrite plane zero with
+ * grad-Y and plane one with exact source X.  No other warp touches the token,
+ * so this is a per-token producer/consumer pipeline with neither a spill nor
+ * a grid-wide intermediate.  The caller joins CTAs at the existing reverse-
+ * dispatch NVLink barrier before any peer TMA reads the reclaimed planes.
+ */
+template <
+    uint32_t kHidden, uint32_t kNumTopk,
+    uint32_t kNumSMs, uint32_t kNumThreads>
+CUTLASS_DEVICE __noinline__ void
+k3_consume_source_down_and_stage_backward_inputs(
+    const cutlass::bfloat16_t* logical_grad_y,
+    const cutlass::bfloat16_t* logical_source_x,
+    cutlass::bfloat16_t* source_down_planes,
+    float* source_grad_route,
+    const K3BackwardRangeSet& backward_ranges,
+    const uint32_t num_backward_tokens,
+    const uint32_t physical_token_capacity) {
+    static_assert(kHidden % 8u == 0u);
+    static_assert(kNumTopk == 16u);
+    constexpr uint32_t kValuesPerVector =
+        sizeof(uint4) / sizeof(cutlass::bfloat16_t);
+    static_assert(kValuesPerVector == 8u);
+    constexpr uint32_t kWarpsPerCTA = kNumThreads / 32u;
+    constexpr uint32_t kGlobalWarps = kNumSMs * kWarpsPerCTA;
+    const uint32_t warp_idx = cutlass::canonical_warp_idx_sync();
+    const uint32_t lane_idx = ptx::get_lane_idx();
+    const uint32_t global_warp = blockIdx.x * kWarpsPerCTA + warp_idx;
+    const uint64_t values_per_plane =
+        static_cast<uint64_t>(physical_token_capacity) * kHidden;
+
+    for (uint32_t logical_token = global_warp;
+         logical_token < num_backward_tokens;
+         logical_token += kGlobalWarps) {
+        const uint32_t physical_token =
+            k3_multirange_physical_token_index(
+                backward_ranges, logical_token);
+        DG_DEVICE_ASSERT(physical_token < physical_token_capacity);
+        const auto* const grad_y_row =
+            logical_grad_y +
+            static_cast<uint64_t>(logical_token) * kHidden;
+
+        #pragma unroll
+        for (uint32_t topk_slot = 0u;
+             topk_slot < kNumTopk; ++topk_slot) {
+            const auto* const down_row =
+                source_down_planes +
+                (static_cast<uint64_t>(topk_slot) *
+                     physical_token_capacity +
+                 physical_token) *
+                    kHidden;
+            float lane_sums[kValuesPerVector] = {};
+            for (uint32_t col_base = lane_idx * kValuesPerVector;
+                 col_base < kHidden;
+                 col_base += 32u * kValuesPerVector) {
+                const auto grad_y_packed =
+                    *reinterpret_cast<const uint4*>(
+                        grad_y_row + col_base);
+                const auto down_packed =
+                    *reinterpret_cast<const uint4*>(
+                        down_row + col_base);
+                const auto* const grad_y_values =
+                    reinterpret_cast<const cutlass::bfloat16_t*>(
+                        &grad_y_packed);
+                const auto* const down_values =
+                    reinterpret_cast<const cutlass::bfloat16_t*>(
+                        &down_packed);
+                #pragma unroll
+                for (uint32_t i = 0u; i < kValuesPerVector; ++i) {
+                    lane_sums[i] = __fadd_rn(
+                        lane_sums[i],
+                        __fmul_rn(
+                            static_cast<float>(grad_y_values[i]),
+                            static_cast<float>(down_values[i])));
+                }
+            }
+            const float sum_01 = __fadd_rn(lane_sums[0], lane_sums[1]);
+            const float sum_23 = __fadd_rn(lane_sums[2], lane_sums[3]);
+            const float sum_45 = __fadd_rn(lane_sums[4], lane_sums[5]);
+            const float sum_67 = __fadd_rn(lane_sums[6], lane_sums[7]);
+            float grad_route = __fadd_rn(
+                __fadd_rn(sum_01, sum_23),
+                __fadd_rn(sum_45, sum_67));
+            #pragma unroll
+            for (uint32_t offset = 16u; offset > 0u; offset >>= 1u) {
+                grad_route = __fadd_rn(
+                    grad_route,
+                    __shfl_down_sync(
+                        0xffffffff, grad_route, offset));
+            }
+            if (lane_idx == 0u) {
+                source_grad_route[
+                    static_cast<uint64_t>(physical_token) *
+                        kNumTopk +
+                    topk_slot] = grad_route;
+            }
+            __syncwarp();
+        }
+
+        auto* const grad_y_plane_row =
+            source_down_planes +
+            static_cast<uint64_t>(physical_token) * kHidden;
+        auto* const source_x_plane_row =
+            source_down_planes + values_per_plane +
+            static_cast<uint64_t>(physical_token) * kHidden;
+        const auto* const source_x_row =
+            logical_source_x +
+            static_cast<uint64_t>(logical_token) * kHidden;
+        for (uint32_t vector_idx = lane_idx;
+             vector_idx < kHidden / kValuesPerVector;
+             vector_idx += 32u) {
+            const uint32_t col = vector_idx * kValuesPerVector;
+            *reinterpret_cast<uint4*>(grad_y_plane_row + col) =
+                *reinterpret_cast<const uint4*>(grad_y_row + col);
+            *reinterpret_cast<uint4*>(source_x_plane_row + col) =
+                *reinterpret_cast<const uint4*>(source_x_row + col);
+        }
+        __syncwarp();
+    }
+    // Every lane owns independent 16-byte stores.  One system fence after
+    // that lane has retired all of its token rows publishes the complete
+    // source range to peer TMA; fencing once per token adds avoidable latency
+    // at long sequence lengths without strengthening the publication edge.
+    __threadfence_system();
+}
+
 /** Pull exact source X and reclaim fixed-top-k combine plane one.
  *
  * This helper is called by W13-idle warp three only.  Keeping the long TMA
@@ -3329,6 +3474,19 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
         kHidden == 3584 && kIntermediateHidden == 3072 &&
         kNumExperts == 112 && BLOCK_M == 192 &&
         kNumSMs == 148 && kNumThreads == 1024;
+    constexpr bool kK3SourceRouteRetention =
+        DG_EXPERIMENTAL_K3_SOURCE_ROUTE_RETENTION &&
+        kCompileW13Dgrad && kInlineWgrad &&
+        kNumRanks == 8 && !kBF16Mode && !kInputsPrepared &&
+        kExactSourceX && kGateUpPrepared && kDirectRemoteGradX &&
+        kComputeRouteGrad &&
+        kActivationType == ActivationType::SiTU &&
+        kSituBeta == 4.0f && kSituLinearBeta == 25.0f &&
+        kRouteWeightMode == RouteWeightMode::PostDown &&
+        kCombineOrderMode == CombineOrderMode::FixedTopK &&
+        kHidden == 3584 && kIntermediateHidden == 3072 &&
+        kNumExperts == 112 && BLOCK_M == 192 &&
+        kNumSMs == 148 && kNumThreads == 1024;
     constexpr bool kK3MxFp8WgradOverlap =
         kK3MxFp8ThreeTermWgrad &&
         DG_EXPERIMENTAL_K3_MXFP8_WGRAD_OVERLAP;
@@ -3359,6 +3517,10 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
         !DG_EXPERIMENTAL_K3_MXFP8_THREE_TERM_WGRAD ||
             kK3MxFp8ThreeTermWgrad,
         "The three-term MXFP8 wgrad gate is exact K3 EP4/EP8 SiTU only");
+    DG_STATIC_ASSERT(
+        !DG_EXPERIMENTAL_K3_SOURCE_ROUTE_RETENTION ||
+            kK3SourceRouteRetention,
+        "Retained source W2 is exact K3 EP8 SiTU training only");
     DG_STATIC_ASSERT(
         !DG_EXPERIMENTAL_K3_BRANCH_MAJOR_BF16_WGRAD_TAIL ||
             kK3BranchMajorBF16WgradTail,
@@ -3478,6 +3640,13 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
         kCombineOrderMode == CombineOrderMode::FixedTopK &&
         kSituBeta == 4.0f && kSituLinearBeta == 25.0f &&
         kNumThreads == 1024;
+    constexpr bool kK3ThreeSegmentBF16ProgressiveWgrad =
+        DG_EXPERIMENTAL_K3_THREE_SEGMENT_BF16_PROGRESSIVE_WGRAD &&
+        kReadyWgradSchedule && kMultiRangeBackward &&
+        kClearWgradPadding && !kAccumulateWgrad &&
+        kCombineOrderMode == CombineOrderMode::FixedTopK &&
+        kSituBeta == 4.0f && kSituLinearBeta == 25.0f &&
+        kNumThreads == 1024;
     constexpr uint32_t kReadyNumClusters = kNumSMs / 2u;
     constexpr uint32_t kK3MxFp8DW13ShepherdClusters =
         DG_EXPERIMENTAL_K3_MXFP8_DW13_SHEPHERD_CLUSTERS;
@@ -3575,8 +3744,16 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
             kK3TwoSegmentBF16ProgressiveWgrad,
         "Progressive two-segment BF16 wgrad is exact K3 EP8 training only");
     DG_STATIC_ASSERT(
-        !kK3TwoSegmentBF16ProgressiveWgrad || !kK3MxFp8DW13Hybrid,
-        "BF16 progressive and exact-MXFP8 dW13 suffixes are mutually exclusive");
+        !DG_EXPERIMENTAL_K3_THREE_SEGMENT_BF16_PROGRESSIVE_WGRAD ||
+            kK3ThreeSegmentBF16ProgressiveWgrad,
+        "Progressive three-segment BF16 wgrad is exact K3 EP8 training only");
+    DG_STATIC_ASSERT(
+        !(kK3TwoSegmentBF16ProgressiveWgrad &&
+          kK3ThreeSegmentBF16ProgressiveWgrad) &&
+            (!(kK3TwoSegmentBF16ProgressiveWgrad ||
+               kK3ThreeSegmentBF16ProgressiveWgrad) ||
+             !kK3MxFp8DW13Hybrid),
+        "BF16 progressive suffixes and exact-MXFP8 dW13 are mutually exclusive");
     DG_STATIC_ASSERT(
         !kK3MxFp8DW13Hybrid ||
             (kK3MxFp8DW13ShepherdClusters > 0u &&
@@ -3685,6 +3862,11 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
     uint32_t launch_epoch = ptx::ld_acq(phase_sense) + 1u;
     if (launch_epoch == 0)
         launch_epoch = 1;
+    // Forward dispatch stores the physical symmetric source token in
+    // TokenSrcMetadata, including DEEP_GEMM_MEGA_MOE_SOURCE_TOKEN_OFFSET.
+    // active_token_begin indexes range-local staged operands; adding it to
+    // metadata.token_idx would double-offset every range after the first and
+    // can address beyond the symmetric token planes.
     // Tag the per-pool-block grad-y completion epoch so no partial count can
     // equal another launch's ready value.
     uint32_t active_range_iteration = 0u;
@@ -3837,6 +4019,33 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
     const bool is_leader_cta = cute::block_rank_in_cluster() == 0;
     const uint32_t warp_idx = cutlass::canonical_warp_idx_sync();
     const uint32_t lane_idx = ptx::get_lane_idx();
+    if constexpr (kK3SourceRouteRetention) {
+        DG_DEVICE_ASSERT(
+            num_topk == 16u && backward_grad_y != nullptr &&
+            backward_x != nullptr && backward_grad_route != nullptr &&
+            down_unweighted_output != nullptr &&
+            backward_ranges.total_backward_tokens ==
+                num_backward_tokens);
+        auto* const source_down_planes =
+            const_cast<cd_dtype_t*>(down_unweighted_output);
+        k3_consume_source_down_and_stage_backward_inputs<
+            kHidden, 16u, kNumSMs, kNumThreads>(
+                backward_grad_y, backward_x,
+                source_down_planes, backward_grad_route,
+                backward_ranges, num_backward_tokens,
+                backward_workspace.num_max_tokens_per_rank);
+        // Every CTA must retire all of its source-token warps before the
+        // dispatch subset enters the existing full-grid/rank publication
+        // edge.  From this point onward the ordinary backward implementation
+        // sees its original plane-zero grad-Y and plane-one exact-X ABI.
+        __syncthreads();
+        const uint64_t values_per_plane =
+            static_cast<uint64_t>(
+                backward_workspace.num_max_tokens_per_rank) *
+            kHidden;
+        backward_grad_y = source_down_planes;
+        backward_x = source_down_planes + values_per_plane;
+    }
     // K3's exact-source W13 wgrad can reuse either POST_DOWN route-dot input
     // or, in the pipelined W2 schedule, the compact primary/residual dgrad
     // planes. Defer the source-X refill until every aliased reader retires; an
@@ -4211,9 +4420,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                     const auto* remote_grad_y =
                         backward_sym_buffer.map(
                             backward_grad_y +
-                                static_cast<uint64_t>(
-                                    (active_token_begin +
-                                     metadata.token_idx)) *
+                                static_cast<uint64_t>(metadata.token_idx) *
                                     kHidden,
                             metadata.rank_idx);
                     if (lane_idx == 0) {
@@ -4224,6 +4431,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                     }
                     if constexpr (
                         kComputeRouteGrad && !kInputsPrepared &&
+                        !kK3SourceRouteRetention &&
                         kRouteWeightMode == RouteWeightMode::PostDown) {
                         // The remote dY TMA provides enough independent
                         // latency to stage the saved down row in L2 before the
@@ -4240,9 +4448,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                         const auto* remote_weight =
                             backward_sym_buffer.map(
                                 backward_topk_weights +
-                                    static_cast<uint64_t>(
-                                        (active_token_begin +
-                                         metadata.token_idx)) *
+                                    static_cast<uint64_t>(metadata.token_idx) *
                                         num_topk +
                                     metadata.topk_idx,
                                 metadata.rank_idx);
@@ -4286,6 +4492,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                 // dispatch row and cannot be clobbered by its MXFP8 alias.
                 if constexpr (
                     kComputeRouteGrad && !kInputsPrepared &&
+                    !kK3SourceRouteRetention &&
                     kRouteWeightMode == RouteWeightMode::PostDown) {
                   if (valid_row) {
                     using RouteDotSavedDownVector =
@@ -4341,9 +4548,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                             auto* remote_grad_route =
                                 backward_sym_buffer.map(
                                     backward_grad_route +
-                                        static_cast<uint64_t>(
-                                            (active_token_begin +
-                                             metadata.token_idx)) *
+                                        static_cast<uint64_t>(metadata.token_idx) *
                                             num_topk +
                                         metadata.topk_idx,
                                     metadata.rank_idx);
@@ -4636,9 +4841,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                         const auto* remote_x =
                             backward_sym_buffer.map(
                                 backward_x +
-                                    static_cast<uint64_t>(
-                                        (active_token_begin +
-                                         metadata.token_idx)) *
+                                    static_cast<uint64_t>(metadata.token_idx) *
                                         kHidden,
                                 metadata.rank_idx);
                         ptx::tma_load_1d(
@@ -5341,9 +5544,13 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
     constexpr bool kPublishRemoteGradients =
         kNumRanks > 1 &&
         (kDirectRemoteGradX || kComputeRouteGrad);
+    // Per-token readiness remains proven only for one physical range. The
+    // three-range body keeps its range-aware reducer inside the kernel, but
+    // restores the full-rank publication edge on its communication warps.
+    // That barrier overlaps the unified dW2/dW13 UMMA/TMA work.
     constexpr bool kStreamingDirectGradXCombine =
-        kReadyWgradSchedule && !kMultiRangeBackward && kNumRanks > 1 &&
-        kDirectRemoteGradX &&
+        kReadyWgradSchedule && kNumRanks > 1 && kDirectRemoteGradX &&
+        !kMultiRangeBackward &&
         kCombineOrderMode == CombineOrderMode::FixedTopK;
     auto* const direct_grad_x_pool_completions = [&]() -> uint32_t* {
         if constexpr (kStreamingDirectGradXCombine)
@@ -5533,6 +5740,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
         bool kFuseWgradCombine,
         uint32_t kExtraCombineThreads = 0,
         bool kPublishBeforeCombineReduce = false,
+        bool kK3TrueVarlenCombine = false,
         bool kRangeAccumulateWgrad = kAccumulateWgrad,
         uint32_t kRunWgradStages = kWgradStages,
         typename TaskStream = sched::ExternalKGroupedRangeStream,
@@ -5549,7 +5757,8 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
         BackgroundWorkCallback background_work,
         const cute::TmaDescriptor* phase_one_tensor_map_a = nullptr,
         const cute::TmaDescriptor* phase_one_tensor_map_b = nullptr,
-        const cute::TmaDescriptor* phase_one_tensor_map_d = nullptr) {
+        const cute::TmaDescriptor* phase_one_tensor_map_d = nullptr,
+        const K3BackwardRangeSet* combine_backward_ranges = nullptr) {
         sm100_bf16_gemm_body<
             cute::UMMA::Major::MN,
             cute::UMMA::Major::MN,
@@ -5574,6 +5783,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
             CombineOrderMode::FixedTopK,
             kExtraCombineThreads,
             kPublishBeforeCombineReduce,
+            kK3TrueVarlenCombine,
             TaskProvider,
             BatchResourceHooks>(
                 reinterpret_cast<int*>(
@@ -5598,7 +5808,8 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                 input_tile_retired, background_work,
                 phase_one_tensor_map_a,
                 phase_one_tensor_map_b,
-                phase_one_tensor_map_d);
+                phase_one_tensor_map_d,
+                combine_backward_ranges);
     };
 
 #if DG_EXPERIMENTAL_K3_BRANCH_MAJOR_BF16_DYNAMIC_TAIL
@@ -6026,6 +6237,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
             CombineOrderMode::FixedTopK,
             kExtraCombineThreads,
             kPublishBeforeCombineReduce,
+            false,
             TaskProvider,
             Sm100Bf16GemmDefaultBatchResourceHooks>(
                 reinterpret_cast<int*>(
@@ -6373,16 +6585,25 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
         }
         return 0u;
     };
-
     const auto prepare_ready_terminal_wgrad_state = [&]() {
       if constexpr (kReadyWgradSchedule && kMultiRangeBackward) {
         DG_DEVICE_ASSERT(
             backward_ranges.num_ranges > 0u &&
             backward_ranges.num_ranges <= kK3MaxBackwardRanges);
+        if constexpr (kK3ThreeSegmentBF16ProgressiveWgrad) {
+            // The per-call selector is accepted by the host only for exactly
+            // three packed ranges. Carry that JIT-time contract into this
+            // specialization so ptxas can discard the conservative one/two-
+            // range call graph instead of retaining both suffixes in the
+            // persistent parent frame.
+            DG_DEVICE_ASSERT(
+                backward_ranges.num_ranges == kK3MaxBackwardRanges);
+        }
         const uint32_t first_range_index =
             backward_ranges.reverse_range_index(0u);
         const uint32_t second_range_index =
-            backward_ranges.num_ranges > 1u
+            kK3ThreeSegmentBF16ProgressiveWgrad ||
+                    backward_ranges.num_ranges > 1u
             ? backward_ranges.reverse_range_index(1u)
             : (first_range_index + 1u) % kK3MaxBackwardRanges;
         auto* const first_state =
@@ -6392,7 +6613,8 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
             weight_tile_states +
             second_range_index * kReadyRangeStateStride;
         const uint32_t third_range_index =
-            backward_ranges.num_ranges > 2u
+            kK3ThreeSegmentBF16ProgressiveWgrad ||
+                    backward_ranges.num_ranges > 2u
             ? backward_ranges.reverse_range_index(2u)
             : (second_range_index + 1u) % kK3MaxBackwardRanges;
         auto* const third_state =
@@ -6409,7 +6631,8 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                    first_epoch) {
                 __nanosleep(64);
             }
-            if (backward_ranges.num_ranges > 1u) {
+            if (kK3ThreeSegmentBF16ProgressiveWgrad ||
+                backward_ranges.num_ranges > 1u) {
                 const uint32_t second_epoch = k3_multirange_epoch(
                     K3MultiRangeBackwardPhase::W2Wgrad,
                     backward_ranges.epoch_seed(second_range_index));
@@ -6433,7 +6656,8 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                         empty_pool_block;
                 }
             }
-            if (backward_ranges.num_ranges > 2u) {
+            if (kK3ThreeSegmentBF16ProgressiveWgrad ||
+                backward_ranges.num_ranges > 2u) {
                 const uint32_t third_epoch = k3_multirange_epoch(
                     K3MultiRangeBackwardPhase::W2Wgrad,
                     backward_ranges.epoch_seed(third_range_index));
@@ -6451,7 +6675,8 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                     first_state[kReadyPoolPrefixWord + expert];
             }
             const uint32_t active_count =
-                backward_ranges.num_ranges == 3u
+                kK3ThreeSegmentBF16ProgressiveWgrad ||
+                        backward_ranges.num_ranges == 3u
                 ? sched::external_k_grouped_build_three_segment_union<
                       kNumExperts,
                       kReadyPoolPrefixWord,
@@ -6463,7 +6688,36 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                       kReadyPoolPrefixWord,
                       kReadyActiveExpertWord>(
                           first_state, second_state, union_state);
-
+            if constexpr (kK3ThreeSegmentBF16ProgressiveWgrad) {
+                // Prebias each active retirement counter below the ready bit.
+                // Every final W13-weight reader contributes one release RMW;
+                // the last contribution reaches the ready bit exactly and the
+                // same low bits then serve as a zero-based dW13 task cursor.
+                // Computing the bias once here removes all prefix reads from
+                // the persistent scheduler and every W13 retirement.
+                constexpr uint32_t kDW13ReadyBit = 1u << 31u;
+                static_assert(
+                    (static_cast<uint64_t>(INT32_MAX) / BLOCK_M) *
+                            (kNumW13DgradBlockNs / 2u) <
+                        kDW13ReadyBit,
+                    "signed host row extents must fit below the ready bit");
+                for (uint32_t expert = 0u;
+                     expert < kNumExperts; ++expert) {
+                    const auto range_pool_blocks = [=](
+                            const uint32_t* state) {
+                        return state[kReadyPoolPrefixWord + expert + 1u] -
+                            state[kReadyPoolPrefixWord + expert];
+                    };
+                    const uint32_t expected =
+                        (range_pool_blocks(first_state) +
+                         range_pool_blocks(second_state) +
+                         range_pool_blocks(third_state)) *
+                        (kNumW13DgradBlockNs / 2u);
+                    union_state[kReadyW13RetiredWord + expert] =
+                        expected == 0u
+                        ? 0u : kDW13ReadyBit - expected;
+                }
+            }
             union_state[kReadyMagicWord] = 0x4b335455u; // "K3TU"
             union_state[kReadyDW2CursorWord] = 0u;
             union_state[kReadyDW13CursorWord] = 0u;
@@ -6483,7 +6737,6 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                             cluster * kReadyClusterSlotWords] =
                     kReadyCompleteRoleMask;
             }
-
             // Publish the immutable prefixes and union state before the
             // following full-grid edge. That edge prevents any consumer from
             // accepting a same-valued stale epoch from an earlier launch and
@@ -6502,7 +6755,8 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
         constexpr bool kClearTwoSegmentEmptyExpertsEarly =
             kK3TwoSegmentBF16ProgressiveWgrad ||
             (kK3BranchMajorBF16DynamicTail && kMultiRangeBackward);
-        if (backward_ranges.num_ranges == 3u ||
+        if (kK3ThreeSegmentBF16ProgressiveWgrad ||
+            backward_ranges.num_ranges == 3u ||
             kClearTwoSegmentEmptyExpertsEarly) {
             // Empty union experts have no W13 dgrad reader in either segment,
             // so their aliased weight-cache slice is writable before W13
@@ -6528,9 +6782,16 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                 for (uint32_t expert = 0u;
                      expert < kNumExperts; ++expert) {
                     bool active_in_union = false;
+                    constexpr uint32_t kProgressiveUnionRanges =
+                        kK3ThreeSegmentBF16ProgressiveWgrad
+                        ? kK3MaxBackwardRanges : 0u;
+                    const uint32_t union_ranges =
+                        kProgressiveUnionRanges != 0u
+                        ? kProgressiveUnionRanges
+                        : backward_ranges.num_ranges;
                     #pragma unroll
                     for (uint32_t range_idx = 0u;
-                         range_idx < backward_ranges.num_ranges;
+                         range_idx < union_ranges;
                          ++range_idx) {
                         active_in_union |= __ldg(
                             expert_counts +
@@ -8356,6 +8617,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
         kPhaseOrderedWeightDequant;
     constexpr bool kRouteGradBeforeW2 =
         kComputeRouteGrad && !kInputsPrepared &&
+        !kK3SourceRouteRetention &&
         kRouteWeightMode == RouteWeightMode::PostDown &&
         (phase_ordered_w2_dequant || kBuildW2ResidualActsOnce);
     if constexpr (!kOverlapInitialBF16WeightDequant) {
@@ -9298,8 +9560,10 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                 gate_up_output != grad_gate_up_output ||
                 h_act_output != grad_h_output ||
                 h_weighted_output != h_act_output ||
-                x_pool_output !=
-                    const_cast<cd_dtype_t*>(down_unweighted_output);
+                (kK3SourceRouteRetention
+                     ? x_pool_output != grad_y_unweighted_output
+                     : x_pool_output != const_cast<cd_dtype_t*>(
+                           down_unweighted_output));
             uint32_t token_capacity_end = 0u;
             uint32_t token_count = 0u;
             uint32_t pool_end = 0u;
@@ -12622,7 +12886,8 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                 // true-varlen launch bucket without allocating more memory.
                 auto* route_ready_states =
                     reinterpret_cast<uint32_t*>(grad_route_output);
-                if (threadIdx.x < route_worker_threads) {
+                if constexpr (!kK3SourceRouteRetention) {
+                  if (threadIdx.x < route_worker_threads) {
                   uint32_t route_pool_block_offset = 0;
                   #pragma unroll 1
                   for (uint32_t expert_idx = 0;
@@ -12996,6 +13261,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                         math::ceil_div(num_tokens, BLOCK_M);
                   }
                 }
+                }
 
                 if (
                     late_exact_source_x &&
@@ -13079,9 +13345,11 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                             const uint32_t pool_row =
                                 pool_block_offset * BLOCK_M +
                                 token_idx;
-                            while (ptx::ld_acq(
-                                       route_ready_states + pool_row) !=
-                                   route_ready_epoch) {
+                            if constexpr (!kK3SourceRouteRetention) {
+                                while (ptx::ld_acq(
+                                           route_ready_states + pool_row) !=
+                                       route_ready_epoch) {
+                                }
                             }
                             const auto metadata =
                                 token_src_metadata[pool_row];
@@ -14953,7 +15221,8 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                 !kK3MxFp8ExactEpilogueRing &&
                                 ((kReadyWgradSchedule &&
                                   (!kMultiRangeBackward ||
-                                   kK3TwoSegmentBF16ProgressiveWgrad)) ||
+                                   kK3TwoSegmentBF16ProgressiveWgrad ||
+                                   kK3ThreeSegmentBF16ProgressiveWgrad)) ||
                                  kK3MxFp8WgradOverlap ||
                                  kK3MxFp8DW13Hybrid)) {
                                 // The final full-barrier wait above retires both
@@ -15017,46 +15286,24 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                                 hybrid_previous <
                                                 hybrid_target);
                                         } else if constexpr (
-                                            kK3TwoSegmentBF16ProgressiveWgrad) {
-                                            // Both range states and the union
-                                            // prefix were published before W13
-                                            // started. Accumulate every final
-                                            // packed-weight read into the union
-                                            // arena; the ready-first dW13
-                                            // provider converts this counter to
-                                            // an expert-local task cursor only
-                                            // after the exact two-segment target.
+                                            kK3TwoSegmentBF16ProgressiveWgrad ||
+                                            kK3ThreeSegmentBF16ProgressiveWgrad) {
+                                            // Every immutable range state and
+                                            // the union were published before
+                                            // W13 started. Accumulate final
+                                            // packed-weight reads into the
+                                            // union arena. The three-range
+                                            // counter is prebiased to reach a
+                                            // ready tag exactly; its low bits
+                                            // then become the dW13 cursor.
                                             DG_DEVICE_ASSERT(
                                                 backward_ranges.num_ranges ==
-                                                2u);
+                                                (kK3ThreeSegmentBF16ProgressiveWgrad
+                                                     ? 3u
+                                                     : 2u));
                                             auto* const union_state =
                                                 weight_tile_states +
                                                 kReadyTerminalUnionStateWord;
-                                            const uint32_t first_pool_blocks =
-                                                union_state[
-                                                    kReadyPoolPrefixWord +
-                                                    expert_idx + 1u] -
-                                                union_state[
-                                                    kReadyPoolPrefixWord +
-                                                    expert_idx];
-                                            const uint32_t second_range_index =
-                                                backward_ranges.
-                                                    reverse_range_index(1u);
-                                            const auto* const second_state =
-                                                weight_tile_states +
-                                                second_range_index *
-                                                    kReadyRangeStateStride;
-                                            const uint32_t second_pool_blocks =
-                                                second_state[
-                                                    kReadyPoolPrefixWord +
-                                                    expert_idx + 1u] -
-                                                second_state[
-                                                    kReadyPoolPrefixWord +
-                                                    expert_idx];
-                                            const uint32_t expected =
-                                                (first_pool_blocks +
-                                                 second_pool_blocks) *
-                                                (kNumW13DgradBlockNs / 2u);
                                             // The full transaction-barrier
                                             // wait above retires both CTAs'
                                             // final W13-weight TMA reads. The
@@ -15066,15 +15313,51 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                             // the generic-to-async proxy fence
                                             // before publishing an aliased D
                                             // TMA-store batch.
-                                            const uint32_t previous =
-                                                ptx::atomic_add_rel(
-                                                    union_state +
-                                                        kReadyW13RetiredWord +
-                                                        expert_idx,
-                                                    1u);
-                                            DG_DEVICE_ASSERT(
-                                                expected != 0u &&
-                                                previous < expected);
+                                            auto* const retirement_cursor =
+                                                union_state +
+                                                kReadyW13RetiredWord +
+                                                expert_idx;
+                                            if constexpr (
+                                                kK3ThreeSegmentBF16ProgressiveWgrad) {
+                                                constexpr uint32_t kReadyBit =
+                                                    1u << 31u;
+                                                const uint32_t previous =
+                                                    ptx::atomic_add_rel(
+                                                        retirement_cursor, 1u);
+                                                DG_DEVICE_ASSERT(
+                                                    previous < kReadyBit);
+                                            } else {
+                                                uint32_t total_pool_blocks = 0u;
+                                                #pragma unroll
+                                                for (uint32_t range_iteration = 0u;
+                                                     range_iteration < 2u;
+                                                     ++range_iteration) {
+                                                    const uint32_t range_index =
+                                                        backward_ranges.
+                                                            reverse_range_index(
+                                                                range_iteration);
+                                                    const auto* const range_state =
+                                                        weight_tile_states +
+                                                        range_index *
+                                                            kReadyRangeStateStride;
+                                                    total_pool_blocks +=
+                                                        range_state[
+                                                            kReadyPoolPrefixWord +
+                                                            expert_idx + 1u] -
+                                                        range_state[
+                                                            kReadyPoolPrefixWord +
+                                                            expert_idx];
+                                                }
+                                                const uint32_t expected =
+                                                    total_pool_blocks *
+                                                    (kNumW13DgradBlockNs / 2u);
+                                                const uint32_t previous =
+                                                    ptx::atomic_add_rel(
+                                                        retirement_cursor, 1u);
+                                                DG_DEVICE_ASSERT(
+                                                    expected != 0u &&
+                                                    previous < expected);
+                                            }
                                         } else {
                                             const uint32_t num_tokens =
                                                 static_cast<uint32_t>(__ldg(
@@ -15627,7 +15910,6 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                                       .topk_idx) *
                                                   backward_workspace
                                                       .num_max_tokens_per_rank +
-                                              active_token_begin +
                                               metadata.token_idx) *
                                                  kHidden +
                                              out_col);
@@ -15753,7 +16035,6 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                                       .topk_idx) *
                                                   backward_workspace
                                                       .num_max_tokens_per_rank +
-                                              active_token_begin +
                                               metadata.token_idx) *
                                                  kHidden +
                                              out_col);
@@ -15858,7 +16139,6 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                                       .topk_idx) *
                                                   backward_workspace
                                                       .num_max_tokens_per_rank +
-                                              active_token_begin +
                                               metadata.token_idx) *
                                                  kHidden +
                                              out_col);
@@ -15929,7 +16209,6 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                     const auto metadata =
                                         token_src_metadata[pool_row];
                                     const uint32_t source_token =
-                                        active_token_begin +
                                         metadata.token_idx;
                                     DG_DEVICE_ASSERT(
                                         source_token <
@@ -15987,6 +16266,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
         } else if constexpr (
             kComputeRouteGrad && !kInputsPrepared &&
             kRouteWeightMode == RouteWeightMode::PostDown &&
+            !kK3SourceRouteRetention &&
             !kRouteGradBeforeW2) {
             // Route gradients are independent of W13 dgrad. Autograd may
             // request router and expert-weight gradients without requesting
@@ -16459,7 +16739,8 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                     }
                 }
             };
-            if (backward_ranges.num_ranges == 3u) {
+            if (kK3ThreeSegmentBF16ProgressiveWgrad ||
+                backward_ranges.num_ranges == 3u) {
               if constexpr (!kK3MxFp8DW13Hybrid) {
                 // Decode all three immutable physical ranges as one logical K
                 // reduction.  The BF16 body keeps one FP32 accumulator and
@@ -16471,11 +16752,19 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                         2, false, kNumSMs,
                         kHidden, kIntermediateHidden,
                         kReadyThreeSegmentBatchTasks,
-                        kReadyDW2TasksPerExpert,
+                        kK3ThreeSegmentBF16ProgressiveWgrad
+                            ? kPairedDW2TasksPerExpert
+                            : kReadyDW2TasksPerExpert,
                         BLOCK_M, kWgradBlockK,
                         kReadyPoolPrefixWord,
                         kReadyActiveExpertWord,
-                        kReadyRangeStateStride>;
+                        kReadyRangeStateStride,
+                        4u, 4u,
+                        sched::get_num_1d_blocks_per_group<
+                            GemmType::KGroupedContiguous,
+                            kWgradBlockM, kWgradBlockN,
+                            kNumSMs, false>(),
+                        kK3ThreeSegmentBF16ProgressiveWgrad>;
                 static_assert(
                     ThreeSegmentReadyDW2Provider::kCompleteAcquireMask ==
                         kReadyCompleteRoleMask,
@@ -16506,13 +16795,75 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                         union_state[kReadyDW2TasksWord],
                         dw2_mailbox,
                         kReadyThreeSegmentBatchTasks,
-                        kReadyDW2TasksPerExpert,
+                        kK3ThreeSegmentBF16ProgressiveWgrad
+                            ? kPairedDW2TasksPerExpert
+                            : kReadyDW2TasksPerExpert,
                     };
-                run_ready_wgrad_range.template operator()<
-                    ThreeSegmentReadyDW2Provider,
-                    InitializeRetainResources,
-                    kPublishRemoteGradients,
-                    0u, false, false>(
+                if constexpr (kK3ThreeSegmentBF16ProgressiveWgrad) {
+                    using ThreeSegmentUnifiedBF16WgradProvider = sched::
+                        ExternalKGroupedK3ThreeSegmentBF16WgradDynamicRangeProvider<
+                            kWgradBlockM, kWgradBlockN, kNumSMs,
+                            kReadyThreeSegmentBatchTasks,
+                            kReadyDW2TasksPerExpert,
+                            BLOCK_M, kWgradBlockK,
+                            kReadyPoolPrefixWord,
+                            kReadyActiveExpertWord,
+                            kReadyRangeStateStride>;
+                    static_assert(
+                        ThreeSegmentUnifiedBF16WgradProvider::
+                                kCompleteAcquireMask ==
+                                    kReadyCompleteRoleMask &&
+                            ThreeSegmentUnifiedBF16WgradProvider::
+                                kTaskBF16PhaseTagged &&
+                            ThreeSegmentUnifiedBF16WgradProvider::
+                                kTaskHasThreeSegmentK &&
+                            !ThreeSegmentUnifiedBF16WgradProvider::
+                                kTaskPairedN &&
+                            ThreeSegmentUnifiedBF16WgradProvider::
+                                kTaskKAlignment == kWgradBlockK,
+                        "three-range unified BF16 scheduler contract changed");
+                    static_assert(
+                        !kStreamingDirectGradXCombine &&
+                            kPublishRemoteGradients &&
+                            kDirectRemoteGradX,
+                        "three-range unified wgrad owns barrier-ordered remote combine");
+
+                    const sched::
+                        ExternalKGroupedK3ThreeSegmentBF16WgradRangeStream
+                            unified_wgrad_stream{
+                                union_state,
+                                second_state,
+                                union_state + kReadyDW2CursorWord,
+                                union_state[kReadyDW2TasksWord],
+                                dw2_mailbox,
+                                kReadyThreeSegmentBatchTasks,
+                                kReadyDW2TasksPerExpert,
+                                union_state + kReadyW13RetiredWord,
+                            };
+                    run_ready_wgrad_range.template operator()<
+                        ThreeSegmentUnifiedBF16WgradProvider,
+                        InitializeReleaseResources,
+                        true, 64u, true, true, false>(
+                            kHidden, kIntermediateHidden,
+                            tensor_map_w2_wgrad_a,
+                            tensor_map_w2_wgrad_b,
+                            tensor_map_w2_wgrad_d,
+                            unified_wgrad_stream, true,
+                            no_input_tile_retired,
+                            no_background_work,
+                            &tensor_map_w13_wgrad_a,
+                            &tensor_map_w13_wgrad_b,
+                            &tensor_map_w13_wgrad_d,
+                            &backward_ranges);
+                    trace_end(17);
+                    trace_end(0);
+                    return;
+                } else {
+                    run_ready_wgrad_range.template operator()<
+                        ThreeSegmentReadyDW2Provider,
+                        InitializeRetainResources,
+                        kPublishRemoteGradients,
+                        0u, false, false>(
                         kHidden, kIntermediateHidden,
                         tensor_map_w2_wgrad_a,
                         tensor_map_w2_wgrad_b,
@@ -16520,6 +16871,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                         dw2_stream, false,
                         no_input_tile_retired,
                         no_background_work);
+                }
               } else {
                 // A compact third descriptor does not grow the two-segment
                 // stream ABI. Drain all three immutable queues in reverse
@@ -17057,11 +17409,19 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                         2, false, kNumSMs,
                         2u * kIntermediateHidden, kHidden,
                         kReadyThreeSegmentBatchTasks,
-                        kReadyDW13TasksPerExpert,
+                        kK3ThreeSegmentBF16ProgressiveWgrad
+                            ? kPairedDW13TasksPerExpert
+                            : kReadyDW13TasksPerExpert,
                         BLOCK_M, kWgradBlockK,
                         kReadyPoolPrefixWord,
                         kReadyActiveExpertWord,
-                        kReadyRangeStateStride>;
+                        kReadyRangeStateStride,
+                        4u, 4u,
+                        sched::get_num_1d_blocks_per_group<
+                            GemmType::KGroupedContiguous,
+                            kWgradBlockM, kWgradBlockN,
+                            kNumSMs, false>(),
+                        kK3ThreeSegmentBF16ProgressiveWgrad>;
                 static_assert(
                     ThreeSegmentReadyDW13Provider::kCompleteAcquireMask ==
                         kReadyCompleteRoleMask,
@@ -17089,7 +17449,9 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                         union_state[kReadyDW13TasksWord],
                         dw13_mailbox,
                         kReadyThreeSegmentBatchTasks,
-                        kReadyDW13TasksPerExpert,
+                        kK3ThreeSegmentBF16ProgressiveWgrad
+                            ? kPairedDW13TasksPerExpert
+                            : kReadyDW13TasksPerExpert,
                     };
                 // The generic BF16 reducer has a two-range logical-to-physical
                 // token map.  Three true-varlen ranges contain two independent

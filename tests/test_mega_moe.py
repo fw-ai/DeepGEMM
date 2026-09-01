@@ -117,6 +117,7 @@ def test_fp8_backward_canonicalizes_block_m_and_clears_padding(
         ),
         grad_ye=pool_hidden.clone(),
         route_weights=torch.ones(rows, dtype=torch.bfloat16),
+        down_unweighted_output=pool_hidden.clone(),
         w2_weights=(
             torch.zeros(1, hidden, intermediate // 2, dtype=torch.int8),
             torch.zeros(1, hidden, 1, dtype=torch.int32),

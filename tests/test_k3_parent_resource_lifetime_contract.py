@@ -206,9 +206,12 @@ def test_tmem_handoffs_keep_cluster_ordering_and_single_ownership() -> None:
 
     terminal = _between(
         parent,
-        "if constexpr (!kK3MxFp8WgradOverlap) {\n"
+        "if constexpr (\n"
+        "            !kK3MxFp8WgradOverlap &&\n"
+        "            !kK3BranchMajorBF16EarlyDW2Overlap) {\n"
         "            comm::cluster_sync_with_relaxed_arrive();",
-        "if constexpr (kK3BranchMajorBF16WgradTail) {",
+        "if constexpr (\n"
+        "            kK3BranchMajorBF16WgradTail &&",
     )
     assert terminal.index("comm::cluster_sync_with_relaxed_arrive()") < (
         terminal.index("Allocator().free(0, kNumTmemCols)")
@@ -240,8 +243,11 @@ def test_terminal_retires_dedicated_dequant_barriers_before_bf16_alias() -> None
     terminal = _between(
         parent,
         "trace_begin(20);\n"
-        "        if constexpr (kInlineWgrad && !kK3MxFp8WgradOverlap) {",
-        "if constexpr (!kK3MxFp8WgradOverlap) {",
+        "        if constexpr (\n"
+        "            kInlineWgrad && !kK3MxFp8WgradOverlap &&\n"
+        "            !kK3BranchMajorBF16EarlyDW2Overlap) {",
+        "if constexpr (\n"
+        "            !kK3MxFp8WgradOverlap &&",
     )
     guard = _between(
         terminal,

@@ -12,13 +12,23 @@ RANGES = ROOT / "deep_gemm/include/deep_gemm/impls/k3_multirange_backward.hpp"
 
 
 def test_three_range_exact_ring_stays_compile_time_disabled() -> None:
-    """Three-range training must retain the verified ready-BF16 suffix."""
+    """Three ranges keep BF16 dW2 and select only the MXFP8 dW13 hybrid."""
     jit = JIT.read_text()
     assert jit.count("const bool enable_k3_mxfp8_exact_epilogue_ring = false;") == 2
     assert (
-        "args.backward_ranges.num_ranges >= 2u &&\n" "            args.num_topk == 16u"
+        "args.backward_ranges.num_ranges == 2u &&\n" "            args.num_topk == 16u"
     ) in jit
+    assert "num_backward_ranges == 2" in jit
+    assert "backward_ranges.num_ranges == 2u" in jit
+    hybrid_begin = jit.index("const bool enable_k3_mxfp8_dw13_hybrid =")
+    hybrid_end = jit.index(
+        "const bool enable_k3_mxfp8_exact_epilogue_ring", hybrid_begin
+    )
+    hybrid = jit[hybrid_begin:hybrid_end]
+    assert "!enable_k3_mxfp8_two_range_exact" in hybrid
+    assert "args.backward_ranges.num_ranges ==\n                    kK3MaxBackwardRanges" in hybrid
     assert "DG_EXPERIMENTAL_K3_READY_WGRAD_BATCH_TASKS 32" in jit
+    assert "DG_EXPERIMENTAL_K3_MXFP8_DW13_HYBRID" in jit
     assert "DG_EXPERIMENTAL_K3_MXFP8_EXACT_EPILOGUE_RING" in jit
 
 

@@ -62,7 +62,8 @@ static void fp8_fp4_mega_moe_backward_dgrad_swiglu_v2(
     const std::optional<torch::Tensor>& w2_wgrad_output,
     const std::optional<torch::Tensor>& w13_wgrad_output,
     const std::vector<int64_t>& backward_range_sizes = {},
-    const bool& mxfp8_three_term_wgrad = false) {
+    const bool& mxfp8_three_term_wgrad = false,
+    const bool& three_segment_bf16_progressive_wgrad = false) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [w2_weights, w2_scales] = w2_weights_tuple;
     const auto [w13_weights, w13_scales] = w13_weights_tuple;
@@ -94,7 +95,8 @@ static void fp8_fp4_mega_moe_backward_dgrad_swiglu_v2(
         inline_wgrad, accumulate_wgrad,
         combined_grad_x_output, gate_up_prepared,
         w2_wgrad_output, w13_wgrad_output,
-        backward_range_sizes, mxfp8_three_term_wgrad);
+        backward_range_sizes, mxfp8_three_term_wgrad,
+        three_segment_bf16_progressive_wgrad);
 }
 
 // Legacy raw binding: preserve the original positional ABI and PRE_DOWN
@@ -575,7 +577,8 @@ static void register_apis(pybind11::module_& m) {
           py::arg("w13_wgrad_output") = py::none(),
           py::arg("backward_range_sizes") =
               std::vector<int64_t>{},
-          py::arg("mxfp8_three_term_wgrad") = false);
+          py::arg("mxfp8_three_term_wgrad") = false,
+          py::arg("three_segment_bf16_progressive_wgrad") = false);
     m.def("fp8_fp4_mega_moe_backward_dgrad_swiglu",
           &fp8_fp4_mega_moe_backward_dgrad_swiglu,
           py::arg("gate_up_output"), py::arg("grad_h_output"),

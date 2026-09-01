@@ -270,7 +270,8 @@ static void fp8_fp4_mega_moe(
     const std::string& route_weight_mode,
     const std::optional<torch::Tensor>& saved_down_unweighted,
     const std::optional<int>& num_config_tokens_opt,
-    const int& l2_activation_group_size
+    const int& l2_activation_group_size,
+    const int& source_token_offset
 ) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
@@ -314,6 +315,10 @@ static void fp8_fp4_mega_moe(
     DG_HOST_ASSERT(l1_weights.is_contiguous() and l2_weights.is_contiguous());
     DG_HOST_ASSERT(num_config_tokens >= num_tokens);
     DG_HOST_ASSERT(num_config_tokens <= num_max_tokens_per_rank);
+    DG_HOST_ASSERT(source_token_offset >= 0);
+    DG_HOST_ASSERT(
+        source_token_offset + num_tokens <=
+        num_max_tokens_per_rank);
 
     // Check weight SF layout for UE8M0 packing, MN-major, and TMA alignment
     constexpr int kGranMN = 1, kGranK = 32;
@@ -383,7 +388,8 @@ static void fp8_fp4_mega_moe(
                                situ_beta, situ_linear_beta, fast_math,
                                route_weight_mode,
                                saved_down_unweighted,
-                               l2_activation_group_size);
+                               l2_activation_group_size,
+                               source_token_offset);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -563,7 +569,8 @@ static void register_apis(pybind11::module_& m) {
         py::arg("route_weight_mode") = "pre_down",
         py::arg("saved_down_unweighted") = py::none(),
         py::arg("num_config_tokens") = py::none(),
-        py::arg("l2_activation_group_size") = 32);
+        py::arg("l2_activation_group_size") = 32,
+        py::arg("source_token_offset") = 0);
     m.def("bf16_mega_moe", &bf16_mega_moe);
 #endif
 }

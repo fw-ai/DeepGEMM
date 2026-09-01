@@ -392,10 +392,28 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // Allocate slots for each token-topk
                 int expert_idx = -1;
                 if (i + (lane_idx / kNumTopk) < num_tokens and lane_idx < kNumActivateLanes) {
+#if defined(DEEP_GEMM_MEGA_MOE_SOURCE_TOKEN_OFFSET) && \
+    DEEP_GEMM_MEGA_MOE_SOURCE_TOKEN_OFFSET > 0
+                    static_assert(
+                        DEEP_GEMM_MEGA_MOE_SOURCE_TOKEN_OFFSET <=
+                        kNumMaxTokensPerRank);
+                    const uint32_t physical_token_topk_idx =
+                        (i + DEEP_GEMM_MEGA_MOE_SOURCE_TOKEN_OFFSET) *
+                            kNumTopk +
+                        lane_idx;
+                    expert_idx = static_cast<int>(
+                        __ldg(
+                            input_topk_idx_buffer
+                                .get_base_ptr<int64_t>() +
+                            physical_token_topk_idx));
+                    if (expert_idx >= 0)
+                        process(physical_token_topk_idx, expert_idx);
+#else
                     expert_idx = static_cast<int>(
                         __ldg(input_topk_idx_buffer.get_base_ptr<int64_t>() + i * kNumTopk + lane_idx));
                     if (expert_idx >= 0)
                         process(i * kNumTopk + lane_idx, expert_idx);
+#endif
                 }
                 __syncwarp();
             }
@@ -1651,10 +1669,26 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         for (uint32_t token_idx = sm_idx * kNumEpilogueWarps + epilogue_warp_idx;
              token_idx < num_tokens;
              token_idx += kNumSMs * kNumEpilogueWarps) {
+#if defined(DEEP_GEMM_MEGA_MOE_SOURCE_TOKEN_OFFSET) && \
+    DEEP_GEMM_MEGA_MOE_SOURCE_TOKEN_OFFSET > 0
+            constexpr uint32_t source_token_offset =
+                DEEP_GEMM_MEGA_MOE_SOURCE_TOKEN_OFFSET;
+            static_assert(source_token_offset <= kNumMaxTokensPerRank);
+            const uint32_t physical_token_idx =
+                token_idx + source_token_offset;
+#endif
             // Read top-k slot indices: each lane reads one slot, then broadcast via exchange
             DG_STATIC_ASSERT(kNumTopk <= 32, "Invalid number of topk");
+#if defined(DEEP_GEMM_MEGA_MOE_SOURCE_TOKEN_OFFSET) && \
+    DEEP_GEMM_MEGA_MOE_SOURCE_TOKEN_OFFSET > 0
+            const int stored_topk_slot_idx = lane_idx < kNumTopk ?
+                static_cast<int>(__ldg(
+                    input_topk_idx_buffer.get_base_ptr<int64_t>() +
+                    physical_token_idx * kNumTopk + lane_idx)) : -1;
+#else
             const int stored_topk_slot_idx = lane_idx < kNumTopk ?
                 static_cast<int>(__ldg(input_topk_idx_buffer.get_base_ptr<int64_t>() + token_idx * kNumTopk + lane_idx)) : -1;
+#endif
             const uint32_t total_mask = __ballot_sync(0xffffffff, stored_topk_slot_idx >= 0);
 
             // Iterate all chunks
@@ -1674,7 +1708,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         if (cute::elect_one_sync()) {
                             const auto src_ptr = math::advance_ptr<uint8_t>(
                                 combine_token_buffer.get_rank_buffer(slot_idx)
+#if defined(DEEP_GEMM_MEGA_MOE_SOURCE_TOKEN_OFFSET) && \
+    DEEP_GEMM_MEGA_MOE_SOURCE_TOKEN_OFFSET > 0
+                                                    .get_data_buffer(physical_token_idx).get_base_ptr(),
+#else
                                                     .get_data_buffer(token_idx).get_base_ptr(),
+#endif
                                 chunk_byte_offset);
                             ptx::tma_load_1d(combine_load_buffer[i], src_ptr, combine_load_barriers[i], kNumChunkBytes);
                             ptx::mbarrier_arrive_and_set_tx(combine_load_barriers[i], kNumChunkBytes);
@@ -1702,7 +1741,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         RouteWeightMode::PostDown) {
                         route_weight = __ldg(
                             input_topk_weights_buffer.get_base_ptr<float>() +
+#if defined(DEEP_GEMM_MEGA_MOE_SOURCE_TOKEN_OFFSET) && \
+    DEEP_GEMM_MEGA_MOE_SOURCE_TOKEN_OFFSET > 0
+                            static_cast<uint64_t>(physical_token_idx) * kNumTopk +
+#else
                             static_cast<uint64_t>(token_idx) * kNumTopk +
+#endif
                             loaded_slot_idx[load_stage_idx]);
                     }
                     #pragma unroll

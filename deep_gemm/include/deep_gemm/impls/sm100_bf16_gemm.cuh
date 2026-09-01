@@ -21,6 +21,27 @@
 
 namespace deep_gemm {
 
+struct K3BackwardRangeSet;
+
+/** Outlined fixed-top-k reducer used by the K3 wgrad communication role.
+ *
+ * A non-null readiness plane provides one system-scope acquire per physical
+ * token; a null plane requires the caller to have completed the rank barrier.
+ */
+template <uint32_t kNumSMs, uint32_t kNumCombineWarps>
+CUTLASS_DEVICE __noinline__ void
+k3_mxfp8_wgrad_fixed_topk_combine(
+        cutlass::bfloat16_t* grad_x_output,
+        const cutlass::bfloat16_t* combine_buffer,
+        const K3BackwardRangeSet* backward_ranges,
+        uint32_t num_tokens,
+        uint32_t num_max_tokens,
+        uint32_t num_topk,
+        uint32_t hidden,
+        uint32_t combine_warp_idx,
+        uint32_t lane_idx,
+        const int* ready_counts);
+
 // A fused caller may isolate this large persistent body from an earlier phase
 // by supplying ``__noinline__`` before including the header. Standalone BF16
 // GEMM translation units leave it empty so their existing inlining contract is
@@ -77,6 +98,7 @@ template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
           CombineOrderMode kCombineOrderMode,
           uint32_t kNumExtraCombineThreads,
           bool kPublishBeforeCombineReduce = false,
+          bool kK3TrueVarlenCombine = false,
           typename TaskProvider = sched::Scheduler<
               kGemmType, BLOCK_M, BLOCK_N, kNumGroups,
               kNumMulticast, kIsMulticastOnA, kNumSMs,
@@ -117,6 +139,8 @@ sm100_bf16_gemm_body(int* grouped_layout,
                      const cute::TmaDescriptor* phase_one_tensor_map_b =
                          nullptr,
                      const cute::TmaDescriptor* phase_one_tensor_map_cd =
+                         nullptr,
+                     const K3BackwardRangeSet* combine_backward_ranges =
                          nullptr) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     // A phase-tagged provider lets one persistent UMMA/TMA body consume two
@@ -348,7 +372,7 @@ sm100_bf16_gemm_body(int* grouped_layout,
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
             const uint32_t current_wgrad_phase = [&]() {
                 if constexpr (kTaskPhaseTagged)
-                    return scheduler.current_wgrad_phase;
+                    return scheduler.get_current_wgrad_phase();
                 return 0u;
             }();
             const auto* const active_tensor_map_a =
@@ -632,12 +656,12 @@ sm100_bf16_gemm_body(int* grouped_layout,
                                 const uint32_t retired_n_block) {
                             if constexpr (requires {
                                 input_tile_retired(
-                                    scheduler.current_wgrad_phase,
+                                    scheduler.get_current_wgrad_phase(),
                                     scheduler.current_group_idx,
                                     m_block_idx, retired_n_block);
                             }) {
                                 input_tile_retired(
-                                    scheduler.current_wgrad_phase,
+                                    scheduler.get_current_wgrad_phase(),
                                     scheduler.current_group_idx,
                                     m_block_idx, retired_n_block);
                             } else if constexpr (requires {
@@ -656,7 +680,7 @@ sm100_bf16_gemm_body(int* grouped_layout,
                                 m_block_idx, n_block_idx);
                         } || requires {
                             input_tile_retired(
-                                scheduler.current_wgrad_phase,
+                                scheduler.get_current_wgrad_phase(),
                                 scheduler.current_group_idx,
                                 m_block_idx, n_block_idx);
                         }) {
@@ -866,21 +890,33 @@ sm100_bf16_gemm_body(int* grouped_layout,
         }
     } else if (
         kFuseCombine and
-        ((warp_idx >= 2 and
-          warp_idx < kNumNonEpilogueThreads / 32) or
-         (warp_idx >=
-              (kNumNonEpilogueThreads +
-               kNumEpilogueThreads) /
-                  32 and
-          warp_idx <
-              (kNumNonEpilogueThreads +
-               kNumEpilogueThreads +
-               kNumExtraCombineThreads) /
-                  32))) {
+        (kK3TrueVarlenCombine
+             ? (warp_idx >=
+                    (kNumNonEpilogueThreads +
+                     kNumEpilogueThreads) /
+                        32 and
+                warp_idx <
+                    (kNumNonEpilogueThreads +
+                     kNumEpilogueThreads +
+                     kNumExtraCombineThreads) /
+                        32)
+             : ((warp_idx >= 2 and
+                 warp_idx < kNumNonEpilogueThreads / 32) or
+                (warp_idx >=
+                     (kNumNonEpilogueThreads +
+                      kNumEpilogueThreads) /
+                         32 and
+                 warp_idx <
+                     (kNumNonEpilogueThreads +
+                      kNumEpilogueThreads +
+                      kNumExtraCombineThreads) /
+                         32)))) {
         if constexpr (kFuseCombine) {
             constexpr uint32_t kNumCombineThreads =
-                kNumNonEpilogueThreads - 64 +
-                kNumExtraCombineThreads;
+                kK3TrueVarlenCombine
+                    ? kNumExtraCombineThreads
+                    : kNumNonEpilogueThreads - 64 +
+                          kNumExtraCombineThreads;
             DG_STATIC_ASSERT(
                 kNumCombineThreads == 64 or
                     kNumCombineThreads == 128,
@@ -889,6 +925,10 @@ sm100_bf16_gemm_body(int* grouped_layout,
                 !kPublishBeforeCombineReduce ||
                     kCombineNumRanks > 1,
                 "Remote publication requires multiple ranks");
+            DG_STATIC_ASSERT(
+                !kK3TrueVarlenCombine ||
+                    kNumExtraCombineThreads == 64u,
+                "K3 true-varlen combine owns exactly warps 8 and 9");
             constexpr uint32_t kCombineNamedBarrierIdx = 15;
             constexpr uint32_t kBeforeCombineReuseGridSyncIdx = 2;
             constexpr uint32_t kBeforeCombineReuseTag = 7;
@@ -897,13 +937,16 @@ sm100_bf16_gemm_body(int* grouped_layout,
                  kNumEpilogueThreads) /
                 32;
             const uint32_t combine_thread_idx =
-                warp_idx < kNumNonEpilogueThreads / 32
-                    ? (warp_idx - 2) * 32 + lane_idx
-                    : kNumNonEpilogueThreads - 64 +
-                          (warp_idx -
-                           kExtraCombineWarpBegin) *
-                              32 +
-                          lane_idx;
+                kK3TrueVarlenCombine
+                    ? (warp_idx - kExtraCombineWarpBegin) * 32 +
+                          lane_idx
+                    : (warp_idx < kNumNonEpilogueThreads / 32
+                           ? (warp_idx - 2) * 32 + lane_idx
+                           : kNumNonEpilogueThreads - 64 +
+                                 (warp_idx -
+                                  kExtraCombineWarpBegin) *
+                                     32 +
+                                 lane_idx);
             const auto combine_sync = [=]() {
                 ptx::sync_aligned(
                     kNumCombineThreads,
@@ -960,20 +1003,37 @@ sm100_bf16_gemm_body(int* grouped_layout,
                                 !wait_for_primary_kernel);
                     }
                 }
-                constexpr uint32_t kReduceValuesPerVec =
-                    2 * kValuesPerVec;
-                constexpr uint32_t kWarpSize = 32u;
-                constexpr uint32_t kNumCombineWarps =
-                    kNumCombineThreads / kWarpSize;
-                DG_STATIC_ASSERT(
-                    kNumCombineThreads % kWarpSize == 0,
-                    "Combine threads must form complete warps");
-                const uint32_t combine_warp_idx =
-                    combine_thread_idx / kWarpSize;
-                const uint32_t num_vecs_per_token =
-                    combine_hidden / kReduceValuesPerVec;
-                DG_DEVICE_ASSERT(
-                    combine_hidden % kReduceValuesPerVec == 0);
+                if constexpr (kK3TrueVarlenCombine) {
+                    DG_STATIC_ASSERT(
+                        kPublishBeforeCombineReduce,
+                        "true-varlen combine requires inline publication");
+                    DG_DEVICE_ASSERT(combine_backward_ranges != nullptr);
+                    k3_mxfp8_wgrad_fixed_topk_combine<
+                        kNumSMs, kNumCombineThreads / 32u>(
+                            grad_x_output, combine_buffer,
+                            combine_backward_ranges,
+                            combine_num_tokens,
+                            combine_num_max_tokens,
+                            combine_num_topk,
+                            combine_hidden,
+                            combine_thread_idx / 32u,
+                            lane_idx,
+                            combine_ready_counts);
+                } else {
+                    constexpr uint32_t kReduceValuesPerVec =
+                        2 * kValuesPerVec;
+                    constexpr uint32_t kWarpSize = 32u;
+                    constexpr uint32_t kNumCombineWarps =
+                        kNumCombineThreads / kWarpSize;
+                    DG_STATIC_ASSERT(
+                        kNumCombineThreads % kWarpSize == 0,
+                        "Combine threads must form complete warps");
+                    const uint32_t combine_warp_idx =
+                        combine_thread_idx / kWarpSize;
+                    const uint32_t num_vecs_per_token =
+                        combine_hidden / kReduceValuesPerVec;
+                    DG_DEVICE_ASSERT(
+                        combine_hidden % kReduceValuesPerVec == 0);
 
                 // Assign whole tokens to physical combine warps. The leader
                 // performs the sole system-scope readiness acquire, and the
@@ -1220,6 +1280,7 @@ sm100_bf16_gemm_body(int* grouped_layout,
                     output[1] = packed_output[1];
                     }
                 }
+                }
             }
         }
     } else if (warp_idx >= kNumNonEpilogueThreads / 32 and warp_idx < (kNumNonEpilogueThreads + kNumUMMAStoreThreads) / 32) {
@@ -1251,7 +1312,7 @@ sm100_bf16_gemm_body(int* grouped_layout,
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
             const uint32_t current_wgrad_phase = [&]() {
                 if constexpr (kTaskPhaseTagged)
-                    return scheduler.current_wgrad_phase;
+                    return scheduler.get_current_wgrad_phase();
                 return 0u;
             }();
             const auto* const active_tensor_map_cd =

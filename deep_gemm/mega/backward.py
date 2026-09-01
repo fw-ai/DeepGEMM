@@ -936,6 +936,7 @@ def fp8_fp4_mega_moe_backward_dgrad_swiglu(
     ] = None,
     backward_range_sizes: Optional[Sequence[int]] = None,
     mxfp8_three_term_wgrad: bool = False,
+    three_segment_bf16_progressive_wgrad: bool = False,
 ) -> None:
     """Run production L1 replay, gated activation dgrad, and grad-x dispatch.
 
@@ -949,6 +950,14 @@ def fp8_fp4_mega_moe_backward_dgrad_swiglu(
     specialization directly from this argument; there is no environment or
     process-global override. The owning training mode is full-parameter only
     and rejects LoRA before this API is called.
+
+    ``three_segment_bf16_progressive_wgrad`` is a separate per-call selector
+    for the exact three-packed-range Kimi-K3 EP=8 BF16 dW2/dW13 suffix. It
+    changes only the phase-tagged weight-gradient schedule: activation and
+    weight quantization, descriptor extents, retained tensors, and output
+    storage keep the regular ready-BF16 contract. It is intentionally
+    mutually exclusive with ``mxfp8_three_term_wgrad`` so the progressive
+    suffix cannot acquire the compact MXFP8-ring lifetime by accident.
 
     POST_DOWN writes BF16 ``score * grad_y`` to ``grad_ye``, retains
     unweighted ``h_act`` in ``h_weighted_output`` for W2 wgrad, and computes
@@ -1000,10 +1009,28 @@ def fp8_fp4_mega_moe_backward_dgrad_swiglu(
     ranges as flattened five-integer records: active tokens, symmetric token
     capacity, pool rows, activation rows, and scale-factor rows. ``None``
     preserves the single-range behavior. For multiple ranges, logical
-    ``grad_y``, ``topk_weights``, and ``source_x_bf16`` rows are staged into
-    capacity-strided symmetric slots. ``combined_grad_route_output`` gathers
-    those physical source-gradient slots back into logical row order.
+    ``topk_weights`` rows are staged into capacity-strided symmetric slots.
+    The exact K3 MXFP8-wgrad path instead consumes Forward's source-layout
+    unweighted W2 directly from the symmetric combine planes: one warp
+    computes all router dots for a source token, then reclaims that token's
+    first two planes for compact ``grad_y`` and exact ``source_x_bf16``. This
+    avoids both a pool-layout W2 snapshot and a second hidden-sized source
+    arena. Other paths stage ``grad_y`` and ``source_x_bf16`` as before.
+    ``combined_grad_route_output`` gathers the physical source-gradient slots
+    back into logical row order.
     """
+    if mxfp8_three_term_wgrad and three_segment_bf16_progressive_wgrad:
+        raise ValueError(
+            "three-segment BF16 progressive wgrad is incompatible with "
+            "MXFP8 three-term wgrad"
+        )
+    if three_segment_bf16_progressive_wgrad and (
+        backward_range_sizes is None or len(backward_range_sizes) != 15
+    ):
+        raise ValueError(
+            "three-segment BF16 progressive wgrad requires exactly three "
+            "five-int backward ranges"
+        )
     if activation not in ("swiglu", "geglu", "situ"):
         raise ValueError(f"unsupported MegaMoE backward activation: {activation!r}")
     if activation == "situ":
@@ -1014,6 +1041,9 @@ def fp8_fp4_mega_moe_backward_dgrad_swiglu(
                 "SiTU MegaMoE backward requires situ_linear_beta > 0 when set"
             )
     route_weight_mode = RouteWeightMode(route_weight_mode)
+    requested_source_route_retention = bool(
+        mxfp8_three_term_wgrad and down_unweighted_output is None
+    )
     if route_weight_mode is RouteWeightMode.POST_DOWN:
         if route_weights.dtype != torch.float32:
             raise TypeError(
@@ -1021,7 +1051,7 @@ def fp8_fp4_mega_moe_backward_dgrad_swiglu(
         if grad_y_unweighted_output is None:
             raise ValueError(
                 "post_down requires grad_y_unweighted_output")
-        if down_unweighted_output is None:
+        if down_unweighted_output is None and not requested_source_route_retention:
             raise ValueError(
                 "post_down requires saved down_unweighted_output")
         if grad_route_output is None and sym_buffer is None:
@@ -1065,24 +1095,31 @@ def fp8_fp4_mega_moe_backward_dgrad_swiglu(
                 "multi-range K3 backward requires DeepGEMM runtime "
                 "num_sms=148"
             )
+        source_route_retention = requested_source_route_retention
         grad_y_bf16 = grad_y.to(torch.bfloat16).contiguous()
         topk_weights_fp32 = topk_weights.float().contiguous()
         if len(backward_ranges) > 1:
-            _stage_backward_ranges(
-                sym_buffer.backward_grad_y,
-                grad_y_bf16,
-                backward_ranges,
-            )
+            if not source_route_retention:
+                _stage_backward_ranges(
+                    sym_buffer.backward_grad_y,
+                    grad_y_bf16,
+                    backward_ranges,
+                )
             _stage_backward_ranges(
                 sym_buffer.topk_weights,
                 topk_weights_fp32,
                 backward_ranges,
             )
         else:
-            sym_buffer.backward_grad_y[:num_tokens].copy_(grad_y_bf16)
+            if not source_route_retention:
+                sym_buffer.backward_grad_y[:num_tokens].copy_(grad_y_bf16)
             sym_buffer.topk_weights[:num_tokens].copy_(topk_weights_fp32)
         sym_buffer.backward_grad_route.zero_()
-        backward_grad_y = sym_buffer.backward_grad_y
+        backward_grad_y = (
+            grad_y_bf16
+            if source_route_retention
+            else sym_buffer.backward_grad_y
+        )
         backward_topk_weights = sym_buffer.topk_weights
         backward_grad_route = sym_buffer.backward_grad_route
         if source_x_bf16 is not None:
@@ -1102,27 +1139,31 @@ def fp8_fp4_mega_moe_backward_dgrad_swiglu(
                     "source_x_bf16 staging requires at least two symmetric "
                     "combine planes"
                 )
-            combine_planes = torch.as_strided(
-                sym_buffer.backward_grad_y,
-                size=(
-                    sym_buffer.num_topk * sym_buffer.num_max_tokens_per_rank,
-                    sym_buffer.hidden,
-                ),
-                stride=(sym_buffer.hidden, 1),
-            )
-            backward_x = combine_planes.narrow(
-                0,
-                sym_buffer.num_max_tokens_per_rank,
-                sym_buffer.num_max_tokens_per_rank,
-            )
-            if len(backward_ranges) > 1:
-                _stage_backward_ranges(
-                    backward_x,
-                    source_x_bf16,
-                    backward_ranges,
-                )
+            if source_route_retention:
+                backward_x = source_x_bf16
+                # Forward retained one exact BF16 unweighted W2 row per
+                # physical source slot in these planes. Kernel A consumes all
+                # top-k rows before reclaiming planes zero and one in place.
+                down_unweighted_output = _direct_grad_x_planes(sym_buffer)
             else:
-                backward_x[:num_tokens].copy_(source_x_bf16)
+                combine_planes = _direct_grad_x_planes(sym_buffer)
+                backward_x = combine_planes.narrow(
+                    0,
+                    sym_buffer.num_max_tokens_per_rank,
+                    sym_buffer.num_max_tokens_per_rank,
+                )
+                if len(backward_ranges) > 1:
+                    _stage_backward_ranges(
+                        backward_x,
+                        source_x_bf16,
+                        backward_ranges,
+                    )
+                else:
+                    backward_x[:num_tokens].copy_(source_x_bf16)
+        elif source_route_retention:
+            raise ValueError(
+                "source-retained K3 backward requires exact source_x_bf16"
+            )
         backward_sym_buffer_ptrs = sym_buffer.handle.buffer_ptrs
         backward_rank = sym_buffer.group.rank()
         num_max_tokens_per_rank = sym_buffer.num_max_tokens_per_rank
@@ -1268,6 +1309,7 @@ def fp8_fp4_mega_moe_backward_dgrad_swiglu(
         w13_wgrad_output,
         [] if backward_range_sizes is None else list(backward_range_sizes),
         mxfp8_three_term_wgrad,
+        three_segment_bf16_progressive_wgrad,
     )
     if combined_grad_route_output is not None:
         assert backward_grad_route is not None
