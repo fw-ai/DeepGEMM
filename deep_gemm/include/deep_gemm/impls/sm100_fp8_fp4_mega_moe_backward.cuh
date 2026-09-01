@@ -13,6 +13,7 @@
 #include <deep_gemm/epilogue/sm100_store_cd.cuh>
 #include <deep_gemm/epilogue/sm100_store_cd_swap_ab.cuh>
 #include <deep_gemm/epilogue/transform.cuh>
+#include <deep_gemm/impls/sm100_bf16_gemm.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
 #include <deep_gemm/mma/sm100.cuh>
 #include <deep_gemm/ptx/tma.cuh>
@@ -24,6 +25,7 @@ namespace deep_gemm {
 template <
     uint32_t kHidden, uint32_t kNumExperts, uint32_t BLOCK_M,
     uint32_t kNumSMs, uint32_t kNumThreads,
+    uint32_t kNumRanks,
     CombineOrderMode kCombineOrderMode>
 __device__ __forceinline__ void
 bf16_mega_moe_reduce_post_down_route(
@@ -31,6 +33,10 @@ bf16_mega_moe_reduce_post_down_route(
     const cutlass::bfloat16_t* grad_y_unweighted,
     const cutlass::bfloat16_t* down_unweighted,
     float* grad_route_output,
+    float* backward_grad_route,
+    const layout::TokenSrcMetadata* token_src_metadata,
+    const uint32_t num_topk,
+    const layout::SymBuffer<kNumRanks>& backward_sym_buffer,
     uint8_t* scratch) {
     constexpr uint32_t kTritonRouteBlockH = [] {
         uint32_t value = 1;
@@ -78,7 +84,7 @@ bf16_mega_moe_reduce_post_down_route(
             *route_warp_arrivals = 0;
         __syncthreads();
         uint32_t route_pool_block_offset = 0;
-        #pragma unroll
+        #pragma unroll 1
         for (uint32_t expert_idx = 0;
              expert_idx < kNumExperts; ++expert_idx) {
             const uint32_t num_tokens =
@@ -210,9 +216,23 @@ bf16_mega_moe_reduce_post_down_route(
                                 grad_route, offset));
                     }
                 }
-                if (threadIdx.x == 0)
+                if (threadIdx.x == 0) {
                     grad_route_output[pool_row] =
                         grad_route;
+                    if (backward_grad_route != nullptr) {
+                        const auto metadata =
+                            token_src_metadata[pool_row];
+                        auto* remote_grad_route =
+                            backward_sym_buffer.map(
+                                backward_grad_route +
+                                    static_cast<uint64_t>(
+                                        metadata.token_idx) *
+                                        num_topk +
+                                    metadata.topk_idx,
+                                metadata.rank_idx);
+                        *remote_grad_route = grad_route;
+                    }
+                }
                 __syncthreads();
                 if (threadIdx.x == 0)
                     *route_warp_arrivals = 0;
@@ -226,7 +246,7 @@ bf16_mega_moe_reduce_post_down_route(
 
     if (threadIdx.x == 0) {
         uint32_t total_route_rows = 0;
-        #pragma unroll
+        #pragma unroll 1
         for (uint32_t expert_idx = 0;
              expert_idx < kNumExperts; ++expert_idx) {
             total_route_rows += static_cast<uint32_t>(
@@ -265,7 +285,7 @@ bf16_mega_moe_reduce_post_down_route(
         kNumSMs * num_route_groups_per_cta;
     uint32_t route_pool_block_offset = 0;
 
-    #pragma unroll
+    #pragma unroll 1
     for (uint32_t expert_idx = 0;
          expert_idx < kNumExperts; ++expert_idx) {
         const uint32_t num_tokens = static_cast<uint32_t>(
@@ -432,8 +452,22 @@ bf16_mega_moe_reduce_post_down_route(
                     }
                 }
             }
-            if (route_group_lane_idx == 0)
+            if (route_group_lane_idx == 0) {
                 grad_route_output[pool_row] = grad_route;
+                if (backward_grad_route != nullptr) {
+                    const auto metadata =
+                        token_src_metadata[pool_row];
+                    auto* remote_grad_route =
+                        backward_sym_buffer.map(
+                            backward_grad_route +
+                                static_cast<uint64_t>(
+                                    metadata.token_idx) *
+                                    num_topk +
+                                metadata.topk_idx,
+                            metadata.rank_idx);
+                    *remote_grad_route = grad_route;
+                }
+            }
             if (route_group_threads > 32) {
                 ptx::sync_aligned(
                     route_group_threads, route_group_idx);
@@ -568,7 +602,7 @@ sm100_bf16_mega_moe_backward_post_down_prelude(
         reinterpret_cast<uint32_t*>(scratch);
     if (threadIdx.x == 0) {
         uint32_t total_route_rows = 0;
-        #pragma unroll
+        #pragma unroll 1
         for (uint32_t expert_idx = 0;
              expert_idx < kNumExperts; ++expert_idx) {
             total_route_rows += static_cast<uint32_t>(
@@ -610,7 +644,7 @@ sm100_bf16_mega_moe_backward_post_down_prelude(
         kNumSMs * num_route_groups_per_cta;
     uint32_t route_pool_block_offset = 0;
 
-    #pragma unroll
+    #pragma unroll 1
     for (uint32_t expert_idx = 0;
          expert_idx < kNumExperts; ++expert_idx) {
         const uint32_t num_tokens = static_cast<uint32_t>(
@@ -1213,7 +1247,7 @@ sm100_bf16_mega_moe_backward_post_down_prelude(
     }
 
     uint32_t padded_pool_blocks = 0;
-    #pragma unroll
+    #pragma unroll 1
     for (uint32_t expert_idx = 0;
          expert_idx < kNumExperts; ++expert_idx) {
         const uint32_t num_tokens = static_cast<uint32_t>(
@@ -1310,7 +1344,15 @@ template <
     uint32_t kNumRanks = 1,
     bool kCompileW13Dgrad = true,
     bool kBF16Mode = false,
+    bool kInlineWeightDequant = false,
+    bool kPhaseOrderedWeightDequant = false,
+    bool kResidualMXFP8Dgrad = false,
+    bool kExactSourceX = false,
+    bool kGateUpPrepared = false,
     ActivationType kActivationType = ActivationType::SwiGLU,
+    float kSituBeta = 1.0f,
+    float kSituLinearBeta =
+        cute::numeric_limits<float>::infinity(),
     bool kFastMath = false,
     RouteWeightMode kRouteWeightMode = RouteWeightMode::PreDown,
     CombineOrderMode kCombineOrderMode = CombineOrderMode::FixedTopK,
@@ -1319,6 +1361,8 @@ template <
     bool kDirectRemoteGradX = false,
     bool kWriteGradXPool = true,
     bool kClearWgradPadding = false,
+    bool kInlineWgrad = false,
+    bool kAccumulateWgrad = false,
     bool kComputeRouteGrad = false,
     bool kTraceKernel = false,
     bool kVectorizedGradXStore = false,
@@ -1337,6 +1381,8 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
     const cutlass::bfloat16_t* backward_x,
     const float* backward_topk_weights,
     float* backward_grad_route,
+    cutlass::bfloat16_t* backward_grad_x_output,
+    const uint32_t num_backward_tokens,
     const layout::TokenSrcMetadata* token_src_metadata,
     const uint32_t num_topk,
     const uint32_t num_pool_rows,
@@ -1349,12 +1395,22 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
     const __grid_constant__ cute::TmaDescriptor tensor_map_output,
     const __grid_constant__ cute::TmaDescriptor tensor_map_grad_ye,
     const __grid_constant__ cute::TmaDescriptor tensor_map_w2_dequant,
+    const __grid_constant__ cute::TmaDescriptor tensor_map_w2_dgrad_weights,
+    const __grid_constant__ cute::TmaDescriptor tensor_map_w2_dgrad_weights_sf,
     const __grid_constant__ cute::TmaDescriptor tensor_map_w2_weights,
     const __grid_constant__ cute::TmaDescriptor tensor_map_w2_scales,
     const __grid_constant__ cute::TmaDescriptor tensor_map_w13_dequant,
+    const __grid_constant__ cute::TmaDescriptor tensor_map_w13_dgrad_weights,
+    const __grid_constant__ cute::TmaDescriptor tensor_map_w13_dgrad_weights_sf,
     const __grid_constant__ cute::TmaDescriptor tensor_map_w13_weights,
     const __grid_constant__ cute::TmaDescriptor tensor_map_w13_scales,
     const __grid_constant__ cute::TmaDescriptor tensor_map_grad_gate_up,
+    const __grid_constant__ cute::TmaDescriptor tensor_map_w2_wgrad_a,
+    const __grid_constant__ cute::TmaDescriptor tensor_map_w2_wgrad_b,
+    const __grid_constant__ cute::TmaDescriptor tensor_map_w2_wgrad_d,
+    const __grid_constant__ cute::TmaDescriptor tensor_map_w13_wgrad_a,
+    const __grid_constant__ cute::TmaDescriptor tensor_map_w13_wgrad_b,
+    const __grid_constant__ cute::TmaDescriptor tensor_map_w13_wgrad_d,
     const cutlass::float_e4m3_t* acts_ptr,
     const uint32_t* acts_sf_ptr,
     const int8_t* w2_weights,
@@ -1377,7 +1433,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
     const cutlass::bfloat16_t* down_unweighted_output,
     float* grad_route_output,
     uint32_t* weight_tile_states,
-    const uint32_t launch_epoch,
+    const bool clear_empty_wgrad_expert_outputs,
     const float activation_limit,
     uint64_t* kernel_trace) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)) || defined(__CLION_IDE__)
@@ -1387,6 +1443,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
     using b_dtype_t = cutlass::detail::float_e2m1_unpacksmem_t;
     using cd_dtype_t = cutlass::bfloat16_t;
     using dgrad_b_dtype_t = cutlass::bfloat16_t;
+    using residual_dgrad_dtype_t = cutlass::float_e4m3_t;
 
     constexpr uint32_t kNumEpilogueStages = 2;
     constexpr uint32_t kNumTMAStoreStages = 2;
@@ -1394,10 +1451,29 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
         kNumRanks > 1 ? 128 : 0;
     constexpr uint32_t kNumDispatchWarps =
         kNumDispatchThreads / 32;
+    // Initial grad-y dispatch and the later route/exact-X pipeline run in
+    // distinct phases but need independent transaction-barrier parity.
+    constexpr uint32_t kNumDispatchBarrierStages = 2;
+    constexpr uint32_t kNumDispatchBarriers =
+        kNumDispatchWarps * kNumDispatchBarrierStages;
     constexpr uint32_t kDispatchWarpStart =
         (kNumNonEpilogueThreads + kNumEpilogueThreads) / 32;
+    // Inline MXFP4 conversion is scalar CUDA work rather than UMMA work.  Use
+    // six warps (1 and 3..7) to feed the dgrad pipeline; 24 warps remain for
+    // the pool epilogue and remote grad-x scatter.  The non-inline TMA path
+    // retains its original four-warp producer/MMA prefix.
+    constexpr uint32_t kDgradEpilogueWarpStart =
+        (kInlineWeightDequant || kResidualMXFP8Dgrad) ? 8 : 4;
     constexpr uint32_t kNumDgradEpilogueThreads =
-        kNumThreads - kNumNonEpilogueThreads;
+        kNumThreads - kDgradEpilogueWarpStart * 32;
+    constexpr uint32_t kNumInlineWeightProducerWarps = 6;
+    constexpr uint32_t kNumInlineWeightProducerThreads =
+        kNumInlineWeightProducerWarps * 32;
+    constexpr uint32_t kInlineWeightProducerBarrier = 1;
+    constexpr uint32_t kNumResidualProducerWarps = 7;
+    constexpr uint32_t kNumResidualProducerThreads =
+        kNumResidualProducerWarps * 32;
+    constexpr uint32_t kResidualWeightProducerBarrier = 2;
     constexpr uint32_t kGranK = 32;
     constexpr uint32_t kNumUTCCPAlignedElems = 128;
     constexpr uint32_t kNumBlockNs = (2 * kIntermediateHidden) / BLOCK_N;
@@ -1409,8 +1485,10 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
     constexpr uint32_t UMMA_M = LAYOUT_AD_M * 2;
     constexpr uint32_t UMMA_N = BLOCK_M;
     constexpr uint32_t UMMA_K = 32;
-    constexpr uint32_t DGRAD_BLOCK_K = 64;
-    constexpr uint32_t DGRAD_UMMA_K = 16;
+    constexpr uint32_t DGRAD_BLOCK_K =
+        kResidualMXFP8Dgrad ? 128 : 64;
+    constexpr uint32_t DGRAD_UMMA_K =
+        kResidualMXFP8Dgrad ? 32 : 16;
     constexpr uint32_t kNumW2WeightTileStates =
         kNumExperts * (kHidden / DGRAD_BLOCK_K) *
         kNumDgradBlockNs;
@@ -1438,6 +1516,12 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
     DG_STATIC_ASSERT(SF_BLOCK_N == BLOCK_N, "Invalid SFB block");
     DG_STATIC_ASSERT(kHidden % BLOCK_K == 0, "Invalid hidden size");
     DG_STATIC_ASSERT(kNumSMs % 2 == 0, "2-CTA clusters require an even SM count");
+    DG_STATIC_ASSERT(
+        !kResidualMXFP8Dgrad || (!kBF16Mode && !kInlineWeightDequant),
+        "Residual MXFP8 dgrad is exclusive with BF16 and legacy inline dequant modes");
+    DG_STATIC_ASSERT(
+        !kGateUpPrepared || !kBF16Mode,
+        "Prepared gate/up is supported only by the FP8/FP4 MegaMoE path");
 
     constexpr uint32_t kNumW13WeightTileStates =
         kNumExperts *
@@ -1447,6 +1531,14 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
         weight_tile_states + kNumW2WeightTileStates +
         kNumW13WeightTileStates;
     auto* phase_sense = phase_count + 1;
+    // The caller-owned grid state persists across launches. Capture its
+    // current phase before the first full-grid barrier and use the following
+    // value as this launch's tile-ready epoch. The barrier cannot advance the
+    // phase until every CTA has reached it, so every CTA observes the same
+    // epoch without host-global state or a clearing launch.
+    uint32_t launch_epoch = ptx::ld_acq(phase_sense) + 1u;
+    if (launch_epoch == 0)
+        launch_epoch = 1;
     constexpr uint32_t kTraceSiteCount = 22;
     constexpr uint32_t kTraceValueCount = 5;
     constexpr uint32_t kTraceBeginCycle = 0;
@@ -1462,7 +1554,14 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
     };
     const auto trace_begin = [&](const uint32_t site) {
         if constexpr (kTraceKernel) {
-            if (threadIdx.x == 0) {
+            // Dispatch sites execute only in the dedicated communication
+            // warpgroup, so their first lane records them. All other sites
+            // retain CTA-thread-zero ownership.
+            const bool is_trace_thread =
+                threadIdx.x == 0 ||
+                ((site == 3 || site == 4) &&
+                 threadIdx.x == kDispatchWarpStart * 32);
+            if (is_trace_thread) {
                 auto* values =
                     kernel_trace +
                     (static_cast<uint64_t>(site) * kNumSMs +
@@ -1476,7 +1575,11 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
     };
     const auto trace_end = [&](const uint32_t site) {
         if constexpr (kTraceKernel) {
-            if (threadIdx.x == 0) {
+            const bool is_trace_thread =
+                threadIdx.x == 0 ||
+                ((site == 3 || site == 4) &&
+                 threadIdx.x == kDispatchWarpStart * 32);
+            if (is_trace_thread) {
                 auto* values =
                     kernel_trace +
                     (static_cast<uint64_t>(site) * kNumSMs +
@@ -1495,7 +1598,8 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
     }
     const auto full_grid_phase_barrier =
         [&](const uint32_t trace_site) {
-        trace_begin(trace_site);
+        if (trace_site < kTraceSiteCount)
+            trace_begin(trace_site);
         if (threadIdx.x == 0) {
             const uint32_t old_sense =
                 atomicAdd(phase_sense, 0u);
@@ -1513,24 +1617,48 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
             }
         }
         __syncthreads();
-        trace_end(trace_site);
+        if (trace_site < kTraceSiteCount)
+            trace_end(trace_site);
     };
 
     const bool is_leader_cta = cute::block_rank_in_cluster() == 0;
     const uint32_t warp_idx = cutlass::canonical_warp_idx_sync();
     const uint32_t lane_idx = ptx::get_lane_idx();
+    // K3's exact-source W13 wgrad can reuse the POST_DOWN grad-y pool. The
+    // dispatch role detects that alias and defers the source-X pull until all
+    // dgrad and route-gradient readers have retired.
+    const bool late_exact_source_x =
+        !kBF16Mode && kExactSourceX &&
+        x_pool_output == grad_y_unweighted_output;
+    // Prepared forward preactivations use MegaMoE's [gate(8), up(8)] column
+    // layout, whereas W13 dgrad/wgrad consume conventional [all gate | all
+    // up] gradients. When both tensors alias, publish each derivative back to
+    // the exact column it just consumed, then deinterleave only after every
+    // activation CTA has retired. Direct conventional stores would race with
+    // another N-tile CTA's still-live preactivation reads.
+    const bool inplace_gate_up_grad =
+        gate_up_output == grad_gate_up_output;
+    uint32_t dispatch_pull_mbarrier_phase = 0;
 
     if (warp_idx == 0) {
         cute::prefetch_tma_descriptor(&tensor_map_grad_ye);
         cute::prefetch_tma_descriptor(&tensor_map_w2_dequant);
+        if constexpr (kResidualMXFP8Dgrad) {
+            cute::prefetch_tma_descriptor(&tensor_map_w2_dgrad_weights);
+            cute::prefetch_tma_descriptor(&tensor_map_w2_dgrad_weights_sf);
+            cute::prefetch_tma_descriptor(&tensor_map_w13_dgrad_weights);
+            cute::prefetch_tma_descriptor(&tensor_map_w13_dgrad_weights_sf);
+        }
         cute::prefetch_tma_descriptor(&tensor_map_w13_dequant);
         cute::prefetch_tma_descriptor(&tensor_map_grad_gate_up);
         if constexpr (!kBF16Mode) {
-            cute::prefetch_tma_descriptor(&tensor_map_acts);
-            cute::prefetch_tma_descriptor(&tensor_map_acts_sf);
-            cute::prefetch_tma_descriptor(&tensor_map_weights);
-            cute::prefetch_tma_descriptor(&tensor_map_weights_sf);
-            cute::prefetch_tma_descriptor(&tensor_map_output);
+            if constexpr (!kGateUpPrepared) {
+                cute::prefetch_tma_descriptor(&tensor_map_acts);
+                cute::prefetch_tma_descriptor(&tensor_map_acts_sf);
+                cute::prefetch_tma_descriptor(&tensor_map_weights);
+                cute::prefetch_tma_descriptor(&tensor_map_weights_sf);
+                cute::prefetch_tma_descriptor(&tensor_map_output);
+            }
             cute::prefetch_tma_descriptor(&tensor_map_w2_weights);
             cute::prefetch_tma_descriptor(&tensor_map_w2_scales);
             cute::prefetch_tma_descriptor(&tensor_map_w13_weights);
@@ -1547,6 +1675,25 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
         LOAD_BLOCK_N * BLOCK_K * sizeof(b_dtype_t);
     constexpr uint32_t SMEM_SFA_SIZE_PER_STAGE = SF_BLOCK_M * sizeof(uint32_t);
     constexpr uint32_t SMEM_SFB_SIZE_PER_STAGE = SF_BLOCK_N * sizeof(uint32_t);
+    constexpr uint32_t SMEM_RESIDUAL_A_SIZE_PER_STAGE =
+        kResidualMXFP8Dgrad ? SMEM_A_SIZE_PER_STAGE : 0;
+    constexpr uint32_t SMEM_RESIDUAL_SFA_SIZE_PER_STAGE =
+        kResidualMXFP8Dgrad ? SMEM_SFA_SIZE_PER_STAGE : 0;
+    // Residual-MXFP8 dgrad re-encodes each transposed MXFP4 tile in the
+    // persistent pipeline.  Stage the original packed values and FP32 scales
+    // with TMA while the producer warps quantize A, then consume them from
+    // shared memory.  This replaces scattered scalar global loads without a
+    // persistent transformed-weight allocation.
+    constexpr uint32_t SMEM_DGRAD_WEIGHT_SOURCE_SIZE =
+        kResidualMXFP8Dgrad
+        ? DGRAD_BLOCK_K * (LOAD_BLOCK_N / 2) * sizeof(int8_t)
+        : 0;
+    constexpr uint32_t SMEM_DGRAD_WEIGHT_SCALE_SOURCE_SIZE =
+        kResidualMXFP8Dgrad
+        ? DGRAD_BLOCK_K * (LOAD_BLOCK_N / kGranK) * sizeof(float)
+        : 0;
+    constexpr uint32_t kNumWeightLoadBarriers =
+        kResidualMXFP8Dgrad ? 1 : 0;
     constexpr uint32_t SMEM_DISPATCH_SIZE =
         kNumDispatchWarps * kHidden * sizeof(cd_dtype_t);
 
@@ -1584,12 +1731,19 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
             i * SMEM_B_SIZE_PER_STAGE);
     });
     DG_STATIC_ASSERT(
-        LOAD_BLOCK_M * DGRAD_BLOCK_K * sizeof(cd_dtype_t) ==
-            SMEM_A_SIZE_PER_STAGE,
+        kResidualMXFP8Dgrad ||
+            LOAD_BLOCK_M * DGRAD_BLOCK_K * sizeof(cd_dtype_t) ==
+                SMEM_A_SIZE_PER_STAGE,
         "Dgrad A alias size mismatch");
     DG_STATIC_ASSERT(
-        LOAD_BLOCK_N * DGRAD_BLOCK_K * sizeof(dgrad_b_dtype_t) ==
-            SMEM_B_SIZE_PER_STAGE,
+        (kResidualMXFP8Dgrad &&
+         LOAD_BLOCK_N * DGRAD_BLOCK_K *
+                 sizeof(residual_dgrad_dtype_t) ==
+             SMEM_B_SIZE_PER_STAGE) ||
+            (!kResidualMXFP8Dgrad &&
+             LOAD_BLOCK_N * DGRAD_BLOCK_K *
+                     sizeof(dgrad_b_dtype_t) ==
+                 SMEM_B_SIZE_PER_STAGE),
         "Dgrad B alias size mismatch");
     auto sf_start_ptr = smem_gemm_base + SMEM_CD_SIZE +
                         kNumStages *
@@ -1604,37 +1758,94 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
             i * SMEM_SFB_SIZE_PER_STAGE);
     });
 
-    auto barrier_start_ptr = reinterpret_cast<Barrier*>(smem_sfb[kNumStages]);
+    auto* residual_a_start_ptr =
+        reinterpret_cast<uint8_t*>(smem_sfb[kNumStages]);
+    auto smem_dgrad_a_residual =
+        utils::PatternVisitor([=](const uint32_t& i) {
+            return reinterpret_cast<residual_dgrad_dtype_t*>(
+                residual_a_start_ptr +
+                i * SMEM_RESIDUAL_A_SIZE_PER_STAGE);
+        });
+    auto* residual_sfa_start_ptr =
+        residual_a_start_ptr +
+        kNumStages * SMEM_RESIDUAL_A_SIZE_PER_STAGE;
+    auto smem_dgrad_sfa_residual =
+        utils::PatternVisitor([=](const uint32_t& i) {
+            return reinterpret_cast<uint32_t*>(
+                residual_sfa_start_ptr +
+                i * SMEM_RESIDUAL_SFA_SIZE_PER_STAGE);
+        });
+
+    auto* weight_source_start_ptr =
+        residual_sfa_start_ptr +
+        kNumStages * SMEM_RESIDUAL_SFA_SIZE_PER_STAGE;
+    auto* smem_dgrad_weight_source =
+        reinterpret_cast<int8_t*>(weight_source_start_ptr);
+    auto* weight_scale_source_start_ptr =
+        weight_source_start_ptr +
+        SMEM_DGRAD_WEIGHT_SOURCE_SIZE;
+    auto* smem_dgrad_weight_scale_source =
+        reinterpret_cast<float*>(weight_scale_source_start_ptr);
+
+    auto barrier_start_ptr = reinterpret_cast<Barrier*>(
+        weight_scale_source_start_ptr +
+        SMEM_DGRAD_WEIGHT_SCALE_SOURCE_SIZE);
     auto full_barriers = utils::PatternVisitor(
         [=](const uint32_t& i) { return barrier_start_ptr + i; });
     auto empty_barriers = utils::PatternVisitor(
         [=](const uint32_t& i) { return barrier_start_ptr + kNumStages + i; });
+    auto* weight_load_barrier = barrier_start_ptr + 2 * kNumStages;
     auto tmem_full_barriers = utils::PatternVisitor([=](const uint32_t& i) {
-        return barrier_start_ptr + 2 * kNumStages + i;
+        return barrier_start_ptr + 2 * kNumStages +
+            kNumWeightLoadBarriers + i;
     });
     auto tmem_empty_barriers = utils::PatternVisitor([=](const uint32_t& i) {
-        return barrier_start_ptr + 2 * kNumStages + kNumEpilogueStages + i;
+        return barrier_start_ptr + 2 * kNumStages +
+            kNumWeightLoadBarriers + kNumEpilogueStages + i;
     });
     auto dispatch_barriers = utils::PatternVisitor([=](const uint32_t& i) {
         return barrier_start_ptr + 2 * kNumStages +
-            2 * kNumEpilogueStages + i;
+            kNumWeightLoadBarriers + 2 * kNumEpilogueStages + i;
     });
-    auto tmem_ptr_in_smem = reinterpret_cast<uint32_t*>(
+    auto* dequant_barriers =
         barrier_start_ptr + 2 * kNumStages +
-        2 * kNumEpilogueStages + kNumDispatchWarps);
+        kNumWeightLoadBarriers + 2 * kNumEpilogueStages +
+        kNumDispatchBarriers;
+    auto tmem_ptr_in_smem = reinterpret_cast<uint32_t*>(
+        dequant_barriers + 2);
 
     constexpr uint32_t kNumAccumTmemCols = UMMA_N * kNumEpilogueStages;
     constexpr uint32_t kNumSFATmemCols = SF_BLOCK_M / 32;
     constexpr uint32_t kNumSFBTmemCols = SF_BLOCK_N / 32;
+    constexpr uint32_t kNumResidualSFATmemCols =
+        kResidualMXFP8Dgrad ? kNumSFATmemCols : 0;
     constexpr uint32_t kNumTmemCols =
         utils::get_num_aligned_tmem_cols<
-            kNumAccumTmemCols + kNumSFATmemCols + kNumSFBTmemCols>();
+            kNumAccumTmemCols + kNumSFATmemCols + kNumSFBTmemCols +
+            kNumResidualSFATmemCols>();
     constexpr uint32_t kTmemStartColOfSFA = kNumAccumTmemCols;
     constexpr uint32_t kTmemStartColOfSFB =
         kNumAccumTmemCols + kNumSFATmemCols;
+    constexpr uint32_t kTmemStartColOfResidualSFA =
+        kNumAccumTmemCols + kNumSFATmemCols + kNumSFBTmemCols;
     DG_STATIC_ASSERT(kNumTmemCols <= 512, "Backward recompute exceeds TMEM");
 
-    if constexpr (!kBF16Mode) {
+    // Materialize one canonical BF16 weight matrix at the phase boundary
+    // where its backing storage is dead.  The caller can therefore alias W2
+    // to the symmetric combine planes and W13 to the consumed gate/up pool
+    // without extending peak memory.  Tile epochs let a cluster start the
+    // following UMMA phase while slower clusters finish unrelated tiles.
+    const auto dequant_noninline_weights_once =
+        [&](const bool dequant_w13,
+            const bool phase_ordered_dequant,
+            const bool initialize_barriers) {
+      if constexpr (
+          !kBF16Mode && !kInlineWeightDequant &&
+          !kResidualMXFP8Dgrad) {
+        auto* dequant_barrier =
+            phase_ordered_dequant
+            ? dequant_barriers + static_cast<uint32_t>(dequant_w13)
+            : full_barriers[static_cast<uint32_t>(dequant_w13)];
         // Dequantize W2 exactly once per launch into an ephemeral
         // [expert, dim, H] BF16 workspace.  Keeping the source orientation
         // makes both packed-FP4 reads and BF16 writes coalesced; dgrad consumes
@@ -1667,15 +1878,25 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
             reinterpret_cast<uint32_t*>(
                 smem_buffer + kDequantWeightBytes +
                 kDequantScaleBytes);
-        comm::cluster_sync_with_relaxed_arrive();
-        if (warp_idx == 0 && cute::elect_one_sync()) {
-            full_barriers[0]->init(1);
-            if constexpr (kCompileW13Dgrad)
-                full_barriers[1]->init(1);
-            cutlass::arch::fence_barrier_init();
+        if (initialize_barriers) {
+            comm::cluster_sync_with_relaxed_arrive();
+            if (warp_idx == 0 && cute::elect_one_sync()) {
+                if (phase_ordered_dequant) {
+                    dequant_barrier->init(1);
+                } else {
+                    // Preserve the original single-chunk fast path: W2 and
+                    // W13 share one initialization and then hand these slots
+                    // directly to the main UMMA pipeline for reinitialization.
+                    full_barriers[0]->init(1);
+                    if constexpr (kCompileW13Dgrad)
+                        full_barriers[1]->init(1);
+                }
+                cutlass::arch::fence_barrier_init();
+            }
+            comm::cluster_sync_with_relaxed_arrive();
         }
-        comm::cluster_sync_with_relaxed_arrive();
-        uint32_t dequant_phase = 0;
+        if (!dequant_w13) {
+          uint32_t dequant_phase = 0;
 
         for (uint32_t tile_idx = blockIdx.x;
              tile_idx < kNumDequantTiles;
@@ -1688,6 +1909,8 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                 k_expert_tile_idx % kNumDequantKTiles;
             const uint32_t expert_idx =
                 k_expert_tile_idx / kNumDequantKTiles;
+            if (__ldg(expert_counts + expert_idx) == 0)
+                continue;
             const uint32_t global_k_base =
                 k_tile_idx * kDequantTileK;
             const uint32_t global_n_base =
@@ -1698,21 +1921,21 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                     kDequantTileN / 2, kDequantTileK, 0,
                     int8_t>(
                     &tensor_map_w2_weights,
-                    full_barriers[0], dequant_weights,
+                    dequant_barrier, dequant_weights,
                     global_n_base / 2,
                     expert_idx * kHidden + global_k_base);
                 tma::copy<
                     kDequantSFsPerK, kDequantTileK, 0,
                     float>(
                     &tensor_map_w2_scales,
-                    full_barriers[0], dequant_scales,
+                    dequant_barrier, dequant_scales,
                     global_n_base / 32,
                     expert_idx * kHidden + global_k_base);
-                full_barriers[0]->arrive_and_expect_tx(
+                dequant_barrier->arrive_and_expect_tx(
                     kDequantWeightBytes +
                     kDequantScaleBytes);
             }
-            full_barriers[0]->wait(dequant_phase);
+            dequant_barrier->wait(dequant_phase);
             __syncthreads();
 
             for (uint32_t scale_idx = threadIdx.x;
@@ -1805,7 +2028,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
             dequant_phase ^= 1;
         }
 
-        if constexpr (kCompileW13Dgrad) {
+        } else if constexpr (kCompileW13Dgrad) {
             constexpr uint32_t kW13DequantTileK = 256;
             constexpr uint32_t kW13DequantTileN = LOAD_BLOCK_N;
             constexpr uint32_t kW13DequantPairsPerTile =
@@ -1840,6 +2063,8 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                     k_expert_tile_idx % kNumW13DequantKTiles;
                 const uint32_t expert_idx =
                     k_expert_tile_idx / kNumW13DequantKTiles;
+                if (__ldg(expert_counts + expert_idx) == 0)
+                    continue;
                 const uint32_t global_k_base =
                     k_tile_idx * kW13DequantTileK;
                 const uint32_t global_n_base =
@@ -1850,7 +2075,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                         kW13DequantTileN / 2,
                         kW13DequantTileK, 0, int8_t>(
                         &tensor_map_w13_weights,
-                        full_barriers[1],
+                        dequant_barrier,
                         dequant_weights,
                         global_n_base / 2,
                         expert_idx *
@@ -1860,17 +2085,17 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                         kW13DequantSFsPerK,
                         kW13DequantTileK, 0, float>(
                         &tensor_map_w13_scales,
-                        full_barriers[1],
+                        dequant_barrier,
                         dequant_scales,
                         global_n_base / 32,
                         expert_idx *
                                 (2 * kIntermediateHidden) +
                             global_k_base);
-                    full_barriers[1]->arrive_and_expect_tx(
+                    dequant_barrier->arrive_and_expect_tx(
                         kW13DequantWeightBytes +
                         kW13DequantScaleBytes);
                 }
-                full_barriers[1]->wait(
+                dequant_barrier->wait(
                     w13_dequant_phase);
                 __syncthreads();
 
@@ -1981,6 +2206,27 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                 w13_dequant_phase ^= 1;
             }
         }
+        if (phase_ordered_dequant) {
+            // A delayed phase can write into symmetric or formerly consumed
+            // pool storage. Publish generic stores to TMA's async proxy before
+            // the grid-wide phase handoff. The original early path instead
+            // relies on its existing tile epochs and pipeline initialization.
+            asm volatile(
+                "fence.proxy.async.global;" ::: "memory");
+            comm::cluster_sync_with_relaxed_arrive();
+        }
+      }
+    };
+    constexpr bool phase_ordered_w2_dequant =
+        kPhaseOrderedWeightDequant;
+    constexpr bool phase_ordered_w13_dequant =
+        kPhaseOrderedWeightDequant;
+    if constexpr (!phase_ordered_w2_dequant) {
+        dequant_noninline_weights_once(false, false, true);
+        if constexpr (!phase_ordered_w13_dequant)
+            dequant_noninline_weights_once(true, false, false);
+    } else if constexpr (!phase_ordered_w13_dequant) {
+        dequant_noninline_weights_once(true, false, true);
     }
     trace_begin(1);
     comm::cluster_sync_with_relaxed_arrive();
@@ -1991,13 +2237,15 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
             full_barriers[i]->init(4);
             empty_barriers[i]->init(1);
         }
+        if constexpr (kResidualMXFP8Dgrad)
+            weight_load_barrier->init(1);
         #pragma unroll
         for (uint32_t i = 0; i < kNumEpilogueStages; ++i) {
             tmem_full_barriers[i]->init(1);
             tmem_empty_barriers[i]->init(2 * kNumEpilogueThreads);
         }
         #pragma unroll
-        for (uint32_t i = 0; i < kNumDispatchWarps; ++i)
+        for (uint32_t i = 0; i < kNumDispatchBarriers; ++i)
             dispatch_barriers[i]->init(1);
         cutlass::arch::fence_barrier_init();
     } else if (warp_idx == 1) {
@@ -2013,7 +2261,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
         uint32_t next_assigned_block = blockIdx.x;
         uint32_t global_block = 0;
         uint32_t pool_block_offset = 0;
-        #pragma unroll
+        #pragma unroll 1
         for (uint32_t expert_idx = 0; expert_idx < kNumExperts; ++expert_idx) {
             const uint32_t num_tokens =
                 static_cast<uint32_t>(__ldg(expert_counts + expert_idx));
@@ -2039,6 +2287,15 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
             pool_block_offset += num_m_blocks;
         }
     };
+    // Kimi-K3 training asks MegaMoE Forward to publish the exact BF16 SiTU
+    // preactivation into gate_up_output.  Preserve the persistent backward
+    // role/register layout, but make its otherwise redundant W13 replay
+    // schedule empty.  All later reverse dispatch, route-gradient, dgrad, and
+    // wgrad phases still execute on the same clustered kernel launch.
+    const auto for_each_replay_block = [&](const auto& func) {
+        if constexpr (!kGateUpPrepared)
+            for_each_block(func);
+    };
 
     uint32_t stage_idx = 0;
     uint32_t phase = 0;
@@ -2054,7 +2311,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
     if constexpr (!kBF16Mode) {
       if (warp_idx == 0) {
         cutlass::arch::warpgroup_reg_dealloc<kNumProducerRegisters>();
-        for_each_block([&](const uint32_t&, const uint32_t& pool_block_offset,
+        for_each_replay_block([&](const uint32_t&, const uint32_t& pool_block_offset,
                            const uint32_t& m_block_idx, const uint32_t&,
                            const uint32_t& valid_m) {
             const uint32_t pool_block_idx =
@@ -2089,7 +2346,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
         });
     } else if (warp_idx == 1) {
         cutlass::arch::warpgroup_reg_dealloc<kNumProducerRegisters>();
-        for_each_block([&](const uint32_t& expert_idx, const uint32_t&,
+        for_each_replay_block([&](const uint32_t& expert_idx, const uint32_t&,
                            const uint32_t&, const uint32_t& n_block_idx,
                            const uint32_t&) {
             #pragma unroll
@@ -2145,7 +2402,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                 : 0;
             uint32_t current_iter = 0;
 
-            for_each_block([&](const uint32_t&, const uint32_t&,
+            for_each_replay_block([&](const uint32_t&, const uint32_t&,
                                const uint32_t&, const uint32_t&,
                                const uint32_t& valid_m) {
                 mma::sm100::update_instr_desc_with_umma_n(
@@ -2256,7 +2513,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
         uint32_t current_iter = 0;
         uint32_t tma_stage_idx = 0;
 
-        for_each_block([&](const uint32_t&, const uint32_t& pool_block_offset,
+        for_each_replay_block([&](const uint32_t&, const uint32_t& pool_block_offset,
                            const uint32_t& m_block_idx,
                            const uint32_t& n_block_idx,
                            const uint32_t& valid_m) {
@@ -2332,10 +2589,10 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                 dispatch_warp_idx * kHidden;
             auto* pull_mbarrier =
                 dispatch_barriers[dispatch_warp_idx];
-            uint32_t pull_mbarrier_phase = 0;
             uint32_t pool_block_offset = 0;
 
-            #pragma unroll
+            // Keep source-row dispatch compact for K3's 112 local experts.
+            #pragma unroll 1
             for (uint32_t expert_idx = 0;
                  expert_idx < kNumExperts; ++expert_idx) {
                 const uint32_t num_tokens =
@@ -2390,7 +2647,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                             kHidden * sizeof(cd_dtype_t));
                         ptx::mbarrier_wait_and_flip_phase(
                             pull_mbarrier,
-                            pull_mbarrier_phase);
+                            dispatch_pull_mbarrier_phase);
                         ptx::tma_store_1d(
                             grad_y_unweighted_output +
                                 static_cast<uint64_t>(
@@ -2400,6 +2657,40 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                             kHidden * sizeof(cd_dtype_t));
                         cute::tma_store_arrive();
                         ptx::tma_store_wait<0>();
+
+                        if constexpr (!kBF16Mode && kExactSourceX) {
+                          if (!late_exact_source_x) {
+                            // W13 wgrad requires the original BF16 source
+                            // activation. Reuse the grad-y TMA staging buffer
+                            // after its store drains instead of issuing one
+                            // remote scalar load per element.
+                            const auto* remote_x =
+                                backward_sym_buffer.map(
+                                    backward_x +
+                                        static_cast<uint64_t>(
+                                            metadata.token_idx) *
+                                            kHidden,
+                                    metadata.rank_idx);
+                            ptx::tma_load_1d(
+                                pull_buffer, remote_x,
+                                pull_mbarrier,
+                                kHidden * sizeof(cd_dtype_t));
+                            ptx::mbarrier_arrive_and_set_tx(
+                                pull_mbarrier,
+                                kHidden * sizeof(cd_dtype_t));
+                            ptx::mbarrier_wait_and_flip_phase(
+                                pull_mbarrier,
+                                dispatch_pull_mbarrier_phase);
+                            ptx::tma_store_1d(
+                                x_pool_output +
+                                    static_cast<uint64_t>(pool_row) *
+                                    kHidden,
+                                pull_buffer,
+                                kHidden * sizeof(cd_dtype_t));
+                            cute::tma_store_arrive();
+                            ptx::tma_store_wait<0>();
+                          }
+                        }
                     }
                     __syncwarp();
                 }
@@ -2440,7 +2731,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
         if constexpr (!(kBF16Mode && kDispatchInputsPrepared)) {
           uint32_t pool_block_offset = 0;
           uint32_t global_pool_block = 0;
-          #pragma unroll
+          #pragma unroll 1
           for (uint32_t expert_idx = 0; expert_idx < kNumExperts;
                ++expert_idx) {
             const uint32_t num_tokens =
@@ -2499,6 +2790,11 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                         weight;
                                 }
                             }
+                        } else if constexpr (kExactSourceX) {
+                            // Active exact-BF16 rows are TMA-dispatched above.
+                            // These warps retain only the padding clear needed
+                            // by the K-rounded W13 wgrad mainloop.
+                            continue;
                         } else {
                             if (pool_row >= num_acts_rows) {
                                 asm volatile("trap;");
@@ -2571,7 +2867,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                  RouteWeightMode::PostDown) &&
             !kDispatchInputsPrepared) {
             uint32_t grad_pool_block_offset = 0;
-            #pragma unroll
+            #pragma unroll 1
             for (uint32_t expert_idx = 0;
                  expert_idx < kNumExperts; ++expert_idx) {
                 const uint32_t num_tokens =
@@ -2648,7 +2944,51 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                 full_grid_phase_barrier(6);
             }
         }
-        if constexpr (kDirectRemoteGradX) {
+        const auto clear_and_publish_combine_planes = [&]() {
+          if constexpr (
+              kDirectRemoteGradX &&
+              kCombineOrderMode ==
+                  CombineOrderMode::FixedTopK) {
+            // FixedTopK consumes every physical slot, including invalid
+            // routes. Clear all slot planes only after all grad-y pulls have
+            // completed, then publish the clear before remote stores.
+            auto* combine_buffer =
+                const_cast<cd_dtype_t*>(backward_grad_y);
+            const uint64_t num_plane_values =
+                static_cast<uint64_t>(num_topk) *
+                backward_workspace.num_max_tokens_per_rank *
+                kHidden;
+            for (uint64_t linear =
+                     static_cast<uint64_t>(blockIdx.x) *
+                         kNumThreads +
+                     threadIdx.x;
+                 linear < num_plane_values;
+                 linear +=
+                     static_cast<uint64_t>(kNumSMs) *
+                     kNumThreads) {
+                combine_buffer[linear] = cd_dtype_t(0.0f);
+            }
+            if constexpr (kNumRanks > 1) {
+                constexpr uint32_t
+                    kAfterGradYClearGridSyncIndex = 3;
+                constexpr uint32_t
+                    kAfterGradYClearBarrierTag = 8;
+                trace_begin(8);
+                comm::nvlink_barrier<
+                    kNumRanks, kNumSMs, kNumThreads,
+                    kAfterGradYClearGridSyncIndex,
+                    kAfterGradYClearBarrierTag>(
+                    backward_workspace,
+                    backward_sym_buffer,
+                    blockIdx.x, threadIdx.x,
+                    []() { __syncthreads(); });
+                trace_end(8);
+            }
+          }
+        };
+
+        const auto prepare_direct_grad_x_planes = [&]() {
+          if constexpr (kDirectRemoteGradX) {
             if constexpr (kNumRanks > 1) {
                 // backward_grad_y aliases combine plane zero. All ranks must
                 // finish remotely pulling it before any W13 dgrad epilogue
@@ -2670,56 +3010,16 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                         []() { __syncthreads(); });
                     trace_end(7);
                 }
-
             }
-
-            if constexpr (
-                kCombineOrderMode ==
-                CombineOrderMode::FixedTopK) {
-                // FixedTopK consumes every physical slot, including invalid
-                // routes. Clear all slot planes only after all grad-y pulls
-                // have completed, then publish the clear before any direct
-                // remote stores. This also makes repeated and single-rank
-                // calls independent of stale valid routes.
-                auto* combine_buffer =
-                    const_cast<cd_dtype_t*>(backward_grad_y);
-                const uint64_t num_plane_values =
-                    static_cast<uint64_t>(num_topk) *
-                    backward_workspace.num_max_tokens_per_rank *
-                    kHidden;
-                for (uint64_t linear =
-                         static_cast<uint64_t>(blockIdx.x) *
-                             kNumThreads +
-                         threadIdx.x;
-                     linear < num_plane_values;
-                     linear +=
-                         static_cast<uint64_t>(kNumSMs) *
-                         kNumThreads) {
-                    combine_buffer[linear] =
-                        cd_dtype_t(0.0f);
-                }
-
-                if constexpr (kNumRanks > 1) {
-                    // Do not let a rank remotely write direct grad-x until
-                    // every destination has finished clearing its local
-                    // slot planes.
-                    constexpr uint32_t
-                        kAfterGradYClearGridSyncIndex = 3;
-                    constexpr uint32_t
-                        kAfterGradYClearBarrierTag = 8;
-                    trace_begin(8);
-                    comm::nvlink_barrier<
-                        kNumRanks, kNumSMs, kNumThreads,
-                        kAfterGradYClearGridSyncIndex,
-                        kAfterGradYClearBarrierTag>(
-                        backward_workspace,
-                        backward_sym_buffer,
-                        blockIdx.x, threadIdx.x,
-                        []() { __syncthreads(); });
-                    trace_end(8);
-                }
-            }
-        }
+            clear_and_publish_combine_planes();
+          }
+        };
+        // Exact source X is staged in combine plane one. When x_pool aliases
+        // grad-y, retain that plane until the W2/route readers release grad-y;
+        // the late TMA pull below drains it immediately before W13 dgrad starts
+        // publishing direct grad-x into the same symmetric planes.
+        if (!late_exact_source_x)
+            prepare_direct_grad_x_planes();
         if constexpr (!kBF16Mode) {
             if (warp_idx >= kDispatchWarpStart &&
                 warp_idx <
@@ -2737,7 +3037,9 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
             uint32_t next_assigned_block = blockIdx.x;
             uint32_t global_block = 0;
             uint32_t pool_block_offset = 0;
-            #pragma unroll
+            // Cloning this full scheduler body for all 112 local K3 experts
+            // produces a multi-megabyte instruction image and trashes L0/L1 I$.
+            #pragma unroll 1
             for (uint32_t expert_idx = 0;
                  expert_idx < kNumExperts; ++expert_idx) {
                 const uint32_t num_tokens =
@@ -2781,6 +3083,119 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
         comm::cluster_sync_with_relaxed_arrive();
         trace_end(10);
 
+        if constexpr (
+            kComputeRouteGrad && !kInputsPrepared &&
+            kRouteWeightMode ==
+                RouteWeightMode::PostDown) {
+          if constexpr (phase_ordered_w2_dequant) {
+            // POST_DOWN route gradients depend only on reverse-dispatched
+            // grad-y and the saved unweighted down output. Compute them before
+            // W2 dgrad so the saved down pool can become W2's dequant
+            // workspace.
+            // Nontrivial pools use one warp per route in the existing reducer;
+            // retain its four-column lane accumulation and shuffle tree.
+            constexpr uint32_t kRouteGroupThreads = 32;
+            constexpr uint32_t kRouteGroupsPerCTA =
+                kNumThreads / kRouteGroupThreads;
+            const uint32_t route_group_idx =
+                threadIdx.x / kRouteGroupThreads;
+            const uint32_t route_group_lane_idx =
+                threadIdx.x & (kRouteGroupThreads - 1);
+            const uint32_t global_route_group =
+                blockIdx.x * kRouteGroupsPerCTA +
+                route_group_idx;
+            const uint32_t num_route_groups =
+                kNumSMs * kRouteGroupsPerCTA;
+            uint32_t route_pool_block_offset = 0;
+            #pragma unroll 1
+            for (uint32_t expert_idx = 0;
+                 expert_idx < kNumExperts; ++expert_idx) {
+                const uint32_t num_tokens =
+                    static_cast<uint32_t>(
+                        __ldg(expert_counts + expert_idx));
+                for (uint32_t token_idx = global_route_group;
+                     token_idx < num_tokens;
+                     token_idx += num_route_groups) {
+                    const uint32_t pool_row =
+                        route_pool_block_offset * BLOCK_M +
+                        token_idx;
+                    float lane_sums[4] = {
+                        0.0f, 0.0f, 0.0f, 0.0f};
+                    for (uint32_t col_base =
+                             route_group_lane_idx * 4;
+                         col_base < kHidden;
+                         col_base +=
+                             kRouteGroupThreads * 4) {
+                        #pragma unroll
+                        for (uint32_t i = 0; i < 4; ++i) {
+                            const uint32_t col = col_base + i;
+                            const float grad_y =
+                                static_cast<float>(
+                                    grad_y_unweighted_output[
+                                        static_cast<uint64_t>(
+                                            pool_row) *
+                                            kHidden + col]);
+                            const float down =
+                                static_cast<float>(
+                                    down_unweighted_output[
+                                        static_cast<uint64_t>(
+                                            pool_row) *
+                                            kHidden + col]);
+                            lane_sums[i] = __fadd_rn(
+                                lane_sums[i],
+                                __fmul_rn(grad_y, down));
+                        }
+                    }
+                    float grad_route = __fadd_rn(
+                        __fadd_rn(lane_sums[0], lane_sums[1]),
+                        lane_sums[2]);
+                    grad_route = __fadd_rn(
+                        grad_route, lane_sums[3]);
+                    #pragma unroll
+                    for (uint32_t offset = 16;
+                         offset > 0; offset >>= 1) {
+                        grad_route = __fadd_rn(
+                            grad_route,
+                            __shfl_down_sync(
+                                0xffffffff,
+                                grad_route, offset));
+                    }
+                    if (route_group_lane_idx == 0) {
+                        grad_route_output[pool_row] =
+                            grad_route;
+                        if (backward_grad_route != nullptr) {
+                            const auto metadata =
+                                token_src_metadata[pool_row];
+                            auto* remote_grad_route =
+                                backward_sym_buffer.map(
+                                    backward_grad_route +
+                                        static_cast<uint64_t>(
+                                            metadata.token_idx) *
+                                            num_topk +
+                                        metadata.topk_idx,
+                                    metadata.rank_idx);
+                            *remote_grad_route = grad_route;
+                        }
+                    }
+                    __syncwarp();
+                }
+                route_pool_block_offset +=
+                    math::ceil_div(num_tokens, BLOCK_M);
+            }
+            // No dequant writer may reuse the saved down pool until every CTA
+            // has finished its last route dot.
+            full_grid_phase_barrier(kTraceSiteCount);
+          }
+        }
+
+        // The route-gradient dot is complete. A multichunk caller may now
+        // reuse the saved down pool as W2's BF16 dequant workspace;
+        // single-chunk calls keep using dW2 storage.
+        if constexpr (phase_ordered_w2_dequant) {
+            dequant_noninline_weights_once(false, true, true);
+            full_grid_phase_barrier(kTraceSiteCount);
+        }
+
         // Reinitialize the drained pipelines in-place.  The FP32 accumulator
         // columns are phase-aliased; dgrad does not need the SFA/SFB columns.
         if (warp_idx == 0 && cute::elect_one_sync()) {
@@ -2790,6 +3205,8 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                 full_barriers[i]->init(4);
                 empty_barriers[i]->init(1);
             }
+            if constexpr (kResidualMXFP8Dgrad)
+                weight_load_barrier->init(1);
             #pragma unroll
             for (uint32_t i = 0; i < kNumEpilogueStages; ++i) {
                 tmem_full_barriers[i]->init(1);
@@ -2804,13 +3221,24 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
 
         stage_idx = 0;
         phase = 0;
-        if (warp_idx == 0) {
-            // BF16 grad_y producer.  The 2-SM TMA instruction writes each
-            // CTA's half-M operand and completes transactions on CTA0's
-            // cluster barrier.
+        if (
+            warp_idx == 0 ||
+            (kResidualMXFP8Dgrad &&
+             (warp_idx == 1 ||
+              (warp_idx >= 3 && warp_idx < 8)))) {
+            // The legacy path uses a 2-SM BF16 TMA load. Residual MXFP8 uses
+            // all seven non-MMA producer warps per CTA. They quantize BF16
+            // grad-y into primary/residual A operands and re-encode the
+            // transposed MXFP4 weight tile exactly into the MXFP8 B operand.
+            // Both operands are produced inside the persistent pipeline, so
+            // no full-size transformed-weight allocation or extra launch is
+            // required.
+            uint32_t weight_source_phase = 0;
             for_each_dgrad_block(
-                [&](const uint32_t&, const uint32_t& pool_block_offset,
-                    const uint32_t& m_block_idx, const uint32_t&,
+                [&](const uint32_t& expert_idx,
+                    const uint32_t& pool_block_offset,
+                    const uint32_t& m_block_idx,
+                    const uint32_t& n_block_idx,
                     const uint32_t& valid_m) {
                     const uint32_t pool_block_idx =
                         pool_block_offset + m_block_idx;
@@ -2822,35 +3250,414 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                         uint32_t m_idx = pool_block_idx * BLOCK_M;
                         if (!is_leader_cta)
                             m_idx += math::align(valid_m, 16u) / 2;
-                        if (cute::elect_one_sync()) {
-                            tma::copy<
-                                DGRAD_BLOCK_K, LOAD_BLOCK_M,
-                                DGRAD_BLOCK_K * sizeof(cd_dtype_t),
-                                cd_dtype_t>(
-                                &tensor_map_grad_ye,
-                                full_barriers[stage_idx],
-                                smem_dgrad_a[stage_idx],
-                                k_block_idx * DGRAD_BLOCK_K,
-                                m_idx, 2);
-                            if (is_leader_cta) {
-                                full_barriers[stage_idx]
-                                    ->arrive_and_expect_tx(
-                                        SMEM_A_SIZE_PER_STAGE * 2);
-                            } else {
-                                full_barriers[stage_idx]->arrive(0u);
+                        if constexpr (!kResidualMXFP8Dgrad) {
+                            if (cute::elect_one_sync()) {
+                                tma::copy<
+                                    DGRAD_BLOCK_K, LOAD_BLOCK_M,
+                                    DGRAD_BLOCK_K * sizeof(cd_dtype_t),
+                                    cd_dtype_t>(
+                                    &tensor_map_grad_ye,
+                                    full_barriers[stage_idx],
+                                    smem_dgrad_a[stage_idx],
+                                    k_block_idx * DGRAD_BLOCK_K,
+                                    m_idx, 2);
+                                if (is_leader_cta) {
+                                    full_barriers[stage_idx]
+                                        ->arrive_and_expect_tx(
+                                            SMEM_A_SIZE_PER_STAGE * 2);
+                                } else {
+                                    full_barriers[stage_idx]->arrive(0u);
+                                }
                             }
+                        } else {
+                            constexpr uint32_t kQuantProducerWarps =
+                                kNumResidualProducerWarps;
+                            constexpr uint32_t kValuesPerLane = 4;
+                            const uint32_t producer_warp_idx =
+                                warp_idx == 0
+                                ? 0
+                                : (warp_idx == 1
+                                       ? 1
+                                       : warp_idx - 1);
+                            const uint32_t group_idx = lane_idx / 8;
+                            const uint32_t lane_in_group = lane_idx % 8;
+                            if (producer_warp_idx == 0 &&
+                                cute::elect_one_sync()) {
+                                tma::copy<
+                                    LOAD_BLOCK_N / 2,
+                                    DGRAD_BLOCK_K, 0, int8_t>(
+                                    &tensor_map_w2_weights,
+                                    weight_load_barrier,
+                                    smem_dgrad_weight_source,
+                                    n_block_idx * (LOAD_BLOCK_N / 2),
+                                    expert_idx * kHidden +
+                                        k_block_idx * DGRAD_BLOCK_K);
+                                tma::copy<
+                                    LOAD_BLOCK_N / kGranK,
+                                    DGRAD_BLOCK_K, 0, float>(
+                                    &tensor_map_w2_scales,
+                                    weight_load_barrier,
+                                    smem_dgrad_weight_scale_source,
+                                    n_block_idx *
+                                        (LOAD_BLOCK_N / kGranK),
+                                    expert_idx * kHidden +
+                                        k_block_idx * DGRAD_BLOCK_K);
+                                weight_load_barrier
+                                    ->arrive_and_expect_tx(
+                                        SMEM_DGRAD_WEIGHT_SOURCE_SIZE +
+                                        SMEM_DGRAD_WEIGHT_SCALE_SOURCE_SIZE);
+                            }
+                            const uint32_t effective_m =
+                                math::align(valid_m, 16u);
+                            const uint32_t local_valid_m = effective_m / 2;
+                            auto* primary_bytes =
+                                reinterpret_cast<uint8_t*>(
+                                    smem_dgrad_a[stage_idx]);
+                            auto* residual_bytes =
+                                reinterpret_cast<uint8_t*>(
+                                    smem_dgrad_a_residual[stage_idx]);
+                            // UTCCP always transfers the complete aligned scale
+                            // plane. Seed padding rows with scale 1 so a partial
+                            // M tile cannot expose stale shared-memory bytes.
+                            const uint32_t producer_thread_idx =
+                                producer_warp_idx * 32 + lane_idx;
+                            for (uint32_t sf_idx = producer_thread_idx;
+                                 sf_idx < SF_BLOCK_M;
+                                 sf_idx +=
+                                     kNumResidualProducerThreads) {
+                                smem_sfa[stage_idx][sf_idx] =
+                                    0x7f7f7f7fu;
+                                smem_dgrad_sfa_residual[
+                                    stage_idx][sf_idx] =
+                                    0x7f7f7f7fu;
+                            }
+                            cutlass::arch::NamedBarrier::sync(
+                                kNumResidualProducerThreads,
+                                kInlineWeightProducerBarrier);
+                            const uint32_t num_quant_rows = effective_m;
+                            for (uint32_t local_m = producer_warp_idx;
+                                 local_m < num_quant_rows;
+                                 local_m += kQuantProducerWarps) {
+                                const uint32_t full_m = local_m;
+                                const bool valid_row =
+                                    full_m < valid_m;
+                                const bool store_data =
+                                    is_leader_cta
+                                    ? full_m < local_valid_m
+                                    : full_m >= local_valid_m;
+                                const uint32_t local_store_m =
+                                    store_data
+                                    ? (is_leader_cta
+                                           ? full_m
+                                           : full_m - local_valid_m)
+                                    : 0;
+                                const uint32_t global_k =
+                                    k_block_idx * DGRAD_BLOCK_K +
+                                    group_idx * 32 +
+                                    lane_in_group * kValuesPerLane;
+                                float values[kValuesPerLane];
+                                #pragma unroll
+                                for (uint32_t i = 0;
+                                     i < kValuesPerLane; ++i) {
+                                    values[i] = valid_row
+                                        ? static_cast<float>(
+                                              grad_ye_output[
+                                                  static_cast<uint64_t>(
+                                                      pool_block_idx * BLOCK_M +
+                                                      full_m) *
+                                                      kHidden +
+                                                  global_k + i])
+                                        : 0.0f;
+                                }
+
+                                float primary_amax = 0.0f;
+                                #pragma unroll
+                                for (uint32_t i = 0;
+                                     i < kValuesPerLane; ++i)
+                                    primary_amax = cute::max(
+                                        primary_amax,
+                                        cute::abs(values[i]));
+                                #pragma unroll
+                                for (uint32_t offset = 4;
+                                     offset > 0; offset >>= 1)
+                                    primary_amax = cute::max(
+                                        primary_amax,
+                                        __shfl_xor_sync(
+                                            0xffffffff, primary_amax,
+                                            offset, 8));
+                                float2 primary_sf_pair;
+                                float2 primary_sf_inv_pair;
+                                math::get_e4m3_sf_and_sf_inv(
+                                    make_float2(primary_amax, 0.0f),
+                                    primary_sf_pair,
+                                    primary_sf_inv_pair);
+                                const float primary_sf =
+                                    primary_sf_pair.x;
+                                const float primary_sf_inv =
+                                    primary_sf_inv_pair.x;
+                                const auto primary = __nv_fp8x4_e4m3(
+                                    make_float4(
+                                        values[0] * primary_sf_inv,
+                                        values[1] * primary_sf_inv,
+                                        values[2] * primary_sf_inv,
+                                        values[3] * primary_sf_inv));
+                                const float4 primary_float =
+                                    static_cast<float4>(primary);
+                                float residual[kValuesPerLane] = {
+                                    values[0] -
+                                        primary_float.x * primary_sf,
+                                    values[1] -
+                                        primary_float.y * primary_sf,
+                                    values[2] -
+                                        primary_float.z * primary_sf,
+                                    values[3] -
+                                        primary_float.w * primary_sf,
+                                };
+                                float residual_amax = 0.0f;
+                                #pragma unroll
+                                for (uint32_t i = 0;
+                                     i < kValuesPerLane; ++i)
+                                    residual_amax = cute::max(
+                                        residual_amax,
+                                        cute::abs(residual[i]));
+                                #pragma unroll
+                                for (uint32_t offset = 4;
+                                     offset > 0; offset >>= 1)
+                                    residual_amax = cute::max(
+                                        residual_amax,
+                                        __shfl_xor_sync(
+                                            0xffffffff, residual_amax,
+                                            offset, 8));
+                                float2 residual_sf_pair;
+                                float2 residual_sf_inv_pair;
+                                math::get_e4m3_sf_and_sf_inv(
+                                    make_float2(residual_amax, 0.0f),
+                                    residual_sf_pair,
+                                    residual_sf_inv_pair);
+                                const auto residual_quantized =
+                                    __nv_fp8x4_e4m3(make_float4(
+                                        residual[0] *
+                                            residual_sf_inv_pair.x,
+                                        residual[1] *
+                                            residual_sf_inv_pair.x,
+                                        residual[2] *
+                                            residual_sf_inv_pair.x,
+                                        residual[3] *
+                                            residual_sf_inv_pair.x));
+
+                                const uint32_t row = local_store_m & 7u;
+                                const uint32_t logical_k_byte =
+                                    group_idx * 32 +
+                                    lane_in_group * kValuesPerLane;
+                                const uint32_t byte_offset =
+                                    (local_store_m >> 3) * 8 * 128 +
+                                    row * 128 +
+                                    ((logical_k_byte >> 4) ^ row) * 16 +
+                                    (logical_k_byte & 15);
+                                if (store_data) {
+                                    *reinterpret_cast<uint32_t*>(
+                                        primary_bytes + byte_offset) =
+                                        primary.__x;
+                                    *reinterpret_cast<uint32_t*>(
+                                        residual_bytes + byte_offset) =
+                                        residual_quantized.__x;
+                                }
+
+                                const uint32_t primary_scale_byte =
+                                    (*reinterpret_cast<const uint32_t*>(
+                                         &primary_sf)) >> 23;
+                                const uint32_t residual_scale_byte =
+                                    (*reinterpret_cast<const uint32_t*>(
+                                         &residual_sf_pair.x)) >> 23;
+                                uint32_t primary_scale_word = 0;
+                                uint32_t residual_scale_word = 0;
+                                #pragma unroll
+                                for (uint32_t group = 0;
+                                     group < 4; ++group) {
+                                    primary_scale_word |=
+                                        __shfl_sync(
+                                            0xffffffff,
+                                            primary_scale_byte,
+                                            group * 8) <<
+                                        (group * 8);
+                                    residual_scale_word |=
+                                        __shfl_sync(
+                                            0xffffffff,
+                                            residual_scale_byte,
+                                            group * 8) <<
+                                        (group * 8);
+                                }
+                                if (valid_row && lane_idx == 0) {
+                                    // MegaMoE pre-transposes each 128-row scale
+                                    // tile into the physical order consumed by
+                                    // UTCCP, matching its forward ring buffers.
+                                    const uint32_t sf_m =
+                                        (full_m & ~127u) +
+                                        (full_m & 31u) * 4 +
+                                        ((full_m >> 5) & 3u);
+                                    smem_sfa[stage_idx][sf_m] =
+                                        primary_scale_word;
+                                    smem_dgrad_sfa_residual[
+                                        stage_idx][sf_m] =
+                                        residual_scale_word;
+                                }
+                            }
+                            cutlass::arch::fence_view_async_shared();
+                            __threadfence_cluster();
+                            cutlass::arch::NamedBarrier::sync(
+                                kNumResidualProducerThreads,
+                                kInlineWeightProducerBarrier);
+                            if (producer_warp_idx == 0 &&
+                                cute::elect_one_sync())
+                                full_barriers[stage_idx]->arrive(0u);
+
+                            weight_load_barrier->wait(weight_source_phase);
+                            // Re-group the original MXFP4 W2 matrix along the
+                            // transposed dgrad K axis. E2M1 * UE8M0 values are
+                            // dyadic and fit E4M3 exactly, so this changes only
+                            // the encoding—not the represented weight. Each
+                            // CTA materializes the complete B tile required by
+                            // the two-CTA UMMA instruction.
+                            auto* weight_bytes =
+                                reinterpret_cast<uint8_t*>(
+                                    smem_dgrad_b[stage_idx]);
+                            for (uint32_t local_n = producer_warp_idx;
+                                 local_n < LOAD_BLOCK_N;
+                                 local_n += kNumResidualProducerWarps) {
+                                const uint32_t global_n =
+                                    n_block_idx * LOAD_BLOCK_N + local_n;
+                                float weight_values[kValuesPerLane];
+                                #pragma unroll
+                                for (uint32_t i = 0;
+                                     i < kValuesPerLane; ++i) {
+                                    const uint8_t packed =
+                                        static_cast<uint8_t>(
+                                            smem_dgrad_weight_source[
+                                                (group_idx * 32 +
+                                                 lane_in_group *
+                                                     kValuesPerLane +
+                                                 i) *
+                                                    (LOAD_BLOCK_N / 2) +
+                                                local_n / 2]);
+                                    uint32_t decoded_fp16x2;
+                                    asm volatile(
+                                        "{\n"
+                                        ".reg .b8 fp4;\n"
+                                        ".reg .b8 unused1, unused2, unused3;\n"
+                                        "mov.b32 {fp4, unused1, unused2, unused3}, %1;\n"
+                                        "cvt.rn.f16x2.e2m1x2 %0, fp4;\n"
+                                        "}\n"
+                                        : "=r"(decoded_fp16x2)
+                                        : "r"(static_cast<uint32_t>(packed)));
+                                    const float2 decoded =
+                                        __half22float2(
+                                            *reinterpret_cast<__half2*>(
+                                                &decoded_fp16x2));
+                                    const float source_scale =
+                                        smem_dgrad_weight_scale_source[
+                                            (group_idx * 32 +
+                                             lane_in_group *
+                                                 kValuesPerLane +
+                                             i) *
+                                                (LOAD_BLOCK_N / kGranK) +
+                                            local_n / kGranK];
+                                    weight_values[i] =
+                                        (global_n & 1u
+                                             ? decoded.y
+                                             : decoded.x) *
+                                        source_scale;
+                                }
+
+                                float weight_amax = 0.0f;
+                                #pragma unroll
+                                for (uint32_t i = 0;
+                                     i < kValuesPerLane; ++i)
+                                    weight_amax = cute::max(
+                                        weight_amax,
+                                        cute::abs(weight_values[i]));
+                                #pragma unroll
+                                for (uint32_t offset = 4;
+                                     offset > 0; offset >>= 1)
+                                    weight_amax = cute::max(
+                                        weight_amax,
+                                        __shfl_xor_sync(
+                                            0xffffffff, weight_amax,
+                                            offset, 8));
+                                float2 weight_sf_pair;
+                                float2 weight_sf_inv_pair;
+                                math::get_e4m3_sf_and_sf_inv(
+                                    make_float2(weight_amax, 0.0f),
+                                    weight_sf_pair,
+                                    weight_sf_inv_pair);
+                                const auto weight_quantized =
+                                    __nv_fp8x4_e4m3(make_float4(
+                                        weight_values[0] *
+                                            weight_sf_inv_pair.x,
+                                        weight_values[1] *
+                                            weight_sf_inv_pair.x,
+                                        weight_values[2] *
+                                            weight_sf_inv_pair.x,
+                                        weight_values[3] *
+                                            weight_sf_inv_pair.x));
+                                const uint32_t weight_row = local_n & 7u;
+                                const uint32_t logical_k_byte =
+                                    group_idx * 32 +
+                                    lane_in_group * kValuesPerLane;
+                                const uint32_t weight_byte_offset =
+                                    (local_n >> 3) * 8 * 128 +
+                                    weight_row * 128 +
+                                    ((logical_k_byte >> 4) ^ weight_row) *
+                                        16 +
+                                    (logical_k_byte & 15);
+                                *reinterpret_cast<uint32_t*>(
+                                    weight_bytes + weight_byte_offset) =
+                                    weight_quantized.__x;
+
+                                const uint32_t weight_scale_byte =
+                                    (*reinterpret_cast<const uint32_t*>(
+                                         &weight_sf_pair.x)) >> 23;
+                                uint32_t weight_scale_word = 0;
+                                #pragma unroll
+                                for (uint32_t group = 0;
+                                     group < 4; ++group)
+                                    weight_scale_word |=
+                                        __shfl_sync(
+                                            0xffffffff,
+                                            weight_scale_byte,
+                                            group * 8) <<
+                                        (group * 8);
+                                if (lane_idx == 0) {
+                                    const uint32_t sf_n =
+                                        (local_n & 31u) * 4 +
+                                        ((local_n >> 5) & 3u);
+                                    smem_sfb[stage_idx][sf_n] =
+                                        weight_scale_word;
+                                }
+                            }
+                            cutlass::arch::fence_view_async_shared();
+                            cutlass::arch::NamedBarrier::sync(
+                                kNumResidualProducerThreads,
+                                kResidualWeightProducerBarrier);
+                            if (producer_warp_idx == 0 &&
+                                cute::elect_one_sync())
+                                full_barriers[stage_idx]->arrive(0u);
+                            weight_source_phase ^= 1;
                         }
                         __syncwarp();
                     }
                 });
-        } else if (warp_idx == 1) {
+        } else if (
+            warp_idx == 1 ||
+            (kInlineWeightDequant && warp_idx >= 3 && warp_idx < 8)) {
             // Load the in-kernel dequantized transposed W2 workspace.  It is
             // shared by all M tiles for this expert instead of reconverting
             // the same packed weights for every token block.
             for_each_dgrad_block(
-                [&](const uint32_t& expert_idx, const uint32_t&,
-                    const uint32_t&, const uint32_t& n_block_idx,
-                    const uint32_t&) {
+                [&](const uint32_t& expert_idx,
+                    const uint32_t& pool_block_offset,
+                    const uint32_t& m_block_idx,
+                    const uint32_t& n_block_idx,
+                    const uint32_t& valid_m) {
                     #pragma unroll 1
                     for (uint32_t k_block_idx = 0;
                          k_block_idx < kHidden / DGRAD_BLOCK_K;
@@ -2861,42 +3668,79 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                              k_block_idx) *
                                 kNumDgradBlockNs +
                             n_block_idx;
-                        if constexpr (!kBF16Mode) {
+                        if constexpr (
+                            !kBF16Mode && !kInlineWeightDequant &&
+                            !kResidualMXFP8Dgrad) {
                             while (ptx::ld_acq(
                                        weight_tile_states +
                                        weight_tile_idx) !=
                                    launch_epoch) {
                             }
                         }
-                        constexpr bool weight_tile_ready = true;
+                        constexpr bool weight_tile_ready =
+                            !kInlineWeightDequant;
                         empty_barriers[stage_idx]->wait(phase ^ 1);
                         if (weight_tile_ready) {
                             if (cute::elect_one_sync()) {
-                                tma::copy<
-                                    LOAD_BLOCK_N,
-                                    DGRAD_BLOCK_K,
-                                    DGRAD_BLOCK_K *
-                                        sizeof(
-                                            dgrad_b_dtype_t),
-                                    dgrad_b_dtype_t>(
-                                    &tensor_map_w2_dequant,
-                                    full_barriers[stage_idx],
-                                    smem_dgrad_b[stage_idx],
-                                    n_block_idx *
-                                        BLOCK_N,
-                                    expert_idx *
-                                            kHidden +
-                                        k_block_idx *
-                                            DGRAD_BLOCK_K,
-                                    2);
-                                if (is_leader_cta) {
-                                    full_barriers[stage_idx]
-                                        ->arrive_and_expect_tx(
-                                            SMEM_B_SIZE_PER_STAGE *
-                                            2);
+                                if constexpr (kResidualMXFP8Dgrad) {
+                                    tma::copy<
+                                        DGRAD_BLOCK_K, LOAD_BLOCK_N,
+                                        128, residual_dgrad_dtype_t>(
+                                        &tensor_map_w2_dgrad_weights,
+                                        full_barriers[stage_idx],
+                                        reinterpret_cast<
+                                            residual_dgrad_dtype_t*>(
+                                            smem_dgrad_b[stage_idx]),
+                                        k_block_idx * DGRAD_BLOCK_K,
+                                        expert_idx *
+                                                kIntermediateHidden +
+                                            n_block_idx * BLOCK_N,
+                                        2);
+                                    tma::copy<BLOCK_N, 1, 0>(
+                                        &tensor_map_w2_dgrad_weights_sf,
+                                        full_barriers[stage_idx],
+                                        smem_sfb[stage_idx],
+                                        n_block_idx * BLOCK_N,
+                                        expert_idx *
+                                                (kHidden /
+                                                 (kGranK * 4)) +
+                                            k_block_idx,
+                                        2);
+                                    if (is_leader_cta) {
+                                        full_barriers[stage_idx]
+                                            ->arrive_and_expect_tx(
+                                                (SMEM_B_SIZE_PER_STAGE +
+                                                 SMEM_SFB_SIZE_PER_STAGE) *
+                                                2);
+                                    } else {
+                                        full_barriers[stage_idx]
+                                            ->arrive(0u);
+                                    }
                                 } else {
-                                    full_barriers[stage_idx]
-                                        ->arrive(0u);
+                                    tma::copy<
+                                        LOAD_BLOCK_N,
+                                        DGRAD_BLOCK_K,
+                                        DGRAD_BLOCK_K *
+                                            sizeof(
+                                                dgrad_b_dtype_t),
+                                        dgrad_b_dtype_t>(
+                                        &tensor_map_w2_dequant,
+                                        full_barriers[stage_idx],
+                                        smem_dgrad_b[stage_idx],
+                                        n_block_idx * BLOCK_N,
+                                        expert_idx * kHidden +
+                                            k_block_idx *
+                                                DGRAD_BLOCK_K,
+                                        2);
+                                    if (is_leader_cta) {
+                                        full_barriers[stage_idx]
+                                            ->arrive_and_expect_tx(
+                                                SMEM_B_SIZE_PER_STAGE *
+                                                2);
+                                    } else {
+                                        full_barriers[stage_idx]
+                                            ->arrive(0u);
+                                    }
                                 }
                             }
                         } else {
@@ -2907,9 +3751,13 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                             auto* smem_b_bytes =
                                 reinterpret_cast<uint8_t*>(
                                     smem_dgrad_b[stage_idx]);
-                            for (uint32_t pair_idx = lane_idx;
+                            const uint32_t producer_warp_idx =
+                                warp_idx == 1 ? 0 : warp_idx - 2;
+                            for (uint32_t pair_idx =
+                                     producer_warp_idx * 32 + lane_idx;
                                  pair_idx < kPairsPerTile;
-                                 pair_idx += 32) {
+                                 pair_idx +=
+                                     kNumInlineWeightProducerThreads) {
                                 const uint32_t local_k =
                                     pair_idx /
                                     (LOAD_BLOCK_N / 2);
@@ -2941,16 +3789,13 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                             global_n_pair));
                                 const float scale = __ldg(
                                     w2_scales +
-                                    (static_cast<uint64_t>(
-                                         expert_idx) *
+                                    (static_cast<uint64_t>(expert_idx) *
                                          kHidden +
                                      global_k) *
-                                        (kIntermediateHidden /
-                                         32) +
+                                        (kIntermediateHidden / 32) +
                                     n_block_idx *
                                         (LOAD_BLOCK_N / 32) +
-                                    (local_n_pair * 2) /
-                                        32);
+                                    (local_n_pair * 2) / 32);
                                 uint32_t fp16x2;
                                 asm volatile(
                                     "{\n"
@@ -2969,8 +3814,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                         __half2*>(&fp16x2);
                                 value_pair = __hmul2(
                                     value_pair,
-                                    __float2half2_rn(
-                                        scale));
+                                    __float2half2_rn(scale));
                                 const auto
                                     value_pair_bf16 =
                                         __float22bfloat162_rn(
@@ -2986,21 +3830,30 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                      i < 2; ++i) {
                                     const uint32_t local_n =
                                         local_n_pair * 2 + i;
+                                    // tma::copy splits the 128-wide MN tile
+                                    // into two independently swizzled 64x64
+                                    // atoms. Within each atom MN is the inner
+                                    // dimension and K is the outer dimension.
+                                    const uint32_t atom_n =
+                                        local_n / 64;
+                                    const uint32_t atom_col_byte =
+                                        (local_n % 64) *
+                                        sizeof(dgrad_b_dtype_t);
                                     const uint32_t row =
-                                        local_n & 7;
-                                    const uint32_t col_byte =
-                                        local_k *
-                                        sizeof(
-                                            dgrad_b_dtype_t);
+                                        local_k & 7;
                                     const uint32_t
                                         byte_offset =
-                                            (local_n >> 3) *
+                                            atom_n *
+                                                DGRAD_BLOCK_K *
+                                                64 *
+                                                sizeof(dgrad_b_dtype_t) +
+                                            (local_k >> 3) *
                                                 8 * 128 +
                                             row * 128 +
-                                            ((col_byte >> 4) ^
+                                            ((atom_col_byte >> 4) ^
                                              row) *
                                                 16 +
-                                            (col_byte & 15);
+                                            (atom_col_byte & 15);
                                     *reinterpret_cast<
                                         uint16_t*>(
                                         smem_b_bytes +
@@ -3011,9 +3864,12 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                             (i * 16));
                                 }
                             }
-                            cutlass::arch::
-                                fence_view_async_shared();
-                            if (cute::elect_one_sync())
+                            cutlass::arch::fence_view_async_shared();
+                            cutlass::arch::NamedBarrier::sync(
+                                kNumInlineWeightProducerThreads,
+                                kInlineWeightProducerBarrier);
+                            if (producer_warp_idx == 0 &&
+                                cute::elect_one_sync())
                                 full_barriers[stage_idx]
                                     ->arrive(0u);
                         }
@@ -3022,6 +3878,200 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                 });
         } else if (warp_idx == 2) {
             if (is_leader_cta) {
+              if constexpr (kResidualMXFP8Dgrad) {
+                auto instr_desc =
+                    cute::UMMA::make_instr_desc_block_scaled<
+                        residual_dgrad_dtype_t,
+                        residual_dgrad_dtype_t, float,
+                        cutlass::float_ue8m0_t,
+                        UMMA_M, UMMA_N,
+                        cute::UMMA::Major::K,
+                        cute::UMMA::Major::K>();
+                auto sf_desc = mma::sm100::make_sf_desc(nullptr);
+                auto primary_a_desc = mma::sm100::make_umma_desc<
+                    cute::UMMA::Major::K, LOAD_BLOCK_M,
+                    DGRAD_BLOCK_K, 128>(
+                    reinterpret_cast<residual_dgrad_dtype_t*>(
+                        smem_dgrad_a[0]),
+                    0, 0);
+                auto residual_a_desc = mma::sm100::make_umma_desc<
+                    cute::UMMA::Major::K, LOAD_BLOCK_M,
+                    DGRAD_BLOCK_K, 128>(
+                    smem_dgrad_a_residual[0], 0, 0);
+                auto b_desc = mma::sm100::make_umma_desc<
+                    cute::UMMA::Major::K, LOAD_BLOCK_N,
+                    DGRAD_BLOCK_K, 128>(
+                    reinterpret_cast<residual_dgrad_dtype_t*>(
+                        smem_dgrad_b[0]),
+                    0, 0);
+                const uint32_t primary_a_desc_lo =
+                    lane_idx < kNumStages
+                    ? primary_a_desc.lo +
+                          lane_idx * SMEM_A_SIZE_PER_STAGE / 16
+                    : 0;
+                const uint32_t residual_a_desc_lo =
+                    lane_idx < kNumStages
+                    ? residual_a_desc.lo +
+                          lane_idx *
+                              SMEM_RESIDUAL_A_SIZE_PER_STAGE / 16
+                    : 0;
+                const uint32_t b_desc_lo =
+                    lane_idx < kNumStages
+                    ? b_desc.lo +
+                          lane_idx * SMEM_B_SIZE_PER_STAGE / 16
+                    : 0;
+                uint32_t current_iter = 0;
+
+                for_each_dgrad_block(
+                    [&](const uint32_t&, const uint32_t&,
+                        const uint32_t&, const uint32_t&,
+                        const uint32_t& valid_m) {
+                        mma::sm100::update_instr_desc_with_umma_n(
+                            instr_desc,
+                            math::align(valid_m, 16u));
+                        const uint32_t accum_stage =
+                            current_iter % kNumEpilogueStages;
+                        const uint32_t accum_phase =
+                            (current_iter++ /
+                             kNumEpilogueStages) &
+                            1;
+                        tmem_empty_barriers[accum_stage]->wait(
+                            accum_phase ^ 1);
+                        ptx::tcgen05_after_thread_sync();
+
+                        #pragma unroll 1
+                        for (uint32_t k_block_idx = 0;
+                             k_block_idx <
+                                 kHidden / DGRAD_BLOCK_K;
+                             advance_pipeline(k_block_idx)) {
+                            full_barriers[stage_idx]->wait(phase);
+                            ptx::tcgen05_after_thread_sync();
+                            const uint32_t primary_a_desc_base =
+                                ptx::exchange(
+                                    primary_a_desc_lo, stage_idx);
+                            const uint32_t residual_a_desc_base =
+                                ptx::exchange(
+                                    residual_a_desc_lo, stage_idx);
+                            const uint32_t b_desc_base =
+                                ptx::exchange(
+                                    b_desc_lo, stage_idx);
+                            if (cute::elect_one_sync()) {
+                                using utccp_t =
+                                    cute::SM100_UTCCP_4x32dp128bit_2cta;
+                                #pragma unroll
+                                for (uint32_t i = 0;
+                                     i < SF_BLOCK_M /
+                                             kNumUTCCPAlignedElems;
+                                     ++i) {
+                                    mma::sm100::replace_smem_desc_addr(
+                                        sf_desc,
+                                        smem_sfa[stage_idx] +
+                                            i *
+                                                kNumUTCCPAlignedElems);
+                                    utccp_t::copy(
+                                        sf_desc,
+                                        kTmemStartColOfSFA + i * 4);
+                                    mma::sm100::replace_smem_desc_addr(
+                                        sf_desc,
+                                        smem_dgrad_sfa_residual[
+                                            stage_idx] +
+                                            i *
+                                                kNumUTCCPAlignedElems);
+                                    utccp_t::copy(
+                                        sf_desc,
+                                        kTmemStartColOfResidualSFA +
+                                            i * 4);
+                                }
+                                mma::sm100::replace_smem_desc_addr(
+                                    sf_desc, smem_sfb[stage_idx]);
+                                utccp_t::copy(
+                                    sf_desc, kTmemStartColOfSFB);
+
+                                #pragma unroll
+                                for (uint32_t k = 0;
+                                     k < DGRAD_BLOCK_K /
+                                             DGRAD_UMMA_K;
+                                     ++k) {
+                                    const auto runtime_instr_desc =
+                                        mma::sm100::
+                                            make_runtime_instr_desc_with_sf_id(
+                                                instr_desc, k, k);
+                                    primary_a_desc.lo =
+                                        mma::sm100::
+                                            advance_umma_desc_lo<
+                                                cute::UMMA::Major::K,
+                                                LOAD_BLOCK_M, 128,
+                                                residual_dgrad_dtype_t>(
+                                                primary_a_desc_base,
+                                                0,
+                                                k * DGRAD_UMMA_K);
+                                    residual_a_desc.lo =
+                                        mma::sm100::
+                                            advance_umma_desc_lo<
+                                                cute::UMMA::Major::K,
+                                                LOAD_BLOCK_M, 128,
+                                                residual_dgrad_dtype_t>(
+                                                residual_a_desc_base,
+                                                0,
+                                                k * DGRAD_UMMA_K);
+                                    b_desc.lo =
+                                        mma::sm100::
+                                            advance_umma_desc_lo<
+                                                cute::UMMA::Major::K,
+                                                LOAD_BLOCK_N, 128,
+                                                residual_dgrad_dtype_t>(
+                                                b_desc_base, 0,
+                                                k * DGRAD_UMMA_K);
+                                    ptx::
+                                        SM100_MMA_MXF8F6F4_2x1SM_SS::
+                                            fma(
+                                                b_desc,
+                                                primary_a_desc,
+                                                accum_stage * UMMA_N,
+                                                k_block_idx > 0 ||
+                                                    k > 0,
+                                                runtime_instr_desc,
+                                                kTmemStartColOfSFB,
+                                                kTmemStartColOfSFA);
+                                    ptx::
+                                        SM100_MMA_MXF8F6F4_2x1SM_SS::
+                                            fma(
+                                                b_desc,
+                                                residual_a_desc,
+                                                accum_stage * UMMA_N,
+                                                true,
+                                                runtime_instr_desc,
+                                                kTmemStartColOfSFB,
+                                                kTmemStartColOfResidualSFA);
+                                }
+                            }
+                            __syncwarp();
+                            constexpr uint16_t kCTAMask = 0x3;
+                            cutlass::arch::
+                                umma_arrive_multicast_2x1SM(
+                                    reinterpret_cast<uint64_t*>(
+                                        empty_barriers[stage_idx]),
+                                    kCTAMask);
+                            if (k_block_idx ==
+                                kHidden / DGRAD_BLOCK_K - 1) {
+                                cutlass::arch::
+                                    umma_arrive_multicast_2x1SM(
+                                        reinterpret_cast<uint64_t*>(
+                                            tmem_full_barriers[
+                                                accum_stage]),
+                                        kCTAMask);
+                            }
+                            __syncwarp();
+                        }
+                    });
+                if (current_iter > 0) {
+                    const uint32_t last = current_iter - 1;
+                    tmem_empty_barriers[
+                        last % kNumEpilogueStages]
+                        ->wait(
+                            (last / kNumEpilogueStages) & 1);
+                }
+              } else {
                 auto instr_desc =
                     cute::UMMA::make_instr_desc<
                         dgrad_b_dtype_t, cd_dtype_t, float,
@@ -3049,8 +4099,10 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                 uint32_t current_iter = 0;
 
                 for_each_dgrad_block(
-                    [&](const uint32_t&, const uint32_t&,
-                        const uint32_t&, const uint32_t&,
+                    [&](const uint32_t& expert_idx,
+                        const uint32_t& pool_block_offset,
+                        const uint32_t& m_block_idx,
+                        const uint32_t& n_block_idx,
                         const uint32_t& valid_m) {
                         mma::sm100::update_instr_desc_with_umma_n(
                             instr_desc,
@@ -3072,7 +4124,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                         for (uint32_t k_block_idx = 0;
                              k_block_idx <
                                  kHidden / DGRAD_BLOCK_K;
-                             advance_pipeline(k_block_idx)) {
+                            advance_pipeline(k_block_idx)) {
                             full_barriers[stage_idx]->wait(phase);
                             ptx::tcgen05_after_thread_sync();
                             const uint32_t a_desc_base =
@@ -3150,9 +4202,11 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                         ->wait(
                             (last / kNumEpilogueStages) & 1);
                 }
+              }
             }
-        } else if (warp_idx >= 4) {
-            const uint32_t epilogue_warp_idx = warp_idx - 4;
+        } else if (warp_idx >= kDgradEpilogueWarpStart) {
+            const uint32_t epilogue_warp_idx =
+                warp_idx - kDgradEpilogueWarpStart;
             const uint32_t epilogue_thread_idx =
                 epilogue_warp_idx * 32 + lane_idx;
             uint32_t current_iter = 0;
@@ -3392,18 +4446,139 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                 z = gate;
                                 dz_dgate = 1.0f;
                             }
-                            const float neg_exp =
-                                !kBF16Mode || kFastMath
-                                ? __expf(-z)
-                                : expf(-z);
-                            const float denom =
-                                __fadd_rn(1.0f, neg_exp);
-                            const float sig =
-                                1.0f / denom;
+                            float gate_tanh = 0.0f;
+                            float sig;
+                            float denom = 0.0f;
+                            if constexpr (
+                                kActivationType ==
+                                ActivationType::SiTU) {
+                                gate_tanh =
+                                    kFastMath
+                                    ? __tanhf(
+                                          gate / kSituBeta)
+                                    : tanhf(
+                                          gate / kSituBeta);
+                                if constexpr (kSituBeta == 4.0f) {
+                                    // K3 beta=4 makes sigmoid(g) exactly
+                                    // expressible from the already-required
+                                    // tanh(g / beta): tanh(g / 2) follows
+                                    // from the double-angle identity, and
+                                    // sigmoid(g) is
+                                    // (1 + tanh(g / 2)) / 2. This removes
+                                    // one accurate expf per routed
+                                    // intermediate while preserving the
+                                    // real-valued SiTU formula; no fast-math
+                                    // intrinsic or extra BF16 boundary is
+                                    // introduced.
+                                    const float gate_tanh_sq =
+                                        __fmul_rn(
+                                            gate_tanh,
+                                            gate_tanh);
+                                    const float tanh_gate_half =
+                                        __fdiv_rn(
+                                            __fmul_rn(
+                                                2.0f,
+                                                gate_tanh),
+                                            __fadd_rn(
+                                                1.0f,
+                                                gate_tanh_sq));
+                                    sig = __fmul_rn(
+                                        0.5f,
+                                        __fadd_rn(
+                                            1.0f,
+                                            tanh_gate_half));
+                                } else {
+                                    const float neg_exp =
+                                        kFastMath
+                                        ? __expf(-gate)
+                                        : expf(-gate);
+                                    sig = 1.0f / __fadd_rn(
+                                        1.0f,
+                                        neg_exp);
+                                }
+                            } else {
+                                const float neg_exp =
+                                    !kBF16Mode || kFastMath
+                                    ? __expf(-z)
+                                    : expf(-z);
+                                denom =
+                                    __fadd_rn(1.0f, neg_exp);
+                                sig = 1.0f / denom;
+                            }
                             cd_dtype_t h_act_bf16;
                             cd_dtype_t grad_gate_bf16;
                             cd_dtype_t grad_up_bf16;
                             if constexpr (
+                                kActivationType ==
+                                    ActivationType::SiTU) {
+                                static_assert(
+                                    kSituBeta > 0.0f,
+                                    "SiTU beta must be positive");
+                                static_assert(
+                                    kSituLinearBeta > 0.0f,
+                                    "SiTU linear beta must be positive");
+                                const float situ_gate =
+                                    __fmul_rn(
+                                        __fmul_rn(
+                                            kSituBeta,
+                                            gate_tanh),
+                                        sig);
+                                float activated_up = up;
+                                float grad_up_scale = 1.0f;
+                                if constexpr (
+                                    kSituLinearBeta !=
+                                    cute::numeric_limits<
+                                        float>::infinity()) {
+                                    const float up_tanh =
+                                        kFastMath
+                                        ? __tanhf(
+                                              up /
+                                              kSituLinearBeta)
+                                        : tanhf(
+                                              up /
+                                              kSituLinearBeta);
+                                    activated_up = __fmul_rn(
+                                        kSituLinearBeta,
+                                        up_tanh);
+                                    grad_up_scale = __fsub_rn(
+                                        1.0f,
+                                        __fmul_rn(
+                                            up_tanh,
+                                            up_tanh));
+                                }
+                                const float one_minus_gate_tanh_sq =
+                                    __fsub_rn(
+                                        1.0f,
+                                        __fmul_rn(
+                                            gate_tanh,
+                                            gate_tanh));
+                                const float gate_grad =
+                                    __fadd_rn(
+                                        __fmul_rn(
+                                            one_minus_gate_tanh_sq,
+                                            sig),
+                                        __fmul_rn(
+                                            situ_gate,
+                                            __fsub_rn(
+                                                1.0f,
+                                                sig)));
+                                h_act_bf16 = cd_dtype_t(
+                                    __fmul_rn(
+                                        situ_gate,
+                                        activated_up));
+                                grad_gate_bf16 = cd_dtype_t(
+                                    __fmul_rn(
+                                        __fmul_rn(
+                                            grad_h,
+                                            activated_up),
+                                        gate_grad));
+                                grad_up_bf16 = cd_dtype_t(
+                                    __fmul_rn(
+                                        __fmul_rn(
+                                            grad_h,
+                                            situ_gate),
+                                        grad_up_scale));
+                            } else if constexpr (
                                 kBF16Mode &&
                                 kActivationType ==
                                     ActivationType::SwiGLU) {
@@ -3564,21 +4739,26 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                               h_act_bf16) *
                                           route_weight);
                             }
-                            grad_gate_up_output[
-                                static_cast<uint64_t>(
-                                    pool_row) *
-                                    (2 *
-                                     kIntermediateHidden) +
-                                hidden_col] =
-                                grad_gate_bf16;
-                            grad_gate_up_output[
-                                static_cast<uint64_t>(
-                                    pool_row) *
-                                    (2 *
-                                     kIntermediateHidden) +
-                                kIntermediateHidden +
-                                hidden_col] =
-                                grad_up_bf16;
+                            const uint64_t grad_row_base =
+                                static_cast<uint64_t>(pool_row) *
+                                (2 * kIntermediateHidden);
+                            if (inplace_gate_up_grad) {
+                                grad_gate_up_output[
+                                    grad_row_base + gate_col] =
+                                    grad_gate_bf16;
+                                grad_gate_up_output[
+                                    grad_row_base + up_col] =
+                                    grad_up_bf16;
+                            } else {
+                                grad_gate_up_output[
+                                    grad_row_base + hidden_col] =
+                                    grad_gate_bf16;
+                                grad_gate_up_output[
+                                    grad_row_base +
+                                    kIntermediateHidden +
+                                    hidden_col] =
+                                    grad_up_bf16;
+                            }
                         }
                     }
                     ptx::tcgen05_before_thread_sync();
@@ -3589,11 +4769,82 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
 
         __syncthreads();
         if constexpr (kCompileW13Dgrad) {
+            // K3's POST_DOWN router dot is independent of W13 dgrad once W2
+            // has produced grad_gate_up.  The four communication warps are
+            // otherwise only extra W13 scatter workers at this point.  Let
+            // them reduce router rows while the UMMA/TMA roles compute W13;
+            // the publication barrier after W13 joins both paths.  This is a
+            // first readiness-driven task split borrowed from MoK: independent
+            // work no longer serializes an entire persistent-grid phase.
+            constexpr bool kOverlapRouteGradWithW13 =
+                kNumDispatchWarps > 0 &&
+                kComputeRouteGrad && !kInputsPrepared &&
+                kRouteWeightMode == RouteWeightMode::PostDown &&
+                !phase_ordered_w2_dequant && !kExactSourceX;
+            constexpr uint32_t kNumW13EpilogueThreads =
+                kNumDgradEpilogueThreads -
+                (kOverlapRouteGradWithW13
+                     ? kNumDispatchThreads
+                     : 0);
+            DG_STATIC_ASSERT(
+                kNumW13EpilogueThreads >= kNumEpilogueThreads,
+                "W13 needs the four proven TMEM loader warps");
+
             // W13 dgrad consumes grad_gate_up rows produced by every CTA in
             // the preceding L2-dgrad/SwiGLU phase. Cluster synchronization is
             // insufficient here: an early cluster can otherwise read rows
             // whose owning cluster has not stored them yet.
             full_grid_phase_barrier(12);
+
+            if (inplace_gate_up_grad) {
+                // Each CTA owns complete rows. Shared memory snapshots one
+                // interleaved row before any conventional-column stores, so
+                // the permutation is race-free without another HBM tensor.
+                auto* gate_up_row_scratch =
+                    reinterpret_cast<cd_dtype_t*>(smem_gemm_base);
+                constexpr uint32_t kGateUpColumns =
+                    2 * kIntermediateHidden;
+                for (uint32_t pool_row = blockIdx.x;
+                     pool_row < num_pool_rows;
+                     pool_row += kNumSMs) {
+                    const uint64_t row_base =
+                        static_cast<uint64_t>(pool_row) *
+                        kGateUpColumns;
+                    for (uint32_t col = threadIdx.x;
+                         col < kGateUpColumns;
+                         col += kNumThreads) {
+                        gate_up_row_scratch[col] =
+                            grad_gate_up_output[row_base + col];
+                    }
+                    __syncthreads();
+                    for (uint32_t col = threadIdx.x;
+                         col < kGateUpColumns;
+                         col += kNumThreads) {
+                        const uint32_t hidden_col =
+                            col < kIntermediateHidden
+                            ? col
+                            : col - kIntermediateHidden;
+                        const uint32_t source_col =
+                            (hidden_col / 8) * 16 +
+                            (col >= kIntermediateHidden ? 8 : 0) +
+                            (hidden_col & 7);
+                        grad_gate_up_output[row_base + col] =
+                            gate_up_row_scratch[source_col];
+                    }
+                    __syncthreads();
+                }
+                // W13 TMA readers may start on a different CTA, so publish the
+                // completed in-place permutation grid-wide.
+                full_grid_phase_barrier(kTraceSiteCount);
+            }
+
+            // Gate/up has had its final SiTU-backward read. A multichunk
+            // caller can now reuse that pool allocation as W13's canonical
+            // BF16 dequant matrix before the W13 UMMA phase begins.
+            if constexpr (phase_ordered_w13_dequant) {
+                dequant_noninline_weights_once(true, true, true);
+                full_grid_phase_barrier(kTraceSiteCount);
+            }
 
             if constexpr (kBF16Mode) {
                 // In phase-ordered mode these outputs may still contain the
@@ -3602,7 +4853,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                 // per-expert block padding and the unused capacity tail only
                 // after all active gate reads have completed.
                 uint32_t padding_pool_block_offset = 0;
-                #pragma unroll
+                #pragma unroll 1
                 for (uint32_t expert_idx = 0;
                      expert_idx < kNumExperts; ++expert_idx) {
                     const uint32_t num_tokens =
@@ -3735,7 +4986,15 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
             }
 
             if constexpr (
-                kComputeRouteGrad && !kInputsPrepared) {
+                kComputeRouteGrad && !kInputsPrepared &&
+                !kOverlapRouteGradWithW13) {
+              // Trace site 14 is otherwise used only by the BF16 PRE_DOWN
+              // alias handoff, which is compile-time absent for K3 POST_DOWN.
+              trace_begin(14);
+              if constexpr (!(
+                      kRouteWeightMode ==
+                          RouteWeightMode::PostDown &&
+                      phase_ordered_w2_dequant)) {
                 // The activation epilogue spans multiple N-tile CTAs. Reduce
                 // each route term only after all tiles are visible so the
                 // router gradient has a fixed FP32 summation order instead of
@@ -3790,7 +5049,9 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                     reinterpret_cast<uint32_t*>(smem_gemm_base);
                 if (threadIdx.x == 0) {
                     uint32_t total_route_rows = 0;
-                    #pragma unroll
+                    // This is a serial count reduction; unrolling 112 loads
+                    // only inflates the instruction image.
+                    #pragma unroll 1
                     for (uint32_t expert_idx = 0;
                          expert_idx < kNumExperts;
                          ++expert_idx) {
@@ -3824,30 +5085,71 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                     cute::min(
                         kRouteInputPow2,
                         512u / route_block_height);
+                // The dgrad launch has 32 warps.  Once the W2 epilogue has
+                // retired, four additional idle warps can reuse its shared
+                // pipeline storage and the completed first dispatch-barrier
+                // epoch.  Doubling exact-X producers removes the serial TMA
+                // tail without increasing launch size or dynamic SMEM.
+                constexpr uint32_t kMaxRouteExactXDispatchWarps =
+                    2 * kNumDispatchWarps;
+                const uint32_t num_route_exact_x_dispatch_warps =
+                    route_group_threads == 32
+                    ? kMaxRouteExactXDispatchWarps
+                    : kNumDispatchWarps;
+                const uint32_t route_exact_x_dispatch_threads =
+                    num_route_exact_x_dispatch_warps * 32;
+                const uint32_t route_worker_threads =
+                    late_exact_source_x
+                    ? kNumThreads - route_exact_x_dispatch_threads
+                    : kNumThreads;
                 const uint32_t num_route_groups_per_cta =
-                    kNumThreads / route_group_threads;
+                    route_worker_threads / route_group_threads;
                 const uint32_t route_group_idx =
                     threadIdx.x / route_group_threads;
                 const uint32_t route_group_lane_idx =
                     threadIdx.x &
                     (route_group_threads - 1);
+                // Number route groups in the same wave-major order used by
+                // the exact-X TMA warps below.  For K3/32K, CTA-major route
+                // numbering activated only the first ~49 of 148 CTAs for an
+                // average 585-row expert while every CTA's TMA warp waited.
+                // Wave-major numbering makes each CTA produce the four rows
+                // its own TMA warps consume before moving to the next wave.
+                const uint32_t route_groups_per_dispatch_wave =
+                    kNumSMs * num_route_exact_x_dispatch_warps;
+                const uint32_t route_group_wave =
+                    route_group_idx /
+                    num_route_exact_x_dispatch_warps;
+                const uint32_t route_dispatch_warp_idx =
+                    route_group_idx %
+                    num_route_exact_x_dispatch_warps;
                 const uint32_t global_route_group =
+                    route_group_wave *
+                        route_groups_per_dispatch_wave +
                     blockIdx.x *
-                        num_route_groups_per_cta +
-                    route_group_idx;
-                const uint32_t num_route_groups =
-                    kNumSMs *
-                    num_route_groups_per_cta;
-                uint32_t route_pool_block_offset = 0;
-                #pragma unroll
-                for (uint32_t expert_idx = 0;
-                     expert_idx < kNumExperts; ++expert_idx) {
+                        num_route_exact_x_dispatch_warps +
+                    route_dispatch_warp_idx;
+                const uint32_t route_group_stride =
+                    math::ceil_div(
+                        num_route_groups_per_cta,
+                        num_route_exact_x_dispatch_warps) *
+                    route_groups_per_dispatch_wave;
+                const uint32_t route_ready_epoch =
+                    launch_epoch ^ 0x20000000u;
+                DG_DEVICE_ASSERT(
+                    !late_exact_source_x ||
+                    num_pool_rows <= kNumW2WeightTileStates);
+                if (threadIdx.x < route_worker_threads) {
+                  uint32_t route_pool_block_offset = 0;
+                  #pragma unroll 1
+                  for (uint32_t expert_idx = 0;
+                       expert_idx < kNumExperts; ++expert_idx) {
                     const uint32_t num_tokens =
                         static_cast<uint32_t>(
                             __ldg(expert_counts + expert_idx));
                     for (uint32_t token_idx = global_route_group;
                          token_idx < num_tokens;
-                         token_idx += num_route_groups) {
+                         token_idx += route_group_stride) {
                         const uint32_t pool_row =
                             route_pool_block_offset * BLOCK_M +
                             token_idx;
@@ -3996,39 +5298,62 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                 }
                             }
                         } else {
-                            float lane_sums[4] = {
-                                0.0f, 0.0f, 0.0f, 0.0f};
+                            constexpr uint32_t kRouteVectorValues =
+                                kRouteWeightMode ==
+                                        RouteWeightMode::PostDown
+                                    ? 8
+                                    : 4;
+                            float lane_sums[kRouteVectorValues] = {};
                             if constexpr (
                                 kRouteWeightMode ==
                                 RouteWeightMode::PostDown) {
                                 for (uint32_t col_base =
                                          route_group_lane_idx *
-                                         4;
+                                         kRouteVectorValues;
                                      col_base < kHidden;
                                      col_base +=
                                          route_group_threads *
-                                         4) {
+                                         kRouteVectorValues) {
+                                    // Eight adjacent BF16 values are naturally
+                                    // 16-byte aligned for every production K3
+                                    // row. Force one vector transaction per
+                                    // operand instead of eight scalar loads.
+                                    // Explicit round-to-nearest FP32 math
+                                    // keeps the association deterministic;
+                                    // parity is enforced by the route-cosine
+                                    // release gate.
+                                    const auto grad_y_packed =
+                                        *reinterpret_cast<const uint4*>(
+                                            grad_y_unweighted_output +
+                                            static_cast<uint64_t>(
+                                                pool_row) *
+                                                kHidden +
+                                            col_base);
+                                    const auto down_packed =
+                                        *reinterpret_cast<const uint4*>(
+                                            down_unweighted_output +
+                                            static_cast<uint64_t>(
+                                                pool_row) *
+                                                kHidden +
+                                            col_base);
+                                    const auto* grad_y_values =
+                                        reinterpret_cast<
+                                            const cd_dtype_t*>(
+                                            &grad_y_packed);
+                                    const auto* down_values =
+                                        reinterpret_cast<
+                                            const cd_dtype_t*>(
+                                            &down_packed);
                                     #pragma unroll
-                                    for (uint32_t i = 0; i < 4;
+                                    for (uint32_t i = 0;
+                                         i < kRouteVectorValues;
                                          ++i) {
-                                        const uint32_t col =
-                                            col_base + i;
                                         const float grad_y =
                                             static_cast<float>(
-                                                grad_y_unweighted_output[
-                                                    static_cast<
-                                                        uint64_t>(
-                                                        pool_row) *
-                                                        kHidden +
-                                                    col]);
+                                                grad_y_values[i]);
                                         const float down =
                                             static_cast<float>(
-                                                down_unweighted_output[
-                                                    static_cast<
-                                                        uint64_t>(
-                                                        pool_row) *
-                                                        kHidden +
-                                                    col]);
+                                                down_values[i]);
                                         lane_sums[i] =
                                             __fadd_rn(
                                                 lane_sums[i],
@@ -4076,17 +5401,33 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                     }
                                 }
                             }
-                            grad_route = __fadd_rn(
-                                __fadd_rn(
-                                    lane_sums[0],
-                                    lane_sums[1]),
-                                lane_sums[2]);
-                            grad_route = __fadd_rn(
-                                grad_route, lane_sums[3]);
+                            if constexpr (
+                                kRouteWeightMode ==
+                                RouteWeightMode::PostDown) {
+                                const float sum_01 = __fadd_rn(
+                                    lane_sums[0], lane_sums[1]);
+                                const float sum_23 = __fadd_rn(
+                                    lane_sums[2], lane_sums[3]);
+                                const float sum_45 = __fadd_rn(
+                                    lane_sums[4], lane_sums[5]);
+                                const float sum_67 = __fadd_rn(
+                                    lane_sums[6], lane_sums[7]);
+                                grad_route = __fadd_rn(
+                                    __fadd_rn(sum_01, sum_23),
+                                    __fadd_rn(sum_45, sum_67));
+                            } else {
+                                grad_route = __fadd_rn(
+                                    __fadd_rn(
+                                        lane_sums[0],
+                                        lane_sums[1]),
+                                    lane_sums[2]);
+                                grad_route = __fadd_rn(
+                                    grad_route, lane_sums[3]);
+                            }
 
-                            route_lane_sums[threadIdx.x] =
-                                grad_route;
                             if (route_group_threads > 32) {
+                                route_lane_sums[threadIdx.x] =
+                                    grad_route;
                                 for (uint32_t offset =
                                          route_group_threads /
                                          2;
@@ -4140,6 +5481,19 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                         metadata.rank_idx);
                                 *remote_grad_route = grad_route;
                             }
+                            if (late_exact_source_x) {
+                                // Publish completion of every read from this
+                                // grad-y row before a TMA dispatch warp reuses
+                                // the aliased row for exact source X.
+                                // There is exactly one producer per row, so a
+                                // release store paired with ``ld_acq`` avoids
+                                // the serialization cost of a global atomic.
+                                asm volatile(
+                                    "st.release.gpu.global.u32 [%0], %1;"
+                                    :: "l"(weight_tile_states + pool_row),
+                                       "r"(route_ready_epoch)
+                                    : "memory");
+                            }
                         }
                         if (route_group_threads > 32) {
                             ptx::sync_aligned(
@@ -4151,7 +5505,142 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                     }
                     route_pool_block_offset +=
                         math::ceil_div(num_tokens, BLOCK_M);
+                  }
                 }
+
+                if (
+                    late_exact_source_x &&
+                    threadIdx.x >= route_worker_threads &&
+                    threadIdx.x <
+                        route_worker_threads +
+                            route_exact_x_dispatch_threads) {
+                    const uint32_t dispatch_warp_idx =
+                        (threadIdx.x - route_worker_threads) / 32;
+                    auto* pull_buffer = dispatch_warp_idx <
+                            kNumDispatchWarps
+                        ? reinterpret_cast<cd_dtype_t*>(smem_buffer) +
+                              dispatch_warp_idx * kHidden
+                        : reinterpret_cast<cd_dtype_t*>(
+                              smem_gemm_base) +
+                              (dispatch_warp_idx -
+                               kNumDispatchWarps) *
+                                  kHidden;
+                    auto* pull_mbarrier =
+                        dispatch_warp_idx < kNumDispatchWarps
+                        ? dispatch_barriers[
+                              kNumDispatchWarps +
+                              dispatch_warp_idx]
+                        : dispatch_barriers[
+                              dispatch_warp_idx -
+                              kNumDispatchWarps];
+                    uint32_t pull_phase = 0;
+                    if (
+                        dispatch_warp_idx >= kNumDispatchWarps &&
+                        cute::elect_one_sync()) {
+                        // The extra warps reuse the completed barrier from the
+                        // corresponding initial dY-dispatch warp. Recover its
+                        // next parity from the exact number of rows that warp
+                        // pulled; every transaction was waited before the
+                        // initial dispatch grid barrier.
+                        const uint32_t reused_dispatch_warp_idx =
+                            dispatch_warp_idx - kNumDispatchWarps;
+                        const uint32_t first_token_idx =
+                            blockIdx.x * kNumDispatchWarps +
+                            reused_dispatch_warp_idx;
+                        constexpr uint32_t kInitialDispatchStride =
+                            kNumSMs * kNumDispatchWarps;
+                        uint32_t prior_transactions = 0;
+                        #pragma unroll 1
+                        for (uint32_t expert_idx = 0;
+                             expert_idx < kNumExperts;
+                             ++expert_idx) {
+                            const uint32_t num_tokens =
+                                static_cast<uint32_t>(
+                                    __ldg(
+                                        expert_counts +
+                                        expert_idx));
+                            if (first_token_idx < num_tokens) {
+                                prior_transactions +=
+                                    1 +
+                                    (num_tokens - 1 -
+                                     first_token_idx) /
+                                        kInitialDispatchStride;
+                            }
+                        }
+                        pull_phase = prior_transactions & 1u;
+                    }
+                    uint32_t pool_block_offset = 0;
+                    #pragma unroll 1
+                    for (uint32_t expert_idx = 0;
+                         expert_idx < kNumExperts; ++expert_idx) {
+                        const uint32_t num_tokens =
+                            static_cast<uint32_t>(
+                                __ldg(expert_counts + expert_idx));
+                        for (uint32_t token_idx =
+                                 blockIdx.x *
+                                     num_route_exact_x_dispatch_warps +
+                                 dispatch_warp_idx;
+                             token_idx < num_tokens;
+                             token_idx +=
+                                 kNumSMs *
+                                     num_route_exact_x_dispatch_warps) {
+                            const uint32_t pool_row =
+                                pool_block_offset * BLOCK_M +
+                                token_idx;
+                            while (ptx::ld_acq(
+                                       reinterpret_cast<uint32_t*>(
+                                           weight_tile_states) +
+                                       pool_row) !=
+                                   route_ready_epoch) {
+                            }
+                            const auto metadata =
+                                token_src_metadata[pool_row];
+                            const auto* remote_x =
+                                backward_sym_buffer.map(
+                                    backward_x +
+                                        static_cast<uint64_t>(
+                                            metadata.token_idx) *
+                                        kHidden,
+                                    metadata.rank_idx);
+                            if (cute::elect_one_sync()) {
+                                ptx::tma_load_1d(
+                                    pull_buffer, remote_x,
+                                    pull_mbarrier,
+                                    kHidden * sizeof(cd_dtype_t));
+                                ptx::mbarrier_arrive_and_set_tx(
+                                    pull_mbarrier,
+                                    kHidden * sizeof(cd_dtype_t));
+                                ptx::mbarrier_wait_and_flip_phase(
+                                    pull_mbarrier, pull_phase);
+                                ptx::tma_store_1d(
+                                    x_pool_output +
+                                        static_cast<uint64_t>(pool_row) *
+                                            kHidden,
+                                    pull_buffer,
+                                    kHidden * sizeof(cd_dtype_t));
+                                cute::tma_store_arrive();
+                                ptx::tma_store_wait<0>();
+                            }
+                            __syncwarp();
+                        }
+                        pool_block_offset +=
+                            math::ceil_div(num_tokens, BLOCK_M);
+                    }
+                }
+              }
+              trace_end(14);
+            }
+
+            if constexpr (
+                kNumRanks > 1 && !kBF16Mode && kExactSourceX) {
+              if (late_exact_source_x) {
+                // Route groups publish row-level readiness to the exact-X TMA
+                // warps above, so exact source dispatch is already complete
+                // when this grid join retires. The source combine plane can
+                // now be cleared for direct W13 grad-x publication.
+                full_grid_phase_barrier(kTraceSiteCount);
+                prepare_direct_grad_x_planes();
+              }
             }
             if constexpr (
                 kBF16Mode &&
@@ -4162,7 +5651,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                     // the shared storage becomes the W2-wgrad input.
                     full_grid_phase_barrier(14);
                     uint32_t pool_block_offset = 0;
-                    #pragma unroll
+                    #pragma unroll 1
                     for (uint32_t expert_idx = 0;
                          expert_idx < kNumExperts; ++expert_idx) {
                         const uint32_t num_tokens =
@@ -4227,7 +5716,9 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                         blockIdx.x;
                     uint32_t global_block = 0;
                     uint32_t pool_block_offset = 0;
-                    #pragma unroll
+                    // The inline MXFP4 dequant body is large; runtime-loop the
+                    // 112 experts instead of cloning that body 112 times.
+                    #pragma unroll 1
                     for (uint32_t expert_idx = 0;
                          expert_idx < kNumExperts;
                          ++expert_idx) {
@@ -4296,13 +5787,15 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                     full_barriers[i]->init(4);
                     empty_barriers[i]->init(1);
                 }
+                if constexpr (kResidualMXFP8Dgrad)
+                    weight_load_barrier->init(1);
                 #pragma unroll
                 for (uint32_t i = 0;
                      i < kNumEpilogueStages; ++i) {
                     tmem_full_barriers[i]->init(1);
                     tmem_empty_barriers[i]->init(
                         2 *
-                        kNumDgradEpilogueThreads);
+                        kNumW13EpilogueThreads);
                 }
                 cutlass::arch::fence_barrier_init();
             }
@@ -4313,14 +5806,19 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
 
             stage_idx = 0;
             phase = 0;
-            if (warp_idx == 0) {
+            if (
+                warp_idx == 0 ||
+                (kResidualMXFP8Dgrad &&
+                 (warp_idx == 1 ||
+                  (warp_idx >= 3 && warp_idx < 8)))) {
+                uint32_t weight_source_phase = 0;
                 for_each_w13_dgrad_block(
-                    [&](const uint32_t&,
+                    [&](const uint32_t& expert_idx,
                         const uint32_t&
                             pool_block_offset,
                         const uint32_t&
                             m_block_idx,
-                        const uint32_t&,
+                        const uint32_t& n_block_idx,
                         const uint32_t& valid_m) {
                         const uint32_t pool_block_idx =
                             pool_block_offset +
@@ -4349,43 +5847,473 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                         math::align(
                                             valid_m, 16u) /
                                         2;
-                                if (cute::elect_one_sync()) {
-                                    tma::copy<
-                                        DGRAD_BLOCK_K,
-                                        LOAD_BLOCK_M,
-                                        DGRAD_BLOCK_K *
-                                            sizeof(
-                                                cd_dtype_t),
-                                        cd_dtype_t>(
-                                        &tensor_map_grad_gate_up,
-                                        full_barriers[
-                                            stage_idx],
-                                        smem_dgrad_a[
-                                            stage_idx],
-                                        split_idx *
-                                                ((2 *
-                                                  kIntermediateHidden) /
-                                                 kNumW13DgradSplits) +
-                                            k_block_idx *
-                                                DGRAD_BLOCK_K,
-                                        m_idx, 2);
-                                    if (is_leader_cta) {
-                                        full_barriers[
-                                            stage_idx]
-                                            ->arrive_and_expect_tx(
-                                                SMEM_A_SIZE_PER_STAGE *
-                                                2);
-                                    } else {
-                                        full_barriers[
-                                            stage_idx]
-                                            ->arrive(0u);
+                                if constexpr (!kResidualMXFP8Dgrad) {
+                                    if (cute::elect_one_sync()) {
+                                        tma::copy<
+                                            DGRAD_BLOCK_K,
+                                            LOAD_BLOCK_M,
+                                            DGRAD_BLOCK_K *
+                                                sizeof(cd_dtype_t),
+                                            cd_dtype_t>(
+                                            &tensor_map_grad_gate_up,
+                                            full_barriers[stage_idx],
+                                            smem_dgrad_a[stage_idx],
+                                            split_idx *
+                                                    ((2 *
+                                                      kIntermediateHidden) /
+                                                     kNumW13DgradSplits) +
+                                                k_block_idx *
+                                                    DGRAD_BLOCK_K,
+                                            m_idx, 2);
+                                        if (is_leader_cta) {
+                                            full_barriers[stage_idx]
+                                                ->arrive_and_expect_tx(
+                                                    SMEM_A_SIZE_PER_STAGE *
+                                                    2);
+                                        } else {
+                                            full_barriers[stage_idx]
+                                                ->arrive(0u);
+                                        }
                                     }
+                                } else {
+                                    constexpr uint32_t
+                                        kQuantProducerWarps =
+                                            kNumResidualProducerWarps;
+                                    constexpr uint32_t
+                                        kValuesPerLane = 4;
+                                    const uint32_t producer_warp_idx =
+                                        warp_idx == 0
+                                        ? 0
+                                        : (warp_idx == 1
+                                               ? 1
+                                               : warp_idx - 1);
+                                    const uint32_t group_idx =
+                                        lane_idx / 8;
+                                    const uint32_t lane_in_group =
+                                        lane_idx % 8;
+                                    const uint32_t effective_m =
+                                        math::align(valid_m, 16u);
+                                    const uint32_t local_valid_m =
+                                        effective_m / 2;
+                                    const uint32_t global_k_block_idx =
+                                        split_idx *
+                                            ((2 * kIntermediateHidden) /
+                                             (DGRAD_BLOCK_K *
+                                              kNumW13DgradSplits)) +
+                                        k_block_idx;
+                                    if (producer_warp_idx == 0 &&
+                                        cute::elect_one_sync()) {
+                                        tma::copy<
+                                            LOAD_BLOCK_N / 2,
+                                            DGRAD_BLOCK_K, 0, int8_t>(
+                                            &tensor_map_w13_weights,
+                                            weight_load_barrier,
+                                            smem_dgrad_weight_source,
+                                            n_block_idx *
+                                                (LOAD_BLOCK_N / 2),
+                                            expert_idx *
+                                                    (2 *
+                                                     kIntermediateHidden) +
+                                                global_k_block_idx *
+                                                    DGRAD_BLOCK_K);
+                                        tma::copy<
+                                            LOAD_BLOCK_N / kGranK,
+                                            DGRAD_BLOCK_K, 0, float>(
+                                            &tensor_map_w13_scales,
+                                            weight_load_barrier,
+                                            smem_dgrad_weight_scale_source,
+                                            n_block_idx *
+                                                (LOAD_BLOCK_N / kGranK),
+                                            expert_idx *
+                                                    (2 *
+                                                     kIntermediateHidden) +
+                                                global_k_block_idx *
+                                                    DGRAD_BLOCK_K);
+                                        weight_load_barrier
+                                            ->arrive_and_expect_tx(
+                                                SMEM_DGRAD_WEIGHT_SOURCE_SIZE +
+                                                SMEM_DGRAD_WEIGHT_SCALE_SOURCE_SIZE);
+                                    }
+                                    auto* primary_bytes =
+                                        reinterpret_cast<uint8_t*>(
+                                            smem_dgrad_a[stage_idx]);
+                                    auto* residual_bytes =
+                                        reinterpret_cast<uint8_t*>(
+                                            smem_dgrad_a_residual[
+                                                stage_idx]);
+                                    // Keep every UTCCP-visible padding row
+                                    // finite before publishing valid scales.
+                                    const uint32_t producer_thread_idx =
+                                        producer_warp_idx * 32 +
+                                        lane_idx;
+                                    for (uint32_t sf_idx =
+                                             producer_thread_idx;
+                                         sf_idx < SF_BLOCK_M;
+                                         sf_idx +=
+                                             kNumResidualProducerThreads) {
+                                        smem_sfa[stage_idx][sf_idx] =
+                                            0x7f7f7f7fu;
+                                        smem_dgrad_sfa_residual[
+                                            stage_idx][sf_idx] =
+                                            0x7f7f7f7fu;
+                                    }
+                                    cutlass::arch::NamedBarrier::sync(
+                                        kNumResidualProducerThreads,
+                                        kInlineWeightProducerBarrier);
+                                    const uint32_t num_quant_rows =
+                                        effective_m;
+                                    for (uint32_t local_m =
+                                             producer_warp_idx;
+                                         local_m < num_quant_rows;
+                                         local_m +=
+                                             kQuantProducerWarps) {
+                                        const uint32_t full_m = local_m;
+                                        const bool valid_row =
+                                            full_m < valid_m;
+                                        const bool store_data =
+                                            is_leader_cta
+                                            ? full_m < local_valid_m
+                                            : full_m >= local_valid_m;
+                                        const uint32_t local_store_m =
+                                            store_data
+                                            ? (is_leader_cta
+                                                   ? full_m
+                                                   : full_m - local_valid_m)
+                                            : 0;
+                                        const uint32_t global_k =
+                                            global_k_block_idx *
+                                                DGRAD_BLOCK_K +
+                                            group_idx * 32 +
+                                            lane_in_group *
+                                                kValuesPerLane;
+                                        float values[kValuesPerLane];
+                                        #pragma unroll
+                                        for (uint32_t i = 0;
+                                             i < kValuesPerLane; ++i) {
+                                            values[i] = valid_row
+                                                ? static_cast<float>(
+                                                      grad_gate_up_output[
+                                                          static_cast<
+                                                              uint64_t>(
+                                                              pool_block_idx *
+                                                                  BLOCK_M +
+                                                              full_m) *
+                                                              (2 *
+                                                               kIntermediateHidden) +
+                                                          global_k + i])
+                                                : 0.0f;
+                                        }
+                                        float primary_amax = 0.0f;
+                                        #pragma unroll
+                                        for (uint32_t i = 0;
+                                             i < kValuesPerLane; ++i)
+                                            primary_amax = cute::max(
+                                                primary_amax,
+                                                cute::abs(values[i]));
+                                        #pragma unroll
+                                        for (uint32_t offset = 4;
+                                             offset > 0; offset >>= 1)
+                                            primary_amax = cute::max(
+                                                primary_amax,
+                                                __shfl_xor_sync(
+                                                    0xffffffff,
+                                                    primary_amax,
+                                                    offset, 8));
+                                        float2 primary_sf_pair;
+                                        float2 primary_sf_inv_pair;
+                                        math::get_e4m3_sf_and_sf_inv(
+                                            make_float2(
+                                                primary_amax, 0.0f),
+                                            primary_sf_pair,
+                                            primary_sf_inv_pair);
+                                        const float primary_sf =
+                                            primary_sf_pair.x;
+                                        const auto primary =
+                                            __nv_fp8x4_e4m3(make_float4(
+                                                values[0] *
+                                                    primary_sf_inv_pair.x,
+                                                values[1] *
+                                                    primary_sf_inv_pair.x,
+                                                values[2] *
+                                                    primary_sf_inv_pair.x,
+                                                values[3] *
+                                                    primary_sf_inv_pair.x));
+                                        const float4 primary_float =
+                                            static_cast<float4>(primary);
+                                        float residual[kValuesPerLane] = {
+                                            values[0] -
+                                                primary_float.x *
+                                                    primary_sf,
+                                            values[1] -
+                                                primary_float.y *
+                                                    primary_sf,
+                                            values[2] -
+                                                primary_float.z *
+                                                    primary_sf,
+                                            values[3] -
+                                                primary_float.w *
+                                                    primary_sf,
+                                        };
+                                        float residual_amax = 0.0f;
+                                        #pragma unroll
+                                        for (uint32_t i = 0;
+                                             i < kValuesPerLane; ++i)
+                                            residual_amax = cute::max(
+                                                residual_amax,
+                                                cute::abs(residual[i]));
+                                        #pragma unroll
+                                        for (uint32_t offset = 4;
+                                             offset > 0; offset >>= 1)
+                                            residual_amax = cute::max(
+                                                residual_amax,
+                                                __shfl_xor_sync(
+                                                    0xffffffff,
+                                                    residual_amax,
+                                                    offset, 8));
+                                        float2 residual_sf_pair;
+                                        float2 residual_sf_inv_pair;
+                                        math::get_e4m3_sf_and_sf_inv(
+                                            make_float2(
+                                                residual_amax, 0.0f),
+                                            residual_sf_pair,
+                                            residual_sf_inv_pair);
+                                        const auto residual_quantized =
+                                            __nv_fp8x4_e4m3(make_float4(
+                                                residual[0] *
+                                                    residual_sf_inv_pair.x,
+                                                residual[1] *
+                                                    residual_sf_inv_pair.x,
+                                                residual[2] *
+                                                    residual_sf_inv_pair.x,
+                                                residual[3] *
+                                                    residual_sf_inv_pair.x));
+                                        const uint32_t row =
+                                            local_store_m & 7u;
+                                        const uint32_t logical_k_byte =
+                                            group_idx * 32 +
+                                            lane_in_group *
+                                                kValuesPerLane;
+                                        const uint32_t byte_offset =
+                                            (local_store_m >> 3) *
+                                                8 * 128 +
+                                            row * 128 +
+                                            ((logical_k_byte >> 4) ^ row) *
+                                                16 +
+                                            (logical_k_byte & 15);
+                                        if (store_data) {
+                                            *reinterpret_cast<uint32_t*>(
+                                                primary_bytes + byte_offset) =
+                                                primary.__x;
+                                            *reinterpret_cast<uint32_t*>(
+                                                residual_bytes + byte_offset) =
+                                                residual_quantized.__x;
+                                        }
+                                        const uint32_t primary_scale_byte =
+                                            (*reinterpret_cast<
+                                                 const uint32_t*>(
+                                                 &primary_sf)) >> 23;
+                                        const uint32_t residual_scale_byte =
+                                            (*reinterpret_cast<
+                                                 const uint32_t*>(
+                                                 &residual_sf_pair.x)) >> 23;
+                                        uint32_t primary_scale_word = 0;
+                                        uint32_t residual_scale_word = 0;
+                                        #pragma unroll
+                                        for (uint32_t group = 0;
+                                             group < 4; ++group) {
+                                            primary_scale_word |=
+                                                __shfl_sync(
+                                                    0xffffffff,
+                                                    primary_scale_byte,
+                                                    group * 8) <<
+                                                (group * 8);
+                                            residual_scale_word |=
+                                                __shfl_sync(
+                                                    0xffffffff,
+                                                    residual_scale_byte,
+                                                    group * 8) <<
+                                                (group * 8);
+                                        }
+                                        if (valid_row && lane_idx == 0) {
+                                            const uint32_t sf_m =
+                                                (full_m & ~127u) +
+                                                (full_m & 31u) * 4 +
+                                                ((full_m >> 5) & 3u);
+                                            smem_sfa[stage_idx][sf_m] =
+                                                primary_scale_word;
+                                            smem_dgrad_sfa_residual[
+                                                stage_idx][sf_m] =
+                                                residual_scale_word;
+                                        }
+                                    }
+                                    cutlass::arch::
+                                        fence_view_async_shared();
+                                    __threadfence_cluster();
+                                    cutlass::arch::NamedBarrier::sync(
+                                        kNumResidualProducerThreads,
+                                        kInlineWeightProducerBarrier);
+                                    if (producer_warp_idx == 0 &&
+                                        cute::elect_one_sync())
+                                        full_barriers[stage_idx]
+                                            ->arrive(0u);
+
+                                    weight_load_barrier->wait(
+                                        weight_source_phase);
+                                    // Re-encode the combined [W1; W3] tile
+                                    // along its transposed dgrad K axis. The
+                                    // source expert switches at intermediate,
+                                    // matching the exact Triton prototype but
+                                    // keeping the tile entirely in shared
+                                    // memory inside this persistent launch.
+                                    auto* weight_bytes =
+                                        reinterpret_cast<uint8_t*>(
+                                            smem_dgrad_b[stage_idx]);
+                                    for (uint32_t local_n =
+                                             producer_warp_idx;
+                                         local_n < LOAD_BLOCK_N;
+                                         local_n +=
+                                             kNumResidualProducerWarps) {
+                                        const uint32_t global_n =
+                                            n_block_idx * LOAD_BLOCK_N +
+                                            local_n;
+                                        float weight_values[
+                                            kValuesPerLane];
+                                        #pragma unroll
+                                        for (uint32_t i = 0;
+                                             i < kValuesPerLane; ++i) {
+                                            const uint8_t packed =
+                                                static_cast<uint8_t>(
+                                                    smem_dgrad_weight_source[
+                                                        (group_idx * 32 +
+                                                         lane_in_group *
+                                                             kValuesPerLane +
+                                                         i) *
+                                                            (LOAD_BLOCK_N / 2) +
+                                                        local_n / 2]);
+                                            uint32_t decoded_fp16x2;
+                                            asm volatile(
+                                                "{\n"
+                                                ".reg .b8 fp4;\n"
+                                                ".reg .b8 unused1, unused2, unused3;\n"
+                                                "mov.b32 {fp4, unused1, unused2, unused3}, %1;\n"
+                                                "cvt.rn.f16x2.e2m1x2 %0, fp4;\n"
+                                                "}\n"
+                                                : "=r"(decoded_fp16x2)
+                                                : "r"(static_cast<uint32_t>(
+                                                      packed)));
+                                            const float2 decoded =
+                                                __half22float2(
+                                                    *reinterpret_cast<
+                                                        __half2*>(
+                                                        &decoded_fp16x2));
+                                            const float source_scale =
+                                                smem_dgrad_weight_scale_source[
+                                                    (group_idx * 32 +
+                                                     lane_in_group *
+                                                         kValuesPerLane +
+                                                     i) *
+                                                        (LOAD_BLOCK_N /
+                                                         kGranK) +
+                                                    local_n / kGranK];
+                                            weight_values[i] =
+                                                (global_n & 1u
+                                                     ? decoded.y
+                                                     : decoded.x) *
+                                                source_scale;
+                                        }
+
+                                        float weight_amax = 0.0f;
+                                        #pragma unroll
+                                        for (uint32_t i = 0;
+                                             i < kValuesPerLane; ++i)
+                                            weight_amax = cute::max(
+                                                weight_amax,
+                                                cute::abs(
+                                                    weight_values[i]));
+                                        #pragma unroll
+                                        for (uint32_t offset = 4;
+                                             offset > 0; offset >>= 1)
+                                            weight_amax = cute::max(
+                                                weight_amax,
+                                                __shfl_xor_sync(
+                                                    0xffffffff,
+                                                    weight_amax,
+                                                    offset, 8));
+                                        float2 weight_sf_pair;
+                                        float2 weight_sf_inv_pair;
+                                        math::get_e4m3_sf_and_sf_inv(
+                                            make_float2(
+                                                weight_amax, 0.0f),
+                                            weight_sf_pair,
+                                            weight_sf_inv_pair);
+                                        const auto weight_quantized =
+                                            __nv_fp8x4_e4m3(make_float4(
+                                                weight_values[0] *
+                                                    weight_sf_inv_pair.x,
+                                                weight_values[1] *
+                                                    weight_sf_inv_pair.x,
+                                                weight_values[2] *
+                                                    weight_sf_inv_pair.x,
+                                                weight_values[3] *
+                                                    weight_sf_inv_pair.x));
+                                        const uint32_t weight_row =
+                                            local_n & 7u;
+                                        const uint32_t logical_k_byte =
+                                            group_idx * 32 +
+                                            lane_in_group *
+                                                kValuesPerLane;
+                                        const uint32_t weight_byte_offset =
+                                            (local_n >> 3) * 8 * 128 +
+                                            weight_row * 128 +
+                                            ((logical_k_byte >> 4) ^
+                                             weight_row) *
+                                                16 +
+                                            (logical_k_byte & 15);
+                                        *reinterpret_cast<uint32_t*>(
+                                            weight_bytes +
+                                            weight_byte_offset) =
+                                            weight_quantized.__x;
+
+                                        const uint32_t weight_scale_byte =
+                                            (*reinterpret_cast<
+                                                 const uint32_t*>(
+                                                 &weight_sf_pair.x)) >> 23;
+                                        uint32_t weight_scale_word = 0;
+                                        #pragma unroll
+                                        for (uint32_t group = 0;
+                                             group < 4; ++group)
+                                            weight_scale_word |=
+                                                __shfl_sync(
+                                                    0xffffffff,
+                                                    weight_scale_byte,
+                                                    group * 8) <<
+                                                (group * 8);
+                                        if (lane_idx == 0) {
+                                            const uint32_t sf_n =
+                                                (local_n & 31u) * 4 +
+                                                ((local_n >> 5) & 3u);
+                                            smem_sfb[stage_idx][sf_n] =
+                                                weight_scale_word;
+                                        }
+                                    }
+                                    cutlass::arch::
+                                        fence_view_async_shared();
+                                    cutlass::arch::NamedBarrier::sync(
+                                        kNumResidualProducerThreads,
+                                        kResidualWeightProducerBarrier);
+                                    if (producer_warp_idx == 0 &&
+                                        cute::elect_one_sync())
+                                        full_barriers[stage_idx]
+                                            ->arrive(0u);
+                                    weight_source_phase ^= 1;
                                 }
                                 __syncwarp();
                             }
                         }
                     });
-            } else if (warp_idx == 1) {
+            } else if (
+                warp_idx == 1 ||
+                (kInlineWeightDequant && warp_idx >= 3 && warp_idx < 8)) {
                 for_each_w13_dgrad_block(
                     [&](const uint32_t& expert_idx,
                         const uint32_t&,
@@ -4424,7 +6352,10 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                          global_k_block_idx) *
                                             kNumW13DgradBlockNs +
                                         n_block_idx;
-                                if constexpr (!kBF16Mode) {
+                                if constexpr (
+                                    !kBF16Mode &&
+                                    !kInlineWeightDequant &&
+                                    !kResidualMXFP8Dgrad) {
                                     while (ptx::ld_acq(
                                                weight_tile_states +
                                                kNumW2WeightTileStates +
@@ -4434,38 +6365,180 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                 }
                                 empty_barriers[stage_idx]
                                     ->wait(phase ^ 1);
-                                if (cute::elect_one_sync()) {
-                                    tma::copy<
-                                        LOAD_BLOCK_N,
-                                        DGRAD_BLOCK_K,
-                                        DGRAD_BLOCK_K *
-                                            sizeof(
-                                                dgrad_b_dtype_t),
-                                        dgrad_b_dtype_t>(
-                                        &tensor_map_w13_dequant,
-                                        full_barriers[
-                                            stage_idx],
-                                        smem_dgrad_b[
-                                            stage_idx],
-                                        n_block_idx *
-                                            BLOCK_N,
-                                        expert_idx *
-                                                (2 *
-                                                 kIntermediateHidden) +
-                                            global_k_block_idx *
+                                if constexpr (!kInlineWeightDequant) {
+                                    if (cute::elect_one_sync()) {
+                                        if constexpr (
+                                            kResidualMXFP8Dgrad) {
+                                            tma::copy<
                                                 DGRAD_BLOCK_K,
-                                        2);
-                                    if (is_leader_cta) {
-                                        full_barriers[
-                                            stage_idx]
-                                            ->arrive_and_expect_tx(
-                                                SMEM_B_SIZE_PER_STAGE *
+                                                LOAD_BLOCK_N,
+                                                128,
+                                                residual_dgrad_dtype_t>(
+                                                &tensor_map_w13_dgrad_weights,
+                                                full_barriers[stage_idx],
+                                                reinterpret_cast<
+                                                    residual_dgrad_dtype_t*>(
+                                                    smem_dgrad_b[stage_idx]),
+                                                global_k_block_idx *
+                                                    DGRAD_BLOCK_K,
+                                                expert_idx * kHidden +
+                                                    n_block_idx * BLOCK_N,
                                                 2);
-                                    } else {
-                                        full_barriers[
-                                            stage_idx]
-                                            ->arrive(0u);
+                                            tma::copy<BLOCK_N, 1, 0>(
+                                                &tensor_map_w13_dgrad_weights_sf,
+                                                full_barriers[stage_idx],
+                                                smem_sfb[stage_idx],
+                                                n_block_idx * BLOCK_N,
+                                                expert_idx *
+                                                        ((2 *
+                                                          kIntermediateHidden) /
+                                                         (kGranK * 4)) +
+                                                    global_k_block_idx,
+                                                2);
+                                            if (is_leader_cta) {
+                                                full_barriers[stage_idx]
+                                                    ->arrive_and_expect_tx(
+                                                        (SMEM_B_SIZE_PER_STAGE +
+                                                         SMEM_SFB_SIZE_PER_STAGE) *
+                                                        2);
+                                            } else {
+                                                full_barriers[stage_idx]
+                                                    ->arrive(0u);
+                                            }
+                                        } else {
+                                            tma::copy<
+                                                LOAD_BLOCK_N,
+                                                DGRAD_BLOCK_K,
+                                                DGRAD_BLOCK_K *
+                                                    sizeof(
+                                                        dgrad_b_dtype_t),
+                                                dgrad_b_dtype_t>(
+                                                &tensor_map_w13_dequant,
+                                                full_barriers[stage_idx],
+                                                smem_dgrad_b[stage_idx],
+                                                n_block_idx * BLOCK_N,
+                                                expert_idx *
+                                                        (2 *
+                                                         kIntermediateHidden) +
+                                                    global_k_block_idx *
+                                                        DGRAD_BLOCK_K,
+                                                2);
+                                            if (is_leader_cta) {
+                                                full_barriers[stage_idx]
+                                                    ->arrive_and_expect_tx(
+                                                        SMEM_B_SIZE_PER_STAGE *
+                                                        2);
+                                            } else {
+                                                full_barriers[stage_idx]
+                                                    ->arrive(0u);
+                                            }
+                                        }
                                     }
+                                } else {
+                                    constexpr uint32_t kPairsPerTile =
+                                        LOAD_BLOCK_N * DGRAD_BLOCK_K / 2;
+                                    auto* smem_b_bytes =
+                                        reinterpret_cast<uint8_t*>(
+                                            smem_dgrad_b[stage_idx]);
+                                    const uint32_t producer_warp_idx =
+                                        warp_idx == 1 ? 0 : warp_idx - 2;
+                                    for (uint32_t pair_idx =
+                                             producer_warp_idx * 32 + lane_idx;
+                                         pair_idx < kPairsPerTile;
+                                         pair_idx +=
+                                             kNumInlineWeightProducerThreads) {
+                                        const uint32_t local_k =
+                                            pair_idx / (LOAD_BLOCK_N / 2);
+                                        const uint32_t local_n_pair =
+                                            pair_idx % (LOAD_BLOCK_N / 2);
+                                        const uint32_t global_k =
+                                            global_k_block_idx *
+                                                DGRAD_BLOCK_K +
+                                            local_k;
+                                        const uint32_t global_n_pair =
+                                            n_block_idx *
+                                                (LOAD_BLOCK_N / 2) +
+                                            local_n_pair;
+                                        const uint8_t packed =
+                                            static_cast<uint8_t>(__ldg(
+                                                w13_weights +
+                                                (static_cast<uint64_t>(
+                                                     expert_idx) *
+                                                     (2 *
+                                                      kIntermediateHidden) +
+                                                 global_k) *
+                                                    (kHidden / 2) +
+                                                global_n_pair));
+                                        const float scale = __ldg(
+                                            w13_scales +
+                                            (static_cast<uint64_t>(
+                                                 expert_idx) *
+                                                 (2 *
+                                                  kIntermediateHidden) +
+                                             global_k) *
+                                                (kHidden / 32) +
+                                            n_block_idx *
+                                                (LOAD_BLOCK_N / 32) +
+                                            (local_n_pair * 2) / 32);
+                                        uint32_t fp16x2;
+                                        asm volatile(
+                                            "{\n"
+                                            ".reg .b8 fp4;\n"
+                                            ".reg .b8 unused1, unused2, unused3;\n"
+                                            "mov.b32 {fp4, unused1, unused2, unused3}, %1;\n"
+                                            "cvt.rn.f16x2.e2m1x2 %0, fp4;\n"
+                                            "}\n"
+                                            : "=r"(fp16x2)
+                                            : "r"(static_cast<uint32_t>(packed)));
+                                        auto value_pair =
+                                            *reinterpret_cast<__half2*>(
+                                                &fp16x2);
+                                        value_pair = __hmul2(
+                                            value_pair,
+                                            __float2half2_rn(scale));
+                                        const auto value_pair_bf16 =
+                                            __float22bfloat162_rn(
+                                                __half22float2(value_pair));
+                                        const uint32_t scaled_pair =
+                                            *reinterpret_cast<const uint32_t*>(
+                                                &value_pair_bf16);
+                                        #pragma unroll
+                                        for (uint32_t i = 0; i < 2; ++i) {
+                                            const uint32_t local_n =
+                                                local_n_pair * 2 + i;
+                                            // Match tma::copy's pair of
+                                            // independently swizzled 64x64
+                                            // MN-major atoms.
+                                            const uint32_t atom_n =
+                                                local_n / 64;
+                                            const uint32_t atom_col_byte =
+                                                (local_n % 64) *
+                                                sizeof(dgrad_b_dtype_t);
+                                            const uint32_t row =
+                                                local_k & 7;
+                                            const uint32_t byte_offset =
+                                                atom_n *
+                                                    DGRAD_BLOCK_K *
+                                                    64 *
+                                                    sizeof(dgrad_b_dtype_t) +
+                                                (local_k >> 3) * 8 * 128 +
+                                                row * 128 +
+                                                ((atom_col_byte >> 4) ^ row) *
+                                                    16 +
+                                                (atom_col_byte & 15);
+                                            *reinterpret_cast<uint16_t*>(
+                                                smem_b_bytes + byte_offset) =
+                                                static_cast<uint16_t>(
+                                                    scaled_pair >> (i * 16));
+                                        }
+                                    }
+                                    cutlass::arch::fence_view_async_shared();
+                                    cutlass::arch::NamedBarrier::sync(
+                                        kNumInlineWeightProducerThreads,
+                                        kInlineWeightProducerBarrier);
+                                    if (producer_warp_idx == 0 &&
+                                        cute::elect_one_sync())
+                                        full_barriers[stage_idx]->arrive(0u);
                                 }
                                 __syncwarp();
                             }
@@ -4473,6 +6546,240 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                     });
             } else if (warp_idx == 2) {
                 if (is_leader_cta) {
+                  if constexpr (kResidualMXFP8Dgrad) {
+                    auto instr_desc =
+                        cute::UMMA::make_instr_desc_block_scaled<
+                            residual_dgrad_dtype_t,
+                            residual_dgrad_dtype_t, float,
+                            cutlass::float_ue8m0_t,
+                            UMMA_M, UMMA_N,
+                            cute::UMMA::Major::K,
+                            cute::UMMA::Major::K>();
+                    auto sf_desc = mma::sm100::make_sf_desc(nullptr);
+                    auto primary_a_desc =
+                        mma::sm100::make_umma_desc<
+                            cute::UMMA::Major::K,
+                            LOAD_BLOCK_M, DGRAD_BLOCK_K, 128>(
+                            reinterpret_cast<
+                                residual_dgrad_dtype_t*>(
+                                smem_dgrad_a[0]),
+                            0, 0);
+                    auto residual_a_desc =
+                        mma::sm100::make_umma_desc<
+                            cute::UMMA::Major::K,
+                            LOAD_BLOCK_M, DGRAD_BLOCK_K, 128>(
+                            smem_dgrad_a_residual[0], 0, 0);
+                    auto b_desc = mma::sm100::make_umma_desc<
+                        cute::UMMA::Major::K,
+                        LOAD_BLOCK_N, DGRAD_BLOCK_K, 128>(
+                        reinterpret_cast<residual_dgrad_dtype_t*>(
+                            smem_dgrad_b[0]),
+                        0, 0);
+                    const uint32_t primary_a_desc_lo =
+                        lane_idx < kNumStages
+                        ? primary_a_desc.lo +
+                              lane_idx * SMEM_A_SIZE_PER_STAGE / 16
+                        : 0;
+                    const uint32_t residual_a_desc_lo =
+                        lane_idx < kNumStages
+                        ? residual_a_desc.lo +
+                              lane_idx *
+                                  SMEM_RESIDUAL_A_SIZE_PER_STAGE / 16
+                        : 0;
+                    const uint32_t b_desc_lo =
+                        lane_idx < kNumStages
+                        ? b_desc.lo +
+                              lane_idx * SMEM_B_SIZE_PER_STAGE / 16
+                        : 0;
+                    uint32_t current_iter = 0;
+
+                    for_each_w13_dgrad_block(
+                        [&](const uint32_t&, const uint32_t&,
+                            const uint32_t&, const uint32_t&,
+                            const uint32_t& valid_m) {
+                            mma::sm100::
+                                update_instr_desc_with_umma_n(
+                                    instr_desc,
+                                    math::align(valid_m, 16u));
+                            #pragma unroll
+                            for (uint32_t split_idx = 0;
+                                 split_idx < kNumW13DgradSplits;
+                                 ++split_idx) {
+                                const uint32_t accum_stage =
+                                    current_iter %
+                                    kNumEpilogueStages;
+                                const uint32_t accum_phase =
+                                    (current_iter++ /
+                                     kNumEpilogueStages) &
+                                    1;
+                                tmem_empty_barriers[accum_stage]
+                                    ->wait(accum_phase ^ 1);
+                                ptx::tcgen05_after_thread_sync();
+
+                                #pragma unroll 1
+                                for (uint32_t k_block_idx = 0;
+                                     k_block_idx <
+                                         (2 * kIntermediateHidden) /
+                                             (DGRAD_BLOCK_K *
+                                              kNumW13DgradSplits);
+                                     advance_pipeline(k_block_idx)) {
+                                    full_barriers[stage_idx]
+                                        ->wait(phase);
+                                    ptx::tcgen05_after_thread_sync();
+                                    const uint32_t
+                                        primary_a_desc_base =
+                                            ptx::exchange(
+                                                primary_a_desc_lo,
+                                                stage_idx);
+                                    const uint32_t
+                                        residual_a_desc_base =
+                                            ptx::exchange(
+                                                residual_a_desc_lo,
+                                                stage_idx);
+                                    const uint32_t b_desc_base =
+                                        ptx::exchange(
+                                            b_desc_lo, stage_idx);
+                                    if (cute::elect_one_sync()) {
+                                        using utccp_t =
+                                            cute::
+                                                SM100_UTCCP_4x32dp128bit_2cta;
+                                        #pragma unroll
+                                        for (uint32_t i = 0;
+                                             i < SF_BLOCK_M /
+                                                     kNumUTCCPAlignedElems;
+                                             ++i) {
+                                            mma::sm100::
+                                                replace_smem_desc_addr(
+                                                    sf_desc,
+                                                    smem_sfa[stage_idx] +
+                                                        i *
+                                                            kNumUTCCPAlignedElems);
+                                            utccp_t::copy(
+                                                sf_desc,
+                                                kTmemStartColOfSFA +
+                                                    i * 4);
+                                            mma::sm100::
+                                                replace_smem_desc_addr(
+                                                    sf_desc,
+                                                    smem_dgrad_sfa_residual[
+                                                        stage_idx] +
+                                                        i *
+                                                            kNumUTCCPAlignedElems);
+                                            utccp_t::copy(
+                                                sf_desc,
+                                                kTmemStartColOfResidualSFA +
+                                                    i * 4);
+                                        }
+                                        mma::sm100::
+                                            replace_smem_desc_addr(
+                                                sf_desc,
+                                                smem_sfb[stage_idx]);
+                                        utccp_t::copy(
+                                            sf_desc,
+                                            kTmemStartColOfSFB);
+
+                                        #pragma unroll
+                                        for (uint32_t k = 0;
+                                             k < DGRAD_BLOCK_K /
+                                                     DGRAD_UMMA_K;
+                                             ++k) {
+                                            const auto
+                                                runtime_instr_desc =
+                                                    mma::sm100::
+                                                        make_runtime_instr_desc_with_sf_id(
+                                                            instr_desc,
+                                                            k, k);
+                                            primary_a_desc.lo =
+                                                mma::sm100::
+                                                    advance_umma_desc_lo<
+                                                        cute::UMMA::Major::K,
+                                                        LOAD_BLOCK_M,
+                                                        128,
+                                                        residual_dgrad_dtype_t>(
+                                                        primary_a_desc_base,
+                                                        0,
+                                                        k *
+                                                            DGRAD_UMMA_K);
+                                            residual_a_desc.lo =
+                                                mma::sm100::
+                                                    advance_umma_desc_lo<
+                                                        cute::UMMA::Major::K,
+                                                        LOAD_BLOCK_M,
+                                                        128,
+                                                        residual_dgrad_dtype_t>(
+                                                        residual_a_desc_base,
+                                                        0,
+                                                        k *
+                                                            DGRAD_UMMA_K);
+                                            b_desc.lo =
+                                                mma::sm100::
+                                                    advance_umma_desc_lo<
+                                                        cute::UMMA::Major::K,
+                                                        LOAD_BLOCK_N,
+                                                        128,
+                                                        residual_dgrad_dtype_t>(
+                                                        b_desc_base,
+                                                        0,
+                                                        k *
+                                                            DGRAD_UMMA_K);
+                                            ptx::
+                                                SM100_MMA_MXF8F6F4_2x1SM_SS::
+                                                    fma(
+                                                        b_desc,
+                                                        primary_a_desc,
+                                                        accum_stage *
+                                                            UMMA_N,
+                                                        k_block_idx > 0 ||
+                                                            k > 0,
+                                                        runtime_instr_desc,
+                                                        kTmemStartColOfSFB,
+                                                        kTmemStartColOfSFA);
+                                            ptx::
+                                                SM100_MMA_MXF8F6F4_2x1SM_SS::
+                                                    fma(
+                                                        b_desc,
+                                                        residual_a_desc,
+                                                        accum_stage *
+                                                            UMMA_N,
+                                                        true,
+                                                        runtime_instr_desc,
+                                                        kTmemStartColOfSFB,
+                                                        kTmemStartColOfResidualSFA);
+                                        }
+                                    }
+                                    __syncwarp();
+                                    constexpr uint16_t kCTAMask = 0x3;
+                                    cutlass::arch::
+                                        umma_arrive_multicast_2x1SM(
+                                            reinterpret_cast<uint64_t*>(
+                                                empty_barriers[
+                                                    stage_idx]),
+                                            kCTAMask);
+                                    if (k_block_idx ==
+                                        (2 * kIntermediateHidden) /
+                                                (DGRAD_BLOCK_K *
+                                                 kNumW13DgradSplits) -
+                                            1) {
+                                        cutlass::arch::
+                                            umma_arrive_multicast_2x1SM(
+                                                reinterpret_cast<
+                                                    uint64_t*>(
+                                                    tmem_full_barriers[
+                                                        accum_stage]),
+                                                kCTAMask);
+                                    }
+                                    __syncwarp();
+                                }
+                            }
+                        });
+                    if (current_iter > 0) {
+                        const uint32_t last = current_iter - 1;
+                        tmem_empty_barriers[
+                            last % kNumEpilogueStages]
+                            ->wait(
+                                (last / kNumEpilogueStages) & 1);
+                    }
+                  } else {
                     auto instr_desc =
                         cute::UMMA::make_instr_desc<
                             dgrad_b_dtype_t,
@@ -4657,10 +6964,135 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                  kNumEpilogueStages) &
                                 1);
                     }
+                  }
                 }
-            } else if (warp_idx >= 4) {
+            } else if (
+                kOverlapRouteGradWithW13 &&
+                warp_idx >= kDispatchWarpStart &&
+                warp_idx <
+                    kDispatchWarpStart +
+                        kNumDispatchWarps) {
+                // One warp owns one route row, preserving the exact four-lane
+                // accumulation and shuffle tree used by the serialized K3
+                // reducer.  Only route-to-warp assignment changes; no row's
+                // FP32 reduction order changes.
+                const uint32_t route_warp_idx =
+                    warp_idx - kDispatchWarpStart;
+                const uint32_t global_route_warp =
+                    blockIdx.x * kNumDispatchWarps +
+                    route_warp_idx;
+                const uint32_t num_route_warps =
+                    kNumSMs * kNumDispatchWarps;
+                uint32_t route_pool_block_offset = 0;
+                #pragma unroll 1
+                for (uint32_t expert_idx = 0;
+                     expert_idx < kNumExperts;
+                     ++expert_idx) {
+                    const uint32_t num_tokens =
+                        static_cast<uint32_t>(
+                            __ldg(
+                                expert_counts +
+                                expert_idx));
+                    for (uint32_t token_idx =
+                             global_route_warp;
+                         token_idx < num_tokens;
+                         token_idx += num_route_warps) {
+                        const uint32_t pool_row =
+                            route_pool_block_offset *
+                                BLOCK_M +
+                            token_idx;
+                        float lane_sums[4] = {
+                            0.0f, 0.0f, 0.0f, 0.0f};
+                        for (uint32_t col_base =
+                                 lane_idx * 4;
+                             col_base < kHidden;
+                             col_base += 32 * 4) {
+                            #pragma unroll
+                            for (uint32_t i = 0;
+                                 i < 4; ++i) {
+                                const uint32_t col =
+                                    col_base + i;
+                                const float grad_y =
+                                    static_cast<float>(
+                                        grad_y_unweighted_output[
+                                            static_cast<uint64_t>(
+                                                pool_row) *
+                                                kHidden +
+                                            col]);
+                                const float down =
+                                    static_cast<float>(
+                                        down_unweighted_output[
+                                            static_cast<uint64_t>(
+                                                pool_row) *
+                                                kHidden +
+                                            col]);
+                                lane_sums[i] =
+                                    __fadd_rn(
+                                        lane_sums[i],
+                                        __fmul_rn(
+                                            grad_y,
+                                            down));
+                            }
+                        }
+                        float grad_route =
+                            __fadd_rn(
+                                __fadd_rn(
+                                    lane_sums[0],
+                                    lane_sums[1]),
+                                lane_sums[2]);
+                        grad_route =
+                            __fadd_rn(
+                                grad_route,
+                                lane_sums[3]);
+                        #pragma unroll
+                        for (uint32_t offset = 16;
+                             offset > 0;
+                             offset >>= 1) {
+                            grad_route =
+                                __fadd_rn(
+                                    grad_route,
+                                    __shfl_down_sync(
+                                        0xffffffff,
+                                        grad_route,
+                                        offset));
+                        }
+                        if (lane_idx == 0) {
+                            grad_route_output[pool_row] =
+                                grad_route;
+                            if (backward_grad_route !=
+                                nullptr) {
+                                const auto metadata =
+                                    token_src_metadata[
+                                        pool_row];
+                                auto* remote_grad_route =
+                                    backward_sym_buffer.map(
+                                        backward_grad_route +
+                                            static_cast<uint64_t>(
+                                                metadata
+                                                    .token_idx) *
+                                                num_topk +
+                                            metadata
+                                                .topk_idx,
+                                        metadata.rank_idx);
+                                *remote_grad_route =
+                                    grad_route;
+                            }
+                        }
+                        __syncwarp();
+                    }
+                    route_pool_block_offset +=
+                        math::ceil_div(
+                            num_tokens, BLOCK_M);
+                }
+            } else if (warp_idx >= kDgradEpilogueWarpStart) {
                 const uint32_t epilogue_warp_idx =
-                    warp_idx - 4;
+                    warp_idx - kDgradEpilogueWarpStart -
+                    (kOverlapRouteGradWithW13 &&
+                             warp_idx >=
+                                 kDispatchWarpStart +
+                                     kNumDispatchWarps
+                         ? kNumDispatchWarps
+                         : 0);
                 const uint32_t epilogue_thread_idx =
                     epilogue_warp_idx * 32 +
                     lane_idx;
@@ -4701,7 +7133,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                              ++s) {
                             cutlass::arch::
                                 NamedBarrier::sync(
-                                    kNumDgradEpilogueThreads,
+                                    kNumW13EpilogueThreads,
                                     0);
                             // The four proven loader warps own the 4 KiB
                             // TMEM-to-shared mapping. Extra dgrad epilogue
@@ -4880,7 +7312,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                             }
                             cutlass::arch::
                                 NamedBarrier::sync(
-                                    kNumDgradEpilogueThreads,
+                                    kNumW13EpilogueThreads,
                                     0);
 
                             if constexpr (
@@ -4898,7 +7330,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                          STORE_BLOCK_M *
                                              (BLOCK_N / 8);
                                      linear +=
-                                         kNumDgradEpilogueThreads) {
+                                         kNumW13EpilogueThreads) {
                                     const uint32_t row =
                                         linear /
                                         (BLOCK_N / 8);
@@ -4999,7 +7431,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                          STORE_BLOCK_M *
                                              (BLOCK_N / 2);
                                      linear +=
-                                         kNumDgradEpilogueThreads) {
+                                         kNumW13EpilogueThreads) {
                                     const uint32_t row =
                                         linear /
                                         (BLOCK_N / 2);
@@ -5119,7 +7551,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                          STORE_BLOCK_M *
                                              BLOCK_N;
                                      linear +=
-                                         kNumDgradEpilogueThreads) {
+                                         kNumW13EpilogueThreads) {
                                     const uint32_t row =
                                         linear / BLOCK_N;
                                     const uint32_t n =
@@ -5220,10 +7652,34 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                 ->arrive(0u);
                     });
             }
+        } else if constexpr (
+            kComputeRouteGrad && !kInputsPrepared &&
+            kRouteWeightMode == RouteWeightMode::PostDown &&
+            !phase_ordered_w2_dequant) {
+            // Route gradients are independent of W13 dgrad. Autograd may
+            // request router and expert-weight gradients without requesting
+            // dX, which compile-time removes the entire W13 dgrad phase. Keep
+            // the POST_DOWN dot and its direct symmetric-memory publication
+            // alive in that specialization instead of silently returning
+            // zeros. The helper preserves the same fixed-order reduction used
+            // by the normal training path.
+            bf16_mega_moe_reduce_post_down_route<
+                kHidden, kNumExperts, BLOCK_M,
+                kNumSMs, kNumThreads, kNumRanks,
+                kCombineOrderMode>(
+                expert_counts,
+                grad_y_unweighted_output,
+                down_unweighted_output,
+                grad_route_output,
+                backward_grad_route,
+                token_src_metadata,
+                num_topk,
+                backward_sym_buffer,
+                smem_buffer);
         }
 
         trace_end(21);
-        if constexpr (kNumRanks > 1) {
+        if constexpr (kNumRanks > 1 && !kInlineWgrad) {
             if constexpr (
                 kDirectRemoteGradX || kComputeRouteGrad) {
                 // Publish every direct grad-x and route-gradient NVLink store
@@ -5287,7 +7743,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
         const auto clear_wgrad_padding_rows = [&]() {
             uint32_t pad_pool_block_offset = 0;
             uint32_t pad_global_block = 0;
-            #pragma unroll
+            #pragma unroll 1
             for (uint32_t expert_idx = 0;
                  expert_idx < kNumExperts; ++expert_idx) {
                 const uint32_t num_tokens =
@@ -5355,19 +7811,201 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
             }
         };
 
+        const auto clear_empty_wgrad_experts = [&]() {
+            // On the first, non-accumulating chunk the dequant workspaces
+            // alias the caller-owned dW buffers. Dequant and Kernel B both
+            // skip empty experts, so clear only those expert slices here.
+            // This replaces a stream-wide 7.4-GB memset for Kimi-K3 EP=8;
+            // nonempty experts are overwritten by Kernel B, while subsequent
+            // chunks must retain their accumulated gradients.
+            constexpr uint64_t kBF16PerVector =
+                sizeof(uint4) / sizeof(cd_dtype_t);
+            constexpr uint64_t kW2VectorsPerExpert =
+                static_cast<uint64_t>(kHidden) *
+                kIntermediateHidden / kBF16PerVector;
+            constexpr uint64_t kW13VectorsPerExpert =
+                static_cast<uint64_t>(2 * kIntermediateHidden) *
+                kHidden / kBF16PerVector;
+            constexpr uint64_t kVectorsPerExpert =
+                kW2VectorsPerExpert + kW13VectorsPerExpert;
+            const uint64_t global_thread =
+                static_cast<uint64_t>(blockIdx.x) * kNumThreads +
+                threadIdx.x;
+            constexpr uint64_t kGlobalThreads =
+                static_cast<uint64_t>(kNumSMs) * kNumThreads;
+            auto* w2_vectors =
+                reinterpret_cast<uint4*>(w2_dequant_scratch);
+            auto* w13_vectors =
+                reinterpret_cast<uint4*>(w13_dequant_scratch);
+            const uint4 zero = {0, 0, 0, 0};
+            #pragma unroll 1
+            for (uint32_t expert_idx = 0;
+                 expert_idx < kNumExperts; ++expert_idx) {
+                if (__ldg(expert_counts + expert_idx) != 0)
+                    continue;
+                for (uint64_t linear = global_thread;
+                     linear < kVectorsPerExpert;
+                     linear += kGlobalThreads) {
+                    if (linear < kW2VectorsPerExpert) {
+                        w2_vectors[
+                            static_cast<uint64_t>(expert_idx) *
+                                kW2VectorsPerExpert +
+                            linear] = zero;
+                    } else {
+                        w13_vectors[
+                            static_cast<uint64_t>(expert_idx) *
+                                kW13VectorsPerExpert +
+                            linear - kW2VectorsPerExpert] = zero;
+                    }
+                }
+            }
+        };
+
         // Standalone Kernel B consumes only these three padded operands. Valid
         // rows are fully overwritten above; clear only the final partial block
         // of each expert instead of memset'ing every active scratch prefix.
         if constexpr (kClearWgradPadding)
             clear_wgrad_padding_rows();
 
-        __syncthreads();
+        // This compile-time combination identifies the first chunk whose
+        // non-inline dequant workspaces are the uninitialized dW outputs.
+        // Inline fallback is used only after live accumulation state exists;
+        // phase-ordered dequant aliases consumed activation storage instead.
+        if constexpr (
+            kClearWgradPadding && !kInlineWeightDequant &&
+            !kPhaseOrderedWeightDequant) {
+            if (clear_empty_wgrad_expert_outputs)
+                clear_empty_wgrad_experts();
+        }
+
+        if constexpr (kInlineWgrad) {
+            // Padding and empty-expert clears are partitioned across the
+            // persistent grid.  The inline grouped GEMM can schedule any
+            // expert on any SM, so a CTA-local/cluster-local join is not a
+            // sufficient readiness edge.  This also retires every remaining
+            // reader before the weight-tile epoch array is reused as the
+            // grouped K schedule.
+            //
+            // Join all producer warps *before* thread 0 contributes this CTA's
+            // global ticket. Without this pre-join, another CTA can observe
+            // the global sense change while nonzero threads here still write
+            // Wgrad operands. Publish generic stores to TMA's async proxy as
+            // part of that one-time phase handoff.
+            asm volatile(
+                "fence.proxy.async.global;" ::: "memory");
+            __threadfence();
+            __syncthreads();
+            full_grid_phase_barrier(kTraceSiteCount);
+        } else {
+            __syncthreads();
+        }
         trace_begin(20);
         comm::cluster_sync_with_relaxed_arrive();
-        trace_end(20);
-        trace_end(0);
         if (warp_idx == 0)
             Allocator().free(0, kNumTmemCols);
+        __syncthreads();
+
+        if constexpr (kInlineWgrad) {
+            // Kernel A's weight-tile epochs are dead after both dgrad phases.
+            // Reuse their caller-owned storage for the block-padded K-grouped
+            // schedule rather than allocating another CUDA tensor.
+            for (uint32_t expert_idx = threadIdx.x;
+                 expert_idx < kNumExperts;
+                 expert_idx += kNumThreads) {
+                weight_tile_states[expert_idx] =
+                    math::ceil_div(
+                        static_cast<uint32_t>(
+                            __ldg(expert_counts + expert_idx)),
+                        BLOCK_M) *
+                    BLOCK_M;
+            }
+            __syncthreads();
+
+            constexpr uint32_t kWgradBlockM = 128;
+            constexpr uint32_t kWgradBlockN = 256;
+            // K-grouped rows are separated by the forward pool's BLOCK_M.
+            // Select the largest divisor so a final K tile never crosses into
+            // the next expert, including tiny true-varlen validation waves.
+            constexpr uint32_t kWgradBlockK =
+                BLOCK_M % 64 == 0 ? 64 :
+                BLOCK_M % 32 == 0 ? 32 : 16;
+            constexpr uint32_t kWgradSwizzle =
+                kWgradBlockK * sizeof(cd_dtype_t);
+            constexpr uint32_t kWgradStages = 6;
+            constexpr uint32_t kWgradRoleThreads = 128;
+            constexpr uint32_t kWgradTensorUtil = 100;
+            constexpr bool kPublishRemoteGradients =
+                kNumRanks > 1 &&
+                (kDirectRemoteGradX || kComputeRouteGrad);
+            const auto run_wgrad = [&]<bool kFuseWgradCombine>(
+                const uint32_t shape_m,
+                const uint32_t shape_n,
+                const cute::TmaDescriptor& tensor_map_a,
+                const cute::TmaDescriptor& tensor_map_b,
+                const cute::TmaDescriptor& tensor_map_d,
+                const bool combine_reduce) {
+                sm100_bf16_gemm_body<
+                    cute::UMMA::Major::MN,
+                    cute::UMMA::Major::MN,
+                    0, 0, 0,
+                    kWgradBlockM, kWgradBlockN, kWgradBlockK,
+                    kNumExperts,
+                    kWgradSwizzle, kWgradSwizzle, kWgradSwizzle,
+                    kWgradStages,
+                    kWgradRoleThreads, kWgradRoleThreads,
+                    2, false,
+                    kNumSMs,
+                    kWgradBlockK,
+                    false, true,
+                    GemmType::KGroupedContiguous,
+                    kAccumulateWgrad,
+                    cd_dtype_t,
+                    kWgradTensorUtil,
+                    kNumRanks,
+                    kFuseWgradCombine,
+                    CombineOrderMode::FixedTopK,
+                    0>(
+                        reinterpret_cast<int*>(weight_tile_states),
+                        shape_m, shape_n, num_pool_rows,
+                        tensor_map_a, tensor_map_b, tensor_map_d,
+                        backward_sym_buffer, backward_workspace,
+                        backward_grad_x_output,
+                        const_cast<cd_dtype_t*>(backward_grad_y),
+                        nullptr,
+                        num_backward_tokens,
+                        backward_workspace.num_max_tokens_per_rank,
+                        num_topk, kHidden, combine_reduce,
+                        smem_buffer, false);
+            };
+
+            // Remote dX/dRoute stores have already been issued by the dgrad
+            // producers. The otherwise-idle W2 combine warps perform the
+            // cross-rank publication barrier while UMMA computes dW2. A
+            // full-grid join after W2 makes the SM-0 completion visible before
+            // W13's combine warps consume the remote top-k planes.
+            run_wgrad.template operator()<kPublishRemoteGradients>(
+                    kHidden, kIntermediateHidden,
+                    tensor_map_w2_wgrad_a,
+                    tensor_map_w2_wgrad_b,
+                    tensor_map_w2_wgrad_d,
+                    false);
+            // The clustered body frees TMEM before returning. Join both CTAs
+            // so no peer begins the second allocation while its peer still
+            // drains the final W2 TMA store.
+            comm::cluster_sync_with_relaxed_arrive();
+            if constexpr (kPublishRemoteGradients)
+                full_grid_phase_barrier(kTraceSiteCount);
+            run_wgrad.template operator()<kDirectRemoteGradX>(
+                    2 * kIntermediateHidden, kHidden,
+                    tensor_map_w13_wgrad_a,
+                    tensor_map_w13_wgrad_b,
+                    tensor_map_w13_wgrad_d,
+                    kDirectRemoteGradX);
+            comm::cluster_sync_with_relaxed_arrive();
+        }
+
+        trace_end(20);
+        trace_end(0);
     }
 #endif
 }

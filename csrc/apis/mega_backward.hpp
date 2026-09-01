@@ -30,6 +30,7 @@ static void fp8_fp4_mega_moe_backward_dgrad_swiglu_v2(
     const bool& direct_remote_grad_x,
     const bool& write_grad_x_pool,
     const bool& clear_wgrad_padding,
+    const bool& clear_empty_wgrad_expert_outputs,
     const std::optional<torch::Tensor>& backward_grad_y,
     const std::optional<torch::Tensor>& backward_topk_weights,
     const std::optional<torch::Tensor>& backward_grad_route,
@@ -41,7 +42,24 @@ static void fp8_fp4_mega_moe_backward_dgrad_swiglu_v2(
     const std::string& route_weight_mode,
     const std::optional<torch::Tensor>& grad_y_unweighted_output,
     const std::optional<torch::Tensor>& down_unweighted_output,
-    const std::optional<torch::Tensor>& grad_route_output) {
+    const std::optional<torch::Tensor>& grad_route_output,
+    const std::string& activation,
+    const std::optional<float>& situ_beta_opt,
+    const std::optional<float>& situ_linear_beta_opt,
+    const bool& inline_weight_dequant,
+    const bool& inline_residual_mxfp8_dgrad,
+    const std::optional<torch::Tensor>& w2_dgrad_weights,
+    const std::optional<torch::Tensor>& w2_dgrad_weights_sf,
+    const std::optional<torch::Tensor>& w13_dgrad_weights,
+    const std::optional<torch::Tensor>& w13_dgrad_weights_sf,
+    const std::optional<torch::Tensor>& backward_x,
+    const std::optional<torch::Tensor>& kernel_trace,
+    const bool& inline_wgrad,
+    const bool& accumulate_wgrad,
+    const std::optional<torch::Tensor>& combined_grad_x_output,
+    const bool& gate_up_prepared,
+    const std::optional<torch::Tensor>& w2_wgrad_output,
+    const std::optional<torch::Tensor>& w13_wgrad_output) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [w2_weights, w2_scales] = w2_weights_tuple;
     const auto [w13_weights, w13_scales] = w13_weights_tuple;
@@ -55,13 +73,23 @@ static void fp8_fp4_mega_moe_backward_dgrad_swiglu_v2(
         activation_limit, compute_w13_dgrad,
         direct_remote_grad_x, write_grad_x_pool,
         clear_wgrad_padding,
+        clear_empty_wgrad_expert_outputs,
         block_m,
         backward_sym_buffer_ptrs, backward_rank,
         num_max_tokens_per_rank, num_topk,
         backward_grad_y, backward_topk_weights,
         backward_grad_route, token_src_metadata, route_weight_mode,
         grad_y_unweighted_output.value_or(grad_ye),
-        down_unweighted_output, grad_route_output);
+        down_unweighted_output, grad_route_output,
+        activation, situ_beta_opt, situ_linear_beta_opt,
+        inline_weight_dequant,
+        inline_residual_mxfp8_dgrad,
+        w2_dgrad_weights, w2_dgrad_weights_sf,
+        w13_dgrad_weights, w13_dgrad_weights_sf,
+        backward_x, kernel_trace,
+        inline_wgrad, accumulate_wgrad,
+        combined_grad_x_output, gate_up_prepared,
+        w2_wgrad_output, w13_wgrad_output);
 }
 
 // Legacy raw binding: preserve the original positional ABI and PRE_DOWN
@@ -107,11 +135,16 @@ static void fp8_fp4_mega_moe_backward_dgrad_swiglu(
         w13_weights_tuple, w13_dequant_scratch,
         expert_counts, grid_sync_counter, activation_limit,
         compute_w13_dgrad, block_m, direct_remote_grad_x,
-        write_grad_x_pool, clear_wgrad_padding,
+        write_grad_x_pool, clear_wgrad_padding, true,
         backward_grad_y, backward_topk_weights, std::nullopt,
         token_src_metadata, backward_sym_buffer_ptrs,
         backward_rank, num_max_tokens_per_rank, num_topk,
-        "pre_down", grad_ye, std::nullopt, std::nullopt);
+        "pre_down", grad_ye, std::nullopt, std::nullopt,
+        "swiglu", std::nullopt, std::nullopt, false,
+        false,
+        std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        std::nullopt, std::nullopt, false, false, std::nullopt,
+        false, std::nullopt, std::nullopt);
 }
 
 static void bf16_mega_moe_backward_dgrad_v2(
@@ -327,13 +360,15 @@ static void bf16_mega_moe_backward_w2(
     const torch::Tensor& h_weighted,
     const torch::Tensor& padded_expert_counts,
     const int& pool_block_m,
-    const std::string& route_weight_mode) {
+    const std::string& route_weight_mode,
+    const bool& with_accumulation) {
     DG_HOST_ASSERT(
         route_weight_mode == "pre_down" ||
         route_weight_mode == "post_down");
     deep_gemm::sm100_bf16_mega_moe_wgrad_1sm(
         grad_ye, h_weighted, grad_w2_output,
-        padded_expert_counts, pool_block_m);
+        padded_expert_counts, pool_block_m,
+        with_accumulation);
 }
 
 static void bf16_mega_moe_backward_w13(
@@ -341,10 +376,12 @@ static void bf16_mega_moe_backward_w13(
     const torch::Tensor& grad_gate_up,
     const torch::Tensor& x_pool,
     const torch::Tensor& padded_expert_counts,
-    const int& pool_block_m) {
+    const int& pool_block_m,
+    const bool& with_accumulation) {
     deep_gemm::sm100_bf16_mega_moe_wgrad_1sm(
         grad_gate_up, x_pool, grad_w13_output,
-        padded_expert_counts, pool_block_m);
+        padded_expert_counts, pool_block_m,
+        with_accumulation);
 }
 
 static MegaMoEBackwardCombineArgs make_backward_combine_args(
@@ -438,7 +475,8 @@ static void bf16_mega_moe_backward_w2_combine(
     const int& rank,
     const int& num_max_tokens_per_rank,
     const int& num_topk,
-    const std::string& route_weight_mode) {
+    const std::string& route_weight_mode,
+    const bool& with_accumulation) {
     DG_HOST_ASSERT(
         route_weight_mode == "pre_down" ||
         route_weight_mode == "post_down");
@@ -448,7 +486,8 @@ static void bf16_mega_moe_backward_w2_combine(
         static_cast<int>(padded_expert_counts.numel()), false);
     deep_gemm::sm100_bf16_mega_moe_wgrad_1sm(
         grad_ye, h_weighted, grad_w2_output,
-        padded_expert_counts, pool_block_m, combine);
+        padded_expert_counts, pool_block_m,
+        with_accumulation, combine);
 }
 
 static void bf16_mega_moe_backward_w13_combine(
@@ -464,7 +503,8 @@ static void bf16_mega_moe_backward_w13_combine(
     const int& num_max_tokens_per_rank,
     const int& num_topk,
     const std::optional<torch::Tensor>& topk_ids,
-    const std::string& combine_order_mode) {
+    const std::string& combine_order_mode,
+    const bool& with_accumulation) {
     const auto combine = make_backward_combine_args(
         grad_x_output, combine_buffer, sym_buffer_ptrs, rank,
         num_max_tokens_per_rank, num_topk,
@@ -472,7 +512,8 @@ static void bf16_mega_moe_backward_w13_combine(
         topk_ids, combine_order_mode);
     deep_gemm::sm100_bf16_mega_moe_wgrad_1sm(
         grad_gate_up, x_pool, grad_w13_output,
-        padded_expert_counts, pool_block_m, combine);
+        padded_expert_counts, pool_block_m,
+        with_accumulation, combine);
 }
 
 static void register_apis(pybind11::module_& m) {
@@ -495,6 +536,7 @@ static void register_apis(pybind11::module_& m) {
           py::arg("direct_remote_grad_x") = false,
           py::arg("write_grad_x_pool") = true,
           py::arg("clear_wgrad_padding") = true,
+          py::arg("clear_empty_wgrad_expert_outputs") = true,
           py::arg("backward_grad_y") = py::none(),
           py::arg("backward_topk_weights") = py::none(),
           py::arg("backward_grad_route") = py::none(),
@@ -507,7 +549,24 @@ static void register_apis(pybind11::module_& m) {
           py::arg("route_weight_mode") = "pre_down",
           py::arg("grad_y_unweighted_output") = py::none(),
           py::arg("down_unweighted_output") = py::none(),
-          py::arg("grad_route_output") = py::none());
+          py::arg("grad_route_output") = py::none(),
+          py::arg("activation") = "swiglu",
+          py::arg("situ_beta_opt") = py::none(),
+          py::arg("situ_linear_beta_opt") = py::none(),
+          py::arg("inline_weight_dequant") = false,
+          py::arg("inline_residual_mxfp8_dgrad") = false,
+          py::arg("w2_dgrad_weights") = py::none(),
+          py::arg("w2_dgrad_weights_sf") = py::none(),
+          py::arg("w13_dgrad_weights") = py::none(),
+          py::arg("w13_dgrad_weights_sf") = py::none(),
+          py::arg("backward_x") = py::none(),
+          py::arg("kernel_trace") = py::none(),
+          py::arg("inline_wgrad") = false,
+          py::arg("accumulate_wgrad") = false,
+          py::arg("combined_grad_x_output") = py::none(),
+          py::arg("gate_up_prepared") = false,
+          py::arg("w2_wgrad_output") = py::none(),
+          py::arg("w13_wgrad_output") = py::none());
     m.def("fp8_fp4_mega_moe_backward_dgrad_swiglu",
           &fp8_fp4_mega_moe_backward_dgrad_swiglu,
           py::arg("gate_up_output"), py::arg("grad_h_output"),
@@ -683,13 +742,15 @@ static void register_apis(pybind11::module_& m) {
           py::arg("h_weighted"),
           py::arg("padded_expert_counts"),
           py::arg("pool_block_m"),
-          py::arg("route_weight_mode") = "pre_down");
+          py::arg("route_weight_mode") = "pre_down",
+          py::arg("with_accumulation") = false);
     m.def("bf16_mega_moe_backward_w13",
           &bf16_mega_moe_backward_w13,
           py::arg("grad_w13_output"),
           py::arg("grad_gate_up"), py::arg("x_pool"),
           py::arg("padded_expert_counts"),
-          py::arg("pool_block_m"));
+          py::arg("pool_block_m"),
+          py::arg("with_accumulation") = false);
     m.def("bf16_mega_moe_backward_w2_combine",
           &bf16_mega_moe_backward_w2_combine,
           py::arg("grad_w2_output"),
@@ -701,7 +762,8 @@ static void register_apis(pybind11::module_& m) {
           py::arg("sym_buffer_ptrs"), py::arg("rank"),
           py::arg("num_max_tokens_per_rank"),
           py::arg("num_topk"),
-          py::arg("route_weight_mode") = "pre_down");
+          py::arg("route_weight_mode") = "pre_down",
+          py::arg("with_accumulation") = false);
     m.def("bf16_mega_moe_backward_w13_combine",
           &bf16_mega_moe_backward_w13_combine,
           py::arg("grad_w13_output"),
@@ -714,7 +776,8 @@ static void register_apis(pybind11::module_& m) {
           py::arg("num_max_tokens_per_rank"),
           py::arg("num_topk"),
           py::arg("topk_ids") = py::none(),
-          py::arg("combine_order_mode") = "fixed_topk");
+          py::arg("combine_order_mode") = "fixed_topk",
+          py::arg("with_accumulation") = false);
 #endif
 }
 

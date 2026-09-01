@@ -22,6 +22,8 @@ static std::string get_activation_type_name(const std::string& activation) {
         return "ActivationType::SwiGLU";
     if (activation == "geglu")
         return "ActivationType::GeGLU";
+    if (activation == "situ")
+        return "ActivationType::SiTU";
     DG_HOST_UNREACHABLE("Unsupported activation");
 }
 
@@ -43,11 +45,14 @@ public:
         int num_experts, num_topk;
         int num_ranks;
         float activation_clamp;
+        float situ_beta;
+        float situ_linear_beta;
         bool fast_math;
         std::string activation;
         bool save_l1_preact;
         std::string route_weight_mode;
         bool save_down_unweighted;
+        int l2_activation_group_size;
         MegaMoEConfig config;
 
         // Runtime arguments
@@ -91,10 +96,12 @@ static void __instantiate_kernel() {{
         {}, {},
         {},
         {},
+        {}, {},
         {},
         {},
         {}, {}, {},
         {}, {},
+        {},
         {},
         {},
         {},
@@ -119,10 +126,13 @@ static void __instantiate_kernel() {{
     to_string(args.activation_clamp),
     args.fast_math ? "true" : "false",
     get_activation_type_name(args.activation),
+    to_string(args.situ_beta),
+    to_string(args.situ_linear_beta),
     args.save_l1_preact ? "true" : "false",
     get_fp8_fp4_route_weight_mode_name(
         args.route_weight_mode),
-    args.save_down_unweighted ? "true" : "false");
+    args.save_down_unweighted ? "true" : "false",
+    args.l2_activation_group_size == 128 ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -164,9 +174,12 @@ static void sm100_fp8_fp4_mega_moe(
     const int& hidden, const int& intermediate_hidden,
     const std::string& activation,
     const float& activation_clamp,
+    const float& situ_beta,
+    const float& situ_linear_beta,
     const bool& fast_math,
     const std::string& route_weight_mode,
-    const std::optional<torch::Tensor>& saved_down_unweighted
+    const std::optional<torch::Tensor>& saved_down_unweighted,
+    const int& l2_activation_group_size
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -179,7 +192,8 @@ static void sm100_fp8_fp4_mega_moe(
         num_max_tokens_per_rank, num_config_tokens, num_topk,
         hidden, intermediate_hidden,
         num_ring_tokens, num_sf_ring_tokens,
-        MmaKind::MXFP8FP4);
+        MmaKind::MXFP8FP4,
+        l2_activation_group_size);
     const auto num_max_pool_tokens =
         layout::get_num_max_pool_tokens(
             num_ranks, num_max_tokens_per_rank, num_topk,
@@ -187,14 +201,26 @@ static void sm100_fp8_fp4_mega_moe(
     if (saved_l1_preact.has_value()) {
         DG_HOST_ASSERT(saved_l1_preact->scalar_type() == torch::kBFloat16);
         DG_HOST_ASSERT(saved_l1_preact->is_contiguous());
-        DG_HOST_ASSERT(saved_l1_preact->sizes() ==
-                       torch::IntArrayRef(
-                           {num_max_pool_tokens,
-                            2 * intermediate_hidden}));
+        DG_HOST_ASSERT(saved_l1_preact->dim() == 2);
+        DG_HOST_ASSERT(saved_l1_preact->size(1) ==
+                       2 * intermediate_hidden);
+        DG_HOST_ASSERT(saved_l1_preact->size(0) > 0);
+        DG_HOST_ASSERT(saved_l1_preact->size(0) %
+                       config.block_m == 0);
+        DG_HOST_ASSERT(saved_l1_preact->size(0) <=
+                       num_max_pool_tokens);
     }
     DG_HOST_ASSERT(
         route_weight_mode == "pre_down" ||
         route_weight_mode == "post_down");
+    DG_HOST_ASSERT(
+        l2_activation_group_size == 32 ||
+        l2_activation_group_size == 128);
+    if (saved_l1_preact.has_value() &&
+        saved_down_unweighted.has_value()) {
+        DG_HOST_ASSERT(saved_l1_preact->size(0) ==
+                       saved_down_unweighted->size(0));
+    }
     if (saved_down_unweighted.has_value()) {
         DG_HOST_ASSERT(
             saved_down_unweighted->scalar_type() ==
@@ -208,9 +234,8 @@ static void sm100_fp8_fp4_mega_moe(
                 config.block_m == 0);
         DG_HOST_ASSERT(
             saved_down_unweighted->size(0) <=
-            num_max_pool_tokens);
+                       num_max_pool_tokens);
     }
-
     // Make tensormap
     constexpr int kGranK = 32;
     const int sf_smem_outer_dim = config.block_k / (kGranK * 4);
@@ -286,12 +311,15 @@ static void sm100_fp8_fp4_mega_moe(
         .num_experts = num_experts, .num_topk = num_topk,
         .num_ranks = num_ranks,
         .activation_clamp = activation_clamp,
+        .situ_beta = situ_beta,
+        .situ_linear_beta = situ_linear_beta,
         .fast_math = fast_math,
         .activation = activation,
         .save_l1_preact = saved_l1_preact.has_value(),
         .route_weight_mode = route_weight_mode,
         .save_down_unweighted =
             saved_down_unweighted.has_value(),
+        .l2_activation_group_size = l2_activation_group_size,
         .config = config,
         .y = y.data_ptr(),
         .saved_l1_preact = saved_l1_preact.has_value()
@@ -302,6 +330,8 @@ static void sm100_fp8_fp4_mega_moe(
         .num_saved_pool_tokens =
             saved_down_unweighted.has_value()
             ? static_cast<int>(saved_down_unweighted->size(0))
+            : saved_l1_preact.has_value()
+            ? static_cast<int>(saved_l1_preact->size(0))
             : num_max_pool_tokens,
         .sym_buffer_ptrs = layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
         .tensor_map_l1_acts = tensor_map_l1_acts,
