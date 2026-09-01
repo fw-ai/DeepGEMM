@@ -385,6 +385,9 @@ public:
         bool direct_remote_grad_x;
         const int* expert_counts;
         cutlass::bfloat16_t* grad_x_pool;
+        const cutlass::bfloat16_t* side_grad_x_scratch1;
+        const cutlass::bfloat16_t* side_grad_x_scratch3;
+        float side_lora_scale;
         const layout::TokenSrcMetadata* token_src_metadata;
         cutlass::bfloat16_t* combine_buffer;
         layout::SymBuffer<> sym_buffer;
@@ -415,6 +418,8 @@ static void __instantiate_kernel() {{
         Args args) {
         DG_CUDA_UNIFIED_CHECK(launch_kernel(
             kernel, config, args.expert_counts, args.grad_x_pool,
+            args.side_grad_x_scratch1, args.side_grad_x_scratch3,
+            args.side_lora_scale,
             args.token_src_metadata, args.combine_buffer,
             args.sym_buffer, args.workspace, args.num_pool_rows,
             args.num_topk));
@@ -1284,25 +1289,6 @@ static void sm100_bf16_mega_moe_side_lora_backward(
     sm100_bf16_mega_moe_side_lora_shared_gemm(
         t3, a3_nt, side_grad_x_scratch3,
         num_pool_rows, hidden, side_lora_rank, "nk");
-    const SM100BF16MegaMoESideLoraAxpy2Runtime::Args axpy2_args{
-        .num_sms = num_sms,
-        .dst = reinterpret_cast<cutlass::bfloat16_t*>(
-            grad_x_pool_output.data_ptr<at::BFloat16>()),
-        .src1 = reinterpret_cast<const cutlass::bfloat16_t*>(
-            side_grad_x_scratch1.data_ptr<at::BFloat16>()),
-        .src3 = reinterpret_cast<const cutlass::bfloat16_t*>(
-            side_grad_x_scratch3.data_ptr<at::BFloat16>()),
-        .num_elements = static_cast<uint64_t>(num_pool_rows) * hidden,
-        .scale = side_lora_scale,
-        .launch_args = LaunchArgs(num_sms, 256, 0, 1),
-    };
-    const auto axpy2_code =
-        SM100BF16MegaMoESideLoraAxpy2Runtime::generate(axpy2_args);
-    const auto axpy2_runtime = compiler->build(
-        "sm100_bf16_mega_moe_side_lora_axpy2_grad_x", axpy2_code);
-    SM100BF16MegaMoESideLoraAxpy2Runtime::launch(
-        axpy2_runtime, axpy2_args);
-
     const SM100BF16MegaMoESideLoraGradXRuntime::Args grad_x_args{
         .hidden = hidden,
         .num_experts = num_experts,
@@ -1314,6 +1300,11 @@ static void sm100_bf16_mega_moe_side_lora_backward(
         .expert_counts = expert_counts.data_ptr<int>(),
         .grad_x_pool = reinterpret_cast<cutlass::bfloat16_t*>(
             grad_x_pool_output.data_ptr<at::BFloat16>()),
+        .side_grad_x_scratch1 = reinterpret_cast<const cutlass::bfloat16_t*>(
+            side_grad_x_scratch1.data_ptr<at::BFloat16>()),
+        .side_grad_x_scratch3 = reinterpret_cast<const cutlass::bfloat16_t*>(
+            side_grad_x_scratch3.data_ptr<at::BFloat16>()),
+        .side_lora_scale = side_lora_scale,
         .token_src_metadata = reinterpret_cast<
             const layout::TokenSrcMetadata*>(
             token_src_metadata.data_ptr<int>()),
@@ -2084,25 +2075,6 @@ static void sm100_fp8_fp4_mega_moe_side_lora_backward(
     sm100_bf16_mega_moe_side_lora_shared_gemm(
         t3, a3_nt, side_grad_x_scratch3,
         num_pool_rows, hidden, side_lora_rank, "nk");
-    const SM100BF16MegaMoESideLoraAxpy2Runtime::Args axpy2_args{
-        .num_sms = num_sms,
-        .dst = reinterpret_cast<cutlass::bfloat16_t*>(
-            grad_x_pool_output.data_ptr<at::BFloat16>()),
-        .src1 = reinterpret_cast<const cutlass::bfloat16_t*>(
-            side_grad_x_scratch1.data_ptr<at::BFloat16>()),
-        .src3 = reinterpret_cast<const cutlass::bfloat16_t*>(
-            side_grad_x_scratch3.data_ptr<at::BFloat16>()),
-        .num_elements = static_cast<uint64_t>(num_pool_rows) * hidden,
-        .scale = side_lora_scale,
-        .launch_args = LaunchArgs(num_sms, 256, 0, 1),
-    };
-    const auto axpy2_code =
-        SM100BF16MegaMoESideLoraAxpy2Runtime::generate(axpy2_args);
-    const auto axpy2_runtime = compiler->build(
-        "sm100_fp8_fp4_mega_moe_side_lora_axpy2_grad_x", axpy2_code);
-    SM100BF16MegaMoESideLoraAxpy2Runtime::launch(
-        axpy2_runtime, axpy2_args);
-
     const SM100BF16MegaMoESideLoraGradXRuntime::Args grad_x_args{
         .hidden = hidden,
         .num_experts = num_experts,
@@ -2114,6 +2086,11 @@ static void sm100_fp8_fp4_mega_moe_side_lora_backward(
         .expert_counts = expert_counts.data_ptr<int>(),
         .grad_x_pool = reinterpret_cast<cutlass::bfloat16_t*>(
             grad_x_pool_output.data_ptr<at::BFloat16>()),
+        .side_grad_x_scratch1 = reinterpret_cast<const cutlass::bfloat16_t*>(
+            side_grad_x_scratch1.data_ptr<at::BFloat16>()),
+        .side_grad_x_scratch3 = reinterpret_cast<const cutlass::bfloat16_t*>(
+            side_grad_x_scratch3.data_ptr<at::BFloat16>()),
+        .side_lora_scale = side_lora_scale,
         .token_src_metadata = !backward_sym_buffer_ptrs.empty()
             ? reinterpret_cast<const layout::TokenSrcMetadata*>(
                   token_src_metadata->data_ptr<int>())

@@ -1310,6 +1310,9 @@ template <
 CUTLASS_GLOBAL void sm100_bf16_mega_moe_side_lora_grad_x_impl(
     const int* expert_counts,
     cutlass::bfloat16_t* grad_x_pool,
+    const cutlass::bfloat16_t* side_grad_x_scratch1,
+    const cutlass::bfloat16_t* side_grad_x_scratch3,
+    const float side_lora_scale,
     const layout::TokenSrcMetadata* token_src_metadata,
     cutlass::bfloat16_t* combine_buffer,
     const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
@@ -1319,6 +1322,12 @@ CUTLASS_GLOBAL void sm100_bf16_mega_moe_side_lora_grad_x_impl(
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)) || defined(__CLION_IDE__)
     using bf16 = cutlass::bfloat16_t;
     constexpr uint32_t kOutputTileN = 128;
+    constexpr uint32_t kVectorElems = sizeof(uint4) / sizeof(bf16);
+    union alignas(16) BF16x8 {
+        uint4 packed;
+        bf16 element[kVectorElems];
+    };
+    const float2 scale2{side_lora_scale, side_lora_scale};
 
     if constexpr (kDirectRemoteGradX) {
         // The direct-write planes previously held grad-y. Valid routes are
@@ -1326,7 +1335,6 @@ CUTLASS_GLOBAL void sm100_bf16_mega_moe_side_lora_grad_x_impl(
         // would otherwise leak that stale value into the final combine.
         // Clear every local fixed-slot plane, then synchronize before any
         // peer publishes its valid routes into this rank's symmetric plane.
-        constexpr uint32_t kVectorElems = sizeof(uint4) / sizeof(bf16);
         const uint64_t num_vectors =
             static_cast<uint64_t>(workspace.num_max_tokens_per_rank) *
             num_topk * kHidden / kVectorElems;
@@ -1369,7 +1377,6 @@ CUTLASS_GLOBAL void sm100_bf16_mega_moe_side_lora_grad_x_impl(
              local_tile += gridDim.x) {
             const uint32_t m_block = local_tile / num_n_blocks;
             const uint32_t n_block = local_tile - m_block * num_n_blocks;
-            constexpr uint32_t kVectorElems = sizeof(uint4) / sizeof(bf16);
             constexpr uint32_t kVectorsPerTile =
                 kOutputTileN / kVectorElems;
             for (uint32_t linear = threadIdx.x;
@@ -1387,9 +1394,36 @@ CUTLASS_GLOBAL void sm100_bf16_mega_moe_side_lora_grad_x_impl(
                     continue;
                 const uint32_t hidden_col = n_block * kOutputTileN +
                     local_vector * kVectorElems;
-                const auto value = *reinterpret_cast<const uint4*>(
-                    grad_x_pool +
-                    static_cast<uint64_t>(pool_row) * kHidden + hidden_col);
+                const uint64_t element_offset =
+                    static_cast<uint64_t>(pool_row) * kHidden + hidden_col;
+                BF16x8 value, side1, side3;
+                value.packed = *reinterpret_cast<const uint4*>(
+                    grad_x_pool + element_offset);
+                side1.packed = *reinterpret_cast<const uint4*>(
+                    side_grad_x_scratch1 + element_offset);
+                side3.packed = *reinterpret_cast<const uint4*>(
+                    side_grad_x_scratch3 + element_offset);
+                auto* value2 = reinterpret_cast<nv_bfloat162*>(&value.packed);
+                const auto* side12 =
+                    reinterpret_cast<const nv_bfloat162*>(&side1.packed);
+                const auto* side32 =
+                    reinterpret_cast<const nv_bfloat162*>(&side3.packed);
+                #pragma unroll
+                for (int i = 0; i < kVectorElems / 2; ++i) {
+                    const auto scaled1 = __float22bfloat162_rn(
+                        __fmul2_rn(scale2, __bfloat1622float2(side12[i])));
+                    const auto scaled3 = __float22bfloat162_rn(
+                        __fmul2_rn(scale2, __bfloat1622float2(side32[i])));
+                    value2[i] = __float22bfloat162_rn(__fadd2_rn(
+                        __fadd2_rn(
+                            __bfloat1622float2(value2[i]),
+                            __bfloat1622float2(scaled1)),
+                        __bfloat1622float2(scaled3)));
+                }
+                if constexpr (kWriteGradXPool) {
+                    *reinterpret_cast<uint4*>(grad_x_pool + element_offset) =
+                        value.packed;
+                }
                 if constexpr (kDirectRemoteGradX) {
                     const auto metadata = token_src_metadata[pool_row];
                     auto* local_dst = combine_buffer +
@@ -1399,7 +1433,8 @@ CUTLASS_GLOBAL void sm100_bf16_mega_moe_side_lora_grad_x_impl(
                              kHidden +
                          hidden_col);
                     *reinterpret_cast<uint4*>(
-                        sym_buffer.map(local_dst, metadata.rank_idx)) = value;
+                        sym_buffer.map(local_dst, metadata.rank_idx)) =
+                        value.packed;
                 }
             }
         }
@@ -1427,6 +1462,7 @@ CUTLASS_GLOBAL void sm100_bf16_mega_moe_side_lora_axpy2_impl(
         uint4 packed;
         bf16 element[8];
     };
+    const float2 scale2{scale, scale};
     constexpr uint64_t kVectorElems = 8;
     const uint64_t num_vectors = num_elements / kVectorElems;
     for (uint64_t vector_idx =
@@ -1437,13 +1473,20 @@ CUTLASS_GLOBAL void sm100_bf16_mega_moe_side_lora_axpy2_impl(
         d.packed = reinterpret_cast<const uint4*>(dst)[vector_idx];
         s1.packed = reinterpret_cast<const uint4*>(src1)[vector_idx];
         s3.packed = reinterpret_cast<const uint4*>(src3)[vector_idx];
+        auto* d2 = reinterpret_cast<nv_bfloat162*>(&d.packed);
+        const auto* s12 = reinterpret_cast<const nv_bfloat162*>(&s1.packed);
+        const auto* s32 = reinterpret_cast<const nv_bfloat162*>(&s3.packed);
         #pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            const bf16 side1(scale * static_cast<float>(s1.element[i]));
-            const bf16 side3(scale * static_cast<float>(s3.element[i]));
-            d.element[i] = bf16(
-                static_cast<float>(d.element[i]) +
-                static_cast<float>(side1) + static_cast<float>(side3));
+        for (int i = 0; i < 4; ++i) {
+            const auto side1 = __float22bfloat162_rn(
+                __fmul2_rn(scale2, __bfloat1622float2(s12[i])));
+            const auto side3 = __float22bfloat162_rn(
+                __fmul2_rn(scale2, __bfloat1622float2(s32[i])));
+            d2[i] = __float22bfloat162_rn(__fadd2_rn(
+                __fadd2_rn(
+                    __bfloat1622float2(d2[i]),
+                    __bfloat1622float2(side1)),
+                __bfloat1622float2(side3)));
         }
         reinterpret_cast<uint4*>(dst)[vector_idx] = d.packed;
     }
@@ -1515,9 +1558,9 @@ CUTLASS_GLOBAL void sm100_bf16_mega_moe_side_lora_scale_grads_impl(
 }
 
 template <uint32_t kHidden, uint32_t kIntermediateHidden>
-CUTLASS_DEVICE void sm100_bf16_mega_moe_side_lora_clear_padding_element(
+CUTLASS_DEVICE void sm100_bf16_mega_moe_side_lora_clear_padding_vector(
     const uint32_t pool_row,
-    const uint32_t column,
+    const uint32_t vector_column,
     cutlass::bfloat16_t* saved_h,
     cutlass::bfloat16_t* q13,
     cutlass::bfloat16_t* q2,
@@ -1525,40 +1568,51 @@ CUTLASS_DEVICE void sm100_bf16_mega_moe_side_lora_clear_padding_element(
     cutlass::bfloat16_t* t2,
     cutlass::bfloat16_t* x_pool,
     cutlass::bfloat16_t* grad_ye) {
-    if (column < kIntermediateHidden) {
-        saved_h[static_cast<uint64_t>(pool_row) * kIntermediateHidden +
-                column] = cutlass::bfloat16_t(0.0f);
+    constexpr uint32_t kVectorElems = sizeof(uint4) / sizeof(cutlass::bfloat16_t);
+    constexpr uint32_t kIntermediateVectors =
+        kIntermediateHidden / kVectorElems;
+    constexpr uint32_t kRankVectors = 128 / kVectorElems;
+    constexpr uint32_t kRankPairVectors = 256 / kVectorElems;
+    constexpr uint32_t kHiddenVectors = kHidden / kVectorElems;
+    const uint4 zero{};
+    if (vector_column < kIntermediateVectors) {
+        reinterpret_cast<uint4*>(saved_h)[
+            static_cast<uint64_t>(pool_row) * kIntermediateVectors +
+            vector_column] = zero;
         return;
     }
-    uint32_t remaining = column - kIntermediateHidden;
-    const uint64_t rank_row = static_cast<uint64_t>(pool_row) * 128;
-    const uint64_t rank_pair_row = static_cast<uint64_t>(pool_row) * 256;
-    if (remaining < 256) {
-        q13[rank_pair_row + remaining] = cutlass::bfloat16_t(0.0f);
+    uint32_t remaining = vector_column - kIntermediateVectors;
+    const uint64_t rank_row =
+        static_cast<uint64_t>(pool_row) * kRankVectors;
+    const uint64_t rank_pair_row =
+        static_cast<uint64_t>(pool_row) * kRankPairVectors;
+    if (remaining < kRankPairVectors) {
+        reinterpret_cast<uint4*>(q13)[rank_pair_row + remaining] = zero;
         return;
     }
-    remaining -= 256;
-    if (remaining < 128) {
-        q2[rank_row + remaining] = cutlass::bfloat16_t(0.0f);
+    remaining -= kRankPairVectors;
+    if (remaining < kRankVectors) {
+        reinterpret_cast<uint4*>(q2)[rank_row + remaining] = zero;
         return;
     }
-    remaining -= 128;
-    if (remaining < 256) {
-        t13[rank_pair_row + remaining] = cutlass::bfloat16_t(0.0f);
+    remaining -= kRankVectors;
+    if (remaining < kRankPairVectors) {
+        reinterpret_cast<uint4*>(t13)[rank_pair_row + remaining] = zero;
         return;
     }
-    remaining -= 256;
-    if (remaining < 128) {
-        t2[rank_row + remaining] = cutlass::bfloat16_t(0.0f);
+    remaining -= kRankPairVectors;
+    if (remaining < kRankVectors) {
+        reinterpret_cast<uint4*>(t2)[rank_row + remaining] = zero;
         return;
     }
-    remaining -= 128;
-    const uint64_t hidden_row = static_cast<uint64_t>(pool_row) * kHidden;
-    if (remaining < kHidden) {
-        x_pool[hidden_row + remaining] = cutlass::bfloat16_t(0.0f);
+    remaining -= kRankVectors;
+    const uint64_t hidden_row =
+        static_cast<uint64_t>(pool_row) * kHiddenVectors;
+    if (remaining < kHiddenVectors) {
+        reinterpret_cast<uint4*>(x_pool)[hidden_row + remaining] = zero;
     } else {
-        grad_ye[hidden_row + remaining - kHidden] =
-            cutlass::bfloat16_t(0.0f);
+        reinterpret_cast<uint4*>(grad_ye)[
+            hidden_row + remaining - kHiddenVectors] = zero;
     }
 }
 
@@ -1581,29 +1635,35 @@ CUTLASS_GLOBAL void sm100_bf16_mega_moe_side_lora_clear_padding_impl(
     // complete block-padded route pool.  Clearing only one operand is not
     // sufficient: IEEE 0 * NaN still produces NaN, so allocator contents in
     // the other operand can poison a shared A1/A3/B2 reduction.
-    constexpr uint32_t kRankStorage = 6 * 128;
-    constexpr uint32_t kHiddenStorage = 2 * kHidden;
-    constexpr uint32_t kRowStorage =
-        kIntermediateHidden + kRankStorage + kHiddenStorage;
+    constexpr uint32_t kVectorElems =
+        sizeof(uint4) / sizeof(cutlass::bfloat16_t);
+    static_assert(kHidden % kVectorElems == 0);
+    static_assert(kIntermediateHidden % kVectorElems == 0);
+    constexpr uint32_t kRankStorageVectors = 6 * 128 / kVectorElems;
+    constexpr uint32_t kHiddenStorageVectors =
+        2 * kHidden / kVectorElems;
+    constexpr uint32_t kRowStorageVectors =
+        kIntermediateHidden / kVectorElems + kRankStorageVectors +
+        kHiddenStorageVectors;
     uint32_t pool_offset = 0;
     for (uint32_t expert = 0; expert < kNumExperts; ++expert) {
         const uint32_t count = static_cast<uint32_t>(
             __ldg(expert_counts + expert));
         const uint32_t capacity = math::ceil_div(count, BLOCK_M) * BLOCK_M;
         const uint32_t padding = capacity - count;
-        const uint64_t elements =
-            static_cast<uint64_t>(padding) * kRowStorage;
+        const uint64_t vectors =
+            static_cast<uint64_t>(padding) * kRowStorageVectors;
         for (uint64_t linear =
                  static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-             linear < elements;
+             linear < vectors;
              linear += static_cast<uint64_t>(kNumSMs) * blockDim.x) {
-            const uint32_t padding_row = linear / kRowStorage;
-            const uint32_t column = linear -
-                static_cast<uint64_t>(padding_row) * kRowStorage;
+            const uint32_t padding_row = linear / kRowStorageVectors;
+            const uint32_t vector_column = linear -
+                static_cast<uint64_t>(padding_row) * kRowStorageVectors;
             const uint32_t pool_row = pool_offset + count + padding_row;
-            sm100_bf16_mega_moe_side_lora_clear_padding_element<
+            sm100_bf16_mega_moe_side_lora_clear_padding_vector<
                 kHidden, kIntermediateHidden>(
-                    pool_row, column, saved_h, q13, q2, t13, t2,
+                    pool_row, vector_column, saved_h, q13, q2, t13, t2,
                     x_pool, grad_ye);
         }
         pool_offset += capacity;
@@ -1611,19 +1671,20 @@ CUTLASS_GLOBAL void sm100_bf16_mega_moe_side_lora_clear_padding_impl(
     // Distributed buffers are sized to the maximum route-pool length across
     // ranks. A sparse rank can therefore have a whole unowned suffix beyond
     // its final local expert; shared wgrads still reduce across that suffix.
-    const uint64_t suffix_elements =
-        static_cast<uint64_t>(num_pool_rows - pool_offset) * kRowStorage;
+    const uint64_t suffix_vectors =
+        static_cast<uint64_t>(num_pool_rows - pool_offset) *
+        kRowStorageVectors;
     for (uint64_t linear =
              static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-         linear < suffix_elements;
+         linear < suffix_vectors;
          linear += static_cast<uint64_t>(kNumSMs) * blockDim.x) {
-        const uint32_t suffix_row = linear / kRowStorage;
-        const uint32_t column = linear -
-            static_cast<uint64_t>(suffix_row) * kRowStorage;
-        sm100_bf16_mega_moe_side_lora_clear_padding_element<
+        const uint32_t suffix_row = linear / kRowStorageVectors;
+        const uint32_t vector_column = linear -
+            static_cast<uint64_t>(suffix_row) * kRowStorageVectors;
+        sm100_bf16_mega_moe_side_lora_clear_padding_vector<
             kHidden, kIntermediateHidden>(
-                pool_offset + suffix_row, column, saved_h, q13, q2, t13,
-                t2, x_pool, grad_ye);
+                pool_offset + suffix_row, vector_column, saved_h, q13, q2,
+                t13, t2, x_pool, grad_ye);
     }
 #endif
 }
