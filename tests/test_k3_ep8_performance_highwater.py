@@ -152,6 +152,17 @@ def test_historical_short_length_frontier_is_immutable_and_qualified() -> None:
             len(digest) == 64 for digest in record["receipts"].values()
         )
 
+    four_k = frontier["4096"]
+    assert four_k["source_status"] == (
+        "raw_receipt_without_same_run_source_provenance"
+    )
+    assert "source_artifacts" not in four_k
+    replay_seed = four_k["reconstructed_replay_seed"]
+    assert replay_seed["relationship"] == (
+        "post_hoc_reconstruction_not_same_run_identity"
+    )
+    assert len(replay_seed["deep_gemm_commit"]) == 40
+
 
 def test_replay_identity_covers_benchmark_integration_and_runtime() -> None:
     """Require every non-DeepGEMM replay component to have a pinned identity."""
