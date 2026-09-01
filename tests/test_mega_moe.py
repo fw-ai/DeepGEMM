@@ -20,6 +20,68 @@ from deep_gemm.utils.dist import dist_print, init_dist, uneven_all_gather
 from deep_gemm.testing import bench_kineto, calc_diff
 
 
+def test_mxfp4_sf_ring_sizing_tracks_reachable_block_regimes():
+    def align(value, alignment):
+        return (value + alignment - 1) // alignment * alignment
+
+    def block_m(tokens, ranks, topk, experts):
+        expected = tokens * ranks * topk / experts
+        if expected <= 8.5:
+            return 16
+        if expected <= 16.5:
+            return 32
+        if expected <= 32.5:
+            return 64
+        if expected <= 64.5:
+            return 96
+        if expected <= 96.5:
+            return 128
+        return 192
+
+    def brute_force(ranks, experts, max_tokens, topk, ring_tokens):
+        experts_per_rank = experts // ranks
+        required = 0
+        for tokens in range(max_tokens + 1):
+            selected_block_m = block_m(tokens, ranks, topk, experts)
+            live_pool_tokens = align(
+                ranks * tokens * min(topk, experts_per_rank)
+                + experts_per_rank * (192 - 1),
+                384,
+            )
+            reachable_ring_tokens = min(ring_tokens, live_pool_tokens)
+            sf_block_m = align(selected_block_m, 128)
+            required = max(
+                required,
+                reachable_ring_tokens // selected_block_m * sf_block_m,
+            )
+        return required
+
+    shapes = (
+        # DSV4-Flash EP4, 262K global tokens: one expert per wave.
+        (4, 256, 65_664, 6, 262_656),
+        # The old generic prefill ring at the same production shape.
+        (4, 256, 65_664, 6, 786_432),
+        # A small-batch shape exercises every compact BLOCK_M regime.
+        (8, 256, 1_152, 6, 9_216),
+    )
+    for shape in shapes:
+        actual = (
+            deep_gemm._C.get_num_max_required_sf_ring_tokens_for_mega_moe(
+                *shape
+            )
+        )
+        assert actual == brute_force(*shape)
+        legacy_worst_case = shape[-1] // 8 * 128
+        assert actual < legacy_worst_case
+
+    assert (
+        deep_gemm._C.get_num_max_required_sf_ring_tokens_for_mega_moe(
+            *shapes[0]
+        )
+        == 350_208
+    )
+
+
 def test_fp8_backward_canonicalizes_block_m_and_clears_padding(
     monkeypatch,
 ):

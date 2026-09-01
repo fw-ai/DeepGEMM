@@ -90,14 +90,13 @@ get_symm_buffer_size_for_mega_moe_v2(
         input_topk_weights_layout, 1, num_max_tokens_per_rank,
         input_topk_idx_buffer.get_end_ptr());
 
-    // Padded SF pool tokens
-    int num_sf_ring_tokens = 0;
-    for (int block_m: layout::kCandidateBlockM) {
-        num_sf_ring_tokens = std::max(
-            num_sf_ring_tokens,
-            layout::get_num_sf_ring_tokens(num_ring_tokens, block_m)
-        );
-    }
+    // Padded SF pool tokens. Small BLOCK_M configurations are reachable only
+    // for small live batches, so they cannot consume every block in a large
+    // token ring. Size across the live-token regimes selected by the kernel.
+    const int num_sf_ring_tokens = with_sf ?
+        get_num_max_required_sf_ring_tokens_for_mega_moe(
+            num_ranks, num_experts, num_max_tokens_per_rank,
+            num_topk, num_ring_tokens) : 0;
 
     // L1 input buffer
     const auto l1_token_buffer = layout::Buffer(
@@ -865,6 +864,8 @@ static void register_apis(pybind11::module_& m) {
 #if DG_TENSORMAP_COMPATIBLE
     m.def("get_token_alignment_for_mega_moe", &get_token_alignment_for_mega_moe);
     m.def("get_ring_limit_for_mega_moe", &get_ring_limit_for_mega_moe);
+    m.def("get_num_max_required_sf_ring_tokens_for_mega_moe",
+          &get_num_max_required_sf_ring_tokens_for_mega_moe);
     m.def("get_symm_buffer_size_for_mega_moe", &get_symm_buffer_size_for_mega_moe);
     m.def("get_symm_buffer_size_for_mega_moe_v2",
           &get_symm_buffer_size_for_mega_moe_v2);

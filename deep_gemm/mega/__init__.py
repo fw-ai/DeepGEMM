@@ -45,6 +45,12 @@ class SymmBuffer:
         self.hidden = hidden
         self.intermediate_hidden = intermediate_hidden
         self.num_ring_tokens = num_ring_tokens
+        self.num_sf_ring_tokens = (
+            _C.get_num_max_required_sf_ring_tokens_for_mega_moe(
+                group.size(), num_experts, num_max_tokens_per_rank,
+                num_topk, num_ring_tokens)
+            if mma_type == 'fp8xfp4' else 0
+        )
 
         # Allocate a symmetric buffer
         num_bytes, slice_input_buffers = \

@@ -1062,6 +1062,7 @@ def run_mxfp4_correctness(local_rank: int, world: int, args) -> None:
         first_grad_x = result.grad_x.detach().clone()
         first_grad_route = buffer.backward_grad_route[:tokens, :topk].clone()
         first_metadata = buffer.token_src_metadata[:pool_rows].clone()
+        first_side_y = y.detach().clone()
 
         # Repeat backward without changing any saved forward boundary. This
         # isolates the new side-LoRA backward from MegaMoE's dispatch order.
@@ -1108,6 +1109,7 @@ def run_mxfp4_correctness(local_rank: int, world: int, args) -> None:
                 .mean()
                 .item()
             ),
+            "output": _accuracy(y, first_side_y),
             "adapter_grads": [
                 _accuracy(actual, expected)
                 for actual, expected in zip(
@@ -1167,6 +1169,7 @@ def run_mxfp4_correctness(local_rank: int, world: int, args) -> None:
         assert fixed_boundary["grad_x"]["relative_l2"] == 0.0, fixed_boundary
         assert fixed_boundary["grad_route"]["relative_l2"] == 0.0, fixed_boundary
         assert repeatability["ordinary_megamoe_forward"]["output"]["relative_l2"] == 0.0
+        assert side_forward_backward_repeatability["output"]["relative_l2"] == 0.0
         assert max(
             metric["relative_l2"]
             for metric in side_forward_backward_repeatability["adapter_grads"]
