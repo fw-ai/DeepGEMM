@@ -841,17 +841,20 @@ def run_mxfp4_correctness(local_rank: int, world: int, args) -> None:
         else:
             raise AssertionError(
                 "short saved_down_unweighted was not rejected")
-    result = deep_gemm.fp8_fp4_mega_moe_side_lora_backward(
-        saved_gate_up, saved_h, saved_down, q13, q2, side,
-        buffer.l1_acts[:pool_rows], buffer.l1_acts_sf,
-        transformed_w13, backward_w13, backward_w2,
-        w13_dequant_scratch, w2_dequant_scratch,
-        counts, padded, grad_y, buffer, block_m,
-        activation_limit=args.activation_limit,
-        activation=args.activation,
-        fast_math=False,
-        route_weight_mode=args.route_weight_mode,
-        side_lora_scale=args.scale, direct_remote_grad_x=ranks > 1)
+    def run_side_backward():
+        return deep_gemm.fp8_fp4_mega_moe_side_lora_backward(
+            saved_gate_up, saved_h, saved_down, q13, q2, side,
+            buffer.l1_acts[:pool_rows], buffer.l1_acts_sf,
+            transformed_w13, backward_w13, backward_w2,
+            w13_dequant_scratch, w2_dequant_scratch,
+            counts, padded, grad_y, buffer, block_m,
+            activation_limit=args.activation_limit,
+            activation=args.activation,
+            fast_math=False,
+            route_weight_mode=args.route_weight_mode,
+            side_lora_scale=args.scale, direct_remote_grad_x=ranks > 1)
+
+    result = run_side_backward()
     torch.cuda.synchronize()
 
     expected_grads = [tensor.grad for tensor in adapter_ref]
@@ -1024,6 +1027,122 @@ def run_mxfp4_correctness(local_rank: int, world: int, args) -> None:
         metric["cosine_similarity"]
         for metric in native_boundary_adapter_accuracy
     ) > 0.9999, native_boundary_adapter_accuracy
+    repeatability = None
+    if args.check_repeatability:
+        first_adapter_grads = tuple(
+            grad.detach().clone() for grad in result.grad_side_lora)
+        first_grad_x = result.grad_x.detach().clone()
+        first_grad_route = buffer.backward_grad_route[:tokens, :topk].clone()
+        first_metadata = buffer.token_src_metadata[:pool_rows].clone()
+
+        # Repeat backward without changing any saved forward boundary. This
+        # isolates the new side-LoRA backward from MegaMoE's dispatch order.
+        fixed_boundary_result = run_side_backward()
+        fixed_boundary = {
+            "adapter_grads": [
+                _accuracy(actual, expected)
+                for actual, expected in zip(
+                    fixed_boundary_result.grad_side_lora,
+                    first_adapter_grads,
+                    strict=True,
+                )
+            ],
+            "grad_x": _accuracy(fixed_boundary_result.grad_x, first_grad_x),
+            "grad_route": _accuracy(
+                buffer.backward_grad_route[:tokens, :topk],
+                first_grad_route,
+            ),
+        }
+
+        # Repeat the entire native forward and backward with identical source
+        # tensors and routes. Any additional drift includes MegaMoE dispatch
+        # row assignment and is not owned by the backward contractions alone.
+        buffer.x[:tokens].copy_(x_fp8[0])
+        buffer.x_sf[:tokens].copy_(x_fp8[1])
+        buffer.topk_idx[:tokens].copy_(topk_idx)
+        buffer.topk_weights[:tokens].copy_(topk_weights)
+        deep_gemm.fp8_fp4_mega_moe_side_lora(
+            y, transformed_w13, transformed_w2, buffer,
+            side_lora_input=x_bf16, side_lora=side,
+            saved_x=saved_x, saved_h_unweighted=saved_h,
+            saved_l1_preact=saved_gate_up,
+            saved_down_unweighted=saved_down,
+            num_config_tokens=tokens, side_lora_scale=args.scale,
+            side_lora_scratch=(q13, q2, ready),
+            activation_clamp=args.activation_limit,
+            route_weight_mode=args.route_weight_mode,
+            fast_math=False)
+        repeated_result = run_side_backward()
+        side_forward_backward_repeatability = {
+            "metadata_exact_fraction": float(
+                (buffer.token_src_metadata[:pool_rows] == first_metadata)
+                .float()
+                .mean()
+                .item()
+            ),
+            "adapter_grads": [
+                _accuracy(actual, expected)
+                for actual, expected in zip(
+                    repeated_result.grad_side_lora,
+                    first_adapter_grads,
+                    strict=True,
+                )
+            ],
+            "grad_x": _accuracy(repeated_result.grad_x, first_grad_x),
+            "grad_route": _accuracy(
+                buffer.backward_grad_route[:tokens, :topk],
+                first_grad_route,
+            ),
+        }
+
+        # Run the ordinary MegaMoE forward twice as a direct control for the
+        # dispatch-row ordering used by the separate side-LoRA forward.
+        base_y_first = torch.empty_like(y)
+        buffer.x[:tokens].copy_(x_fp8[0])
+        buffer.x_sf[:tokens].copy_(x_fp8[1])
+        buffer.topk_idx[:tokens].copy_(topk_idx)
+        buffer.topk_weights[:tokens].copy_(topk_weights)
+        deep_gemm.fp8_fp4_mega_moe(
+            base_y_first, transformed_w13, transformed_w2, buffer,
+            activation_clamp=args.activation_limit,
+            route_weight_mode=args.route_weight_mode,
+            num_config_tokens=tokens, fast_math=False)
+        base_metadata_first = buffer.token_src_metadata[:pool_rows].clone()
+        base_y_second = torch.empty_like(y)
+        buffer.x[:tokens].copy_(x_fp8[0])
+        buffer.x_sf[:tokens].copy_(x_fp8[1])
+        buffer.topk_idx[:tokens].copy_(topk_idx)
+        buffer.topk_weights[:tokens].copy_(topk_weights)
+        deep_gemm.fp8_fp4_mega_moe(
+            base_y_second, transformed_w13, transformed_w2, buffer,
+            activation_clamp=args.activation_limit,
+            route_weight_mode=args.route_weight_mode,
+            num_config_tokens=tokens, fast_math=False)
+        torch.cuda.synchronize()
+        repeatability = {
+            "fixed_saved_boundary": fixed_boundary,
+            "forward_backward": side_forward_backward_repeatability,
+            "ordinary_megamoe_forward": {
+                "metadata_exact_fraction": float(
+                    (buffer.token_src_metadata[:pool_rows] == base_metadata_first)
+                    .float()
+                    .mean()
+                    .item()
+                ),
+                "output": _accuracy(base_y_second, base_y_first),
+            },
+        }
+        assert all(
+            metric["relative_l2"] == 0.0
+            for metric in fixed_boundary["adapter_grads"]
+        ), fixed_boundary
+        assert fixed_boundary["grad_x"]["relative_l2"] == 0.0, fixed_boundary
+        assert fixed_boundary["grad_route"]["relative_l2"] == 0.0, fixed_boundary
+        assert repeatability["ordinary_megamoe_forward"]["output"]["relative_l2"] == 0.0
+        assert max(
+            metric["relative_l2"]
+            for metric in side_forward_backward_repeatability["adapter_grads"]
+        ) < 1e-4, side_forward_backward_repeatability
     if args.scale == 0.0:
         base_y = torch.empty_like(y)
         buffer.x[:tokens].copy_(x_fp8[0])
@@ -1058,6 +1177,7 @@ def run_mxfp4_correctness(local_rank: int, world: int, args) -> None:
             "grad_x_accuracy": grad_x_accuracy,
             "backward_boundary_accuracy": backward_boundary_accuracy,
             "native_boundary_adapter_accuracy": native_boundary_adapter_accuracy,
+            "self_repeatability": repeatability,
         }, indent=2), flush=True)
     buffer.destroy()
     dist.destroy_process_group()
@@ -1086,6 +1206,7 @@ if __name__ == "__main__":
     parser.add_argument("--mode", choices=("bf16", "mxfp4"), default="bf16")
     parser.add_argument("--default-side-lora-scratch", action="store_true")
     parser.add_argument("--check-short-saved-down", action="store_true")
+    parser.add_argument("--check-repeatability", action="store_true")
     args = parser.parse_args()
     if args.experts % args.num_processes:
         parser.error("experts must be divisible by num-processes")
