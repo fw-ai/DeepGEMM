@@ -1,0 +1,90 @@
+{
+  "schema_version": 1,
+  "measurement_contract": {
+    "device": "NVIDIA B300 SXM6 AC",
+    "ep": 8,
+    "context_parallel_size": 1,
+    "length_mode": "true_varlen",
+    "sequence_length_scope": "per_rank",
+    "hidden": 3584,
+    "intermediate": 3072,
+    "global_experts": 896,
+    "local_experts": 112,
+    "topk": 16,
+    "gradient_scope": "full",
+    "rank_tokens_64k": [43691, 49933, 56174, 62416, 68656, 74898, 81139, 87381]
+  },
+  "source_identity": {
+    "deep_gemm_commit": "acef0aa4440cac0867781fbdb852401ec2568031",
+    "backward_parent_header_sha256": "957ee39f75614ab5f36d96b197c9b03b4bb117812a4e04b30c5713aaa0339755",
+    "bf16_gemm_body_sha256": "6894778126cbc5ed7f619474901cf296e645954f907cd72df562d367114dc9d4",
+    "scheduler_sha256": "a0038fb2133a64047fb7ecd3e4ce71e91f47f6e2e1fd342d09c709b46954ea6c",
+    "range_provider_sha256": "275b3a986934a82897cd94f4017a3c9fbedc24cad3251f245907271f4bd67e97",
+    "jit_host_sha256": "5aa8ebe0c4109b1a275d337bdbcf99fb7b6fa96a1ab04c7c4d0217ab5d6b0546",
+    "wgrad_header_sha256": "9fbc293206247ba16d23a7d2d5c36632d6c82f4387f48af0dd4b06f9ced740fa",
+    "verified_extension_sha256": "65bf0d609a0aa565ea54c60a351f27d192192aa1441d868a180debf7f4a40934",
+    "verified_generated_cuda_sha256": "b01700607a4c5cfc0a8fee0593127246ef2feacad0e356eca572ee31204fd030",
+    "verified_generated_cubin_sha256": "014c97b700406efdf9f24bb6d37e77ca99b8e01a0a256d2a60f37c959191d3d4"
+  },
+  "replay_identity": {
+    "benchmark_sha256": "80be4401789f2b2699e275f500d6d9eed4016febbd2cde8e9bb00c85f042eb45",
+    "firetitan_commit": "852ea247c4da7bdf6575220711dcb3ce612b5610",
+    "megamoe_mok_sha256": "0a93bea178db9c5f6604b82b657b50ca37e042b0597d3f27e9ffdd03af0a493e",
+    "native_mxfp4_megamoe_sha256": "07ba38b9bf7069d3b2fd029a34f58346fd4394e0b97197c962891528e2488d9b",
+    "native_quant_experts_sha256": "45743c66ab8aad820660c9582e2dd93e233175f6f4339c81a5d0fbdd8c1ceb99",
+    "mxfp4_quant_sha256": "1dda45606bf2458d988949c24d10e92750142507a50e7c655b3c9bc3db3784f9",
+    "deepep_v2_sha256": "7d6529e1905021d178ec067e0a34014d7aa4adeaf533f1362f59ff7a83ea1db5",
+    "runtime_deep_gemm_init_sha256": "67e14ff11656e5b169330990353c3badcdcaca139fdc9939bc0627d00b601078",
+    "runtime_mega_init_sha256": "f4c4409e5bc51a9a2b1e7874d3d8633c1655c073903c6e1f06cc24ed440c819e",
+    "runtime_mega_backward_sha256": "c9cb42649611311205d64919bfbfe6aab7f70cc0539c405d0fed067f0bbc5d76",
+    "runtime_extension_sha256": "ef869f3893fc98f49b48104dbe61231f35283039bb8a94db23182123972f28b5"
+  },
+  "cosine_floor_exclusive": 0.99999,
+  "qualified_cosines": {
+    "output": 0.9999964487,
+    "dX": 0.9999931287,
+    "dRoute": 0.9999999999,
+    "dW1": 0.9999999909,
+    "dW2": 0.9999999916,
+    "dW3": 0.9999999906
+  },
+  "phase_highwater_ms": {
+    "65536": {
+      "forward": {
+        "native_deepep_v2": 106.712,
+        "candidate": 46.681758880615234,
+        "speedup": 2.285946428730485
+      },
+      "backward": {
+        "native_deepep_v2": 190.4432601928711,
+        "candidate": 139.2091522216797,
+        "speedup": 1.3680369225265097
+      },
+      "forward_backward": {
+        "native_deepep_v2": 294.2889862060547,
+        "candidate": 186.5465316772461,
+        "speedup": 1.577563429135308
+      }
+    }
+  },
+  "promotion": {
+    "maximum_latency_noise_fraction": 0.03,
+    "require_all_six_cosines": true,
+    "require_zero_nonfinite_values": true,
+    "require_no_peak_memory_regression": true,
+    "require_same_revision_evidence": true,
+    "require_fresh_process_memory": true,
+    "maximum_peak_memory_noise_bytes": 67108864
+  },
+  "required_speedup": {
+    "short_range_through_64k": {
+      "forward_exclusive": 1.5,
+      "backward_exclusive": 1.36,
+      "forward_backward_alternative_exclusive": 1.75
+    },
+    "long_range_128k_through_512k": {
+      "forward_exclusive": 1.4,
+      "backward_exclusive": 1.2
+    }
+  }
+}
