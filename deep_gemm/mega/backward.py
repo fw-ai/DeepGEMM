@@ -46,6 +46,9 @@ _BF16_BACKWARD_KERNEL_TRACE_FIELDS = (
 _BF16_BACKWARD_DECOMPOSE_PRELUDE = False
 _BF16_BACKWARD_SPLIT_BARRIER_FUSED_ROUTE = os.getenv("DG_BF16_SPLIT_BARRIER_FUSED_ROUTE", "1") == "1"
 _BF16_ROUTE_PRELUDE_THREADS = os.getenv("DG_BF16_ROUTE_PRELUDE_THREADS", "128")
+_MXFP4_SIDE_LORA_INTEGRATED_PRELUDE = (
+    os.getenv("DG_SIDE_LORA_INTEGRATED_PRELUDE", "0") == "1"
+)
 
 
 def _timed_cuda_phase(name: str, operation: Callable[[], Any]) -> Any:
@@ -1239,15 +1242,19 @@ def fp8_fp4_mega_moe_side_lora_backward(
             num_grid_states, dtype=torch.int32, device=gate_up_output.device)
     if expert_psum_rows is None:
         expert_psum_rows = padded_expert_counts.cumsum(0).to(torch.int32)
-    _C.bf16_mega_moe_backward_post_down_prelude_v2(
-        grad_ye, grad_ye, x_pool, route_weights, grad_route,
-        saved_down_unweighted, expert_counts,
-        sym_buffer.backward_grad_y, sym_buffer.side_lora_source,
-        sym_buffer.topk_weights, sym_buffer.backward_grad_route,
-        sym_buffer.token_src_metadata, sym_buffer.handle.buffer_ptrs,
-        sym_buffer.group.rank(), sym_buffer.num_topk, block_m,
-        CombineOrderMode.FIXED_TOPK.value, True, False,
-        False, True, True, False, False, 256)
+    # The persistent MXFP4 wave already owns grad-y/route dispatch.  The
+    # opt-in path also lets its idle x-pool warps pull the exact BF16 Side-LoRA
+    # source, making this standalone reverse-dispatch launch redundant.
+    if not _MXFP4_SIDE_LORA_INTEGRATED_PRELUDE:
+        _C.bf16_mega_moe_backward_post_down_prelude_v2(
+            grad_ye, grad_ye, x_pool, route_weights, grad_route,
+            saved_down_unweighted, expert_counts,
+            sym_buffer.backward_grad_y, sym_buffer.side_lora_source,
+            sym_buffer.topk_weights, sym_buffer.backward_grad_route,
+            sym_buffer.token_src_metadata, sym_buffer.handle.buffer_ptrs,
+            sym_buffer.group.rank(), sym_buffer.num_topk, block_m,
+            CombineOrderMode.FIXED_TOPK.value, True, False,
+            False, True, True, False, False, 256)
     _C.fp8_fp4_mega_moe_side_lora_backward(
         gate_up_output, grad_h, grad_gate_up, h_act, h_weighted,
         x_pool, grad_x_pool, l1_acts, l1_acts_sf,
@@ -1261,7 +1268,10 @@ def fp8_fp4_mega_moe_side_lora_backward(
         sym_buffer.handle.buffer_ptrs,
         sym_buffer.group.rank(), sym_buffer.num_max_tokens_per_rank,
         sym_buffer.num_topk,
-        sym_buffer.backward_grad_y, sym_buffer.topk_weights,
+        sym_buffer.backward_grad_y,
+        sym_buffer.side_lora_source
+        if _MXFP4_SIDE_LORA_INTEGRATED_PRELUDE else None,
+        sym_buffer.topk_weights,
         sym_buffer.backward_grad_route, sym_buffer.token_src_metadata,
         route_weight_mode.value, grad_ye, saved_down_unweighted,
         grad_route, *side_lora, q13, q2, saved_h, t13, t2,

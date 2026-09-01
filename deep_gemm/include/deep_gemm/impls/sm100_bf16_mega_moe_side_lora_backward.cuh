@@ -2831,8 +2831,15 @@ sm100_bf16_mega_moe_side_lora_backward_wave_impl(
             kNumThreads - kFirstXPoolWarp * 32;
         const uint32_t x_thread_idx =
             (warp_idx - kFirstXPoolWarp) * 32 + lane_idx;
+        // MXFP4 Side-LoRA saves the exact BF16 adapter input separately from
+        // the expert-ordered FP8 pool.  When dispatch is not precomputed, use
+        // these otherwise-idle warps to pull that immutable forward save while
+        // the dispatch warps pull the newly-staged grad-y and route weights.
+        constexpr bool kPullRemoteBF16X =
+            kBF16Mode ||
+            (kGateUpPrepared && !kDispatchInputsPrepared);
         if constexpr (
-            !kGateUpPrepared &&
+            (!kGateUpPrepared || kPullRemoteBF16X) &&
             !(kBF16Mode && kDispatchInputsPrepared)) {
           uint32_t pool_block_offset = 0;
           uint32_t global_pool_block = 0;
@@ -2860,7 +2867,7 @@ sm100_bf16_mega_moe_side_lora_backward_wave_impl(
                         pool_block * BLOCK_M + row;
                     cd_dtype_t value = cd_dtype_t(0.0f);
                     if (row < valid_m) {
-                        if constexpr (kBF16Mode) {
+                        if constexpr (kPullRemoteBF16X) {
                             const auto metadata =
                                 token_src_metadata[pool_row];
                             value = *backward_sym_buffer.map(
@@ -2947,9 +2954,11 @@ sm100_bf16_mega_moe_side_lora_backward_wave_impl(
     {
         __syncthreads();
         if constexpr (
-            kBF16Mode && kNumRanks == 1 &&
-            !kDispatchInputsPrepared) {
-            // In single-rank BF16 mode the x-pool warps also stage grad-y.
+            (kBF16Mode ||
+             (kGateUpPrepared && !kDispatchInputsPrepared)) &&
+            kNumRanks == 1 && !kDispatchInputsPrepared) {
+            // In single-rank BF16 mode, and in the integrated MXFP4 Side-LoRA
+            // mode, the x-pool warps also stage grad-y.
             // Their pool-block assignment is independent of the dgrad tile
             // assignment, so a cluster barrier is insufficient before W2
             // dgrad starts consuming the completed expert pool.

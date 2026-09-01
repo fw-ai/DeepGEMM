@@ -1397,6 +1397,7 @@ static void sm100_fp8_fp4_mega_moe_side_lora_backward(
     const int& num_max_tokens_per_rank,
     const int& num_topk,
     const std::optional<torch::Tensor>& backward_grad_y,
+    const std::optional<torch::Tensor>& backward_x,
     const std::optional<torch::Tensor>& backward_topk_weights,
     const std::optional<torch::Tensor>& backward_grad_route,
     const std::optional<torch::Tensor>& token_src_metadata,
@@ -1618,6 +1619,15 @@ static void sm100_fp8_fp4_mega_moe_side_lora_backward(
         DG_HOST_ASSERT(backward_grad_y->size(0) >= num_max_tokens_per_rank);
         DG_HOST_ASSERT(backward_grad_y->size(1) == hidden);
         DG_HOST_ASSERT(backward_grad_y->is_contiguous());
+        if (backward_x.has_value()) {
+            DG_HOST_ASSERT(
+                backward_x->scalar_type() == torch::kBFloat16);
+            DG_HOST_ASSERT(backward_x->dim() == 2);
+            DG_HOST_ASSERT(
+                backward_x->size(0) >= num_max_tokens_per_rank);
+            DG_HOST_ASSERT(backward_x->size(1) == hidden);
+            DG_HOST_ASSERT(backward_x->is_contiguous());
+        }
         DG_HOST_ASSERT(
             backward_topk_weights->scalar_type() == torch::kFloat);
         DG_HOST_ASSERT(backward_topk_weights->dim() == 2);
@@ -1643,6 +1653,9 @@ static void sm100_fp8_fp4_mega_moe_side_lora_backward(
         DG_HOST_ASSERT(token_src_metadata->size(0) >= num_acts_rows);
         DG_HOST_ASSERT(token_src_metadata->size(1) == 3);
         DG_HOST_ASSERT(token_src_metadata->is_contiguous());
+    }
+    if (backward_x.has_value()) {
+        DG_HOST_ASSERT(!backward_sym_buffer_ptrs.empty());
     }
 
     check_sf_layout(
@@ -1880,12 +1893,17 @@ static void sm100_fp8_fp4_mega_moe_side_lora_backward(
         .expert_counts = expert_counts.data_ptr<int>(),
         .backward_sym_buffer = backward_sym_buffer,
         .backward_workspace = backward_workspace,
-        .backward_grad_y = num_ranks > 1
+        .backward_grad_y =
+            (num_ranks > 1 || backward_x.has_value())
             ? reinterpret_cast<const cutlass::bfloat16_t*>(
                   backward_grad_y->data_ptr<at::BFloat16>())
             : nullptr,
-        .backward_x = nullptr,
-        .backward_topk_weights = num_ranks > 1
+        .backward_x = backward_x.has_value()
+            ? reinterpret_cast<const cutlass::bfloat16_t*>(
+                  backward_x->data_ptr<at::BFloat16>())
+            : nullptr,
+        .backward_topk_weights =
+            (num_ranks > 1 || backward_x.has_value())
             ? backward_topk_weights->data_ptr<float>()
             : nullptr,
         .backward_grad_route =
@@ -1998,16 +2016,16 @@ static void sm100_fp8_fp4_mega_moe_side_lora_backward(
         // would both waste work and erase the side delta before dSwiGLU.
         .gate_up_prepared = true,
         .inputs_prepared = route_weight_mode == "post_down",
-        .dispatch_inputs_prepared = true,
+        .dispatch_inputs_prepared = !backward_x.has_value(),
         .launch_args = LaunchArgs(
             num_sms, 1024, smem_size, 2),
     };
     const auto code =
         SM100BF16MegaMoESideLoraBackwardWaveRuntime::generate(args);
     const auto runtime = compiler->build(fmt::format(
-        "sm100_fp8_fp4_mega_moe_side_lora_backward_{}_fast{}_{}_r{}",
+        "sm100_fp8_fp4_mega_moe_side_lora_backward_{}_fast{}_{}_r{}_dispatch{}",
         activation, fast_math, route_weight_mode,
-        grad_route_output.has_value()), code);
+        grad_route_output.has_value(), args.dispatch_inputs_prepared), code);
     SM100BF16MegaMoESideLoraBackwardWaveRuntime::launch(runtime, args);
 
     const auto grad_gate =
