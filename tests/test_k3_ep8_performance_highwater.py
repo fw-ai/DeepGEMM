@@ -198,9 +198,73 @@ def test_unpromoted_4k_perf_winner_remains_a_mandatory_latency_target() -> None:
     assert all(len(digest) == 64 for digest in record["receipts"].values())
 
     protected = _receipt_validator()["_protected_phases"](ledger, 4096)
-    assert protected["forward"]["candidate"] == 5.0423359870910645
+    assert protected["forward"]["candidate"] == 4.755519866943359
     assert protected["backward"]["candidate"] == 16.252992630004883
     assert protected["forward_backward"]["candidate"] == 20.16431999206543
+
+
+def test_audited_phase_frontier_preserves_every_recovered_winner() -> None:
+    """Protect qualified phase winners independently across source revisions."""
+    ledger = _load_ledger()
+    frontier = ledger["audited_phase_observation_frontier"]
+    expected = {
+        "4096": {"forward": 4.755519866943359},
+        "8192": {"forward": 7.570303916931152},
+        "16384": {
+            "forward": 12.742048263549805,
+            "backward": 42.66243362426758,
+            "forward_backward": 55.04022216796875,
+        },
+        "32768": {"forward": 24.296768188476562},
+    }
+    assert set(frontier) == {"semantics", *expected}
+    for length, phases in expected.items():
+        for phase, candidate_ms in phases.items():
+            record = frontier[length][phase]
+            assert record["candidate"] == candidate_ms
+            assert record["rounds"] >= 5
+            assert record["warmups"] >= 2
+            assert all(
+                value > ledger["cosine_floor_exclusive"]
+                for value in record["qualified_cosines"].values()
+            )
+            assert all(
+                len(digest) == 64
+                for digest in record["receipts"].values()
+            )
+            peaks = record["same_process_peak_allocated_bytes"]
+            assert peaks["candidate"] <= peaks["native_deepep_v2"]
+
+    validator = _receipt_validator()
+    protected = {
+        length: validator["_protected_phases"](ledger, int(length))
+        for length in expected
+    }
+    assert protected["4096"]["forward"]["candidate"] == 4.755519866943359
+    assert protected["8192"]["forward"]["candidate"] == 7.570303916931152
+    assert protected["16384"]["forward"]["candidate"] == 12.742048263549805
+    assert protected["16384"]["backward"]["candidate"] == 42.66243362426758
+    assert protected["16384"]["forward_backward"]["candidate"] == 55.04022216796875
+    assert protected["32768"]["forward"]["candidate"] == 24.296768188476562
+
+
+def test_preliminary_32k_winner_is_retained_but_not_promoted() -> None:
+    """Keep the 66.939-ms lead while excluding it from verified ceilings."""
+    ledger = _load_ledger()
+    preliminary = ledger["preliminary_phase_observation_frontier"]["32768"]
+    assert preliminary["backward"]["candidate"] == 66.93920135498047
+    assert preliminary["forward_backward"]["candidate"] == 92.07823944091797
+    assert preliminary["backward"]["qualification"] == (
+        "single_sample_without_numeric_receipt"
+    )
+    assert set(preliminary["backward"]["promotion_blockers"]) == {
+        "only_one_timing_sample",
+        "missing_matching_numeric_receipt",
+    }
+
+    protected = _receipt_validator()["_protected_phases"](ledger, 32768)
+    assert protected["backward"]["candidate"] == 83.12163543701172
+    assert protected["forward_backward"]["candidate"] == 106.23721313476562
 
 
 def test_replay_identity_covers_benchmark_integration_and_runtime() -> None:

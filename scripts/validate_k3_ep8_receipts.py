@@ -41,7 +41,10 @@ def _protected_phases(
     observed = ledger.get(
         "observed_unpromoted_performance_frontier", {}
     ).get(key)
-    candidates = [
+    audited = ledger.get("audited_phase_observation_frontier", {}).get(
+        key, {}
+    )
+    complete_candidates = [
         phases
         for phases in (
             source_bound,
@@ -50,11 +53,12 @@ def _protected_phases(
         )
         if phases is not None
     ]
-    if not candidates:
+    if not complete_candidates and not audited:
         raise KeyError(f"no protected latency frontier for {avg_tokens_per_rank}")
     return {
         phase: min(
-            (candidate[phase] for candidate in candidates),
+            [candidate[phase] for candidate in complete_candidates]
+            + ([audited[phase]] if phase in audited else []),
             key=lambda record: record["candidate"],
         )
         for phase in _phase_keys()

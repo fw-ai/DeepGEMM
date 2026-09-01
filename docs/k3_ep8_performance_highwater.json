@@ -258,6 +258,226 @@
       }
     }
   },
+  "audited_phase_observation_frontier": {
+    "semantics": "GPU-measured, numerically qualified per-phase observations recovered by auditing the complete K3 log corpus. Each phase remains an independent latency ceiling even when another revision owns a different phase. Missing source-commit identity remains a separate promotion blocker and must never erase a faster latency receipt.",
+    "4096": {
+      "forward": {
+        "qualification": "paired_perf_and_numeric_receipts_missing_source_commit",
+        "promotion_blockers": ["missing_same_run_source_identity"],
+        "receipts": {
+          "performance_log_sha256": "ac758082e7b436d22ee4d6d81e90d3f80b5a6654e88a373d4b4174e0dfec242e",
+          "numerics_log_sha256": "3573f7acfd190f289f6231a3e371de76be7aa5f58899d0cac507661fd2909dff"
+        },
+        "rounds": 5,
+        "warmups": 3,
+        "native_deepep_v2": 8.414624214172363,
+        "candidate": 4.755519866943359,
+        "speedup": 1.7694436044025859,
+        "qualified_cosines": {
+          "output": 0.9999964444295277,
+          "dX": 0.9999931862628643,
+          "dRoute": 0.9999999999358906,
+          "dW1": 0.9999999981295367,
+          "dW2": 0.9999999986998871,
+          "dW3": 0.9999999979097725
+        },
+        "same_process_peak_allocated_bytes": {
+          "native_deepep_v2": 15569354240,
+          "candidate": 14569443328
+        }
+      }
+    },
+    "8192": {
+      "forward": {
+        "qualification": "same_log_perf_and_numeric_missing_source_commit",
+        "promotion_blockers": ["missing_same_run_source_identity"],
+        "receipts": {
+          "combined_log_sha256": "5a787159a05284deedfe65acba6d81cfab9ff8fa7c6acc81e61202d81aa6c73a"
+        },
+        "rounds": 5,
+        "warmups": 2,
+        "native_deepep_v2": 15.37446403503418,
+        "candidate": 7.570303916931152,
+        "speedup": 2.0308912566441157,
+        "qualified_cosines": {
+          "output": 0.9999964575621643,
+          "dX": 0.9999931861314553,
+          "dRoute": 0.9999999999406127,
+          "dW1": 0.9999999032408642,
+          "dW2": 0.9999999034979717,
+          "dW3": 0.9999999032192658
+        },
+        "same_process_peak_allocated_bytes": {
+          "native_deepep_v2": 24351428096,
+          "candidate": 20617977344
+        }
+      }
+    },
+    "16384": {
+      "forward": {
+        "qualification": "same_log_perf_and_numeric_missing_source_commit",
+        "promotion_blockers": ["missing_same_run_source_identity"],
+        "receipts": {
+          "combined_log_sha256": "b49473e569dae1e427a89792d558a8201579645a35b61ceb7a5f40dbd2456309"
+        },
+        "rounds": 7,
+        "warmups": 3,
+        "native_deepep_v2": 26.23187255859375,
+        "candidate": 12.742048263549805,
+        "speedup": 2.0586857007623527,
+        "qualified_cosines": {
+          "output": 0.9999964521332829,
+          "dX": 0.9999931935247042,
+          "dRoute": 0.9999999999386096,
+          "dW1": 0.9999986244491617,
+          "dW2": 0.9999986265593298,
+          "dW3": 0.9999986217118516
+        },
+        "same_process_peak_allocated_bytes": {
+          "native_deepep_v2": 30458330624,
+          "candidate": 22668979712
+        }
+      },
+      "backward": {
+        "qualification": "same_log_perf_numeric_and_source_hash_receipt",
+        "promotion_blockers": ["source_hashes_not_materialized_as_a_git_commit"],
+        "receipts": {
+          "combined_log_sha256": "d237292da300cd901ee29010f15897e2e7b67cf064bd2c757657fa925689d400"
+        },
+        "source_hashes": {
+          "backward_sha256": "7bf078b2a33e906c0f04f011bf84a54d37dced65eeae70322657dc5075e6b2c7",
+          "device_header_sha256": "6c61e6647b7acf8ec508e1bdbee919fc2b3db27ac18fef0e1865646d8dbbed08",
+          "generated_source_sha256": "38013936938e72300a9893ec2439432d7a3f896178b97b529857b4035e8cc013",
+          "host_binding_sha256": "daa5bb0a35d879fc87f2187473703587fcf4b58f4e30afd5c58634cdeb8e90df"
+        },
+        "rounds": 7,
+        "warmups": 3,
+        "native_deepep_v2": 61.74739074707031,
+        "candidate": 42.66243362426758,
+        "speedup": 1.4473480648311323,
+        "qualified_cosines": {
+          "output": 0.9999964521332829,
+          "dX": 0.9999931997435191,
+          "dRoute": 0.9999999999386078,
+          "dW1": 0.9999999955398817,
+          "dW2": 0.999999996080831,
+          "dW3": 0.9999999953318709
+        },
+        "same_process_peak_allocated_bytes": {
+          "native_deepep_v2": 41116513792,
+          "candidate": 38737269248
+        }
+      },
+      "forward_backward": {
+        "qualification": "same_log_perf_numeric_and_source_hash_receipt",
+        "promotion_blockers": ["source_hashes_not_materialized_as_a_git_commit"],
+        "receipts": {
+          "combined_log_sha256": "d237292da300cd901ee29010f15897e2e7b67cf064bd2c757657fa925689d400"
+        },
+        "source_hashes": {
+          "backward_sha256": "7bf078b2a33e906c0f04f011bf84a54d37dced65eeae70322657dc5075e6b2c7",
+          "device_header_sha256": "6c61e6647b7acf8ec508e1bdbee919fc2b3db27ac18fef0e1865646d8dbbed08",
+          "generated_source_sha256": "38013936938e72300a9893ec2439432d7a3f896178b97b529857b4035e8cc013",
+          "host_binding_sha256": "daa5bb0a35d879fc87f2187473703587fcf4b58f4e30afd5c58634cdeb8e90df"
+        },
+        "rounds": 7,
+        "warmups": 3,
+        "native_deepep_v2": 87.56639862060547,
+        "candidate": 55.04022216796875,
+        "speedup": 1.590952855411359,
+        "qualified_cosines": {
+          "output": 0.9999964521332829,
+          "dX": 0.9999931997435191,
+          "dRoute": 0.9999999999386078,
+          "dW1": 0.9999999955398817,
+          "dW2": 0.999999996080831,
+          "dW3": 0.9999999953318709
+        },
+        "same_process_peak_allocated_bytes": {
+          "native_deepep_v2": 41116513792,
+          "candidate": 38737269248
+        }
+      }
+    },
+    "32768": {
+      "forward": {
+        "qualification": "robust_perf_with_same_path_4k_numeric_receipt_missing_source_commit",
+        "promotion_blockers": [
+          "missing_same_run_source_identity",
+          "numeric_receipt_is_same_path_at_4k_not_direct_32k"
+        ],
+        "receipts": {
+          "performance_log_sha256": "56f24a5108ff7a450b56f8d3a556626fa648a04b54353c825951412db2286396",
+          "numerics_log_sha256": "a4fd5bb62fcf5b488e796b5ad3c7b6ff4555b4db5966b5037485ee411d8085c4"
+        },
+        "rounds": 7,
+        "warmups": 3,
+        "native_deepep_v2": 50.6940803527832,
+        "candidate": 24.296768188476562,
+        "speedup": 2.0864536369419833,
+        "qualified_cosines": {
+          "output": 0.9999964444432008,
+          "dX": 0.9999931861885142,
+          "dRoute": 0.9999999999358906,
+          "dW1": 0.9999986864524626,
+          "dW2": 0.9999986867163884,
+          "dW3": 0.9999986841243876
+        },
+        "same_process_peak_allocated_bytes": {
+          "native_deepep_v2": 40042778112,
+          "candidate": 22896308224
+        }
+      }
+    }
+  },
+  "preliminary_phase_observation_frontier": {
+    "semantics": "Fast GPU timing observations retained for recovery but excluded from the verified promotion ceiling until robust timing and all six numeric gates pass. These values must not be presented as verified results.",
+    "32768": {
+      "backward": {
+        "qualification": "single_sample_without_numeric_receipt",
+        "promotion_blockers": [
+          "only_one_timing_sample",
+          "missing_matching_numeric_receipt"
+        ],
+        "receipts": {
+          "performance_log_sha256": "b5c80cf4ec3fc075fe72bd2460355134337e51ac0fce9efc4bb2f3663f725cc5"
+        },
+        "source_hashes": {
+          "backward_sha256": "a77fe4de72d6a7be4320d21f2ed0520abbdf8fa25ec81d863aed1b7fcd987a81",
+          "device_header_sha256": "29f97be4fe9490a2265ee8e25ace8c5e47563de442219c83427820ed59c299c2",
+          "host_binding_sha256": "aa6a4bd6f48681439c9b09920e51ac53070557b840f8d3f94f660952f03ea762"
+        },
+        "rounds": 1,
+        "warmups": 1,
+        "native_deepep_v2": 102.27715301513672,
+        "candidate": 66.93920135498047,
+        "speedup": 1.5279111633369824,
+        "same_process_peak_allocated_bytes": {
+          "native_deepep_v2": 48540313600,
+          "candidate": 42802363392
+        }
+      },
+      "forward_backward": {
+        "qualification": "single_sample_without_numeric_receipt",
+        "promotion_blockers": [
+          "only_one_timing_sample",
+          "missing_matching_numeric_receipt"
+        ],
+        "receipts": {
+          "performance_log_sha256": "b5c80cf4ec3fc075fe72bd2460355134337e51ac0fce9efc4bb2f3663f725cc5"
+        },
+        "rounds": 1,
+        "warmups": 1,
+        "native_deepep_v2": 181.55299377441406,
+        "candidate": 92.07823944091797,
+        "speedup": 1.9717252944536108,
+        "same_process_peak_allocated_bytes": {
+          "native_deepep_v2": 48540313600,
+          "candidate": 42802363392
+        }
+      }
+    }
+  },
   "promotion": {
     "maximum_latency_noise_fraction": 0.03,
     "require_all_six_cosines": true,
