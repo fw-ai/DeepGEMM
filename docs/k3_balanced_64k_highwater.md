@@ -37,8 +37,15 @@ three-product MXFP8 reconstruction.
 The terminal scheduler retains the verified full-rank publication edge for
 multi-range inputs.  It uses readiness-driven work selection and the existing
 union workspace; it adds no tensor, symmetric-memory plane, process-global
-mode, or device allocation.  Sixteen SMs are reserved for the in-kernel
-communication roles for this 64K operating point.
+mode, or device allocation.  Clustered DeepGEMM launches the persistent
+148-SM grid and assigns communication to per-CTA warp roles; it does not
+reserve a configurable subset of SMs.
+
+The archived harness environment contains `K3_MOK_BWD_COMM_SMS=16`.  A later
+call-graph audit proved that setting configures only the standalone MoK
+backward and never reaches this clustered DeepGEMM launch.  The latency and
+numerical result remain valid for the hashed kernel, but they are a repeated
+default-kernel measurement rather than a communication-SM tuning A/B.
 
 ## Exact source and runtime provenance
 
