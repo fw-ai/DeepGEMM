@@ -397,7 +397,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             buffer.num_ring_tokens))
     legacy_buffer = buffer.buffer.narrow(0, 0, legacy_num_bytes)
     legacy_v2_slices = expanded_slicer(legacy_buffer)
-    assert len(legacy_v2_slices) == 11
+    assert len(legacy_v2_slices) == 12
     assert legacy_v2_slices[-1] is None
     legacy_forward_buffer = copy.copy(buffer)
     legacy_forward_buffer.buffer = legacy_buffer
@@ -414,11 +414,13 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         legacy_forward_buffer.backward_grad_y,
     ) = legacy_slicer(legacy_buffer)
     legacy_forward_buffer.backward_grad_route = None
+    appended_bytes = buffer.backward_grad_route.nbytes
+    if buffer.side_lora_source is not None:
+        appended_bytes += buffer.side_lora_source.nbytes
     assert (
-        legacy_num_bytes +
-        buffer.backward_grad_route.nbytes ==
+        legacy_num_bytes + appended_bytes ==
         expanded_num_bytes
-    ), 'v2 must append the route plane without shifting legacy storage'
+    ), 'v2 must append backward-only planes without shifting legacy storage'
 
     # Cast weights into FP4
     def _cast_weights_to_fp4(bf16_weights: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
