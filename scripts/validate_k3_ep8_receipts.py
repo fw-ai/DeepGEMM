@@ -27,15 +27,38 @@ def _benchmark_arms() -> tuple[str, str]:
 def _protected_phases(
     ledger: dict[str, Any], avg_tokens_per_rank: int
 ) -> dict[str, Any]:
-    """Return source-bound or historical per-length latency ceilings."""
+    """Return the fastest observed ceiling for every protected phase.
+
+    A numerically qualified observation can define a latency target before it
+    is promotable as a complete milestone. Keep that target while provenance
+    and memory remain independent mandatory gates; otherwise a slower replay
+    could erase useful performance simply because the faster run was missing
+    one of those separate receipts.
+    """
     key = str(avg_tokens_per_rank)
     source_bound = ledger["phase_highwater_ms"].get(key)
-    if source_bound is not None:
-        return source_bound
     historical = ledger["historical_regression_frontier"].get(key)
-    if historical is None:
+    observed = ledger.get(
+        "observed_unpromoted_performance_frontier", {}
+    ).get(key)
+    candidates = [
+        phases
+        for phases in (
+            source_bound,
+            historical["phases"] if historical is not None else None,
+            observed["phases"] if observed is not None else None,
+        )
+        if phases is not None
+    ]
+    if not candidates:
         raise KeyError(f"no protected latency frontier for {avg_tokens_per_rank}")
-    return historical["phases"]
+    return {
+        phase: min(
+            (candidate[phase] for candidate in candidates),
+            key=lambda record: record["candidate"],
+        )
+        for phase in _phase_keys()
+    }
 
 
 def load_tagged_json(path: Path, tag: str) -> list[dict[str, Any]]:
