@@ -39,10 +39,9 @@ def _receipt_validator() -> dict:
 def _phase_result_from_ledger(avg_tokens_per_rank: int = 65536) -> dict:
     """Build a minimal phase receipt from the immutable high-water values."""
     ledger = _load_ledger()
-    key = str(avg_tokens_per_rank)
-    phases = ledger["phase_highwater_ms"].get(key)
-    if phases is None:
-        phases = ledger["historical_regression_frontier"][key]["phases"]
+    phases = _receipt_validator()["_protected_phases"](
+        ledger, avg_tokens_per_rank
+    )
     result = {}
     for phase, result_key in {
         "forward": "forward_ms",
@@ -164,6 +163,46 @@ def test_historical_short_length_frontier_is_immutable_and_qualified() -> None:
     assert len(replay_seed["deep_gemm_commit"]) == 40
 
 
+def test_unpromoted_4k_perf_winner_remains_a_mandatory_latency_target() -> None:
+    """Preserve the 2.068x BWD result without mislabeling it promotable."""
+    ledger = _load_ledger()
+    record = ledger["observed_unpromoted_performance_frontier"]["4096"]
+    assert record["source_status"] == (
+        "paired_raw_receipts_without_source_commit"
+    )
+    assert set(record["promotion_blockers"]) == {
+        "missing_same_run_source_identity",
+        "forward_backward_peak_allocated_exceeds_native_by_more_than_noise_ceiling",
+    }
+    assert record["phases"]["backward"] == {
+        "native_deepep_v2": 33.61590576171875,
+        "candidate": 16.252992630004883,
+        "speedup": 2.068290223651486,
+    }
+    assert record["phases"]["forward_backward"] == {
+        "native_deepep_v2": 41.53744125366211,
+        "candidate": 20.16431999206543,
+        "speedup": 2.05994753455643,
+    }
+    peaks = record["same_process_peak_allocated_bytes"][
+        "forward_backward"
+    ]
+    assert peaks["candidate"] - peaks["native_deepep_v2"] == 89183744
+    assert peaks["candidate"] - peaks["native_deepep_v2"] > ledger[
+        "promotion"
+    ]["maximum_peak_memory_noise_bytes"]
+    assert all(
+        value > ledger["cosine_floor_exclusive"]
+        for value in record["qualified_cosines"].values()
+    )
+    assert all(len(digest) == 64 for digest in record["receipts"].values())
+
+    protected = _receipt_validator()["_protected_phases"](ledger, 4096)
+    assert protected["forward"]["candidate"] == 5.0423359870910645
+    assert protected["backward"]["candidate"] == 16.252992630004883
+    assert protected["forward_backward"]["candidate"] == 20.16431999206543
+
+
 def test_replay_identity_covers_benchmark_integration_and_runtime() -> None:
     """Require every non-DeepGEMM replay component to have a pinned identity."""
     identity = _load_ledger()["replay_identity"]
@@ -218,7 +257,7 @@ def test_receipt_validator_rejects_the_slower_rollback() -> None:
 
 
 def test_receipt_validator_enforces_the_4k_winner() -> None:
-    """Reject a candidate that starts optimization from a slower 4K result."""
+    """Reject a candidate that starts below any per-phase 4K winner."""
     validator = _receipt_validator()
     ledger = _load_ledger()
     result = _phase_result_from_ledger(4096)
@@ -228,7 +267,7 @@ def test_receipt_validator_enforces_the_4k_winner() -> None:
     )
     assert not failures
 
-    result["backward_ms"]["median"]["megamoe_mok"] = 23.51580810546875
+    result["backward_ms"]["median"]["megamoe_mok"] = 20.046367645263672
     result["backward_ms"]["speedup"] = (
         result["backward_ms"]["median"]["native_deepep_v2"]
         / result["backward_ms"]["median"]["megamoe_mok"]
