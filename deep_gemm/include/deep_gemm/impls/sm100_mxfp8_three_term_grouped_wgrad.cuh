@@ -405,11 +405,13 @@ k3_mxfp8_assert_wgrad_parent_aliases(
 
 /** Reduce fixed-top-k symmetric dX planes on wgrad's idle suffix warps.
  *
- * The enclosing dW2 callback first performs the rank publication barrier.
- * This helper is then called by dW13 after that edge and preserves the native
- * slot-order FP32 accumulation followed by one BF16 output rounding.  It is
- * outlined so the UMMA/TMA body does not inherit the reduction's vector
- * accumulators or address arithmetic.
+ * Callers either complete the rank publication barrier before entering this
+ * helper or pass the per-token system-scope readiness plane. In the latter
+ * case, the warp leader acquires the physical token's zero-count publication
+ * and synchronizes its lanes before any symmetric-plane load. The reduction
+ * preserves native slot-order FP32 accumulation followed by one BF16 output
+ * rounding. It is outlined so the UMMA/TMA body does not inherit the
+ * reduction's vector accumulators or address arithmetic.
  */
 template <uint32_t kNumSMs, uint32_t kNumCombineWarps>
 CUTLASS_DEVICE __noinline__ void
@@ -422,7 +424,8 @@ k3_mxfp8_wgrad_fixed_topk_combine(
         uint32_t num_topk,
         uint32_t hidden,
         uint32_t combine_warp_idx,
-        uint32_t lane_idx) {
+        uint32_t lane_idx,
+        const int* ready_counts = nullptr) {
     constexpr uint32_t kValuesPerVector =
         2u * sizeof(uint4) / sizeof(cutlass::bfloat16_t);
     const uint32_t num_vectors_per_token = hidden / kValuesPerVector;
@@ -438,6 +441,14 @@ k3_mxfp8_wgrad_fixed_topk_combine(
         DG_DEVICE_ASSERT(
             physical_token_idx != static_cast<uint32_t>(-1));
         DG_DEVICE_ASSERT(physical_token_idx < num_max_tokens);
+        if (ready_counts != nullptr) {
+            if (lane_idx == 0u) {
+                while (ptx::ld_acq_sys(
+                           ready_counts + physical_token_idx) != 0u)
+                    __nanosleep(64);
+            }
+            __syncwarp();
+        }
 
         for (uint32_t vector_idx = lane_idx;
              vector_idx < num_vectors_per_token;
@@ -653,8 +664,8 @@ struct K3MxFp8WgradOverlapStateLayout {
     static_assert(kNumSMs % 2u == 0u,
                   "Exact wgrad overlap requires complete CTA pairs");
     static_assert(
-        kNumExperts <= 128u,
-        "dW2 suffix alias masks reserve at most four 32-bit words");
+        kDW2SuffixExpertMaskWords * 32u >= kNumExperts,
+        "dW2 suffix alias masks must cover every local expert");
     static_assert(kDW2TensorMaps % 32u == 0u &&
                       kDW13TensorMaps % 32u == 0u,
                   "Device TensorMaps must remain 128-byte aligned");
@@ -5088,6 +5099,22 @@ sm100_k3_mxfp8_three_term_grouped_wgrad_body(
             (InputPanelLifecycle::kAEnabled ||
              InputPanelLifecycle::kBEnabled),
         "Input-panel lifecycle enable bit must name at least one operand");
+    constexpr uint32_t kK128MapOffset =
+        kK3MxFp8DW13RingK128ValueAPrimaryMap -
+        kK3MxFp8DW13RingValueAPrimaryMap;
+    static_assert(
+        kK128MapOffset ==
+            kK3MxFp8DW13RingK128ValueAResidualMap -
+                kK3MxFp8DW13RingValueAResidualMap &&
+        kK128MapOffset ==
+            kK3MxFp8DW13RingK128ValueBPrimaryMap -
+                kK3MxFp8DW13RingValueBPrimaryMap &&
+        kK128MapOffset ==
+            kK3MxFp8DW13RingK128ValueBResidualMap -
+                kK3MxFp8DW13RingValueBResidualMap);
+    static_assert(
+        !InputPanelLifecycle::kEnabled || !kPhaseTagged,
+        "ring K128 descriptors require one immutable exact-wgrad phase");
     if constexpr (InputPanelLifecycle::kEnabled)
         DG_DEVICE_ASSERT(input_panel_lifecycle != nullptr);
 
@@ -5294,6 +5321,16 @@ sm100_k3_mxfp8_three_term_grouped_wgrad_body(
         cute::prefetch_tma_descriptor(&tensor_map_sfb_primary);
         cute::prefetch_tma_descriptor(&tensor_map_sfb_residual);
         cute::prefetch_tma_descriptor(&tensor_map_d);
+        if constexpr (InputPanelLifecycle::kEnabled) {
+            cute::prefetch_tma_descriptor(
+                &tensor_map_a_primary + kK128MapOffset);
+            cute::prefetch_tma_descriptor(
+                &tensor_map_a_residual + kK128MapOffset);
+            cute::prefetch_tma_descriptor(
+                &tensor_map_b_primary + kK128MapOffset);
+            cute::prefetch_tma_descriptor(
+                &tensor_map_b_residual + kK128MapOffset);
+        }
         if constexpr (kPhaseTagged) {
             #pragma unroll
             for (uint32_t map = 0u; map < 8u; ++map)
@@ -5555,7 +5592,8 @@ sm100_k3_mxfp8_three_term_grouped_wgrad_body(
                                 remaining_k < kBlockK
                                     ? remaining_k : kBlockK,
                                 use_residual_a,
-                                map_a, map_sfa, sf_k_idx,
+                                map_a, map_a + kK128MapOffset,
+                                map_sfa, sf_k_idx,
                                 full_barriers[stage_idx],
                                 reinterpret_cast<uint8_t*>(
                                     smem_a[a_operand_stage_idx]),
@@ -5636,7 +5674,8 @@ sm100_k3_mxfp8_three_term_grouped_wgrad_body(
                                 remaining_k < kBlockK
                                     ? remaining_k : kBlockK,
                                 use_residual_b,
-                                map_b, map_sfb, sf_k_idx,
+                                map_b, map_b + kK128MapOffset,
+                                map_sfb, sf_k_idx,
                                 full_barriers[stage_idx],
                                 reinterpret_cast<uint8_t*>(
                                     smem_b[b_operand_stage_idx]),

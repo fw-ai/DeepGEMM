@@ -457,6 +457,11 @@ struct ExternalKGroupedTerminalThreeSegmentRangeStream {
     uint32_t* cluster_mailbox;
     uint32_t batch_tasks;
     uint32_t tasks_per_expert;
+    // Optional phase-one readiness/cursor plane. A phase-tagged K3 provider
+    // reuses each expert's completed W13-dgrad retirement count as its dW13
+    // task cursor after the exact aggregate target is reached.
+    uint32_t* expert_retired_counts = nullptr;
+    uint32_t retirements_per_pool_block = 0u;
 };
 
 template <bool kTwoSegmentK>
@@ -2615,7 +2620,8 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N,
                   GemmType::KGroupedContiguous,
                   BLOCK_M, BLOCK_N, kNumSMs,
                   kIsMulticastOnA>(),
-          bool kPairAdjacentN = false>
+          bool kPairAdjacentN = false,
+          bool kK3BF16WgradPhaseTagged = false>
 struct ExternalKGroupedTerminalThreeSegmentDynamicRangeProvider {
     static constexpr GemmType kTaskGemmType =
         GemmType::KGroupedContiguous;
@@ -2632,10 +2638,21 @@ struct ExternalKGroupedTerminalThreeSegmentDynamicRangeProvider {
     static constexpr uint32_t kTaskPoolBlockRows = kPoolBlockRows;
     static constexpr bool kTaskHasThreeSegmentK = true;
     static constexpr bool kTaskPairedN = kPairAdjacentN;
+    static constexpr bool kTaskPhaseTagged = kK3BF16WgradPhaseTagged;
+    static constexpr bool kTaskBF16PhaseTagged =
+        kK3BF16WgradPhaseTagged;
+    static constexpr uint32_t kTaskPhaseBit = 0x80000000u;
 
     using Decoder = ExternalKGroupedThreeSegmentRangeDecoder<
         BLOCK_M, BLOCK_N, kNumMulticast, kIsMulticastOnA,
         SHAPE_M, SHAPE_N, kNum1DBlocksPerGroup,
+        kPoolBlockRows, kSFKSpan,
+        kPoolPrefixWord, kActiveExpertWord,
+        kPoolPrefixWord, kPoolPrefixWord, false,
+        kPairAdjacentN>;
+    using K3DW13Decoder = ExternalKGroupedThreeSegmentRangeDecoder<
+        BLOCK_M, BLOCK_N, kNumMulticast, kIsMulticastOnA,
+        6144u, 3584u, kNum1DBlocksPerGroup,
         kPoolBlockRows, kSFKSpan,
         kPoolPrefixWord, kActiveExpertWord,
         kPoolPrefixWord, kPoolPrefixWord, false,
@@ -2672,6 +2689,14 @@ struct ExternalKGroupedTerminalThreeSegmentDynamicRangeProvider {
     static_assert(
         kPhysicalRangeStateStride != 0u,
         "terminal three-segment provider requires contiguous range state");
+    static_assert(
+        !kK3BF16WgradPhaseTagged ||
+            (SHAPE_M == 3584u && SHAPE_N == 3072u &&
+             kTasksPerExpert ==
+                 (kPairAdjacentN ? 84u : 168u) &&
+             K3DW13Decoder::kNumClusterTasksPerGroup ==
+                 (kPairAdjacentN ? 168u : 336u)),
+        "phase-tagged three-segment BF16 wgrad requires exact K3 geometry");
 
     int current_iter = -1;
     uint32_t current_group_idx = 0u;
@@ -2681,12 +2706,15 @@ struct ExternalKGroupedTerminalThreeSegmentDynamicRangeProvider {
     uint32_t current_second_segment_shape_k = 0u;
     uint32_t current_second_segment_k_cumsum = 0u;
     uint32_t current_third_segment_k_cumsum = 0u;
+    uint32_t current_wgrad_phase = 0u;
 
     const uint32_t* first_segment_state_words;
     const uint32_t* second_segment_state_words;
     uint32_t* task_cursor;
     uint32_t task_limit;
     uint32_t* cluster_mailbox;
+    uint32_t* expert_retired_counts;
+    uint32_t retirements_per_pool_block;
 
     uint32_t batch_sequence = 0u;
     uint32_t batch_first = 0u;
@@ -2701,7 +2729,10 @@ struct ExternalKGroupedTerminalThreeSegmentDynamicRangeProvider {
         second_segment_state_words(stream.second_segment_state_words),
         task_cursor(stream.task_cursor),
         task_limit(stream.task_limit),
-        cluster_mailbox(stream.cluster_mailbox) {
+        cluster_mailbox(stream.cluster_mailbox),
+        expert_retired_counts(stream.expert_retired_counts),
+        retirements_per_pool_block(
+            stream.retirements_per_pool_block) {
         DG_DEVICE_ASSERT(first_segment_state_words != nullptr);
         DG_DEVICE_ASSERT(second_segment_state_words != nullptr);
         DG_DEVICE_ASSERT(task_cursor != nullptr);
@@ -2709,6 +2740,10 @@ struct ExternalKGroupedTerminalThreeSegmentDynamicRangeProvider {
         DG_DEVICE_ASSERT(stream.batch_tasks == kBatchTasks);
         DG_DEVICE_ASSERT(stream.tasks_per_expert == kTasksPerExpert);
         DG_DEVICE_ASSERT(task_limit % kBatchTasks == 0u);
+        if constexpr (kK3BF16WgradPhaseTagged) {
+            DG_DEVICE_ASSERT(expert_retired_counts != nullptr);
+            DG_DEVICE_ASSERT(retirements_per_pool_block != 0u);
+        }
     }
 
     CUTLASS_DEVICE explicit
@@ -2758,8 +2793,141 @@ struct ExternalKGroupedTerminalThreeSegmentDynamicRangeProvider {
                 __nanosleep(64);
             }
             cluster_mailbox[0] = 0u;
-            first = atomicAdd(task_cursor, kBatchTasks);
-            count = first < task_limit ? kBatchTasks : 0u;
+            if constexpr (kK3BF16WgradPhaseTagged) {
+                constexpr uint32_t kDW13TasksPerExpert =
+                    K3DW13Decoder::kNumClusterTasksPerGroup;
+                const uint32_t active_count =
+                    task_limit / kTasksPerExpert;
+                const uint32_t cluster_idx =
+                    static_cast<uint32_t>(blockIdx.x) / kNumMulticast;
+                const uint32_t scan_start = active_count == 0u
+                    ? 0u
+                    : (cluster_idx + batch_sequence) % active_count;
+                auto* const dw13_cursors = expert_retired_counts;
+
+                const auto readiness_target = [&](const uint32_t expert) {
+                    const auto range_pool_blocks = [=](
+                            const uint32_t* state_words) {
+                        return state_words[
+                                   kPoolPrefixWord + expert + 1u] -
+                            state_words[kPoolPrefixWord + expert];
+                    };
+                    const auto* const third_segment_state_words =
+                        second_segment_state_words -
+                        kPhysicalRangeStateStride;
+                    return (range_pool_blocks(first_segment_state_words) +
+                            range_pool_blocks(second_segment_state_words) +
+                            range_pool_blocks(third_segment_state_words)) *
+                        retirements_per_pool_block;
+                };
+
+                // W13 readiness is sparse while ordinary dW2 work remains.
+                // Scanning all 112 K3 experts before every 12-task dW2 claim
+                // serializes global acquire traffic onto the scheduler warp.
+                // Rotating four-expert probes across 74 clusters preserve
+                // opportunistic dW13 overlap without putting an O(E) scan on
+                // the common path. Once dW2 is exhausted, a complete scan is
+                // mandatory before the provider may publish termination.
+                constexpr uint32_t kReadyProbeExperts = 4u;
+
+                while (true) {
+                    const bool complete_dw13_scan =
+                        ptx::ld_acq(task_cursor) >= task_limit;
+                    const uint32_t scan_count = complete_dw13_scan
+                        ? active_count
+                        : cute::min(active_count, kReadyProbeExperts);
+                    bool all_dw13_claimed = complete_dw13_scan;
+                    bool claimed = false;
+
+                    // Prefer any expert whose final W13-weight TMA reader has
+                    // retired. This converts dW2's serial terminal dW13 tail
+                    // into complete phase-restoring quanta in the same body.
+                    for (uint32_t scan = 0u;
+                         scan < scan_count; ++scan) {
+                        const uint32_t active_expert =
+                            (scan_start + scan) % active_count;
+                        const uint32_t expert = first_segment_state_words[
+                            kActiveExpertWord + active_expert];
+                        const uint32_t expected =
+                            readiness_target(expert);
+                        DG_DEVICE_ASSERT(expected != 0u);
+                        const uint32_t terminal_value =
+                            expected + kDW13TasksPerExpert;
+                        uint32_t observed = ptx::ld_acq(
+                            expert_retired_counts + expert);
+                        DG_DEVICE_ASSERT(observed <= terminal_value);
+                        if (observed < terminal_value)
+                            all_dw13_claimed = false;
+                        while (observed >= expected &&
+                               observed < terminal_value) {
+                            const uint32_t local_first =
+                                observed - expected;
+                            count = cute::min(
+                                kBatchTasks,
+                                kDW13TasksPerExpert - local_first);
+                            const uint32_t previous = atomicCAS(
+                                dw13_cursors + expert,
+                                observed, observed + count);
+                            if (previous == observed) {
+                                first = kTaskPhaseBit |
+                                    (active_expert *
+                                         kDW13TasksPerExpert +
+                                     local_first);
+                                claimed = true;
+                                break;
+                            }
+                            observed = previous;
+                            DG_DEVICE_ASSERT(
+                                observed <= terminal_value);
+                        }
+                        if (claimed)
+                            break;
+                    }
+                    if (claimed)
+                        break;
+
+                    bool all_dw2_claimed = false;
+                    while (true) {
+                        first = ptx::ld_acq(task_cursor);
+                        if (first >= task_limit) {
+                            all_dw2_claimed = true;
+                            count = 0u;
+                            break;
+                        }
+                        const uint32_t expert_end =
+                            (first / kTasksPerExpert + 1u) *
+                            kTasksPerExpert;
+                        count = cute::min(
+                            kBatchTasks,
+                            cute::min(task_limit - first,
+                                      expert_end - first));
+                        if (atomicCAS(
+                                task_cursor, first, first + count) ==
+                            first) {
+                            claimed = true;
+                            break;
+                        }
+                    }
+                    if (claimed)
+                        break;
+                    if (all_dw2_claimed && all_dw13_claimed) {
+                        count = 0u;
+                        break;
+                    }
+                    __nanosleep(64);
+                }
+                if (count != 0u &&
+                    (first & kTaskPhaseBit) != 0u) {
+                    // The acquire/CAS above orders the aliased dW13 output
+                    // after the final W13-weight reader. Carry that edge into
+                    // the async proxy before publishing the TMA-store batch.
+                    asm volatile(
+                        "fence.proxy.async.global;" ::: "memory");
+                }
+            } else {
+                first = atomicAdd(task_cursor, kBatchTasks);
+                count = first < task_limit ? kBatchTasks : 0u;
+            }
             cluster_mailbox[1] = first;
             cluster_mailbox[2] = count;
             asm volatile(
@@ -2800,11 +2968,38 @@ struct ExternalKGroupedTerminalThreeSegmentDynamicRangeProvider {
 
         const uint32_t cluster_rank =
             static_cast<uint32_t>(blockIdx.x) % kNumMulticast;
-        const auto decoded = Decoder::decode_range_task(
-            first_segment_state_words,
-            second_segment_state_words,
-            second_segment_state_words - kPhysicalRangeStateStride,
-            batch_first, batch_offset++, cluster_rank);
+        current_wgrad_phase =
+            kK3BF16WgradPhaseTagged &&
+                    (batch_first & kTaskPhaseBit) != 0u
+                ? 1u
+                : 0u;
+        const uint32_t phase_first =
+            kK3BF16WgradPhaseTagged
+                ? batch_first & ~kTaskPhaseBit
+                : batch_first;
+        ExternalKGroupedThreeSegmentRangeDecodedTask decoded{};
+        if constexpr (kK3BF16WgradPhaseTagged) {
+            decoded = current_wgrad_phase == 0u
+                ? Decoder::decode_range_task(
+                      first_segment_state_words,
+                      second_segment_state_words,
+                      second_segment_state_words -
+                          kPhysicalRangeStateStride,
+                      phase_first, batch_offset++, cluster_rank)
+                : K3DW13Decoder::decode_range_task(
+                      first_segment_state_words,
+                      second_segment_state_words,
+                      second_segment_state_words -
+                          kPhysicalRangeStateStride,
+                      phase_first, batch_offset++, cluster_rank);
+        } else {
+            decoded = Decoder::decode_range_task(
+                first_segment_state_words,
+                second_segment_state_words,
+                second_segment_state_words -
+                    kPhysicalRangeStateStride,
+                phase_first, batch_offset++, cluster_rank);
+        }
         const auto& task = decoded.output_task;
         current_group_idx = task.group_idx;
         current_shape_k = task.shape_k;
@@ -2848,8 +3043,22 @@ struct ExternalKGroupedTerminalThreeSegmentDynamicRangeProvider {
                 current_second_segment_k_cumsum,
                 current_third_segment_k_cumsum);
         }
-        const uint32_t offset = kWithGroupOffset
-            ? current_group_idx * shape_dim : 0u;
+        uint32_t offset = 0u;
+        if constexpr (kWithGroupOffset) {
+            if constexpr (kIndexType == IndexType::MN) {
+                if constexpr (kK3BF16WgradPhaseTagged) {
+                    DG_DEVICE_ASSERT(
+                        shape_dim == SHAPE_M ||
+                        shape_dim == SHAPE_N);
+                }
+                const uint32_t phase_shape_dim =
+                    kK3BF16WgradPhaseTagged &&
+                            current_wgrad_phase != 0u
+                        ? (shape_dim == SHAPE_M ? 6144u : 3584u)
+                        : shape_dim;
+                offset = current_group_idx * phase_shape_dim;
+            }
+        }
         return offset + block_idx * block_size;
     }
 
@@ -2867,6 +3076,27 @@ struct ExternalKGroupedTerminalThreeSegmentDynamicRangeProvider {
         return true;
     }
 };
+
+/** Exact Kimi K3 three-segment BF16 dW2/dW13 work-conserving provider. */
+template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t kNumSMs,
+          uint32_t kBatchTasks, uint32_t kTasksPerExpert,
+          uint32_t kPoolBlockRows = 192u,
+          uint32_t kSFKSpan = 64u,
+          uint32_t kPoolPrefixWord = 31u,
+          uint32_t kActiveExpertWord = 144u,
+          uint32_t kPhysicalRangeStateStride = 0u>
+using ExternalKGroupedK3ThreeSegmentBF16WgradDynamicRangeProvider =
+    ExternalKGroupedTerminalThreeSegmentDynamicRangeProvider<
+        BLOCK_M, BLOCK_N, 2u, false, kNumSMs,
+        3584u, 3072u, kBatchTasks, kTasksPerExpert,
+        kPoolBlockRows, kSFKSpan,
+        kPoolPrefixWord, kActiveExpertWord,
+        kPhysicalRangeStateStride,
+        4u, 4u,
+        get_num_1d_blocks_per_group<
+            GemmType::KGroupedContiguous,
+            BLOCK_M, BLOCK_N, kNumSMs, false>(),
+        false, true>;
 
 /** Exact Kimi K3 two-segment BF16 dW2/dW13 work-conserving provider.
  *

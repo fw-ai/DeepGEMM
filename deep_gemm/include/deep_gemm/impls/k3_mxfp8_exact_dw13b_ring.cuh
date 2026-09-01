@@ -29,86 +29,80 @@ static_assert(
 static_assert(offsetof(K3MxFp8DW13BGatherStage, work) == 8200u);
 static_assert(sizeof(K3MxFp8DW13BGatherStage) == 8320u);
 
-/** Dense block-major task order shared by the decoupled A/B publisher.
+/** Dense block-major panel order shared by the decoupled A/B publisher.
  *
- * The global cursor hands out every A and B ticket for one compact
- * expert-major block before any ticket from the next block.  Engines may
- * complete those already-claimed tickets out of order; wrapped generations
+ * One cursor task owns all six group-32 tickets in a feature-128 panel. A
+ * four-task claim therefore owns 24 tickets, but cannot cross A/B or physical
+ * block boundaries because 48 A panels and 28 B panels are both divisible by
+ * four. Engines may complete already-claimed panels out of order; wrapped
  * remain safe because slot opening waits for the preceding generation's
  * terminal retirement.
  */
 struct K3MxFp8DW13ABBlockMajorSchedule {
-    static constexpr uint32_t kATicketsPerBlock =
-        K3MxFp8ExactDW13AEpilogueRingLayout::kTicketsPerSlot;
-    static constexpr uint32_t kBTicketsPerBlock =
-        K3MxFp8ExactDW13BEpilogueRingLayout::kTicketsPerSlot;
-    static constexpr uint32_t kTicketsPerBlock =
-        kATicketsPerBlock + kBTicketsPerBlock;
+    static constexpr uint32_t kAPanelsPerBlock =
+        K3MxFp8ExactDW13AEpilogueRingLayout::kFeaturePanels;
+    static constexpr uint32_t kBPanelsPerBlock =
+        K3MxFp8ExactDW13BEpilogueRingLayout::kFeaturePanels;
+    static constexpr uint32_t kGroupsPerPanel =
+        K3MxFp8ExactDW13AEpilogueRingLayout::kGroupsPerBlock;
+    static constexpr uint32_t kPanelBundlesPerBlock =
+        kAPanelsPerBlock + kBPanelsPerBlock;
+    static constexpr uint32_t kPanelBundlesPerClaim = 4u;
+    static_assert(
+        kAPanelsPerBlock % kPanelBundlesPerClaim == 0u &&
+        kBPanelsPerBlock % kPanelBundlesPerClaim == 0u);
 
-    static constexpr uint32_t task_index(
+    static constexpr uint32_t bundle_index(
             uint32_t production_ordinal, bool is_b,
-            uint32_t feature_panel, uint32_t group_in_block) {
+            uint32_t feature_panel) {
         const uint32_t local = is_b
-            ? kATicketsPerBlock +
-                K3MxFp8ExactDW13BEpilogueRingLayout::ticket_index(
-                    feature_panel, group_in_block)
-            : K3MxFp8ExactDW13AEpilogueRingLayout::ticket_index(
-                feature_panel, group_in_block);
-        return production_ordinal * kTicketsPerBlock + local;
+            ? kAPanelsPerBlock + feature_panel
+            : feature_panel;
+        return production_ordinal * kPanelBundlesPerBlock + local;
     }
 
-    static constexpr uint32_t production_ordinal(uint32_t task) {
-        return task / kTicketsPerBlock;
+    static constexpr uint32_t bundle_production_ordinal(uint32_t bundle) {
+        return bundle / kPanelBundlesPerBlock;
     }
 
-    static constexpr uint32_t local_task(uint32_t task) {
-        return task % kTicketsPerBlock;
+    static constexpr uint32_t local_bundle(uint32_t bundle) {
+        return bundle % kPanelBundlesPerBlock;
     }
 
-    static constexpr bool is_b(uint32_t task) {
-        return local_task(task) >= kATicketsPerBlock;
+    static constexpr bool bundle_is_b(uint32_t bundle) {
+        return local_bundle(bundle) >= kAPanelsPerBlock;
     }
 
-    static constexpr uint32_t operand_local_task(uint32_t task) {
-        const uint32_t local = local_task(task);
-        return is_b(task) ? local - kATicketsPerBlock : local;
+    static constexpr uint32_t operand_local_bundle(uint32_t bundle) {
+        const uint32_t local = local_bundle(bundle);
+        return bundle_is_b(bundle) ? local - kAPanelsPerBlock : local;
     }
 
-    static constexpr uint32_t feature_panel(uint32_t task) {
-        const uint32_t local = operand_local_task(task);
-        return local / K3MxFp8ExactDW13AEpilogueRingLayout::
-            kGroupsPerBlock;
+    static constexpr uint32_t bundle_feature_panel(uint32_t bundle) {
+        return operand_local_bundle(bundle);
     }
 
-    static constexpr uint32_t group_in_block(uint32_t task) {
-        const uint32_t local = operand_local_task(task);
-        return local % K3MxFp8ExactDW13AEpilogueRingLayout::
-            kGroupsPerBlock;
-    }
-
-    static constexpr uint32_t num_tasks(uint32_t compact_blocks) {
-        return compact_blocks * kTicketsPerBlock;
+    static constexpr uint32_t num_bundles(uint32_t compact_blocks) {
+        return compact_blocks * kPanelBundlesPerBlock;
     }
 };
 
-static_assert(K3MxFp8DW13ABBlockMajorSchedule::kATicketsPerBlock == 288u);
-static_assert(K3MxFp8DW13ABBlockMajorSchedule::kBTicketsPerBlock == 168u);
-static_assert(K3MxFp8DW13ABBlockMajorSchedule::kTicketsPerBlock == 456u);
+static_assert(K3MxFp8DW13ABBlockMajorSchedule::kAPanelsPerBlock == 48u);
+static_assert(K3MxFp8DW13ABBlockMajorSchedule::kBPanelsPerBlock == 28u);
+static_assert(K3MxFp8DW13ABBlockMajorSchedule::kGroupsPerPanel == 6u);
 static_assert(
-    K3MxFp8DW13ABBlockMajorSchedule::production_ordinal(
-        K3MxFp8DW13ABBlockMajorSchedule::task_index(
-            7u, true, 27u, 5u)) == 7u);
-static_assert(K3MxFp8DW13ABBlockMajorSchedule::is_b(
-    K3MxFp8DW13ABBlockMajorSchedule::task_index(
-        7u, true, 27u, 5u)));
+    K3MxFp8DW13ABBlockMajorSchedule::kPanelBundlesPerBlock == 76u);
 static_assert(
-    K3MxFp8DW13ABBlockMajorSchedule::feature_panel(
-        K3MxFp8DW13ABBlockMajorSchedule::task_index(
-            7u, true, 27u, 5u)) == 27u);
+    K3MxFp8DW13ABBlockMajorSchedule::bundle_production_ordinal(
+        K3MxFp8DW13ABBlockMajorSchedule::bundle_index(
+            7u, true, 27u)) == 7u);
+static_assert(K3MxFp8DW13ABBlockMajorSchedule::bundle_is_b(
+    K3MxFp8DW13ABBlockMajorSchedule::bundle_index(
+        7u, true, 27u)));
 static_assert(
-    K3MxFp8DW13ABBlockMajorSchedule::group_in_block(
-        K3MxFp8DW13ABBlockMajorSchedule::task_index(
-            7u, true, 27u, 5u)) == 5u);
+    K3MxFp8DW13ABBlockMajorSchedule::bundle_feature_panel(
+        K3MxFp8DW13ABBlockMajorSchedule::bundle_index(
+            7u, true, 27u)) == 27u);
 
 /** Packed canonical-pool readiness published once per physical block.
  *
@@ -302,7 +296,8 @@ k3_mxfp8_publish_dw13_ab_group_from_pool(
 #endif
         K3MxFp8DW13BGatherStage* stage,
         uint32_t& load_phase,
-        uint32_t producer_thread) {
+        uint32_t producer_thread,
+        bool source_ready_acquired) {
     using Ring = K3MxFp8EpiloguePanelRingView<
         3584u, kLogicalWidth, kPoolBlockRows>;
     using Layout = typename Ring::Layout;
@@ -331,30 +326,30 @@ k3_mxfp8_publish_dw13_ab_group_from_pool(
         logical_feature_begin % kFeatures == 0u &&
         logical_feature_begin + kFeatures <= kLogicalWidth);
 
-    if (producer_thread == 0u) {
-        uint32_t observed = ptx::ld_acq(
-            source_block_ready + source_block.physical_pool_block);
-#if DG_EXPERIMENTAL_K3_MXFP8_EXACT_RING_WATCHDOG
-        const uint64_t wait_start = clock64();
-#endif
-        while (!k3_mxfp8_dw13_ab_block_ready(observed)) {
-#if DG_EXPERIMENTAL_K3_MXFP8_EXACT_RING_WATCHDOG
-            k3_mxfp8_exact_ring_watchdog<1u>(
-                wait_start, observed, kK3MxFp8DW13ABBlockReadyWord,
-                source_block.physical_pool_block,
-                blockIdx.x == 132u && (threadIdx.x & 31u) == 0u);
-#endif
-            __nanosleep(64);
-            observed = ptx::ld_acq(
+    if (!source_ready_acquired) {
+        if (producer_thread == 0u) {
+            uint32_t observed = ptx::ld_acq(
                 source_block_ready + source_block.physical_pool_block);
+#if DG_EXPERIMENTAL_K3_MXFP8_EXACT_RING_WATCHDOG
+            const uint64_t wait_start = clock64();
+#endif
+            while (!k3_mxfp8_dw13_ab_block_ready(observed)) {
+#if DG_EXPERIMENTAL_K3_MXFP8_EXACT_RING_WATCHDOG
+                k3_mxfp8_exact_ring_watchdog<1u>(
+                    wait_start, observed, kK3MxFp8DW13ABBlockReadyWord,
+                    source_block.physical_pool_block,
+                    blockIdx.x == 132u && (threadIdx.x & 31u) == 0u);
+#endif
+                __nanosleep(64);
+                observed = ptx::ld_acq(
+                    source_block_ready + source_block.physical_pool_block);
+            }
         }
+        cutlass::arch::NamedBarrier::sync(
+            kProducerThreads, kNamedBarrier);
+        // Carry this generic acquire into TMA's async proxy once per claim.
+        asm volatile("fence.proxy.async.global;" ::: "memory");
     }
-    cutlass::arch::NamedBarrier::sync(
-        kProducerThreads, kNamedBarrier);
-    // Packed readiness is a generic-proxy release/acquire edge.  Carry it
-    // into TMA's async proxy before either canonical source descriptor reads
-    // the just-published block.
-    asm volatile("fence.proxy.async.global;" ::: "memory");
 
     const uint32_t production_ordinal =
         source_block.compact_block_ordinal;
@@ -456,15 +451,86 @@ k3_mxfp8_publish_dw13_ab_group_from_pool(
         kProducerThreads, kNamedBarrier);
 }
 
+/** Publish all six group tickets for one feature-panel bundle. */
+template <uint32_t kLogicalWidth, uint32_t kPoolBlockRows,
+          uint32_t kReaderTarget, uint32_t kProducerThreads,
+          uint32_t kNamedBarrier
+#if DG_EXPERIMENTAL_K3_MXFP8_EXACT_RING_WATCHDOG
+          , typename DiagnosticRing
+#endif
+          >
+CUTLASS_DEVICE __noinline__ void
+k3_mxfp8_publish_dw13_ab_panel_bundle_from_pool(
+        const K3MxFp8EpiloguePanelRingView<
+            3584u, kLogicalWidth, kPoolBlockRows>& ring,
+        const cute::TmaDescriptor* source_map,
+        const uint32_t* source_block_ready,
+        bool source_ready_acquired,
+        const K3MxFp8DW13ABSourceBlock& source_block,
+        uint32_t expert_value_begin,
+        uint32_t expert_value_end,
+        uint32_t expert_scale_begin,
+        uint32_t logical_feature_begin,
+        uint32_t* primary_packed_scales,
+        uint32_t* residual_packed_scales,
+#if DG_EXPERIMENTAL_K3_MXFP8_EXACT_RING_WATCHDOG
+        const DiagnosticRing* diagnostic_ring,
+#endif
+        K3MxFp8DW13BGatherStage* stage,
+        uint32_t& load_phase,
+        uint32_t producer_thread) {
+    #pragma unroll 1
+    for (uint32_t group_in_block = 0u;
+         group_in_block <
+             K3MxFp8DW13ABBlockMajorSchedule::kGroupsPerPanel;
+         ++group_in_block) {
+        k3_mxfp8_publish_dw13_ab_group_from_pool<
+            kLogicalWidth, kPoolBlockRows, kReaderTarget,
+            kProducerThreads, kNamedBarrier>(
+                ring, source_map, source_block_ready, source_block,
+                expert_value_begin, expert_value_end, expert_scale_begin,
+                logical_feature_begin, group_in_block,
+                primary_packed_scales, residual_packed_scales,
+#if DG_EXPERIMENTAL_K3_MXFP8_EXACT_RING_WATCHDOG
+                diagnostic_ring,
+#endif
+                stage, load_phase, producer_thread,
+                source_ready_acquired || group_in_block != 0u);
+    }
+}
+
+/** Pointer-stable arguments shared by every A/B producer engine. */
+template <uint32_t kHidden, uint32_t kIntermediateHidden,
+          uint32_t kPoolBlockRows>
+struct alignas(128) K3MxFp8DW13ABBackgroundContext {
+    K3MxFp8EpiloguePanelRingView<
+        kHidden, 2u * kIntermediateHidden, kPoolBlockRows> a_ring;
+    K3MxFp8EpiloguePanelRingView<
+        kHidden, kHidden, kPoolBlockRows> b_ring;
+    const cute::TmaDescriptor* grad_gate_up_source_map;
+    const cute::TmaDescriptor* x_pool_source_map;
+    const uint32_t* source_block_ready;
+    const int* expert_counts;
+    const K3BackwardRangeSet* backward_ranges;
+    const uint32_t* value_prefix;
+    const uint32_t* scale_prefix;
+    const uint32_t* physical_range_prefix;
+    uint32_t* a_primary_packed_scales;
+    uint32_t* a_residual_packed_scales;
+    uint32_t* b_primary_packed_scales;
+    uint32_t* b_residual_packed_scales;
+    uint32_t* ab_block_cursor;
+    K3MxFp8DW13BGatherStage* stages;
+};
 /** Allocation-free decoupled producer for both dW13 input rings.
  *
  * A caller-owned atomic cursor walks
- * `(compact block, A tickets, B tickets)` in that exact order.  Each
- * 128-thread engine claims one ticket, resolves reverse-range varlen source
- * coordinates, waits the block's canonical-pool epoch, and publishes values,
- * compact scales, and the generation ticket.  Engines may overlap adjacent
- * claims, but no engine can claim a later block until all 456 tasks of the
- * current block have been handed out.  Slot opening supplies the rolling
+ * `(compact block, A panels, B panels)` in that exact order. Each 128-thread
+ * engine claims four feature panels, resolves reverse-range varlen source
+ * coordinates once, acquires canonical-pool readiness once, and publishes
+ * the panels' 24 group-32 value/scale tickets. Engines may overlap adjacent
+ * claims, but no engine can claim a later block until all 19 claims of the
+ * current block have been handed out. Slot opening supplies the rolling
  * credit: a wrapped generation cannot overwrite its predecessor until every
  * grouped consumer has retired it.
  */
@@ -474,23 +540,8 @@ template <uint32_t kHidden, uint32_t kIntermediateHidden,
           uint32_t kNamedBarrier>
 CUTLASS_DEVICE __noinline__ void
 k3_mxfp8_run_dw13_ab_block_major_producer(
-        const K3MxFp8EpiloguePanelRingView<
-            kHidden, 2u * kIntermediateHidden, kPoolBlockRows>& a_ring,
-        const K3MxFp8EpiloguePanelRingView<
-            kHidden, kHidden, kPoolBlockRows>& b_ring,
-        const cute::TmaDescriptor* grad_gate_up_source_map,
-        const cute::TmaDescriptor* x_pool_source_map,
-        const uint32_t* source_block_ready,
-        const int* expert_counts,
-        const K3BackwardRangeSet& backward_ranges,
-        const uint32_t* value_prefix,
-        const uint32_t* scale_prefix,
-        const uint32_t* physical_range_prefix,
-        uint32_t* a_primary_packed_scales,
-        uint32_t* a_residual_packed_scales,
-        uint32_t* b_primary_packed_scales,
-        uint32_t* b_residual_packed_scales,
-        uint32_t* task_cursor,
+        const K3MxFp8DW13ABBackgroundContext<
+            kHidden, kIntermediateHidden, kPoolBlockRows>* context,
         K3MxFp8DW13BGatherStage* stage,
         uint32_t producer_thread) {
     using Schedule = K3MxFp8DW13ABBlockMajorSchedule;
@@ -501,36 +552,46 @@ k3_mxfp8_run_dw13_ab_block_major_producer(
     static_assert(kMaxRanges == kK3MaxBackwardRanges);
 
     DG_DEVICE_ASSERT(
-        a_ring.total_pool_blocks == b_ring.total_pool_blocks &&
-        a_ring.depth == b_ring.depth &&
-        a_ring.total_pool_blocks != 0u &&
-        value_prefix[kNumExperts] ==
-            a_ring.total_pool_blocks * kPoolBlockRows &&
-        value_prefix[kNumExperts] % kPoolBlockRows == 0u &&
-        task_cursor != nullptr && source_block_ready != nullptr &&
-        grad_gate_up_source_map != nullptr && x_pool_source_map != nullptr &&
+        context != nullptr &&
+        context->a_ring.total_pool_blocks ==
+            context->b_ring.total_pool_blocks &&
+        context->a_ring.depth == context->b_ring.depth &&
+        context->a_ring.total_pool_blocks != 0u &&
+        context->value_prefix[kNumExperts] ==
+            context->a_ring.total_pool_blocks * kPoolBlockRows &&
+        context->value_prefix[kNumExperts] % kPoolBlockRows == 0u &&
+        context->ab_block_cursor != nullptr &&
+        context->source_block_ready != nullptr &&
+        context->grad_gate_up_source_map != nullptr &&
+        context->x_pool_source_map != nullptr &&
         producer_thread < kProducerThreads);
 
     if (producer_thread == 0u) {
-        cute::prefetch_tma_descriptor(grad_gate_up_source_map);
-        cute::prefetch_tma_descriptor(x_pool_source_map);
+        cute::prefetch_tma_descriptor(
+            context->grad_gate_up_source_map);
+        cute::prefetch_tma_descriptor(context->x_pool_source_map);
     }
     cutlass::arch::NamedBarrier::sync(
         kProducerThreads, kNamedBarrier);
 
     uint32_t load_phase = 0u;
-    const uint32_t total_tasks =
-        Schedule::num_tasks(a_ring.total_pool_blocks);
+    const uint32_t total_bundles =
+        Schedule::num_bundles(context->a_ring.total_pool_blocks);
     while (true) {
         if (producer_thread == 0u) {
-            stage->work[0] = atomicAdd(task_cursor, 1u);
-            if (stage->work[0] < total_tasks) {
+            stage->work[0] = atomicAdd(
+                context->ab_block_cursor,
+                Schedule::kPanelBundlesPerClaim);
+            if (stage->work[0] < total_bundles) {
                 const auto source_block =
                     k3_mxfp8_dw13_ab_source_block<
                         kNumExperts, kPoolBlockRows, kMaxRanges>(
-                            Schedule::production_ordinal(stage->work[0]),
-                            expert_counts, backward_ranges,
-                            value_prefix, physical_range_prefix);
+                            Schedule::bundle_production_ordinal(
+                                stage->work[0]),
+                            context->expert_counts,
+                            *context->backward_ranges,
+                            context->value_prefix,
+                            context->physical_range_prefix);
                 stage->work[1] = source_block.expert;
                 stage->work[2] = source_block.range_index;
                 stage->work[3] = source_block.expert_local_block;
@@ -540,61 +601,76 @@ k3_mxfp8_run_dw13_ab_block_major_producer(
         }
         cutlass::arch::NamedBarrier::sync(
             kProducerThreads, kNamedBarrier);
-        const uint32_t task = stage->work[0];
-        if (task >= total_tasks)
+        const uint32_t base_bundle = stage->work[0];
+        if (base_bundle >= total_bundles)
             break;
 
         const K3MxFp8DW13ABSourceBlock source_block{
             stage->work[1], stage->work[2],
-            Schedule::production_ordinal(task), stage->work[3],
-            stage->work[4], stage->work[5]};
-        const bool is_b = Schedule::is_b(task);
-        const uint32_t feature_panel =
-            Schedule::feature_panel(task);
-        const uint32_t logical_feature_begin =
-            feature_panel * kK3MxFp8EpilogueFeaturePanel;
-        const uint32_t group_in_block =
-            Schedule::group_in_block(task);
-        const uint32_t expert = source_block.expert;
+            Schedule::bundle_production_ordinal(base_bundle),
+            stage->work[3], stage->work[4], stage->work[5]};
+        #pragma unroll 1
+        for (uint32_t bundle_offset = 0u;
+             bundle_offset < Schedule::kPanelBundlesPerClaim;
+             ++bundle_offset) {
+            const uint32_t bundle = base_bundle + bundle_offset;
+            DG_DEVICE_ASSERT(
+                bundle < total_bundles &&
+                Schedule::bundle_production_ordinal(bundle) ==
+                    source_block.compact_block_ordinal);
+            const bool is_b = Schedule::bundle_is_b(bundle);
+            const uint32_t feature_panel =
+                Schedule::bundle_feature_panel(bundle);
+            const uint32_t logical_feature_begin =
+                feature_panel * kK3MxFp8EpilogueFeaturePanel;
+            const uint32_t expert = source_block.expert;
 
-        if (is_b) {
-            DG_DEVICE_ASSERT(
-                feature_panel <
-                    K3MxFp8ExactDW13BEpilogueRingLayout::kFeaturePanels);
-            k3_mxfp8_publish_dw13_ab_group_from_pool<
-                kHidden, kPoolBlockRows,
-                kK3MxFp8DW13BReaderTarget,
-                kProducerThreads, kNamedBarrier>(
-                    b_ring, x_pool_source_map,
-                    source_block_ready,
-                    source_block, value_prefix[expert],
-                    value_prefix[expert + 1u], scale_prefix[expert],
-                    logical_feature_begin, group_in_block,
-                    b_primary_packed_scales,
-                    b_residual_packed_scales,
+            if (is_b) {
+                DG_DEVICE_ASSERT(
+                    feature_panel <
+                        K3MxFp8ExactDW13BEpilogueRingLayout::
+                            kFeaturePanels);
+                k3_mxfp8_publish_dw13_ab_panel_bundle_from_pool<
+                    kHidden, kPoolBlockRows,
+                    kK3MxFp8DW13BReaderTarget,
+                    kProducerThreads, kNamedBarrier>(
+                        context->b_ring, context->x_pool_source_map,
+                        context->source_block_ready,
+                        bundle_offset != 0u, source_block,
+                        context->value_prefix[expert],
+                        context->value_prefix[expert + 1u],
+                        context->scale_prefix[expert],
+                        logical_feature_begin,
+                        context->b_primary_packed_scales,
+                        context->b_residual_packed_scales,
 #if DG_EXPERIMENTAL_K3_MXFP8_EXACT_RING_WATCHDOG
-                    &a_ring,
+                        &context->a_ring,
 #endif
-                    stage, load_phase, producer_thread);
-        } else {
-            DG_DEVICE_ASSERT(
-                feature_panel <
-                    K3MxFp8ExactDW13AEpilogueRingLayout::kFeaturePanels);
-            k3_mxfp8_publish_dw13_ab_group_from_pool<
-                kAWidth, kPoolBlockRows,
-                kK3MxFp8DW13AReaderTarget,
-                kProducerThreads, kNamedBarrier>(
-                    a_ring, grad_gate_up_source_map,
-                    source_block_ready,
-                    source_block, value_prefix[expert],
-                    value_prefix[expert + 1u], scale_prefix[expert],
-                    logical_feature_begin, group_in_block,
-                    a_primary_packed_scales,
-                    a_residual_packed_scales,
+                        stage, load_phase, producer_thread);
+            } else {
+                DG_DEVICE_ASSERT(
+                    feature_panel <
+                        K3MxFp8ExactDW13AEpilogueRingLayout::
+                            kFeaturePanels);
+                k3_mxfp8_publish_dw13_ab_panel_bundle_from_pool<
+                    kAWidth, kPoolBlockRows,
+                    kK3MxFp8DW13AReaderTarget,
+                    kProducerThreads, kNamedBarrier>(
+                        context->a_ring,
+                        context->grad_gate_up_source_map,
+                        context->source_block_ready,
+                        bundle_offset != 0u, source_block,
+                        context->value_prefix[expert],
+                        context->value_prefix[expert + 1u],
+                        context->scale_prefix[expert],
+                        logical_feature_begin,
+                        context->a_primary_packed_scales,
+                        context->a_residual_packed_scales,
 #if DG_EXPERIMENTAL_K3_MXFP8_EXACT_RING_WATCHDOG
-                    &b_ring,
+                        &context->b_ring,
 #endif
-                    stage, load_phase, producer_thread);
+                        stage, load_phase, producer_thread);
+            }
         }
     }
     cutlass::arch::NamedBarrier::sync(
@@ -676,13 +752,12 @@ struct K3MxFp8DW13BGroupedConsumerLifecycle {
             Layout::ticket_index(
                 coord.feature_panel, coord.group_in_block));
         DG_DEVICE_ASSERT(
-            detail::k3_mxfp8_load_ticket_key_acquire_gpu(ticket) ==
-                detail::k3_mxfp8_epilogue_ticket_key(
-                    ring.epoch, coord.sequence) &&
+            coord.sequence != 0u &&
             ticket->production_ordinal == coord.production_ordinal &&
             ticket->expert == coord.expert &&
             coord.reader_panel < ticket->reader_target);
-        k3_mxfp8_epilogue_ring_retire_after_p01(ring, ticket);
+        k3_mxfp8_epilogue_ring_retire_known_sequence_after_p01(
+            ring, ticket, coord.sequence);
     }
 
     CUTLASS_DEVICE void acquire(
@@ -708,11 +783,37 @@ struct K3MxFp8DW13BGroupedConsumerLifecycle {
         }
     }
 
+    /** Gather one non-contiguous or partial B panel with group-32 TMAs. */
+    CUTLASS_DEVICE __noinline__ void load_k32_fallback(
+            uint32_t expert, uint32_t feature_begin,
+            uint32_t reader_panel, uint32_t compact_k_begin,
+            uint32_t valid_k,
+            const cute::TmaDescriptor* value_map,
+            cutlass::arch::ClusterTransactionBarrier* full_barrier,
+            uint8_t* smem_value) const {
+        #pragma unroll 1
+        for (uint32_t group = 0u; group < 4u; ++group) {
+            if (group * kK3MxFp8EpilogueRowsPerGroup >= valid_k)
+                break;
+            const auto coord = coordinate(
+                expert,
+                feature_begin / kK3MxFp8EpilogueFeaturePanel,
+                reader_panel,
+                compact_k_begin +
+                    group * kK3MxFp8EpilogueRowsPerGroup);
+            k3_mxfp8_load_mn_major_k32_fragment(
+                value_map, full_barrier, smem_value,
+                feature_begin, coord.slot_row_begin, group, 2u);
+        }
+    }
+
+    /** Load B with two K128 TMAs when four published groups are adjacent. */
     CUTLASS_DEVICE void load_k128_stage(
             uint32_t expert, uint32_t base_m,
             uint32_t feature_begin, uint32_t compact_k_begin,
             uint32_t valid_k,
             const cute::TmaDescriptor* value_map,
+            const cute::TmaDescriptor* k128_value_map,
             const cute::TmaDescriptor* scale_map,
             uint32_t compact_scale_row,
             cutlass::arch::ClusterTransactionBarrier* full_barrier,
@@ -725,8 +826,11 @@ struct K3MxFp8DW13BGroupedConsumerLifecycle {
         DG_DEVICE_ASSERT(
             feature_begin % kK3MxFp8EpilogueFeaturePanel == 0u &&
             valid_k != 0u && valid_k <= 128u &&
-            valid_k % kK3MxFp8EpilogueRowsPerGroup == 0u);
-        #pragma unroll
+            valid_k % kK3MxFp8EpilogueRowsPerGroup == 0u &&
+            k128_value_map != nullptr);
+        bool contiguous_k128 = valid_k == 128u;
+        uint32_t first_slot_row_begin = 0u;
+        #pragma unroll 1
         for (uint32_t group = 0u; group < 4u; ++group) {
             if (group * kK3MxFp8EpilogueRowsPerGroup >= valid_k)
                 break;
@@ -737,15 +841,27 @@ struct K3MxFp8DW13BGroupedConsumerLifecycle {
                 compact_k_begin +
                     group * kK3MxFp8EpilogueRowsPerGroup);
             acquire_coordinate(coord);
-            asm volatile("fence.proxy.async.global;" ::: "memory");
-            tma::copy<
-                kK3MxFp8EpilogueFeaturePanel,
-                kK3MxFp8EpilogueRowsPerGroup, 64u, uint8_t>(
-                    value_map, full_barrier,
-                    smem_value + group * kGroupValueBytes,
-                    feature_begin, coord.slot_row_begin, 2u);
-            expected_bytes += kGroupValueBytes;
+            if (group == 0u) {
+                first_slot_row_begin = coord.slot_row_begin;
+            } else {
+                contiguous_k128 &= coord.slot_row_begin ==
+                    first_slot_row_begin +
+                        group * kK3MxFp8EpilogueRowsPerGroup;
+            }
         }
+        asm volatile("fence.proxy.async.global;" ::: "memory");
+        if (contiguous_k128) {
+            k3_mxfp8_load_mn_major_k128_contiguous(
+                k128_value_map, full_barrier, smem_value,
+                feature_begin, first_slot_row_begin, 2u);
+        } else {
+            load_k32_fallback(
+                expert, feature_begin, reader_panel,
+                compact_k_begin, valid_k, value_map,
+                full_barrier, smem_value);
+        }
+        expected_bytes +=
+            (valid_k / kK3MxFp8EpilogueRowsPerGroup) * kGroupValueBytes;
         tma::copy<128u, 1u, 0u>(
             scale_map, full_barrier, smem_scale,
             feature_begin, compact_scale_row, 2u);
@@ -758,6 +874,7 @@ struct K3MxFp8DW13BGroupedConsumerLifecycle {
             uint32_t feature_begin, uint32_t compact_k_begin,
             uint32_t valid_k, bool residual,
             const cute::TmaDescriptor* value_map,
+            const cute::TmaDescriptor* k128_value_map,
             const cute::TmaDescriptor* scale_map,
             uint32_t compact_scale_row,
             cutlass::arch::ClusterTransactionBarrier* full_barrier,
@@ -766,8 +883,8 @@ struct K3MxFp8DW13BGroupedConsumerLifecycle {
         (void)residual;
         load_k128_stage(
             expert, base_m, feature_begin, compact_k_begin, valid_k,
-            value_map, scale_map, compact_scale_row, full_barrier,
-            smem_value, smem_scale, expected_bytes);
+            value_map, k128_value_map, scale_map, compact_scale_row,
+            full_barrier, smem_value, smem_scale, expected_bytes);
     }
 
     CUTLASS_DEVICE void retire_k128_after_p01(
@@ -777,7 +894,7 @@ struct K3MxFp8DW13BGroupedConsumerLifecycle {
         const uint32_t feature_panel =
             base_n / kK3MxFp8EpilogueFeaturePanel;
         const uint32_t reader_panel = base_m / kConsumerBlockM;
-        #pragma unroll
+        #pragma unroll 1
         for (uint32_t group = 0u; group < 4u; ++group) {
             if (group * kK3MxFp8EpilogueRowsPerGroup >= valid_k)
                 break;
@@ -855,9 +972,9 @@ struct K3MxFp8DW13ABGroupedConsumerLifecycle {
     }
 };
 
-constexpr uint32_t kK3MxFp8DW13ABProducerFirstWarp = 12u;
+constexpr uint32_t kK3MxFp8DW13ABProducerFirstWarp = 8u;
 constexpr uint32_t kK3MxFp8DW13ABProducerWarpsPerEngine = 4u;
-constexpr uint32_t kK3MxFp8DW13ABProducerNumEngines = 4u;
+constexpr uint32_t kK3MxFp8DW13ABProducerNumEngines = 6u;
 constexpr uint32_t kK3MxFp8DW13ABProducerThreads =
     kK3MxFp8DW13ABProducerWarpsPerEngine * 32u;
 constexpr uint32_t kK3MxFp8DW13ABProducerFirstNamedBarrier = 1u;
@@ -874,36 +991,8 @@ static_assert(
     cutlass::arch::NamedBarrier::HardwareMaxNumNamedBarriers -
         cutlass::arch::NamedBarrier::ReservedNamedBarrierCount);
 
-/** Shared, pointer-stable arguments for the four producer engines.
- *
- * The grouped body receives only one pointer to this context.  Mainloop and
- * epilogue roles therefore do not spill the producer's rings, prefixes, and
- * scale aliases merely because the background callback is in scope.
- */
-template <uint32_t kHidden, uint32_t kIntermediateHidden,
-          uint32_t kPoolBlockRows>
-struct alignas(128) K3MxFp8DW13ABBackgroundContext {
-    K3MxFp8EpiloguePanelRingView<
-        kHidden, 2u * kIntermediateHidden, kPoolBlockRows> a_ring;
-    K3MxFp8EpiloguePanelRingView<
-        kHidden, kHidden, kPoolBlockRows> b_ring;
-    const cute::TmaDescriptor* grad_gate_up_source_map;
-    const cute::TmaDescriptor* x_pool_source_map;
-    const uint32_t* source_block_ready;
-    const int* expert_counts;
-    const K3BackwardRangeSet* backward_ranges;
-    const uint32_t* value_prefix;
-    const uint32_t* scale_prefix;
-    const uint32_t* physical_range_prefix;
-    uint32_t* a_primary_packed_scales;
-    uint32_t* a_residual_packed_scales;
-    uint32_t* b_primary_packed_scales;
-    uint32_t* b_residual_packed_scales;
-    uint32_t* ab_block_cursor;
-    K3MxFp8DW13BGatherStage* stages;
-};
 
-/** Run one of four allocation-free A/B publishers on idle body warps. */
+/** Run one of six allocation-free A/B publishers on idle body warps. */
 template <uint32_t kEngine, uint32_t kHidden,
           uint32_t kIntermediateHidden, uint32_t kNumExperts,
           uint32_t kPoolBlockRows, uint32_t kMaxRanges>
@@ -935,18 +1024,7 @@ k3_mxfp8_run_dw13_ab_background_engine(
         kHidden, kIntermediateHidden, kNumExperts,
         kPoolBlockRows, kMaxRanges,
         kK3MxFp8DW13ABProducerThreads, kNamedBarrier>(
-            context->a_ring, context->b_ring,
-            context->grad_gate_up_source_map,
-            context->x_pool_source_map,
-            context->source_block_ready,
-            context->expert_counts, *context->backward_ranges,
-            context->value_prefix, context->scale_prefix,
-            context->physical_range_prefix,
-            context->a_primary_packed_scales,
-            context->a_residual_packed_scales,
-            context->b_primary_packed_scales,
-            context->b_residual_packed_scales,
-            context->ab_block_cursor, stage, producer_thread);
+            context, stage, producer_thread);
     k3_mxfp8_release_dw13b_gather_stage<
         kK3MxFp8DW13ABProducerThreads, kNamedBarrier>(
             stage, producer_thread);
@@ -979,6 +1057,14 @@ struct K3MxFp8DW13ABBackgroundProducer {
             3u, kHidden, kIntermediateHidden, kNumExperts,
             kPoolBlockRows, kMaxRanges>(
                 background_warp_idx, background_lane_idx, context);
+        k3_mxfp8_run_dw13_ab_background_engine<
+            4u, kHidden, kIntermediateHidden, kNumExperts,
+            kPoolBlockRows, kMaxRanges>(
+                background_warp_idx, background_lane_idx, context);
+        k3_mxfp8_run_dw13_ab_background_engine<
+            5u, kHidden, kIntermediateHidden, kNumExperts,
+            kPoolBlockRows, kMaxRanges>(
+                background_warp_idx, background_lane_idx, context);
     }
 };
 
@@ -987,8 +1073,8 @@ struct K3MxFp8DW13ABBackgroundProducer {
  * This helper is deliberately ordinary rather than ready-first: each
  * cluster may join late, immediately claims grouped M256xN256 work through
  * the existing dynamic stream, and blocks only on the exact A/B ring tickets
- * needed by its K128 load.  A disjoint block-major cursor feeds four
- * 128-thread background producer engines.  The callback performs no legacy
+ * needed by its K128 load. A disjoint block-major cursor feeds six
+ * 128-thread background producer engines. The callback performs no legacy
  * feature-major production, fixed-top-k reduction, or NVLink rendezvous.
  *
  * The caller must have reset `kDW13Cursor`, `kDW13ABBlockCursor`, and every
@@ -1093,7 +1179,7 @@ k3_mxfp8_run_early_dw13_ab_ring(
     static_assert(kLifecycleOffset == 153736u);
     static_assert(kProducerContextOffset == 153856u);
     static_assert(kProducerStageBegin == 154112u);
-    static_assert(kProducerStageEnd == 187392u);
+    static_assert(kProducerStageEnd == 204032u);
     static_assert(
         kProducerStageEnd <= kK3MxFp8WgradStreamingSmemBytes);
 

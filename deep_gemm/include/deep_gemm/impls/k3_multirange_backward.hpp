@@ -22,7 +22,7 @@ constexpr uint32_t kK3MaxBackwardRanges = 3;
 constexpr uint32_t kK3MxFp8WgradMapsPerPhase = 8u;
 constexpr uint32_t kK3MxFp8WgradNumConsumerTensorMaps =
     2u * kK3MxFp8WgradMapsPerPhase;
-constexpr uint32_t kK3MxFp8WgradNumProducerTensorMaps = 12u;
+constexpr uint32_t kK3MxFp8WgradNumProducerTensorMaps = 16u;
 constexpr uint32_t kK3MxFp8WgradNumTensorMaps =
     kK3MxFp8WgradNumConsumerTensorMaps +
     kK3MxFp8WgradNumProducerTensorMaps;
@@ -79,8 +79,7 @@ enum K3MxFp8WgradTensorMapSlot : uint32_t {
     // now-dead immutable value-store slots to the physical BF16-H row pitch
     // of symmetric combine planes 2/3. The selected grouped consumer sees
     // the ring maps only after the producer's complete lifetime, while the
-    // ordinary path retains the original compact store descriptors. This
-    // specialization-time alias keeps the grid-constant pack at 28 maps.
+    // ordinary path retains the original compact store descriptors.
     kK3MxFp8DW13RingValueAPrimaryMap =
         kK3MxFp8DW13ProducerValueAPrimaryMap,
     kK3MxFp8DW13RingValueAResidualMap =
@@ -93,6 +92,13 @@ enum K3MxFp8WgradTensorMapSlot : uint32_t {
         kK3MxFp8DW13ProducerValueBPrimaryMap,
     kK3MxFp8DW13RingValueBResidualMap =
         kK3MxFp8DW13ProducerValueBResidualMap,
+    // Full-height descriptors are used only when four acquired group-32
+    // tickets resolve to adjacent physical rows. Ring wrap and partial-tail
+    // stages retain the group-32 descriptors above.
+    kK3MxFp8DW13RingK128ValueAPrimaryMap = 28u,
+    kK3MxFp8DW13RingK128ValueAResidualMap = 29u,
+    kK3MxFp8DW13RingK128ValueBPrimaryMap = 30u,
+    kK3MxFp8DW13RingK128ValueBResidualMap = 31u,
 };
 
 template <typename TensorMap>

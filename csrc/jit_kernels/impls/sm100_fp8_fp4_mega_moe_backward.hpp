@@ -427,15 +427,14 @@ public:
             args.compute_w13_dgrad &&
             args.direct_remote_grad_x &&
             args.inline_wgrad;
-        // Packed physical ranges use the same compact logical K axis as the
-        // one-range exact engine. The phase-tagged scheduler carries the full
-        // immutable range set, so both two- and three-range launches consume
-        // panel readiness without a terminal hybrid handoff.
+        // Exactly two physical ranges use the packed exact engine. Three
+        // ranges retain the streaming hybrid/ring suffix, whose bounded ring
+        // is required to pipeline quantization, UMMA/TMA, and communication.
         const bool enable_k3_mxfp8_two_range_exact =
             args.mxfp8_three_term_wgrad &&
             args.multi_range_backward &&
             enable_k3_ready_wgrad &&
-            args.backward_ranges.num_ranges >= 2u &&
+            args.backward_ranges.num_ranges == 2u &&
             args.num_topk == 16u &&
             args.clear_wgrad_padding &&
             !args.accumulate_wgrad &&
@@ -504,7 +503,21 @@ public:
                 !args.accumulate_wgrad &&
                 args.situ_beta == 4.0f &&
                 args.situ_linear_beta == 25.0f;
-        const bool enable_k3_mxfp8_exact_epilogue_ring = false;
+        const bool enable_k3_mxfp8_exact_epilogue_ring =
+            enable_k3_mxfp8_dw13_hybrid;
+        const std::string three_segment_bf16_progressive_define =
+            args.multi_range_backward &&
+                enable_k3_ready_wgrad &&
+                !enable_k3_mxfp8_two_range_exact &&
+                !enable_k3_mxfp8_exact_epilogue_ring &&
+                args.backward_ranges.num_ranges == kK3MaxBackwardRanges &&
+                args.num_topk == 16u &&
+                args.clear_wgrad_padding &&
+                !args.accumulate_wgrad &&
+                args.situ_beta == 4.0f &&
+                args.situ_linear_beta == 25.0f
+            ? "#define DG_EXPERIMENTAL_K3_THREE_SEGMENT_BF16_PROGRESSIVE_WGRAD 1\n"
+            : "";
         const std::string mxfp8_dw13_hybrid_define =
             enable_k3_mxfp8_dw13_hybrid
             ? "#define DG_EXPERIMENTAL_K3_MXFP8_DW13_HYBRID 1\n"
@@ -518,7 +531,7 @@ public:
             ? "#define DG_EXPERIMENTAL_K3_MXFP8_EXACT_RING_WATCHDOG 1\n"
             : "";
         return fmt::format(R"(
-{}{}{}{}{}{}{}{}
+{}{}{}{}{}{}{}{}{}
 #include <deep_gemm/impls/sm100_fp8_fp4_mega_moe_backward.cuh>
 
 using namespace deep_gemm;
@@ -569,6 +582,7 @@ static void __instantiate_kernel() {{
             branch_major_bf16_wgrad_tail_define,
             branch_major_bf16_dynamic_tail_define,
             two_segment_bf16_progressive_define,
+            three_segment_bf16_progressive_define,
             mxfp8_dw13_hybrid_define,
             exact_epilogue_ring_define,
             exact_epilogue_ring_watchdog_define,
@@ -920,7 +934,7 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
     const bool enable_k3_mxfp8_packed_range_exact =
         enable_k3_mxfp8_three_term_wgrad && multi_range_backward &&
         !inline_weight_dequant && !phase_ordered_weight_dequant &&
-        !residual_mxfp8_dgrad && num_backward_ranges >= 2 &&
+        !residual_mxfp8_dgrad && num_backward_ranges == 2 &&
         !accumulate_wgrad;
     // The training mode owns exact packed-range selection. The hybrid remains
     // only as a fallback when a packed launch misses the unified exact gate.
@@ -931,7 +945,8 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
         !residual_mxfp8_dgrad &&
         num_backward_ranges == static_cast<int>(kK3MaxBackwardRanges) &&
         !accumulate_wgrad;
-    const bool enable_k3_mxfp8_exact_epilogue_ring = false;
+    const bool enable_k3_mxfp8_exact_epilogue_ring =
+        enable_k3_mxfp8_dw13_hybrid;
 
     DG_HOST_ASSERT(device_runtime->get_arch_major() == 10);
     DG_HOST_ASSERT(num_ranks >= 1);
@@ -1902,7 +1917,8 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
                 row_stride, 0);
         };
         const auto make_ring_value_map = [&] (
-                uint64_t address, int feature, int row_stride) {
+                uint64_t address, int feature, int row_stride,
+                int tile_rows) {
             const int64_t usable_rows =
                 static_cast<int64_t>(num_max_tokens_per_rank) -
                 kK3MxFp8RingReservedRows;
@@ -1911,7 +1927,8 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
             DG_HOST_ASSERT(
                 num_max_tokens_per_rank > kK3MxFp8RingReservedRows &&
                 address != 0u && ring_rows >= block_m &&
-                row_stride >= feature);
+                row_stride >= feature &&
+                (tile_rows == 32 || tile_rows == 128));
             const int64_t storage_bytes = ring_rows * row_stride;
             const auto storage = torch::from_blob(
                 reinterpret_cast<void*>(address), {storage_bytes},
@@ -1919,13 +1936,12 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
                     .dtype(torch::kUInt8)
                     .device(backward_grad_y->device()));
             const auto values = storage.view(torch::kFloat8_e4m3fn);
-            // The rolling consumer gathers one physical group-32 fragment at
-            // a time.  This descriptor box is the actual global transaction
-            // shape; the later tma::copy template controls only destination
-            // staging and cannot crop a 128-row descriptor box to 32 rows.
+            // The descriptor box is the actual global transaction shape; a
+            // copy template cannot crop a K128 descriptor to group-32. Keep
+            // both immutable shapes and select only after ticket acquisition.
             return make_tma_2d_desc(
                 values, feature, static_cast<int>(ring_rows),
-                64, 32, row_stride, 64);
+                64, tile_rows, row_stride, 64);
         };
 
         auto& exact_maps = k3_mxfp8_wgrad_tensor_maps;
@@ -2066,8 +2082,7 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
                 static_cast<uint64_t>(kK3MxFp8RingReservedRows) *
                 retired_grad_ye_row_bytes;
             // Ring mode never executes the streaming dW13-A value stores.
-            // Rebind those two immutable pack slots to the physical ring
-            // row pitch instead of extending the parent with a 30-map pack.
+            // Rebind those immutable pack slots to group-32 ring descriptors.
             exact_maps.maps[kK3MxFp8DW13RingValueAPrimaryMap] =
                 make_ring_value_map(
                     combine_begin +
@@ -2075,7 +2090,7 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
                             combine_plane_bytes +
                         ring_row_base_bytes,
                     intermediate_hidden_2,
-                    retired_grad_ye_row_bytes);
+                    retired_grad_ye_row_bytes, 32);
             exact_maps.maps[kK3MxFp8DW13RingValueAResidualMap] =
                 make_ring_value_map(
                     combine_begin +
@@ -2083,21 +2098,55 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
                             combine_plane_bytes +
                         ring_row_base_bytes,
                     intermediate_hidden_2,
-                    retired_grad_ye_row_bytes);
+                    retired_grad_ye_row_bytes, 32);
             exact_maps.maps[kK3MxFp8DW13RingValueBPrimaryMap] =
                 make_ring_value_map(
                     combine_begin +
                         kK3MxFp8DW13BScratchPrimaryPlane *
                             combine_plane_bytes +
                         ring_row_base_bytes,
-                    hidden, retired_grad_ye_row_bytes);
+                    hidden, retired_grad_ye_row_bytes, 32);
             exact_maps.maps[kK3MxFp8DW13RingValueBResidualMap] =
                 make_ring_value_map(
                     combine_begin +
                         kK3MxFp8DW13BScratchResidualPlane *
                             combine_plane_bytes +
                         ring_row_base_bytes,
-                    hidden, retired_grad_ye_row_bytes);
+                    hidden, retired_grad_ye_row_bytes, 32);
+
+            // Full-height maps have the identical base/stride. They remove six
+            // value TMAs whenever four acquired group tickets are physically
+            // adjacent; the guarded K32 path remains valid across ring wrap.
+            exact_maps.maps[kK3MxFp8DW13RingK128ValueAPrimaryMap] =
+                make_ring_value_map(
+                    combine_begin +
+                        kK3MxFp8EpilogueScratchPrimaryPlane *
+                            combine_plane_bytes +
+                        ring_row_base_bytes,
+                    intermediate_hidden_2,
+                    retired_grad_ye_row_bytes, 128);
+            exact_maps.maps[kK3MxFp8DW13RingK128ValueAResidualMap] =
+                make_ring_value_map(
+                    combine_begin +
+                        kK3MxFp8EpilogueScratchResidualPlane *
+                            combine_plane_bytes +
+                        ring_row_base_bytes,
+                    intermediate_hidden_2,
+                    retired_grad_ye_row_bytes, 128);
+            exact_maps.maps[kK3MxFp8DW13RingK128ValueBPrimaryMap] =
+                make_ring_value_map(
+                    combine_begin +
+                        kK3MxFp8DW13BScratchPrimaryPlane *
+                            combine_plane_bytes +
+                        ring_row_base_bytes,
+                    hidden, retired_grad_ye_row_bytes, 128);
+            exact_maps.maps[kK3MxFp8DW13RingK128ValueBResidualMap] =
+                make_ring_value_map(
+                    combine_begin +
+                        kK3MxFp8DW13BScratchResidualPlane *
+                            combine_plane_bytes +
+                        ring_row_base_bytes,
+                    hidden, retired_grad_ye_row_bytes, 128);
         }
     }
 
@@ -2147,14 +2196,14 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
     DG_HOST_ASSERT((
         !multi_range_backward ||
         backward_ranges.is_full_arena_compatible<112, 192>()));
-    // Packed physical ranges are compacted into one logical K axis and
+    // Exactly two physical ranges are compacted into one logical K axis and
     // consumed by the phase-tagged exact dW2/dW13 engine. This must match the
     // generated-source selector above: the exact AuxSlots carry both D maps,
     // the immutable range set, and the suffix arguments.
     const bool enable_k3_mxfp8_two_range_exact =
         enable_k3_mxfp8_three_term_wgrad && multi_range_backward &&
         !inline_weight_dequant && !phase_ordered_weight_dequant &&
-        !residual_mxfp8_dgrad && backward_ranges.num_ranges >= 2u &&
+        !residual_mxfp8_dgrad && backward_ranges.num_ranges == 2u &&
         num_topk == 16 && clear_wgrad_padding && !accumulate_wgrad &&
         situ_beta == 4.0f && situ_linear_beta == 25.0f;
     DG_HOST_ASSERT(

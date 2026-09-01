@@ -52,6 +52,57 @@ constexpr uint32_t kK3MxFp8EpilogueValueBytesPerGroup =
 constexpr uint32_t kK3MxFp8EpilogueScaleBytesPerPackedRow =
     kK3MxFp8EpilogueFeaturePanel * sizeof(uint32_t);
 
+/** Load one physical K32 fragment into a full MN-major K128 UMMA stage.
+ *
+ * A swizzle-64 TensorMap transfers one 64-feature atom at a time. Fragment
+ * loads must retain the full K128 atom pitch: laying them out group-major
+ * transposes the middle address bits and feeds UMMA corrupted operands.
+ */
+CUTLASS_DEVICE void k3_mxfp8_load_mn_major_k32_fragment(
+        const cute::TmaDescriptor* value_map,
+        cutlass::arch::ClusterTransactionBarrier* full_barrier,
+        uint8_t* smem_value, uint32_t feature_begin,
+        uint32_t physical_row_begin, uint32_t group,
+        uint32_t num_tma_multicast) {
+    constexpr uint32_t kFeatureAtom = 64u;
+    constexpr uint32_t kFeatureAtoms = 2u;
+    constexpr uint32_t kFragmentRows = 32u;
+    constexpr uint32_t kFullKRows = 128u;
+    DG_DEVICE_ASSERT(group < kFullKRows / kFragmentRows);
+    #pragma unroll
+    for (uint32_t atom = 0u; atom < kFeatureAtoms; ++atom) {
+        tma::copy<kFeatureAtom, kFragmentRows, 64u, uint8_t>(
+            value_map, full_barrier,
+            smem_value + atom * kFeatureAtom * kFullKRows +
+                group * kFeatureAtom * kFragmentRows,
+            feature_begin + atom * kFeatureAtom,
+            physical_row_begin, num_tma_multicast);
+    }
+}
+
+/** Load one physically contiguous K128 panel with two full-height TMAs.
+ *
+ * The descriptor box is 64x128 and preserves the same swizzle-64 MN-major
+ * layout as four K32 fragments. Callers must acquire all four publication
+ * tickets and prove that their physical rows are adjacent before using it.
+ */
+CUTLASS_DEVICE void k3_mxfp8_load_mn_major_k128_contiguous(
+        const cute::TmaDescriptor* value_map,
+        cutlass::arch::ClusterTransactionBarrier* full_barrier,
+        uint8_t* smem_value, uint32_t feature_begin,
+        uint32_t physical_row_begin, uint32_t num_tma_multicast) {
+    constexpr uint32_t kFeatureAtom = 64u;
+    constexpr uint32_t kFeatureAtoms = 2u;
+    constexpr uint32_t kFullKRows = 128u;
+    #pragma unroll
+    for (uint32_t atom = 0u; atom < kFeatureAtoms; ++atom) {
+        tma::copy<kFeatureAtom, kFullKRows, 64u, uint8_t>(
+            value_map, full_barrier,
+            smem_value + atom * kFeatureAtom * kFullKRows,
+            feature_begin + atom * kFeatureAtom,
+            physical_row_begin, num_tma_multicast);
+    }
+}
 constexpr uint32_t k3_mxfp8_epilogue_operand_group(
         K3MxFp8EpilogueOperand operand, uint32_t group_in_scale_row) {
     return (static_cast<uint32_t>(operand) << 8) |
@@ -637,18 +688,15 @@ k3_mxfp8_epilogue_ring_acquire_ticket(
     return ticket;
 }
 
-/** Retire only after P01's final input read; the last reader closes the slot. */
+/** Retire after P01 using the sequence proved by the earlier acquire. */
 template <typename Ring>
-CUTLASS_DEVICE void k3_mxfp8_epilogue_ring_retire_after_p01(
-        const Ring& ring, K3MxFp8EpiloguePanelTicket* ticket) {
+CUTLASS_DEVICE void
+k3_mxfp8_epilogue_ring_retire_known_sequence_after_p01(
+        const Ring& ring, K3MxFp8EpiloguePanelTicket* ticket,
+        uint32_t sequence) {
     using Layout = typename Ring::Layout;
-    const uint64_t key =
-        detail::k3_mxfp8_load_ticket_key_acquire_gpu(ticket);
-    const uint32_t epoch = static_cast<uint32_t>(key);
-    const uint32_t sequence = static_cast<uint32_t>(key >> 32u);
     DG_DEVICE_ASSERT(
-        epoch == ring.epoch && sequence != 0u &&
-        ticket->reader_target != 0u);
+        sequence != 0u && ticket->reader_target != 0u);
     const uint32_t previous = ptx::atomic_add_acq_rel(
         &ticket->reader_arrivals, 1u);
     DG_DEVICE_ASSERT(previous < ticket->reader_target);
@@ -777,12 +825,12 @@ struct K3MxFp8EpilogueGroupedConsumerLifecycle {
             Layout::ticket_index(
                 coord.feature_panel, coord.group_in_block));
         DG_DEVICE_ASSERT(
-            detail::k3_mxfp8_load_ticket_key_acquire_gpu(ticket) ==
-                detail::k3_mxfp8_epilogue_ticket_key(
-                    ring.epoch, coord.sequence) &&
+            coord.sequence != 0u &&
+            ticket->production_ordinal == coord.production_ordinal &&
             ticket->expert == coord.expert &&
             coord.reader_panel < ticket->reader_target);
-        k3_mxfp8_epilogue_ring_retire_after_p01(ring, ticket);
+        k3_mxfp8_epilogue_ring_retire_known_sequence_after_p01(
+            ring, ticket, coord.sequence);
     }
 
     CUTLASS_DEVICE void acquire(
@@ -811,13 +859,36 @@ struct K3MxFp8EpilogueGroupedConsumerLifecycle {
         }
     }
 
-    /** Four physical value fragments plus one native compact scale TMA. */
+    /** Gather one non-contiguous or partial A panel with group-32 TMAs. */
+    CUTLASS_DEVICE __noinline__ void load_k32_fallback(
+            uint32_t expert, uint32_t value_feature_begin,
+            uint32_t reader_panel, uint32_t compact_k_begin,
+            uint32_t valid_k,
+            const cute::TmaDescriptor* value_map,
+            cutlass::arch::ClusterTransactionBarrier* full_barrier,
+            uint8_t* smem_value) const {
+        #pragma unroll 1
+        for (uint32_t group = 0u; group < 4u; ++group) {
+            if (group * kK3MxFp8EpilogueRowsPerGroup >= valid_k)
+                break;
+            const auto coord = coordinate(
+                expert, value_feature_begin / 128u, reader_panel,
+                compact_k_begin +
+                    group * kK3MxFp8EpilogueRowsPerGroup);
+            k3_mxfp8_load_mn_major_k32_fragment(
+                value_map, full_barrier, smem_value,
+                value_feature_begin, coord.slot_row_begin, group, 2u);
+        }
+    }
+
+    /** Load A with two K128 TMAs when four published groups are adjacent. */
     CUTLASS_DEVICE void load_k128_stage(
             uint32_t expert, uint32_t value_feature_begin,
             uint32_t scale_feature_begin, uint32_t reader_panel,
             uint32_t compact_k_begin, uint32_t valid_k,
             bool residual,
             const cute::TmaDescriptor* value_map,
+            const cute::TmaDescriptor* k128_value_map,
             const cute::TmaDescriptor* scale_map,
             uint32_t compact_scale_row,
             cutlass::arch::ClusterTransactionBarrier* full_barrier,
@@ -827,16 +898,20 @@ struct K3MxFp8EpilogueGroupedConsumerLifecycle {
             valid_k != 0u && valid_k <= 128u &&
             valid_k % kK3MxFp8EpilogueRowsPerGroup == 0u &&
             value_feature_begin % 128u == 0u &&
-            scale_feature_begin % 256u == 0u);
+            scale_feature_begin % 256u == 0u &&
+            k128_value_map != nullptr);
         (void)residual;
         constexpr uint32_t kGroupValueBytes = 128u * 32u;
-        #pragma unroll
+        bool contiguous_k128 = valid_k == 128u;
+        uint32_t first_slot_row_begin = 0u;
+        #pragma unroll 1
         for (uint32_t group = 0u; group < 4u; ++group) {
-            if (group * 32u >= valid_k)
+            if (group * kK3MxFp8EpilogueRowsPerGroup >= valid_k)
                 break;
             const auto local_coord = coordinate(
                 expert, value_feature_begin / 128u, reader_panel,
-                compact_k_begin + group * 32u);
+                compact_k_begin +
+                    group * kK3MxFp8EpilogueRowsPerGroup);
             acquire_coordinate(local_coord);
             // Scale staging spans both 128-feature panels even though this
             // CTA's value TMA owns one panel. Acquire the sibling publication
@@ -845,14 +920,29 @@ struct K3MxFp8EpilogueGroupedConsumerLifecycle {
                 expert, scale_feature_begin / 128u +
                     static_cast<uint32_t>(
                         value_feature_begin == scale_feature_begin),
-                reader_panel, compact_k_begin + group * 32u));
-            asm volatile("fence.proxy.async.global;" ::: "memory");
-            tma::copy<128u, 32u, 64u, uint8_t>(
-                value_map, full_barrier,
-                smem_value + group * kGroupValueBytes,
-                value_feature_begin, local_coord.slot_row_begin, 2u);
-            expected_bytes += kGroupValueBytes;
+                reader_panel, compact_k_begin +
+                    group * kK3MxFp8EpilogueRowsPerGroup));
+            if (group == 0u) {
+                first_slot_row_begin = local_coord.slot_row_begin;
+            } else {
+                contiguous_k128 &= local_coord.slot_row_begin ==
+                    first_slot_row_begin +
+                        group * kK3MxFp8EpilogueRowsPerGroup;
+            }
         }
+        asm volatile("fence.proxy.async.global;" ::: "memory");
+        if (contiguous_k128) {
+            k3_mxfp8_load_mn_major_k128_contiguous(
+                k128_value_map, full_barrier, smem_value,
+                value_feature_begin, first_slot_row_begin, 2u);
+        } else {
+            load_k32_fallback(
+                expert, value_feature_begin, reader_panel,
+                compact_k_begin, valid_k, value_map,
+                full_barrier, smem_value);
+        }
+        expected_bytes +=
+            (valid_k / kK3MxFp8EpilogueRowsPerGroup) * kGroupValueBytes;
 
         // The SiTU producer writes its bytes directly into the compact
         // expert scale rows in UTCCP-native order. Keep the established
@@ -870,6 +960,7 @@ struct K3MxFp8EpilogueGroupedConsumerLifecycle {
             uint32_t compact_k_begin, uint32_t valid_k,
             bool residual,
             const cute::TmaDescriptor* value_map,
+            const cute::TmaDescriptor* k128_value_map,
             const cute::TmaDescriptor* scale_map,
             uint32_t compact_scale_row,
             cutlass::arch::ClusterTransactionBarrier* full_barrier,
@@ -878,8 +969,8 @@ struct K3MxFp8EpilogueGroupedConsumerLifecycle {
         load_k128_stage(
             expert, value_feature_begin, scale_feature_begin,
             reader_panel, compact_k_begin, valid_k, residual,
-            value_map, scale_map, compact_scale_row, full_barrier,
-            smem_value, smem_scale, expected_bytes);
+            value_map, k128_value_map, scale_map, compact_scale_row,
+            full_barrier, smem_value, smem_scale, expected_bytes);
     }
 
     CUTLASS_DEVICE void retire_k128_after_p01(
@@ -894,11 +985,11 @@ struct K3MxFp8EpilogueGroupedConsumerLifecycle {
         const uint32_t first_feature_panel =
             base_m / kK3MxFp8EpilogueFeaturePanel;
         const uint32_t reader_panel = base_n / 128u;
-        #pragma unroll
+        #pragma unroll 1
         for (uint32_t group = 0u; group < 4u; ++group) {
             if (group * kK3MxFp8EpilogueRowsPerGroup >= valid_k)
                 break;
-            #pragma unroll
+            #pragma unroll 1
             for (uint32_t panel = 0u; panel < 2u; ++panel) {
                 retire_coordinate_after_p01(coordinate(
                     expert, first_feature_panel + panel, reader_panel,
