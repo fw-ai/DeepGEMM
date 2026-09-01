@@ -180,6 +180,12 @@ they are immutable regression ceilings, not evidence that one current revision
 attains the whole table. The 64K row is additionally bound to the protected
 source commit and generated CUDA/CUBIN identities.
 
+The historical 4K log predates the surviving source artifacts and does not
+contain same-run source hashes. Commit `e21cc60` plus its seeded CUDA/CUBIN is
+retained only as a post-hoc replay seed. The 4K latency remains a required
+regression ceiling, but it must not be described as source-bound until a fresh
+same-revision replay qualifies it.
+
 | Seq/rank | Phase | Native/DeepEPv2 | Candidate | Speedup |
 |---:|:---|---:|---:|---:|
 | 4K | FWD | 8.695 ms | 5.042 ms | 1.724x |

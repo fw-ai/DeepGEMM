@@ -70,15 +70,17 @@
   "historical_regression_frontier": {
     "semantics": "GPU-measured per-length ceilings from numerically qualified historical revisions. These entries prevent latency regression but do not prove that one current revision attains the complete frontier.",
     "4096": {
-      "source_status": "recoverable_v249_artifacts_not_yet_git_bound",
+      "source_status": "raw_receipt_without_same_run_source_provenance",
       "receipts": {
         "combined_log_sha256": "d5d3e4c2a4ad7418cb4ed038f5cfee600d020195b891c1ffeace6c2e51670ad3"
       },
-      "source_artifacts": {
-        "backward_parent_header_sha256": "76e854365046ae81171873489474773f50c67d1b43be0ed655993a46348e66af",
-        "bf16_gemm_body_sha256": "73ed398ce2cd8839e9bfcd190d8fa8636812d9ecfd4e2adb76eddde2c65a80b2",
-        "generated_cuda_sha256": "24056fcbb08c5d7a665178e3bddc3626938c3f56e4a88eef1ef51ad0fdd42f82",
-        "generated_cubin_sha256": "a5e6a5f38dcf8dc0f9da6aeadb9b933f6a4a1214787b6727a718b3d1e5bc693b"
+      "reconstructed_replay_seed": {
+        "relationship": "post_hoc_reconstruction_not_same_run_identity",
+        "deep_gemm_commit": "e21cc608c5654e06cd3fb1a53d7ae55d92f7e3d4",
+        "backward_parent_header_sha256": "08c8baebfca47b0dc7b7b19a9e70fb7c0b4bd84a46546354468172b71ad469e5",
+        "extension_sha256": "b36a7af1e642735460eb34f968b75f78a4142dd23eb22a135bfbfab158702f07",
+        "seeded_cuda_sha256": "18d39cc2510a28e253a975aaa16eb65879aa9a51fcc3e38b7608c6f40191f5f7",
+        "seeded_cubin_sha256": "299f5ced32f71fd6380d1f6a08aea67e524647b4624a3ef7dc118e230d67fece"
       },
       "qualified_cosines": {
         "output": 0.9999964444295277,
