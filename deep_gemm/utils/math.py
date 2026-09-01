@@ -40,7 +40,7 @@ def per_token_cast_to_fp8(x: torch.Tensor, use_ue8m0: bool, gran_k: int = 128,
     sf = x_amax / 448.0
     sf = ceil_to_ue8m0(sf) if use_ue8m0 else sf
     x_fp8 = (x_view * (1.0 / sf.unsqueeze(2))).to(torch.float8_e4m3fn).view(m, padded_n)[:, :n].contiguous()
-    return x_fp8, _pack_generated_ue8m0_to_int(sf) if use_packed_ue8m0 else sf
+    return x_fp8, pack_ue8m0_to_int(sf) if use_packed_ue8m0 else sf
 
 
 def per_channel_cast_to_fp8(x: torch.Tensor, use_ue8m0: bool, gran_k: int = 128) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -112,7 +112,7 @@ def per_token_cast_to_fp4(x: torch.Tensor, use_ue8m0: bool, gran_k: int = 128,
         if num_sf % 4 != 0:
             pad = align(num_sf, 4) - num_sf
             sf = torch.nn.functional.pad(sf, (0, pad), value=1.0)
-        return packed[:, :n // 2].contiguous(), _pack_generated_ue8m0_to_int(sf)
+        return packed[:, :n // 2].contiguous(), pack_ue8m0_to_int(sf)
     return packed[:, :n // 2].contiguous(), sf
 
 
