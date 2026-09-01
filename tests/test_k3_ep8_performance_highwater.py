@@ -248,6 +248,32 @@ def test_audited_phase_frontier_preserves_every_recovered_winner() -> None:
     assert protected["32768"]["forward"]["candidate"] == 24.296768188476562
 
 
+def test_design_report_renders_composite_phase_frontier() -> None:
+    """Keep the human-readable optimization baseline aligned with the ledger."""
+    report = (
+        Path(__file__).parents[1]
+        / "docs"
+        / "k3_mxfp8_mxfp4_megamoe_training_backward.md"
+    ).read_text()
+    expected_rows = {
+        "| 4K | FWD | 8.415 ms | 4.756 ms | 1.769x |",
+        "| 4K | BWD | 33.616 ms | 16.253 ms | 2.068x |",
+        "| 4K | FWD+BWD | 41.537 ms | 20.164 ms | 2.060x |",
+        "| 8K | FWD | 15.374 ms | 7.570 ms | 2.031x |",
+        "| 8K | BWD | 41.729 ms | 25.516 ms | 1.635x |",
+        "| 8K | FWD+BWD | 55.907 ms | 32.219 ms | 1.735x |",
+        "| 16K | FWD | 26.232 ms | 12.742 ms | 2.059x |",
+        "| 16K | BWD | 61.747 ms | 42.662 ms | 1.447x |",
+        "| 16K | FWD+BWD | 87.566 ms | 55.040 ms | 1.591x |",
+        "| 32K | FWD | 50.694 ms | 24.297 ms | 2.086x |",
+        "| 32K | BWD | 101.208 ms | 83.122 ms | 1.218x |",
+        "| 32K | FWD+BWD | 152.996 ms | 106.237 ms | 1.440x |",
+    }
+    assert all(row in report for row in expected_rows)
+    assert "6c61e6647b7acf8e" in report
+    assert "66.939 ms" in report
+
+
 def test_preliminary_32k_winner_is_retained_but_not_promoted() -> None:
     """Keep the 66.939-ms lead while excluding it from verified ceilings."""
     ledger = _load_ledger()

@@ -174,11 +174,14 @@ noise; it is not permission for a new persistent buffer.
 
 ## Performance high-water and promotion
 
-Performance protection is a per-sequence-length Pareto frontier. Historical
-4K--32K rows came from numerically qualified GPU runs on different revisions;
-they are immutable regression ceilings, not evidence that one current revision
-attains the whole table. The 64K row is additionally bound to the protected
-source commit and generated CUDA/CUBIN identities.
+Performance protection is a per-sequence-length, per-phase Pareto frontier.
+Historical 4K--32K rows came from numerically qualified GPU runs on different
+revisions; they are immutable regression ceilings, not evidence that one
+current revision attains the whole table. A faster phase observation is never
+discarded because another revision has better provenance or memory evidence:
+latency, source identity, and promotion eligibility remain separate fields in
+the machine-readable ledger. The 64K row is additionally bound to the
+protected source commit and generated CUDA/CUBIN identities.
 
 The historical 4K log predates the surviving source artifacts and does not
 contain same-run source hashes. Commit `e21cc60` plus its seeded CUDA/CUBIN is
@@ -188,18 +191,27 @@ same-revision replay qualifies it.
 
 | Seq/rank | Phase | Native/DeepEPv2 | Candidate | Speedup |
 |---:|:---|---:|---:|---:|
-| 4K | FWD | 8.695 ms | 5.042 ms | 1.724x |
-| 4K | BWD | 33.732 ms | 20.046 ms | 1.683x |
-| 4K | FWD+BWD | 42.116 ms | 24.014 ms | 1.754x |
-| 8K | FWD | 14.452 ms | 8.091 ms | 1.786x |
+| 4K | FWD | 8.415 ms | 4.756 ms | 1.769x |
+| 4K | BWD | 33.616 ms | 16.253 ms | 2.068x |
+| 4K | FWD+BWD | 41.537 ms | 20.164 ms | 2.060x |
+| 8K | FWD | 15.374 ms | 7.570 ms | 2.031x |
 | 8K | BWD | 41.729 ms | 25.516 ms | 1.635x |
 | 8K | FWD+BWD | 55.907 ms | 32.219 ms | 1.735x |
-| 16K | FWD | 26.768 ms | 13.441 ms | 1.992x |
-| 16K | BWD | 60.261 ms | 44.304 ms | 1.360x |
-| 16K | FWD+BWD | 87.173 ms | 56.119 ms | 1.553x |
-| 32K | FWD | 51.265 ms | 24.800 ms | 2.067x |
+| 16K | FWD | 26.232 ms | 12.742 ms | 2.059x |
+| 16K | BWD | 61.747 ms | 42.662 ms | 1.447x |
+| 16K | FWD+BWD | 87.566 ms | 55.040 ms | 1.591x |
+| 32K | FWD | 50.694 ms | 24.297 ms | 2.086x |
 | 32K | BWD | 101.208 ms | 83.122 ms | 1.218x |
 | 32K | FWD+BWD | 152.996 ms | 106.237 ms | 1.440x |
+
+These are composite phase ceilings. In particular, the 16K BWD and FWD+BWD
+observations have same-log six-cosine, memory, generated-source, device-header,
+and host-binding hashes, but the exact source was not committed at measurement
+time. Its device header identity is
+`6c61e6647b7acf8ec508e1bdbee919fc2b3db27ac18fef0e1865646d8dbbed08`.
+The faster single-sample 32K BWD observation at 66.939 ms is retained only in
+`preliminary_phase_observation_frontier`: it has no matching numeric receipt
+and is therefore not a verified or promotable ceiling.
 
 The protected EP=8, no-CP, true-variable-length 64K/rank phase records are:
 
