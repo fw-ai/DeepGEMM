@@ -13,6 +13,7 @@ import torch
 import torch.distributed as dist
 
 import deep_gemm
+from deep_gemm.mega import backward as mega_backward
 from deep_gemm.testing import calc_diff
 from deep_gemm.utils import (
     cast_back_from_fp4, per_token_cast_to_fp4, per_token_cast_to_fp8,
@@ -321,6 +322,7 @@ def test_mxfp4_side_lora_backward_signature_and_unknown_activation() -> None:
         deep_gemm.fp8_fp4_mega_moe_side_lora_backward)
     assert signature.parameters["activation"].default == "swiglu"
     assert signature.parameters["fast_math"].default is False
+    assert signature.parameters["reuse_gate_for_grad_x"].default is False
     try:
         deep_gemm.fp8_fp4_mega_moe_side_lora_backward(
             gate_up_output=None, saved_h=None,
@@ -337,6 +339,32 @@ def test_mxfp4_side_lora_backward_signature_and_unknown_activation() -> None:
     else:
         raise AssertionError(
             "MXFP4 side-LoRA backward accepted an unknown activation")
+
+
+def test_mxfp4_side_lora_backward_can_reuse_saved_gate_for_grad_x() -> None:
+    rows, hidden, intermediate, experts, rank = 5, 16, 8, 2, 128
+    gate_up = torch.empty(rows, 2 * intermediate, dtype=torch.bfloat16)
+    transformed_side_lora = (
+        torch.empty(rank, hidden, dtype=torch.bfloat16),
+        torch.empty(experts, intermediate, rank, dtype=torch.bfloat16),
+        torch.empty(rank, hidden, dtype=torch.bfloat16),
+        torch.empty(experts, intermediate, rank, dtype=torch.bfloat16),
+        torch.empty(experts, rank, intermediate, dtype=torch.bfloat16),
+        torch.empty(hidden, rank, dtype=torch.bfloat16),
+    )
+
+    outputs = mega_backward._allocate_side_lora_backward_outputs(
+        gate_up,
+        transformed_side_lora,
+        hidden,
+        intermediate,
+        reuse_gate_for_grad_x=True,
+    )
+
+    grad_x_pool = outputs[6]
+    assert grad_x_pool.data_ptr() == gate_up.data_ptr()
+    assert grad_x_pool.numel() == gate_up.numel()
+    assert outputs[2].data_ptr() != gate_up.data_ptr()
 
 
 def test_side_lora_transform_validates_shared_layout() -> None:

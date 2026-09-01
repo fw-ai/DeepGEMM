@@ -970,6 +970,7 @@ def _allocate_side_lora_backward_outputs(
     hidden: int,
     intermediate_hidden: int,
     write_grad_x_pool: bool = True,
+    reuse_gate_for_grad_x: bool = False,
 ) -> tuple[torch.Tensor, ...]:
     pool_rows = gate_up.size(0)
     options = dict(dtype=torch.bfloat16, device=gate_up.device)
@@ -979,11 +980,18 @@ def _allocate_side_lora_backward_outputs(
     h_act = torch.empty_like(grad_h)
     h_weighted = torch.empty_like(grad_h)
     x_pool = torch.empty_like(grad_ye)
-    grad_x_pool = (
-        torch.empty_like(grad_ye)
-        if write_grad_x_pool
-        else torch.empty((0, hidden), **options)
-    )
+    if write_grad_x_pool and reuse_gate_for_grad_x:
+        if gate_up.numel() != pool_rows * hidden:
+            raise ValueError(
+                "gate_up storage cannot cover the grad-x pool"
+            )
+        grad_x_pool = gate_up.view(pool_rows, hidden)
+    else:
+        grad_x_pool = (
+            torch.empty_like(grad_ye)
+            if write_grad_x_pool
+            else torch.empty((0, hidden), **options)
+        )
     route_weights = torch.empty(
         pool_rows, dtype=torch.float32, device=gate_up.device)
     grad_route = torch.empty_like(route_weights)
@@ -1160,6 +1168,7 @@ def fp8_fp4_mega_moe_side_lora_backward(
     out: Optional[MegaMoESideLoraBackwardResult] = None,
     grid_sync_counter: Optional[torch.Tensor] = None,
     expert_psum_rows: Optional[torch.Tensor] = None,
+    reuse_gate_for_grad_x: bool = False,
 ) -> MegaMoESideLoraBackwardResult:
     """Run the dedicated MXFP4 base-dgrad + BF16 side-LoRA backward."""
     if activation not in ("swiglu", "geglu"):
@@ -1198,7 +1207,8 @@ def fp8_fp4_mega_moe_side_lora_backward(
     outputs = (
         _allocate_side_lora_backward_outputs(
             gate_up_output, side_lora, hidden, intermediate_hidden,
-            write_grad_x_pool)
+            write_grad_x_pool,
+            reuse_gate_for_grad_x=reuse_gate_for_grad_x)
         if out is None else (
             out.grad_ye, out.grad_h, out.grad_gate_up, out.h_act,
             out.h_weighted, out.x_pool, out.grad_x_pool,
@@ -1208,6 +1218,14 @@ def fp8_fp4_mega_moe_side_lora_backward(
     (grad_ye, grad_h, grad_gate_up, h_act, h_weighted, x_pool,
      grad_x_pool, route_weights, grad_route, t13, t2,
      grad_side_lora) = outputs
+    if reuse_gate_for_grad_x:
+        if (
+            grad_x_pool.data_ptr() != gate_up_output.data_ptr()
+            or grad_x_pool.numel() != gate_up_output.numel()
+        ):
+            raise ValueError(
+                "reuse_gate_grad_x requires grad_x_pool to reuse gate_up"
+            )
     _direct_grad_x_planes(sym_buffer).zero_()
     sym_buffer.backward_grad_y[:grad_y.size(0)].copy_(
         grad_y.to(torch.bfloat16).contiguous())
