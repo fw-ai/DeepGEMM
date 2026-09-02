@@ -971,6 +971,7 @@ def _allocate_side_lora_backward_outputs(
     intermediate_hidden: int,
     write_grad_x_pool: bool = True,
     reuse_gate_for_grad_x: bool = False,
+    saved_x_pool: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, ...]:
     pool_rows = gate_up.size(0)
     options = dict(dtype=torch.bfloat16, device=gate_up.device)
@@ -979,7 +980,21 @@ def _allocate_side_lora_backward_outputs(
     grad_gate_up = torch.empty_like(gate_up)
     h_act = torch.empty_like(grad_h)
     h_weighted = torch.empty_like(grad_h)
-    x_pool = torch.empty_like(grad_ye)
+    if saved_x_pool is not None:
+        if saved_x_pool.dtype != torch.bfloat16:
+            raise TypeError("saved_x_pool must be BF16")
+        if saved_x_pool.device != gate_up.device:
+            raise ValueError("saved_x_pool must be on the same device as gate_up")
+        if not saved_x_pool.is_contiguous():
+            raise ValueError("saved_x_pool must be contiguous")
+        if tuple(saved_x_pool.shape) != (pool_rows, hidden):
+            raise ValueError(
+                "saved_x_pool must have shape "
+                f"{(pool_rows, hidden)}; got {tuple(saved_x_pool.shape)}"
+            )
+        x_pool = saved_x_pool
+    else:
+        x_pool = torch.empty_like(grad_ye)
     if write_grad_x_pool and reuse_gate_for_grad_x:
         if gate_up.numel() != pool_rows * hidden:
             raise ValueError(
@@ -1044,6 +1059,7 @@ def bf16_mega_moe_side_lora_backward(
     out: Optional[MegaMoESideLoraBackwardResult] = None,
     grid_sync_counter: Optional[torch.Tensor] = None,
     expert_psum_rows: Optional[torch.Tensor] = None,
+    saved_x_pool: Optional[torch.Tensor] = None,
 ) -> MegaMoESideLoraBackwardResult:
     """Run the dedicated BF16 base-dgrad + rank-128 LoRA backward.
 
@@ -1073,7 +1089,8 @@ def bf16_mega_moe_side_lora_backward(
     outputs = (
         _allocate_side_lora_backward_outputs(
             gate_up_output, side_lora, w13_weights.size(2),
-            w2_weights.size(2), write_grad_x_pool)
+            w2_weights.size(2), write_grad_x_pool,
+            saved_x_pool=saved_x_pool)
         if out is None else (
             out.grad_ye, out.grad_h, out.grad_gate_up, out.h_act,
             out.h_weighted, out.x_pool, out.grad_x_pool,
@@ -1083,6 +1100,8 @@ def bf16_mega_moe_side_lora_backward(
     (grad_ye, grad_h, grad_gate_up, h_act, h_weighted, x_pool,
      grad_x_pool, route_weights, grad_route, t13, t2,
      grad_side_lora) = outputs
+    if saved_x_pool is not None and x_pool.data_ptr() != saved_x_pool.data_ptr():
+        raise ValueError("out.x_pool must alias saved_x_pool when it is provided")
     _direct_grad_x_planes(sym_buffer).zero_()
     sym_buffer.backward_grad_y[:grad_y.size(0)].copy_(
         grad_y.to(torch.bfloat16).contiguous())
@@ -1108,7 +1127,7 @@ def bf16_mega_moe_side_lora_backward(
         sym_buffer.token_src_metadata, sym_buffer.handle.buffer_ptrs,
         sym_buffer.group.rank(), sym_buffer.num_topk, block_m,
         combine_order_mode.value, True, False, False, True, True,
-        False, False, 256)
+        False, saved_x_pool is not None, 256)
     _C.bf16_mega_moe_side_lora_backward(
         gate_up_output, grad_h, grad_gate_up, h_act, h_weighted,
         x_pool, grad_x_pool, grad_route, grad_ye, grad_ye,
@@ -1169,6 +1188,7 @@ def fp8_fp4_mega_moe_side_lora_backward(
     grid_sync_counter: Optional[torch.Tensor] = None,
     expert_psum_rows: Optional[torch.Tensor] = None,
     reuse_gate_for_grad_x: bool = False,
+    saved_x_pool: Optional[torch.Tensor] = None,
 ) -> MegaMoESideLoraBackwardResult:
     """Run the dedicated MXFP4 base-dgrad + BF16 side-LoRA backward."""
     if activation not in ("swiglu", "geglu"):
@@ -1208,7 +1228,8 @@ def fp8_fp4_mega_moe_side_lora_backward(
         _allocate_side_lora_backward_outputs(
             gate_up_output, side_lora, hidden, intermediate_hidden,
             write_grad_x_pool,
-            reuse_gate_for_grad_x=reuse_gate_for_grad_x)
+            reuse_gate_for_grad_x=reuse_gate_for_grad_x,
+            saved_x_pool=saved_x_pool)
         if out is None else (
             out.grad_ye, out.grad_h, out.grad_gate_up, out.h_act,
             out.h_weighted, out.x_pool, out.grad_x_pool,
@@ -1218,6 +1239,8 @@ def fp8_fp4_mega_moe_side_lora_backward(
     (grad_ye, grad_h, grad_gate_up, h_act, h_weighted, x_pool,
      grad_x_pool, route_weights, grad_route, t13, t2,
      grad_side_lora) = outputs
+    if saved_x_pool is not None and x_pool.data_ptr() != saved_x_pool.data_ptr():
+        raise ValueError("out.x_pool must alias saved_x_pool when it is provided")
     if reuse_gate_for_grad_x:
         if (
             grad_x_pool.data_ptr() != gate_up_output.data_ptr()
@@ -1247,7 +1270,7 @@ def fp8_fp4_mega_moe_side_lora_backward(
         sym_buffer.token_src_metadata, sym_buffer.handle.buffer_ptrs,
         sym_buffer.group.rank(), sym_buffer.num_topk, block_m,
         CombineOrderMode.FIXED_TOPK.value, True, False,
-        False, True, True, False, False, 256)
+        False, True, True, False, saved_x_pool is not None, 256)
     _C.fp8_fp4_mega_moe_side_lora_backward(
         gate_up_output, grad_h, grad_gate_up, h_act, h_weighted,
         x_pool, grad_x_pool, l1_acts, l1_acts_sf,
