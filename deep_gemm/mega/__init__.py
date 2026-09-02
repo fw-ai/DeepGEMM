@@ -45,6 +45,12 @@ class SymmBuffer:
         self.hidden = hidden
         self.intermediate_hidden = intermediate_hidden
         self.num_ring_tokens = num_ring_tokens
+        self.num_sf_ring_tokens = (
+            _C.get_num_max_required_sf_ring_tokens_for_mega_moe(
+                group.size(), num_experts, num_max_tokens_per_rank,
+                num_topk, num_ring_tokens)
+            if mma_type == 'fp8xfp4' else 0
+        )
 
         # Allocate a symmetric buffer
         num_bytes, slice_input_buffers = \
@@ -82,6 +88,7 @@ class SymmBuffer:
             self.token_src_metadata,
             self.backward_grad_y,
             self.backward_grad_route,
+            self.side_lora_source,
         ) = slice_input_buffers(self.buffer)
 
     def destroy(self):
@@ -93,6 +100,7 @@ class SymmBuffer:
         self.token_src_metadata = None
         self.backward_grad_y = None
         self.backward_grad_route = None
+        self.side_lora_source = None
 
 
 def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
@@ -196,6 +204,56 @@ def transform_weights_for_mega_moe(
     return l1_transformed, l2_transformed
 
 
+def transform_side_lora_for_mega_moe(
+    side_lora: Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
+                     torch.Tensor, torch.Tensor, torch.Tensor]
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
+           torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Create the K-major rank-128 views consumed by the fused TC path.
+
+    Input tensors use the conventional ``(A1, B1, A3, B3, A2, B2)``
+    layouts from the shared side-LoRA contract: A1/A3 are independent
+    ``[H, R]`` matrices shared across experts, B1/B3 and A2 are expert-local,
+    and B2 is one shared ``[R, H]`` matrix. Keep and refresh this transformed
+    tuple after optimizer updates; it must not be rebuilt for every forward.
+    """
+    if len(side_lora) != 6:
+        raise ValueError(
+            "side_lora must contain (A1, B1, A3, B3, A2, B2)")
+    rank = side_lora[0].size(-1)
+    if rank != 128:
+        raise ValueError(
+            "the tensor-core MegaMoE side-LoRA path currently requires "
+            "rank 128")
+    a1, b1, a3, b3, a2, b2 = side_lora
+    if a1.dim() != 2 or a3.dim() != 2 or b2.dim() != 2:
+        raise ValueError(
+            "side-LoRA requires shared A1/A3 and shared B2")
+    if b1.dim() != 3 or b3.dim() != 3 or a2.dim() != 3:
+        raise ValueError(
+            "side-LoRA requires expert-local B1/B3/A2")
+    hidden, rank = a1.shape
+    experts, b1_rank, intermediate = b1.shape
+    expected_shapes = (
+        ("A3", a3.shape, (hidden, rank)),
+        ("B1", b1.shape, (experts, rank, intermediate)),
+        ("B3", b3.shape, (experts, rank, intermediate)),
+        ("A2", a2.shape, (experts, intermediate, rank)),
+        ("B2", b2.shape, (rank, hidden)),
+    )
+    for name, actual, expected in expected_shapes:
+        if tuple(actual) != expected:
+            raise ValueError(
+                f"invalid {name} shape {tuple(actual)}; expected {expected}")
+    if b1_rank != rank:
+        raise ValueError("B1 rank must match A1 rank")
+    if any(tensor.dtype != torch.bfloat16 for tensor in side_lora):
+        raise TypeError("side-LoRA tensors must all be BF16")
+    return tuple(tensor.transpose(-1, -2).contiguous()
+                 for tensor in side_lora)
+
+
+
 def fp8_fp4_mega_moe(
     y: torch.Tensor,
     l1_weights: Tuple[torch.Tensor, torch.Tensor],
@@ -257,6 +315,89 @@ def fp8_fp4_mega_moe(
         num_config_tokens,
     )
 
+
+def fp8_fp4_mega_moe_side_lora(
+    y: torch.Tensor,
+    l1_weights: Tuple[torch.Tensor, torch.Tensor],
+    l2_weights: Tuple[torch.Tensor, torch.Tensor],
+    sym_buffer: SymmBuffer,
+    side_lora_input: torch.Tensor,
+    side_lora: Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
+                     torch.Tensor, torch.Tensor, torch.Tensor],
+    saved_x: torch.Tensor,
+    saved_h_unweighted: torch.Tensor,
+    cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+    recipe: Tuple[int, int, int] = (1, 1, 32),
+    activation: str = "swiglu",
+    activation_clamp: Optional[float] = None,
+    fast_math: bool = True,
+    saved_l1_preact: Optional[torch.Tensor] = None,
+    route_weight_mode: RouteWeightMode = RouteWeightMode.PRE_DOWN,
+    saved_down_unweighted: Optional[torch.Tensor] = None,
+    num_config_tokens: Optional[int] = None,
+    side_lora_scale: float = 1.0,
+    side_lora_scratch: Optional[
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run the dedicated MXFP4 base + BF16 rank-128 side-LoRA kernel.
+
+    Only q1/q3/q2 are persisted. Rank expansion accumulators remain in TMEM
+    beside the MXFP4 base accumulators and are BF16-rounded before addition;
+    no hidden- or intermediate-width side delta is allocated.
+    """
+    route_weight_mode = RouteWeightMode(route_weight_mode)
+    if len(side_lora) != 6:
+        raise ValueError(
+            "side_lora must contain (A1, B1, A3, B3, A2, B2)")
+    if side_lora[0].size(0) != 128:
+        raise ValueError("MXFP4 side-LoRA requires rank 128")
+    if side_lora_input.dtype != torch.bfloat16:
+        raise TypeError("side_lora_input must be BF16")
+    if side_lora_input.shape != (y.size(0), sym_buffer.hidden):
+        raise ValueError("side_lora_input must have shape [tokens, hidden]")
+    if sym_buffer.side_lora_source.numel() == 0:
+        raise ValueError("symmetric buffer has no MXFP4 side-LoRA source plane")
+    sym_buffer.side_lora_source[:y.size(0)].copy_(
+        side_lora_input.contiguous())
+    pool_rows = saved_x.size(0)
+    if side_lora_scratch is None:
+        side_lora_scratch = (
+            torch.empty(
+                (pool_rows, 2, 128), dtype=torch.bfloat16,
+                device=y.device),
+            torch.empty(
+                (pool_rows, 128), dtype=torch.bfloat16,
+                device=y.device),
+            torch.zeros(
+                4 * sym_buffer.num_ring_tokens // 8,
+                dtype=torch.int32, device=y.device),
+        )
+    if len(side_lora_scratch) != 3:
+        raise ValueError("side_lora_scratch must contain (q13, q2, ready)")
+    q13, q2, ready = side_lora_scratch
+    has_explicit_config_tokens = num_config_tokens is not None
+    if num_config_tokens is None:
+        num_config_tokens = y.size(0)
+    if not has_explicit_config_tokens and sym_buffer.group.size() > 1:
+        rank_uniform_num_tokens = torch.tensor(
+            num_config_tokens, dtype=torch.int32, device=y.device)
+        dist.all_reduce(
+            rank_uniform_num_tokens, op=dist.ReduceOp.MAX,
+            group=sym_buffer.group)
+        num_config_tokens = int(rank_uniform_num_tokens.item())
+    _C.fp8_fp4_mega_moe_side_lora(
+        y, l1_weights, l2_weights,
+        cumulative_local_expert_recv_stats,
+        sym_buffer.buffer, sym_buffer.handle.buffer_ptrs,
+        sym_buffer.group.rank(), sym_buffer.num_max_tokens_per_rank,
+        sym_buffer.num_experts, sym_buffer.num_topk, recipe,
+        activation, activation_clamp, fast_math,
+        sym_buffer.num_ring_tokens, saved_l1_preact,
+        route_weight_mode.value, saved_down_unweighted,
+        num_config_tokens, saved_x, saved_h_unweighted,
+        *side_lora, q13, q2, ready, float(side_lora_scale))
+    return q13, q2, ready
+
 def bf16_mega_moe(y: torch.Tensor,
                   l1_weights: torch.Tensor,
                   l2_weights: torch.Tensor,
@@ -280,8 +421,8 @@ def bf16_mega_moe(y: torch.Tensor,
     """Run BF16 MegaMoE with an explicit route-weight boundary.
 
     The optional stage saves expose unweighted/weighted activation and W2
-    output boundaries for strict parity checks. ``saved_down_unweighted`` is
-    also used by post-down backward for the exact router gradient.
+    output boundaries for strict parity checks. The fused backward currently
+    supports the production ``pre_down`` route-weight boundary only.
 
     Training callers may provide an exact local source-route histogram,
     rank-uniform ``active_pool_rows``, and a scalar mismatch flag to size saved
@@ -348,4 +489,144 @@ def bf16_mega_moe(y: torch.Tensor,
         active_pool_rows,
         route_count_mismatch,
         saved_x,
+    )
+
+def bf16_mega_moe_side_lora(y: torch.Tensor,
+                  l1_weights: torch.Tensor,
+                  l2_weights: torch.Tensor,
+                  sym_buffer: SymmBuffer,
+                  cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+                  activation: str = 'swiglu',
+                  activation_clamp: Optional[float] = None,
+                  fast_math: bool = True,
+                  saved_l1_preact: Optional[torch.Tensor] = None,
+                  route_weight_mode: RouteWeightMode = RouteWeightMode.PRE_DOWN,
+                  saved_h_unweighted: Optional[torch.Tensor] = None,
+                  saved_h_weighted: Optional[torch.Tensor] = None,
+                  saved_down_unweighted: Optional[torch.Tensor] = None,
+                  combine_order_mode: CombineOrderMode =
+                  CombineOrderMode.FIXED_TOPK,
+                  precomputed_route_counts: Optional[torch.Tensor] = None,
+                  active_pool_rows: Optional[int] = None,
+                  route_count_mismatch: Optional[torch.Tensor] = None,
+                  num_config_tokens: Optional[int] = None,
+                  saved_x: Optional[torch.Tensor] = None,
+                  side_lora: Optional[Tuple[torch.Tensor, torch.Tensor,
+                                            torch.Tensor, torch.Tensor,
+                                            torch.Tensor, torch.Tensor]] = None,
+                  side_lora_scale: float = 1.0,
+                  side_lora_scratch: Optional[
+                      Tuple[torch.Tensor, torch.Tensor,
+                            torch.Tensor]] = None):
+    """Run the dedicated native rank-128 BF16 side-LoRA MegaMoE kernel.
+
+    The optional stage saves expose unweighted/weighted activation and W2
+    output boundaries for strict parity checks. ``saved_down_unweighted`` is
+    also used by post-down backward for the exact router gradient.
+
+    Training callers may provide an exact local source-route histogram,
+    rank-uniform ``active_pool_rows``, and a scalar mismatch flag to size saved
+    pools from actual receive counts. The kernel publishes the precomputed
+    counts, verifies them against its internal dispatch count, and sets the
+    flag before any caller can accept a truncated result.
+
+    ``side_lora`` is the K-major tuple returned by
+    :func:`transform_side_lora_for_mega_moe`. The optional scratch tuple is
+    ``(l1_shrink, l2_shrink, ready)``. Callers on a hot
+    path should retain and reuse it; otherwise correctly-sized buffers are
+    allocated.
+    """
+    route_weight_mode = RouteWeightMode(route_weight_mode)
+    combine_order_mode = CombineOrderMode(combine_order_mode)
+    if (
+        (saved_h_unweighted is None) !=
+        (saved_h_weighted is None)
+    ):
+        raise ValueError(
+            "both activation stage outputs must be provided together")
+    active_plan = (
+        precomputed_route_counts is not None,
+        active_pool_rows is not None,
+        route_count_mismatch is not None,
+    )
+    if any(active_plan) and not all(active_plan):
+        raise ValueError(
+            "precomputed_route_counts, active_pool_rows, and "
+            "route_count_mismatch must be provided together")
+    has_precomputed_config_tokens = num_config_tokens is not None
+    if num_config_tokens is None:
+        num_config_tokens = y.size(0)
+    if (
+        not has_precomputed_config_tokens
+        and sym_buffer.group.size() > 1
+    ):
+        # The config selects BLOCK_M, which defines the persistent launch and
+        # pool packing. Empty source ranks can still receive expert rows, so
+        # every rank must select the config from the same source-token extent.
+        rank_uniform_num_tokens = torch.tensor(
+            num_config_tokens, dtype=torch.int32, device=y.device)
+        dist.all_reduce(
+            rank_uniform_num_tokens,
+            op=dist.ReduceOp.MAX,
+            group=sym_buffer.group)
+        num_config_tokens = int(rank_uniform_num_tokens.item())
+    if side_lora is None:
+        raise ValueError("the dedicated side-LoRA kernel requires adapters")
+    else:
+        if len(side_lora) != 6:
+            raise ValueError(
+                "side_lora must contain (A1, B1, A3, B3, A2, B2)")
+        side_lora_rank = side_lora[0].size(0)
+        if side_lora_rank != 128:
+            raise ValueError(
+                "side_lora must be the rank-128 K-major tuple returned by "
+                "transform_side_lora_for_mega_moe")
+        if side_lora_scratch is None:
+            side_lora_scratch = (
+                torch.empty(
+                    (active_pool_rows or
+                     sym_buffer.token_src_metadata.size(0),
+                     2, side_lora_rank),
+                    dtype=torch.bfloat16, device=y.device),
+                torch.empty(
+                    (active_pool_rows or
+                     sym_buffer.token_src_metadata.size(0),
+                     side_lora_rank),
+                    dtype=torch.bfloat16, device=y.device),
+                torch.empty(
+                    (4, sym_buffer.num_ring_tokens // 8),
+                    dtype=torch.int32, device=y.device),
+            )
+        if len(side_lora_scratch) != 3:
+            raise ValueError(
+                "side_lora_scratch must contain "
+                "(l1_shrink, l2_shrink, ready)")
+        side_lora_args = (*side_lora, *side_lora_scratch)
+    _C.bf16_mega_moe_side_lora(
+        y,
+        l1_weights,
+        l2_weights,
+        cumulative_local_expert_recv_stats,
+        sym_buffer.buffer,
+        sym_buffer.handle.buffer_ptrs,
+        sym_buffer.group.rank(),
+        sym_buffer.num_max_tokens_per_rank,
+        sym_buffer.num_experts,
+        sym_buffer.num_topk,
+        activation, activation_clamp,
+        fast_math,
+        sym_buffer.num_ring_tokens,
+        saved_l1_preact,
+        route_weight_mode.value,
+        saved_h_unweighted,
+        saved_h_weighted,
+        saved_down_unweighted,
+        num_config_tokens,
+        combine_order_mode.value,
+        precomputed_route_counts,
+        active_pool_rows,
+        route_count_mismatch,
+        saved_x,
+        *side_lora_args,
+        float(side_lora_scale),
     )
