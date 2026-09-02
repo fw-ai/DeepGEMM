@@ -323,6 +323,10 @@ def test_mxfp4_side_lora_backward_signature_and_unknown_activation() -> None:
     assert signature.parameters["activation"].default == "swiglu"
     assert signature.parameters["fast_math"].default is False
     assert signature.parameters["reuse_gate_for_grad_x"].default is False
+    assert signature.parameters["saved_x_pool"].default is None
+    bf16_signature = inspect.signature(
+        deep_gemm.bf16_mega_moe_side_lora_backward)
+    assert bf16_signature.parameters["saved_x_pool"].default is None
     try:
         deep_gemm.fp8_fp4_mega_moe_side_lora_backward(
             gate_up_output=None, saved_h=None,
@@ -365,6 +369,64 @@ def test_mxfp4_side_lora_backward_can_reuse_saved_gate_for_grad_x() -> None:
     assert grad_x_pool.data_ptr() == gate_up.data_ptr()
     assert grad_x_pool.numel() == gate_up.numel()
     assert outputs[2].data_ptr() != gate_up.data_ptr()
+
+
+def test_side_lora_backward_can_reuse_forward_saved_x_pool() -> None:
+    rows, hidden, intermediate, experts, rank = 5, 16, 8, 2, 128
+    gate_up = torch.empty(rows, 2 * intermediate, dtype=torch.bfloat16)
+    saved_x = torch.randn(rows, hidden, dtype=torch.bfloat16)
+    transformed_side_lora = (
+        torch.empty(rank, hidden, dtype=torch.bfloat16),
+        torch.empty(experts, intermediate, rank, dtype=torch.bfloat16),
+        torch.empty(rank, hidden, dtype=torch.bfloat16),
+        torch.empty(experts, intermediate, rank, dtype=torch.bfloat16),
+        torch.empty(experts, rank, intermediate, dtype=torch.bfloat16),
+        torch.empty(hidden, rank, dtype=torch.bfloat16),
+    )
+
+    outputs = mega_backward._allocate_side_lora_backward_outputs(
+        gate_up,
+        transformed_side_lora,
+        hidden,
+        intermediate,
+        saved_x_pool=saved_x,
+    )
+
+    assert outputs[5].data_ptr() == saved_x.data_ptr()
+    assert torch.equal(outputs[5], saved_x)
+
+
+def test_side_lora_backward_rejects_invalid_saved_x_pool() -> None:
+    rows, hidden, intermediate, experts, rank = 5, 16, 8, 2, 128
+    gate_up = torch.empty(rows, 2 * intermediate, dtype=torch.bfloat16)
+    transformed_side_lora = (
+        torch.empty(rank, hidden, dtype=torch.bfloat16),
+        torch.empty(experts, intermediate, rank, dtype=torch.bfloat16),
+        torch.empty(rank, hidden, dtype=torch.bfloat16),
+        torch.empty(experts, intermediate, rank, dtype=torch.bfloat16),
+        torch.empty(experts, rank, intermediate, dtype=torch.bfloat16),
+        torch.empty(hidden, rank, dtype=torch.bfloat16),
+    )
+
+    for invalid, error in (
+        (torch.empty(rows, hidden), TypeError),
+        (torch.empty(rows, hidden + 1, dtype=torch.bfloat16), ValueError),
+        (torch.empty(hidden, rows, dtype=torch.bfloat16).t(), ValueError),
+    ):
+        try:
+            mega_backward._allocate_side_lora_backward_outputs(
+                gate_up,
+                transformed_side_lora,
+                hidden,
+                intermediate,
+                saved_x_pool=invalid,
+            )
+        except error:
+            pass
+        else:
+            raise AssertionError(
+                f"invalid saved_x_pool {tuple(invalid.shape)} was accepted"
+            )
 
 
 def test_side_lora_transform_validates_shared_layout() -> None:
@@ -541,7 +603,8 @@ def run_bf16_correctness(local_rank: int, world: int, args) -> None:
         block_m, activation_limit=args.activation_limit,
         activation=args.activation, fast_math=False,
         route_weight_mode=args.route_weight_mode,
-        side_lora_scale=args.scale, direct_remote_grad_x=ranks > 1)
+        side_lora_scale=args.scale, direct_remote_grad_x=ranks > 1,
+        saved_x_pool=saved_x if args.reuse_saved_x_pool else None)
     torch.cuda.synchronize()
     grad_diffs = [
         _relative(actual, expected.grad)
@@ -880,7 +943,8 @@ def run_mxfp4_correctness(local_rank: int, world: int, args) -> None:
             activation=args.activation,
             fast_math=False,
             route_weight_mode=args.route_weight_mode,
-            side_lora_scale=args.scale, direct_remote_grad_x=ranks > 1)
+            side_lora_scale=args.scale, direct_remote_grad_x=ranks > 1,
+            saved_x_pool=saved_x if args.reuse_saved_x_pool else None)
 
     result = run_side_backward()
     torch.cuda.synchronize()
@@ -1247,6 +1311,7 @@ if __name__ == "__main__":
     parser.add_argument("--default-side-lora-scratch", action="store_true")
     parser.add_argument("--check-short-saved-down", action="store_true")
     parser.add_argument("--check-repeatability", action="store_true")
+    parser.add_argument("--reuse-saved-x-pool", action="store_true")
     args = parser.parse_args()
     if args.experts % args.num_processes:
         parser.error("experts must be divisible by num-processes")
