@@ -1057,9 +1057,16 @@ def run_mxfp4_correctness(local_rank: int, world: int, args) -> None:
     ) > 0.9999, native_boundary_adapter_accuracy
     repeatability = None
     if args.check_repeatability:
+        def effective_grad_x(backward_result):
+            return (
+                backward_result.grad_x
+                if backward_result.grad_x is not None
+                else backward_result.grad_x_pool
+            )
+
         first_adapter_grads = tuple(
             grad.detach().clone() for grad in result.grad_side_lora)
-        first_grad_x = result.grad_x.detach().clone()
+        first_grad_x = effective_grad_x(result).detach().clone()
         first_grad_route = buffer.backward_grad_route[:tokens, :topk].clone()
         first_metadata = buffer.token_src_metadata[:pool_rows].clone()
         first_side_y = y.detach().clone()
@@ -1076,7 +1083,8 @@ def run_mxfp4_correctness(local_rank: int, world: int, args) -> None:
                     strict=True,
                 )
             ],
-            "grad_x": _accuracy(fixed_boundary_result.grad_x, first_grad_x),
+            "grad_x": _accuracy(
+                effective_grad_x(fixed_boundary_result), first_grad_x),
             "grad_route": _accuracy(
                 buffer.backward_grad_route[:tokens, :topk],
                 first_grad_route,
@@ -1118,7 +1126,8 @@ def run_mxfp4_correctness(local_rank: int, world: int, args) -> None:
                     strict=True,
                 )
             ],
-            "grad_x": _accuracy(repeated_result.grad_x, first_grad_x),
+            "grad_x": _accuracy(
+                effective_grad_x(repeated_result), first_grad_x),
             "grad_route": _accuracy(
                 buffer.backward_grad_route[:tokens, :topk],
                 first_grad_route,
