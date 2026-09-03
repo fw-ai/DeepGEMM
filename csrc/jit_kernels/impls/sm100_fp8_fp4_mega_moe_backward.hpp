@@ -294,6 +294,7 @@ public:
         bool inline_weight_dequant = false;
         bool phase_ordered_weight_dequant = false;
         bool branch_major_bf16_wgrad_tail = false;
+        bool branch_major_bf16_early_dw2_overlap = false;
         bool mxfp8_three_term_wgrad = false;
         bool inline_residual_mxfp8_dgrad = false;
         bool residual_mxfp8_dgrad = false;
@@ -462,6 +463,10 @@ public:
             args.branch_major_bf16_wgrad_tail
             ? "#define DG_EXPERIMENTAL_K3_BRANCH_MAJOR_BF16_DYNAMIC_TAIL 1\n"
             : "";
+        const std::string branch_major_bf16_early_dw2_overlap_define =
+            args.branch_major_bf16_early_dw2_overlap
+            ? "#define DG_EXPERIMENTAL_K3_BRANCH_MAJOR_BF16_EARLY_DW2_OVERLAP 1\n"
+            : "";
         const std::string two_segment_bf16_progressive_define =
             args.mxfp8_three_term_wgrad &&
                 args.multi_range_backward &&
@@ -499,7 +504,7 @@ public:
             ? "#define DG_EXPERIMENTAL_K3_MXFP8_EXACT_RING_WATCHDOG 1\n"
             : "";
         return fmt::format(R"(
-{}{}{}{}{}{}{}{}
+{}{}{}{}{}{}{}{}{}
 #include <deep_gemm/impls/sm100_fp8_fp4_mega_moe_backward.cuh>
 
 using namespace deep_gemm;
@@ -549,6 +554,7 @@ static void __instantiate_kernel() {{
             mxfp8_three_term_wgrad_define,
             branch_major_bf16_wgrad_tail_define,
             branch_major_bf16_dynamic_tail_define,
+            branch_major_bf16_early_dw2_overlap_define,
             two_segment_bf16_progressive_define,
             mxfp8_dw13_hybrid_define,
             exact_epilogue_ring_define,
@@ -891,6 +897,20 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
         !accumulate_wgrad &&
         !inline_weight_dequant && !phase_ordered_weight_dequant &&
         !residual_mxfp8_dgrad;
+    // Compile separate cubins so the measured two-range buckets use the
+    // early-overlap body while larger arenas retain the protected terminal body.
+    // Use the rank-uniform first-range capacity as the bucket discriminator:
+    // the reusable symmetric arena may have been cache-grown by an earlier
+    // invocation and therefore does not identify the current sequence bucket.
+    const int64_t first_backward_range_capacity =
+        backward_range_sizes.size() >= 2u
+        ? backward_range_sizes[1] : 0;
+    const bool enable_k3_branch_major_bf16_early_dw2_overlap =
+        enable_k3_branch_major_bf16_wgrad_tail &&
+        multi_range_backward && num_backward_ranges == 2 &&
+        first_backward_range_capacity > 0 &&
+        first_backward_range_capacity <= 65536;
+
     const bool enable_k3_mxfp8_three_term_wgrad =
         mxfp8_three_term_wgrad &&
         k3_mxfp8_three_term_wgrad_eligible &&
@@ -2382,6 +2402,8 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
             phase_ordered_weight_dequant,
         .branch_major_bf16_wgrad_tail =
             enable_k3_branch_major_bf16_wgrad_tail,
+        .branch_major_bf16_early_dw2_overlap =
+            enable_k3_branch_major_bf16_early_dw2_overlap,
         .mxfp8_three_term_wgrad =
             enable_k3_mxfp8_three_term_wgrad,
         .inline_residual_mxfp8_dgrad =
@@ -2556,13 +2578,14 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
     const auto code =
         SM100FP8FP4MegaMoEBackwardWaveRuntime::generate(args);
     const auto kernel_name = fmt::format(
-        "sm100_fp8_fp4_mega_moe_backward_dgrad_{}_{}_r{}_inline{}_phase{}_residual{}_build{}_x{}_gate{}_wgrad{}_accum{}_d4{}_mxfp8wgrad{}_exact2{}_ring{}_trace{}_ranges{}",
+        "sm100_fp8_fp4_mega_moe_backward_dgrad_{}_{}_r{}_inline{}_phase{}_residual{}_build{}_x{}_gate{}_wgrad{}_accum{}_d4{}_e{}_mxfp8wgrad{}_exact2{}_ring{}_trace{}_ranges{}",
         activation, route_weight_mode,
         grad_route_output.has_value(), inline_weight_dequant,
         phase_ordered_weight_dequant, residual_mxfp8_dgrad,
         build_residual_mxfp8_weights, backward_x.has_value(),
         gate_up_prepared, inline_wgrad, accumulate_wgrad,
         enable_k3_branch_major_bf16_wgrad_tail ? "t" : "f",
+        enable_k3_branch_major_bf16_early_dw2_overlap ? "t" : "f",
         enable_k3_mxfp8_three_term_wgrad,
         enable_k3_mxfp8_two_range_exact,
         enable_k3_mxfp8_exact_epilogue_ring,
