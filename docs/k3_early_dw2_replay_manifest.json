@@ -1,0 +1,180 @@
+{
+  "schema_version": 1,
+  "status": "promotion_pending_fresh_process_replay",
+  "measurement_contract": {
+    "device": "NVIDIA B300 SXM6 AC",
+    "ep": 8,
+    "context_parallel_size": 1,
+    "length_mode": "true_varlen",
+    "sequence_length_scope": "per_rank",
+    "hidden": 3584,
+    "intermediate": 3072,
+    "global_experts": 896,
+    "local_experts": 112,
+    "topk": 16,
+    "gradient_scope": "full"
+  },
+  "candidate_source": {
+    "base_commit": "6de36dd94839c836837622a80ad128ced7725247",
+    "branch": "codex/k3-early-dw2-overlap-highwater-20260902",
+    "jit_host_sha256": "4f716bcbb710f2f41436c9a48dfa8430d84a6b3aefc95245a1f770051170a6fe",
+    "device_header_sha256": "b43b9ccffa0114d7f60e582d1177d305ce69efacd67e917f721a3fffa041f6e8",
+    "built_extension_sha256": "60e1a6aa11602dda191bc7893d2be9efd8c0be100002829cac1504e0e3c5e1d1",
+    "generated_cuda_sha256": "6a000f45eac7e73f2caae55d473450d44588df6911e4dbcfff0e95d26cb1f124",
+    "generated_cubin_sha256": "a18b6cf21f214271951fcf175ce8ca311942e5c8ecbb74af9b9c43558f319f9c",
+    "two_range_control_generated_cuda_sha256": "4498f58e444f2916eac32f3a361920e974e09586112488b9c6416201ef49aa17",
+    "two_range_control_generated_cubin_sha256": "8bd141037c42ec0f8e129b59f98ab90761d9b56ab5561863cce95c9ea55ee665",
+    "three_range_64k_generated_cuda_sha256": "460bf9b9a8edc7c9727543d991c945abc8c4e65b55adf68e59c4b00017d4bf27",
+    "three_range_64k_generated_cubin_sha256": "5d93e48eb5c02fcbaef4d11c59d46128aeb99533317be1de8a8174de6075d167"
+  },
+  "replay_identity": {
+    "benchmark_sha256": "e7543a8055a5180125cacee4eb6460ac27514cfd52f70a015eb1354a31e64972",
+    "firetitan_megamoe_mok_sha256": "b3c1ede3e8bec840d1ec0cc3ccec2238936402d60f4dca36a1f95a34f9225197",
+    "firetitan_native_mxfp4_megamoe_sha256": "2af191c6250725f75a8e6bbf341d4fd98f299235be7512634c25ec32362848ba",
+    "required_backward_ranges_at_32k": 2,
+    "isolated_backend_processes": true,
+    "memory_noise_ceiling_bytes": 67108864
+  },
+  "queued_current_source_one_range_replay": {
+    "status": "pending",
+    "tokens_per_rank": [
+      4096,
+      8192,
+      16384
+    ],
+    "required_backward_ranges": 1,
+    "benchmark_sha256": "e7543a8055a5180125cacee4eb6460ac27514cfd52f70a015eb1354a31e64972",
+    "specialization_provenance_required": false,
+    "reason": "the frozen harness emits generated-kernel provenance only for packed multi-range inputs; extension and host source hashes remain mandatory",
+    "early_overlap_expected": false
+  },
+  "queued_current_source_long_replay": {
+    "status": "pending",
+    "tokens_per_rank": [
+      131072,
+      262144,
+      524288
+    ],
+    "expected_backward_launches": [
+      6,
+      11,
+      22
+    ],
+    "benchmark_sha256": "af2514ae50f87a8838e5236dee7e1a6934071f510fd53129b6ba8866843e54de",
+    "performance_verifier_sha256": "47c867d2af2ca47a1ae4921595114ac8599c5583df559cb8afabe49f2ffdcd1c",
+    "memory_verifier_sha256": "7d74d34d3f5dd205a83f942172e009cfc8e20336892c83b1dd4462756c766533",
+    "source_bound_to_candidate": true,
+    "isolated_backend_memory_processes": true,
+    "protected_speedup_highwater": {
+      "131072": {
+        "measurement": "direct",
+        "forward": 2.231,
+        "backward": 1.217,
+        "forward_backward": 1.419
+      },
+      "262144": {
+        "measurement": "segmented_gpu_estimate",
+        "forward": 2.225,
+        "backward": 1.208,
+        "forward_backward": 1.418
+      }
+    },
+    "highwater_replay_tolerance_fraction": 0.03,
+    "early_overlap_expected": false
+  },
+  "ncu_contract": {
+    "ep": 8,
+    "topology": "one profiler process per rank with TCP communicator lockstep and application replay",
+    "section_sha256": "9eeeee23cebf809321377c239e40bdfcaa1b67ca8f065688cabec5fcaafd6402",
+    "early32_wrapper_sha256": "2b99be6241ffccd122f1f9f586444967be139a15351032d7c7438bade4d217fb",
+    "exact64_wrapper_sha256": "efd43c0309ddd669d6c889dac88835b2174d423ad212ac762bc9aa5d7d40f9ee",
+    "report_verifier_sha256": "0f53a5ae15a7aeb12bc922b704b1f6a9ce41c0d2228b165b22b29242ba950ac1",
+    "metrics_verifier_sha256": "e2450f67d22362962ebef7b26d1d431f2b019319c674d202f77c2afdf48ebdee",
+    "captured_backward_launch_index": 1,
+    "captured_range": "first full 32K backward range after the reverse-order short tail",
+    "required_positive_metrics": [
+      "sm_active",
+      "tensor_pipe_active",
+      "tensor_memory_active",
+      "tma_active",
+      "dram_throughput",
+      "l2_throughput"
+    ],
+    "all_rank_reports_required": true,
+    "prior_tail_profile_is_promotion_evidence": false
+  },
+  "offline_non_early_sass_audit": {
+    "scope": "two_range_e_false_control_only; this does not cover the distinct three-range 64K specialization or replace its queued GPU replay",
+    "pre_early_cubin_sha256": "e17ae0d9aec5fe3a366ca50c40700ca20be3526f13af4e57709dd329853bf182",
+    "pre_early_source_commit": "6de36dd94839c836837622a80ad128ced7725247",
+    "pre_early_device_header_sha256": "957ee39f75614ab5f36d96b197c9b03b4bb117812a4e04b30c5713aaa0339755",
+    "pre_early_jit_host_sha256": "5aa8ebe0c4109b1a275d337bdbcf99fb7b6fa96a1ab04c7c4d0217ab5d6b0546",
+    "current_two_range_e_false_cubin_sha256": "8bd141037c42ec0f8e129b59f98ab90761d9b56ab5561863cce95c9ea55ee665",
+    "sass_lines_each": 27065,
+    "raw_instruction_differences": 4,
+    "difference_class": "device_assert_source_line_immediates_shifted by inserted source lines",
+    "normalized_sass_sha256": "fde5df478e9a82d57d1c17a65144318737fce1d337f6a86f50620f7d13629ebe",
+    "normalized_byte_equal": true
+  },
+  "offline_cubin_resource_audit": {
+    "tool": "cuobjdump --dump-resource-usage",
+    "early_e_true": {
+      "registers": 64,
+      "stack_bytes": 344,
+      "static_shared_bytes": 1024,
+      "constant_2_bytes": 28
+    },
+    "non_early_e_false": {
+      "registers": 64,
+      "stack_bytes": 392,
+      "static_shared_bytes": 1024,
+      "constant_2_bytes": 40
+    },
+    "interpretation": "early overlap does not increase static registers or static shared memory; runtime absolute peak memory remains a separate GPU gate"
+  },
+  "verified_predecessor_observation": {
+    "relationship": "same_device_header_and_generated_cuda_but_different_extension_build",
+    "extension_sha256": "d25fa8b3a68030276c33bdd06fb5ace04c9fd1e3a13d6d5a5b760ee66cff1a81",
+    "generated_cuda_sha256": "6a000f45eac7e73f2caae55d473450d44588df6911e4dbcfff0e95d26cb1f124",
+    "source_identity_limit": "the recorded host-source path contained the device header, so a source-bound replay is still required",
+    "tokens_per_rank": 32768,
+    "rounds": 8,
+    "warmups": 3,
+    "phases_ms": {
+      "forward": {
+        "native_deepep_v2": 50.48907279968262,
+        "candidate": 26.613584518432617,
+        "speedup": 1.8971165933966465
+      },
+      "backward": {
+        "native_deepep_v2": 101.25689697265625,
+        "candidate": 74.35414505004883,
+        "speedup": 1.3618191279652103
+      },
+      "forward_backward": {
+        "native_deepep_v2": 150.75267028808594,
+        "candidate": 99.6300163269043,
+        "speedup": 1.513125018402475
+      }
+    },
+    "qualified_cosines": {
+      "output": 0.9999964487168779,
+      "dX": 0.9999931286954526,
+      "dRoute": 0.9999999999436178,
+      "dW1": 0.9999999908735591,
+      "dW2": 0.999999991605992,
+      "dW3": 0.9999999906435995
+    },
+    "nonfinite_values": 0
+  },
+  "promotion_requirements": [
+    "source-bound EP=8 true-varlen replay",
+    "current-source 4K, 8K, and 16K one-range compatibility replay",
+    "all six FP64 cosines strictly greater than 0.99999",
+    "forward speedup strictly greater than 1.5",
+    "backward speedup strictly greater than 1.36 or accepted combined target",
+    "fresh-process absolute peak memory no greater than native plus 64 MiB",
+    "no regression beyond the protected 32K phase-latency noise ceiling",
+    "the current source's e=false three-range 64K specialization remains within the protected 64K phase-latency noise ceiling"
+  ]
+}

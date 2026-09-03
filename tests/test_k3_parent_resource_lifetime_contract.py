@@ -133,9 +133,29 @@ class _SelectedLifetime:
         self.tmem_allocated = False
         self.events.append(f"free:tmem:{name}")
 
+    def run_retained_bf16_body(self, name: str) -> None:
+        """Allocate BF16 resources and retain them for the following body."""
+        assert not self.tmem_allocated, f"TMEM still owned before {name}"
+        self.tmem_allocated = True
+        self.events.append(f"alloc:tmem:{name}")
+        self.events.append(f"retain:tmem:{name}")
 
-def _trace_selected_range_count(num_ranges: int) -> _SelectedLifetime:
+    def run_releasing_bf16_body(self, name: str) -> None:
+        """Reuse retained BF16 resources and release them exactly once."""
+        assert self.tmem_allocated, f"TMEM not retained before {name}"
+        self.events.append(f"reuse:tmem:{name}")
+        self.tmem_allocated = False
+        self.events.append(f"free:tmem:{name}")
+
+
+def _trace_selected_range_count(
+    num_ranges: int,
+    *,
+    early_dw2_overlap: bool = False,
+) -> _SelectedLifetime:
+    """Model the selected parent/BF16 ownership transitions."""
     assert num_ranges in (1, 2, 3)
+    assert not early_dw2_overlap or num_ranges == 2
     exact_ring = num_ranges == 3
     lifetime = _SelectedLifetime()
     lifetime.valid.add("parent_dequant_w2")
@@ -157,16 +177,20 @@ def _trace_selected_range_count(num_ranges: int) -> _SelectedLifetime:
     lifetime.initialize("parent_pipeline", "w13")
     lifetime.initialize("parent_epilogue", "w13")
 
-    lifetime.invalidate("parent_pipeline", "terminal")
-    lifetime.invalidate("parent_epilogue", "terminal")
+    handoff = "early_dw2" if early_dw2_overlap else "terminal"
+    lifetime.invalidate("parent_pipeline", handoff)
+    lifetime.invalidate("parent_epilogue", handoff)
     if not exact_ring:
-        lifetime.invalidate("parent_dispatch", "terminal")
-    lifetime.invalidate("parent_dequant_w2", "terminal")
+        lifetime.invalidate("parent_dispatch", handoff)
+    lifetime.invalidate("parent_dequant_w2", handoff)
     if not exact_ring:
-        lifetime.invalidate("parent_dequant_w13", "terminal")
-    lifetime.free_tmem("parent_terminal")
+        lifetime.invalidate("parent_dequant_w13", handoff)
+    lifetime.free_tmem(f"parent_{handoff}")
 
-    if exact_ring:
+    if early_dw2_overlap:
+        lifetime.run_retained_bf16_body("early_dw2")
+        lifetime.run_releasing_bf16_body("dw13")
+    elif exact_ring:
         # Three physical ranges share one retained BF16 lifetime; the final
         # range releases it. The early exact dW13 body retained parent TMEM.
         lifetime.run_default_bf16_body("three_range_dw2")
@@ -199,6 +223,18 @@ def test_selected_one_two_three_range_resource_event_traces() -> None:
     assert traces[3].count("free:tmem:parent_terminal") == 1
 
 
+def test_early_two_range_dw2_retains_one_bf16_resource_lifetime() -> None:
+    """Early dW2 must allocate once and let terminal dW13 perform the release."""
+    trace = _trace_selected_range_count(2, early_dw2_overlap=True).events
+    assert "free:tmem:parent_early_dw2" in trace
+    assert "alloc:tmem:early_dw2" in trace
+    assert "retain:tmem:early_dw2" in trace
+    assert "reuse:tmem:dw13" in trace
+    assert trace.count("free:tmem:dw13") == 1
+    assert "alloc:tmem:dw13" not in trace
+    assert "free:tmem:early_dw2" not in trace
+
+
 def test_tmem_handoffs_keep_cluster_ordering_and_single_ownership() -> None:
     parent = PARENT.read_text()
     bf16 = BF16.read_text()
@@ -206,9 +242,11 @@ def test_tmem_handoffs_keep_cluster_ordering_and_single_ownership() -> None:
 
     terminal = _between(
         parent,
-        "if constexpr (!kK3MxFp8WgradOverlap) {\n"
-        "            comm::cluster_sync_with_relaxed_arrive();",
-        "if constexpr (kK3BranchMajorBF16WgradTail) {",
+        "if constexpr (\n"
+        "            !kK3MxFp8WgradOverlap &&\n"
+        "            !kK3BranchMajorBF16EarlyDW2Overlap) {",
+        "if constexpr (\n"
+        "            kK3BranchMajorBF16WgradTail &&",
     )
     assert terminal.index("comm::cluster_sync_with_relaxed_arrive()") < (
         terminal.index("Allocator().free(0, kNumTmemCols)")
@@ -240,8 +278,11 @@ def test_terminal_retires_dedicated_dequant_barriers_before_bf16_alias() -> None
     terminal = _between(
         parent,
         "trace_begin(20);\n"
-        "        if constexpr (kInlineWgrad && !kK3MxFp8WgradOverlap) {",
-        "if constexpr (!kK3MxFp8WgradOverlap) {",
+        "        if constexpr (\n"
+        "            kInlineWgrad && !kK3MxFp8WgradOverlap &&\n"
+        "            !kK3BranchMajorBF16EarlyDW2Overlap) {",
+        "if constexpr (\n"
+        "            !kK3MxFp8WgradOverlap &&",
     )
     guard = _between(
         terminal,

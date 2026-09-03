@@ -205,6 +205,52 @@
       }
     }
   },
+  "long_sequence_regression_frontier": {
+    "semantics": "Retained EP=8 GPU observations protect long-sequence speedup. The current-source 128K direct replay is attached separately so its source-bound numerics and stable candidate latencies do not overwrite the faster per-phase frontier. Measurement type remains explicit.",
+    "replay_tolerance_fraction": 0.03,
+    "131072": {
+      "source_status": "previous_numerically_verified_gpu_observation",
+      "measurement": "direct",
+      "current_source_replay": {
+        "measurement": "direct_true_varlen_three_range",
+        "rank_tokens": [87382, 99865, 112348, 124831, 137313, 149796, 162279, 174762],
+        "benchmark_sha256": "aee4b258cf0f8548bec1c32ac0e4794bd2a7ad7584574ead0ae16570175312d6",
+        "megamoe_mok_sha256": "818b800de5f2962f3c6bf5b6eb478f9680b7bacc15951a81886cdfed6a97041f",
+        "native_mxfp4_megamoe_sha256": "1f5986d2e58d21debeea7280000966fab5f3c6d9375e52e733838b7019a0c937",
+        "deep_gemm_extension_sha256": "60e1a6aa11602dda191bc7893d2be9efd8c0be100002829cac1504e0e3c5e1d1",
+        "complete_log_sha256": "2dc8c8ad4d6f540e39b6d9b5400c95d1036f5c46322f66b62887900bed0430cf",
+        "verifier_receipt_sha256": "e9611603b3222bf876de42ff6edf1ecf408e16618529a87369adedcf6b38ad87",
+        "qualified_cosines": {
+          "output": 0.9999964491971058,
+          "dX": 0.9999931364886823,
+          "dRoute": 0.9999999999498957,
+          "dW1": 0.9999999655868853,
+          "dW2": 0.9999999668872138,
+          "dW3": 0.9999999651667638
+        },
+        "nonfinite_count": 0,
+        "phases": {
+          "forward": {"native_deepep_v2": 224.5725555419922, "candidate": 97.48863983154297, "speedup": 2.3035766621633647},
+          "backward": {"native_deepep_v2": 432.57704162597656, "candidate": 330.6202392578125, "speedup": 1.3083804022313943},
+          "forward_backward": {"native_deepep_v2": 614.9590148925781, "candidate": 429.9464569091797, "speedup": 1.4303153451093094}
+        }
+      },
+      "phases": {
+        "forward": {"native_deepep_v2": 221.598, "candidate": 99.320, "speedup": 2.231},
+        "backward": {"native_deepep_v2": 395.732, "candidate": 325.285, "speedup": 1.217},
+        "forward_backward": {"native_deepep_v2": 612.105, "candidate": 431.342, "speedup": 1.419}
+      }
+    },
+    "262144": {
+      "source_status": "previous_numerically_verified_gpu_observation",
+      "measurement": "segmented_gpu_estimate",
+      "phases": {
+        "forward": {"native_deepep_v2": 445.081, "candidate": 200.044, "speedup": 2.225},
+        "backward": {"native_deepep_v2": 789.877, "candidate": 654.100, "speedup": 1.208},
+        "forward_backward": {"native_deepep_v2": 1225.944, "candidate": 864.662, "speedup": 1.418}
+      }
+    }
+  },
   "observed_unpromoted_performance_frontier": {
     "semantics": "Numerically qualified GPU latency observations that are faster than a promoted phase ceiling but lack complete same-run source identity or fail another promotion invariant. They remain mandatory latency targets; a future promotion must retain their per-phase minimum while independently passing provenance and fresh-process memory gates.",
     "4096": {
