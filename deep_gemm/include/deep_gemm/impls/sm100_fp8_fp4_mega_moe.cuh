@@ -19,16 +19,38 @@
 
 namespace deep_gemm {
 
-// Store one rowwise reduction value into the corresponding shared-memory
-// address on the peer CTA. MegaMoE schedules adjacent L1 N tiles as a two-CTA
-// cluster, so the peer owns the other 64 values of the same Q128 group.
-CUTLASS_DEVICE void store_cluster_float2(
-    float2* ptr, const uint32_t& cta_rank, const float2& value) {
+// Arm a transaction barrier in the peer CTA. The peer's wait completes only
+// after every asynchronous row-maximum store below has retired.
+CUTLASS_DEVICE void arrive_expect_tx_cluster(
+    cutlass::arch::ClusterTransactionBarrier* ptr,
+    const uint32_t& cta_rank, const uint32_t& num_bytes) {
     const uint32_t remote_addr = cute::set_block_rank(
         cute::cast_smem_ptr_to_uint(ptr), cta_rank);
     asm volatile(
-        "st.shared::cluster.v2.f32 [%0], {%1, %2};\n"
-        :: "r"(remote_addr), "f"(value.x), "f"(value.y)
+        "mbarrier.arrive.expect_tx.release.cluster.shared::cluster.b64 "
+        "_, [%0], %1;\n"
+        :: "r"(remote_addr), "r"(num_bytes)
+        : "memory");
+}
+
+// Store one rowwise reduction value into the corresponding shared-memory
+// address on the peer CTA and account for its eight bytes on the peer barrier.
+// MegaMoE schedules adjacent L1 N tiles as a two-CTA cluster, so the peer owns
+// the other 64 values of the same Q128 group.
+CUTLASS_DEVICE void store_cluster_float2_async(
+    float2* ptr, cutlass::arch::ClusterTransactionBarrier* barrier_ptr,
+    const uint32_t& cta_rank, const float2& value) {
+    const uint32_t remote_addr = cute::set_block_rank(
+        cute::cast_smem_ptr_to_uint(ptr), cta_rank);
+    const uint32_t remote_barrier_addr = cute::set_block_rank(
+        cute::cast_smem_ptr_to_uint(barrier_ptr), cta_rank);
+    asm volatile(
+        "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v2.b32 "
+        "[%0], {%1, %2}, [%3];\n"
+        :: "r"(remote_addr),
+           "r"(__float_as_uint(value.x)),
+           "r"(__float_as_uint(value.y)),
+           "r"(remote_barrier_addr)
         : "memory");
 }
 
@@ -362,9 +384,22 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // Adjust registers
     // NOTES: more experts per rank will cost more schedulers' registers
     constexpr bool kUseMoreEpilogueRegisters = kNumExpertsPerRank <= 64;
-    constexpr uint32_t kNumDispatchRegisters = kUseMoreEpilogueRegisters ? 48 : 96;
-    constexpr uint32_t kNumNonEpilogueRegisters = kUseMoreEpilogueRegisters ? 40 : 88;
-    constexpr uint32_t kNumEpilogueRegisters = kUseMoreEpilogueRegisters ? 208 : 160;
+    constexpr bool kUseK3Q128ThreeEpilogueWarpgroups =
+        kL2ActivationGroup128 &&
+        kRouteWeightMode == RouteWeightMode::PostDown &&
+        kHidden == 3584 && kIntermediateHidden == 3072 &&
+        kNumExperts == 896 && kNumTopk == 16 &&
+        (kNumRanks == 8 || kNumRanks == 4) &&
+        kNumEpilogueThreads == 384;
+    constexpr uint32_t kNumDispatchRegisters =
+        kUseK3Q128ThreeEpilogueWarpgroups ? 88 :
+        kUseMoreEpilogueRegisters ? 48 : 96;
+    constexpr uint32_t kNumNonEpilogueRegisters =
+        kUseK3Q128ThreeEpilogueWarpgroups ? 80 :
+        kUseMoreEpilogueRegisters ? 40 : 88;
+    constexpr uint32_t kNumEpilogueRegisters =
+        kUseK3Q128ThreeEpilogueWarpgroups ? 104 :
+        kUseMoreEpilogueRegisters ? 208 : 160;
     DG_STATIC_ASSERT(kNumDispatchRegisters * kNumDispatchThreads +
                      kNumNonEpilogueRegisters * kNumNonEpilogueThreads +
                      kNumEpilogueRegisters * kNumEpilogueThreads <= 64512,
@@ -1159,28 +1194,53 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             auto gate_numerator = gate;
                             auto activated_up = up;
                             float2 situ_sigmoid = {0.0f, 0.0f};
+                            constexpr bool kUseK3Q128FastSiTU =
+                                kL2ActivationGroup128 &&
+                                kRouteWeightMode ==
+                                    RouteWeightMode::PostDown &&
+                                kHidden == 3584 &&
+                                kIntermediateHidden == 3072 &&
+                                kNumExperts == 896 && kNumTopk == 16 &&
+                                (kNumRanks == 8 || kNumRanks == 4) &&
+                                kSituBeta == 4.0f &&
+                                kSituLinearBeta == 25.0f;
                             if constexpr (kActivationType == ActivationType::SiTU) {
+                                // The SiTU output crosses a BF16 boundary
+                                // before L2 quantization. Promotion of this
+                                // intrinsic path is nevertheless gated by the
+                                // complete Forward, KLD, and gradient checks.
                                 const auto gate_tanh = make_float2(
-                                    kFastMath ? __tanhf(gate.x / kSituBeta) : tanhf(gate.x / kSituBeta),
-                                    kFastMath ? __tanhf(gate.y / kSituBeta) : tanhf(gate.y / kSituBeta));
+                                    kFastMath || kUseK3Q128FastSiTU ?
+                                        __tanhf(gate.x / kSituBeta) :
+                                        tanhf(gate.x / kSituBeta),
+                                    kFastMath || kUseK3Q128FastSiTU ?
+                                        __tanhf(gate.y / kSituBeta) :
+                                        tanhf(gate.y / kSituBeta));
                                 gate_numerator = __fmul2_rn(
                                     {kSituBeta, kSituBeta}, gate_tanh);
-                                if constexpr (!kFastMath && kSituBeta == 4.0f) {
+                                if constexpr (
+                                    !kFastMath && kUseK3Q128FastSiTU) {
                                     // sigmoid(g) = (1 + tanh(g / 2)) / 2 and
                                     // tanh(g / 2) follows from the double-angle
-                                    // identity using the accurate tanh(g / 4)
-                                    // already required by K3 SiTU. This removes
-                                    // one accurate expf per element without
-                                    // enabling the inference fast-math path.
+                                    // identity and reuses tanh(g / 4), already
+                                    // required by K3 SiTU. The approximate
+                                    // reciprocal is promoted only after the
+                                    // complete numerical gates pass.
                                     const auto gate_tanh_sq =
                                         __fmul2_rn(gate_tanh, gate_tanh);
+                                    const auto gate_half_denom =
+                                        __fadd2_rn(
+                                            {1.0f, 1.0f},
+                                            gate_tanh_sq);
                                     const auto tanh_gate_half = make_float2(
-                                        __fdiv_rn(
+                                        __fmul_rn(
                                             __fmul_rn(2.0f, gate_tanh.x),
-                                            __fadd_rn(1.0f, gate_tanh_sq.x)),
-                                        __fdiv_rn(
+                                            math::fast_rcp(
+                                                gate_half_denom.x)),
+                                        __fmul_rn(
                                             __fmul_rn(2.0f, gate_tanh.y),
-                                            __fadd_rn(1.0f, gate_tanh_sq.y)));
+                                            math::fast_rcp(
+                                                gate_half_denom.y)));
                                     situ_sigmoid = __fmul2_rn(
                                         {0.5f, 0.5f},
                                         __fadd2_rn(
@@ -1191,8 +1251,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                     kSituLinearBeta !=
                                     cute::numeric_limits<float>::infinity()) {
                                     const auto up_tanh = make_float2(
-                                        kFastMath ? __tanhf(up.x / kSituLinearBeta) : tanhf(up.x / kSituLinearBeta),
-                                        kFastMath ? __tanhf(up.y / kSituLinearBeta) : tanhf(up.y / kSituLinearBeta));
+                                        kFastMath || kUseK3Q128FastSiTU ?
+                                            __tanhf(up.x / kSituLinearBeta) :
+                                            tanhf(up.x / kSituLinearBeta),
+                                        kFastMath || kUseK3Q128FastSiTU ?
+                                            __tanhf(up.y / kSituLinearBeta) :
+                                            tanhf(up.y / kSituLinearBeta));
                                     activated_up = __fmul2_rn(
                                         {kSituLinearBeta, kSituLinearBeta},
                                         up_tanh);
@@ -1202,7 +1266,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             float2 activated;
                             if constexpr (
                                 kActivationType == ActivationType::SiTU &&
-                                !kFastMath && kSituBeta == 4.0f) {
+                                !kFastMath && kUseK3Q128FastSiTU) {
                                 activated = __fmul2_rn(
                                     gate_numerator, situ_sigmoid);
                             } else {
@@ -1306,30 +1370,33 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             }
                         }
 
+                        constexpr uint32_t kQ128PeerAmaxBytes =
+                            kNumAtomsPerStore * (ATOM_M / 2) *
+                            sizeof(float2);
+                        const uint32_t peer_cta_rank =
+                            cute::block_rank_in_cluster() ^ 1u;
+                        if (warp_idx_in_wg == 0 &&
+                            cute::elect_one_sync()) {
+                            arrive_expect_tx_cluster(
+                                &shared_storage.l1_scale_barriers
+                                    [epilogue_wg_idx],
+                                peer_cta_rank,
+                                kQ128PeerAmaxBytes);
+                        }
+                        __syncwarp();
                         if (warp_idx_in_wg == 0 && lane_idx < 4) {
                             #pragma unroll
                             for (uint32_t i = 0;
                                  i < kNumAtomsPerStore; ++ i) {
-                                store_cluster_float2(
+                                store_cluster_float2_async(
                                     &shared_storage.l1_peer_amax
                                         [epilogue_wg_idx]
                                         [i * (ATOM_M / 2) + lane_idx],
-                                    cute::block_rank_in_cluster() ^ 1u,
+                                    &shared_storage.l1_scale_barriers
+                                        [epilogue_wg_idx],
+                                    peer_cta_rank,
                                     local_amax[i]);
                             }
-                        }
-                        // Four lanes issue the peer writes and one lane
-                        // publishes the remote mbarrier arrival. Cluster-scope
-                        // release ordering prevents the peer from observing a
-                        // partially published row maximum.
-                        if (warp_idx_in_wg == 0)
-                            __threadfence_cluster();
-                        __syncwarp();
-                        if (warp_idx_in_wg == 0 &&
-                            cute::elect_one_sync()) {
-                            shared_storage.l1_scale_barriers
-                                [epilogue_wg_idx].arrive(
-                                    cute::block_rank_in_cluster() ^ 1u);
                         }
                         shared_storage.l1_scale_barriers
                             [epilogue_wg_idx].wait(l1_scale_phase);
@@ -1656,6 +1723,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const int stored_topk_slot_idx = lane_idx < kNumTopk ?
                 static_cast<int>(__ldg(input_topk_idx_buffer.get_base_ptr<int64_t>() + token_idx * kNumTopk + lane_idx)) : -1;
             const uint32_t total_mask = __ballot_sync(0xffffffff, stored_topk_slot_idx >= 0);
+            float stored_route_weight = 1.0f;
+            if constexpr (
+                kRouteWeightMode == RouteWeightMode::PostDown) {
+                stored_route_weight = lane_idx < kNumTopk ?
+                    __ldg(input_topk_weights_buffer.get_base_ptr<float>() +
+                          static_cast<uint64_t>(token_idx) * kNumTopk +
+                          lane_idx) :
+                    1.0f;
+            }
 
             // Iterate all chunks
             for (uint32_t chunk = 0; chunk < kNumChunks; ++ chunk) {
@@ -1700,9 +1776,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     if constexpr (
                         kRouteWeightMode ==
                         RouteWeightMode::PostDown) {
-                        route_weight = __ldg(
-                            input_topk_weights_buffer.get_base_ptr<float>() +
-                            static_cast<uint64_t>(token_idx) * kNumTopk +
+                        route_weight = __shfl_sync(
+                            0xffffffff,
+                            stored_route_weight,
                             loaded_slot_idx[load_stage_idx]);
                     }
                     #pragma unroll

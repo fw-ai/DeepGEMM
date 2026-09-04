@@ -286,8 +286,19 @@ static MegaMoEConfig get_mega_moe_config(
     const int& l2_activation_group_size = 32) {
 
     // Block config
-    const auto [cluster_size, block_m, store_block_m, block_k, num_epilogue_threads] =
+    auto [cluster_size, block_m, store_block_m, block_k, num_epilogue_threads] =
         get_block_config_for_mega_moe(num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens, mma_kind);
+    if (mma_kind == MmaKind::MXFP8FP4 &&
+        l2_activation_group_size == 128 &&
+        num_ranks == 8 && num_experts == 896 && num_topk == 16 &&
+        hidden == 3584 && intermediate_hidden == 3072 &&
+        block_m == 192) {
+        // Three 64-row epilogue warpgroups cover the complete K3 block while
+        // increasing SiTU and Q128-reduction parallelism. Other models retain
+        // the general MegaMoE heuristic.
+        store_block_m = 64;
+        num_epilogue_threads = 384;
+    }
     const int block_n = 128;
     const int load_block_m = block_m / 2;
     const int load_block_n = block_n;
