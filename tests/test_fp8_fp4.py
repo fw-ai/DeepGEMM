@@ -105,6 +105,7 @@ def test_psum_grouped_gemm_accepts_deepep_column_major_scales() -> None:
         actual,
         psum,
         use_psum_layout=True,
+        allow_strided_psum_scales=True,
     )
     assert torch.equal(actual, expected)
 

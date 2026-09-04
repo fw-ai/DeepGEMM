@@ -64,7 +64,7 @@ using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&transpose_and_pack_fp32_into_ue8m0<
-        {}, {}, {}, {}, {}, {}
+        {}, {}, {}, {}, {}
     >);
 }};
 )", args.launch_args.num_threads, args.block_mn, args.sf_k,
