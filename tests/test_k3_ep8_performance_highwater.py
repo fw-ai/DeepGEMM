@@ -19,6 +19,12 @@ def _load_ledger() -> dict:
     return json.loads(path.read_text())
 
 
+def _load_candidate_manifest() -> dict:
+    """Load the source identity for the candidate awaiting GPU promotion."""
+    path = _repository_root() / "docs/k3_early_dw2_replay_manifest.json"
+    return json.loads(path.read_text())
+
+
 def _sha256(path: Path) -> str:
     """Return the SHA-256 digest for one source file."""
     digest = hashlib.sha256()
@@ -59,33 +65,48 @@ def _phase_result_from_ledger(avg_tokens_per_rank: int = 65536) -> dict:
     return result
 
 
-def test_fast_milestone_source_bytes_match_the_ledger() -> None:
-    """Prevent experiments from silently replacing the recovered fast source."""
+def test_working_source_bytes_match_the_candidate_manifest() -> None:
+    """Require every working source revision to have an explicit identity.
+
+    The immutable high-water ledger identifies the source that produced the
+    protected performance result. A later candidate must not rewrite that
+    historical identity before its own GPU promotion; its changed source files
+    are instead pinned by the replay manifest.
+    """
     root = _repository_root()
-    identity = _load_ledger()["source_identity"]
-    files = {
-        "backward_parent_header_sha256": (
+    protected = _load_ledger()["source_identity"]
+    candidate = _load_candidate_manifest()["candidate_source"]
+    files = (
+        (
+            candidate["device_header_sha256"],
             "deep_gemm/include/deep_gemm/impls/"
-            "sm100_fp8_fp4_mega_moe_backward.cuh"
+            "sm100_fp8_fp4_mega_moe_backward.cuh",
         ),
-        "bf16_gemm_body_sha256": (
-            "deep_gemm/include/deep_gemm/impls/sm100_bf16_gemm.cuh"
+        (
+            protected["bf16_gemm_body_sha256"],
+            "deep_gemm/include/deep_gemm/impls/sm100_bf16_gemm.cuh",
         ),
-        "scheduler_sha256": "deep_gemm/include/deep_gemm/scheduler/gemm.cuh",
-        "range_provider_sha256": (
+        (
+            protected["scheduler_sha256"],
+            "deep_gemm/include/deep_gemm/scheduler/gemm.cuh",
+        ),
+        (
+            protected["range_provider_sha256"],
             "deep_gemm/include/deep_gemm/scheduler/"
-            "external_k_grouped_range.hpp"
+            "external_k_grouped_range.hpp",
         ),
-        "jit_host_sha256": (
-            "csrc/jit_kernels/impls/sm100_fp8_fp4_mega_moe_backward.hpp"
+        (
+            candidate["jit_host_sha256"],
+            "csrc/jit_kernels/impls/sm100_fp8_fp4_mega_moe_backward.hpp",
         ),
-        "wgrad_header_sha256": (
+        (
+            protected["wgrad_header_sha256"],
             "deep_gemm/include/deep_gemm/impls/"
-            "sm100_mxfp8_three_term_grouped_wgrad.cuh"
+            "sm100_mxfp8_three_term_grouped_wgrad.cuh",
         ),
-    }
-    for ledger_key, relative_path in files.items():
-        assert _sha256(root / relative_path) == identity[ledger_key]
+    )
+    for expected_sha256, relative_path in files:
+        assert _sha256(root / relative_path) == expected_sha256
 
 
 def test_64k_phase_highwater_is_the_fastest_retained_receipt() -> None:
