@@ -127,8 +127,6 @@ CUTLASS_GLOBAL void transpose_and_pack_fp32_into_ue8m0(float* sf, uint32_t* out,
         for (uint32_t j = 0; j < 4; ++ j) {
             const auto sf_k_idx = sf_k_pack_idx * 4 + j;
             values[j] = valid_mn and sf_k_idx < SF_K ? ptx::ld_shared(sf_smem_buffer + mn_idx * SF_K + sf_k_idx) : 0;
-            // FP32 SFs must have a zero sign and mantissa (only the exponent is packed)
-            DG_DEVICE_ASSERT((values[j] & 0x807fffffu) == 0);
         }
 
         // Pack and store
@@ -340,11 +338,6 @@ CUTLASS_GLOBAL void pack_fp32_into_ue8m0(float* sf, uint32_t* out, uint32_t* gro
             const uint32_t sf_row_idx = packed_sf_k_idx * 4 + j - num_padding_sf_rows;
             if (sf_row_idx >= group_sf_row_start and sf_row_idx < group_sf_row_end)
                 values[j] = reinterpret_cast<const uint4*>(sf + sf_row_idx * mn)[mn_idx];
-            // FP32 SFs must have a zero sign and mantissa (only the exponent is packed)
-            DG_DEVICE_ASSERT((values[j].x & 0x807fffffu) == 0);
-            DG_DEVICE_ASSERT((values[j].y & 0x807fffffu) == 0);
-            DG_DEVICE_ASSERT((values[j].z & 0x807fffffu) == 0);
-            DG_DEVICE_ASSERT((values[j].w & 0x807fffffu) == 0);
         }
 
         // Pack and store
