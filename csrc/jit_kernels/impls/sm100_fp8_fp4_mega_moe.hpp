@@ -48,14 +48,19 @@ public:
         bool save_l1_preact;
         std::string route_weight_mode;
         bool save_down_unweighted;
+        bool save_l1_acts;
         MegaMoEConfig config;
 
         // Runtime arguments
         void* y;
         void* saved_l1_preact;
+        void* saved_l1_acts;
+        void* saved_l1_acts_sf;
         int* cumulative_local_expert_recv_stats;
         int num_tokens;
         int num_saved_pool_tokens;
+        int num_saved_l1_tokens;
+        int num_saved_l1_sf_tokens;
         layout::SymBuffer<> sym_buffer_ptrs;
 
         // Tensormap
@@ -100,6 +105,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
         {}
     >);
 }};
@@ -122,7 +128,8 @@ static void __instantiate_kernel() {{
     args.save_l1_preact ? "true" : "false",
     get_fp8_fp4_route_weight_mode_name(
         args.route_weight_mode),
-    args.save_down_unweighted ? "true" : "false");
+    args.save_down_unweighted ? "true" : "false",
+    args.save_l1_acts ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -130,9 +137,13 @@ static void __instantiate_kernel() {{
         DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
             args.y,
             args.saved_l1_preact,
+            args.saved_l1_acts,
+            args.saved_l1_acts_sf,
             args.cumulative_local_expert_recv_stats,
             args.num_tokens,
             args.num_saved_pool_tokens,
+            args.num_saved_l1_tokens,
+            args.num_saved_l1_sf_tokens,
             args.sym_buffer_ptrs,
             args.tensor_map_l1_acts,
             args.tensor_map_l1_acts_sf,
@@ -166,7 +177,9 @@ static void sm100_fp8_fp4_mega_moe(
     const float& activation_clamp,
     const bool& fast_math,
     const std::string& route_weight_mode,
-    const std::optional<torch::Tensor>& saved_down_unweighted
+    const std::optional<torch::Tensor>& saved_down_unweighted,
+    const std::optional<torch::Tensor>& saved_l1_acts,
+    const std::optional<torch::Tensor>& saved_l1_acts_sf
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -187,10 +200,14 @@ static void sm100_fp8_fp4_mega_moe(
     if (saved_l1_preact.has_value()) {
         DG_HOST_ASSERT(saved_l1_preact->scalar_type() == torch::kBFloat16);
         DG_HOST_ASSERT(saved_l1_preact->is_contiguous());
-        DG_HOST_ASSERT(saved_l1_preact->sizes() ==
-                       torch::IntArrayRef(
-                           {num_max_pool_tokens,
-                            2 * intermediate_hidden}));
+        DG_HOST_ASSERT(saved_l1_preact->dim() == 2);
+        DG_HOST_ASSERT(saved_l1_preact->size(0) > 0);
+        DG_HOST_ASSERT(
+            saved_l1_preact->size(0) % config.block_m == 0);
+        DG_HOST_ASSERT(
+            saved_l1_preact->size(0) <= num_max_pool_tokens);
+        DG_HOST_ASSERT(
+            saved_l1_preact->size(1) == 2 * intermediate_hidden);
     }
     DG_HOST_ASSERT(
         route_weight_mode == "pre_down" ||
@@ -209,6 +226,17 @@ static void sm100_fp8_fp4_mega_moe(
         DG_HOST_ASSERT(
             saved_down_unweighted->size(0) <=
             num_max_pool_tokens);
+    }
+    if (saved_l1_acts.has_value()) {
+        const auto num_saved_tokens =
+            static_cast<int>(saved_l1_acts->size(0));
+        const auto num_saved_sf_tokens =
+            static_cast<int>(saved_l1_acts_sf->size(0));
+        DG_HOST_ASSERT(num_saved_tokens % config.block_m == 0);
+        DG_HOST_ASSERT(
+            num_saved_sf_tokens ==
+            num_saved_tokens / config.block_m *
+                config.sf_block_m);
     }
 
     // Make tensormap
@@ -292,10 +320,17 @@ static void sm100_fp8_fp4_mega_moe(
         .route_weight_mode = route_weight_mode,
         .save_down_unweighted =
             saved_down_unweighted.has_value(),
+        .save_l1_acts = saved_l1_acts.has_value(),
         .config = config,
         .y = y.data_ptr(),
         .saved_l1_preact = saved_l1_preact.has_value()
             ? saved_l1_preact->data_ptr()
+            : nullptr,
+        .saved_l1_acts = saved_l1_acts.has_value()
+            ? saved_l1_acts->data_ptr()
+            : nullptr,
+        .saved_l1_acts_sf = saved_l1_acts_sf.has_value()
+            ? saved_l1_acts_sf->data_ptr()
             : nullptr,
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,
         .num_tokens = num_tokens,
@@ -303,6 +338,13 @@ static void sm100_fp8_fp4_mega_moe(
             saved_down_unweighted.has_value()
             ? static_cast<int>(saved_down_unweighted->size(0))
             : num_max_pool_tokens,
+        .num_saved_l1_tokens = saved_l1_acts.has_value()
+            ? static_cast<int>(saved_l1_acts->size(0))
+            : 0,
+        .num_saved_l1_sf_tokens =
+            saved_l1_acts_sf.has_value()
+            ? static_cast<int>(saved_l1_acts_sf->size(0))
+            : 0,
         .sym_buffer_ptrs = layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
         .tensor_map_l1_acts = tensor_map_l1_acts,
         .tensor_map_l1_acts_sf = tensor_map_l1_acts_sf,

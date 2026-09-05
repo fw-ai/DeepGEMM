@@ -375,6 +375,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         global l1_weights_bf16, l2_weights_bf16
         global saved_l1_preact, saved_h_unweighted
         global saved_h_weighted, saved_down_unweighted
+        global saved_l1_acts, saved_l1_acts_sf
         global cumulative_local_expert_recv_stats_fused
         global cumulative_local_expert_recv_stats_baseline
         global precomputed_route_counts, active_pool_rows
@@ -487,6 +488,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         saved_h_unweighted = None
         saved_h_weighted = None
         saved_down_unweighted = None
+        saved_l1_acts = None
+        saved_l1_acts_sf = None
         if (
             args.save_l1_preact or args.test_backward
         ):
@@ -522,6 +525,19 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                     buffer.token_src_metadata.size(0),
                     hidden),
                 float('nan'), dtype=torch.bfloat16, device='cuda')
+        if args.active_saved_pool and not is_bf16xbf16:
+            saved_l1_acts = torch.full(
+                (active_pool_rows, hidden),
+                float('nan'), dtype=torch.float8_e4m3fn,
+                device='cuda')
+            scale_block_m = deep_gemm.align(pool_block_m, 128)
+            saved_sf_rows = (
+                active_pool_rows // pool_block_m * scale_block_m)
+            saved_l1_acts_sf = torch.empty_strided(
+                (saved_sf_rows, hidden // 128),
+                (1, saved_sf_rows),
+                dtype=torch.int32, device='cuda')
+            saved_l1_acts_sf.fill_(-1)
 
     # Run fused mega MoE
     # NOTES: copy x into buffer before each call because debug mode zeros the entire buffer
@@ -556,6 +572,11 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 precomputed_route_counts=precomputed_route_counts,
                 active_pool_rows=active_pool_rows,
                 route_count_mismatch=route_count_mismatch,
+                num_config_tokens=num_config_tokens)
+        else:
+            kernel_kwargs.update(
+                saved_l1_acts=saved_l1_acts,
+                saved_l1_acts_sf=saved_l1_acts_sf,
                 num_config_tokens=num_config_tokens)
         (deep_gemm.bf16_mega_moe if is_bf16xbf16 else deep_gemm.fp8_fp4_mega_moe)(**kernel_kwargs)
         if route_count_mismatch is not None:
@@ -610,6 +631,43 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         if destination_rank == rank_idx:
             assert pool_offset == local_padded_pool_rows
         return torch.tensor(rows, dtype=torch.long, device='cuda')
+
+    def active_pool_scale_rows() -> torch.Tensor:
+        rows = []
+        pool_block_offset = 0
+        scale_block_m = deep_gemm.align(pool_block_m, 128)
+        for count in local_expert_counts.cpu().tolist():
+            for token_idx in range(count):
+                block_idx = token_idx // pool_block_m
+                row = token_idx % pool_block_m
+                transformed = (
+                    (row & ~127) + (row & 31) * 4 +
+                    ((row >> 5) & 3))
+                rows.append(
+                    (pool_block_offset + block_idx) *
+                    scale_block_m + transformed)
+            pool_block_offset += (
+                count + pool_block_m - 1) // pool_block_m
+        return torch.tensor(rows, dtype=torch.long, device='cuda')
+
+    def check_fp8_fp4_saved_l1_pool() -> None:
+        assert saved_l1_acts is not None
+        assert saved_l1_acts_sf is not None
+        if args.require_ring_wrap:
+            assert active_pool_rows > buffer.num_ring_tokens
+        route_rows = active_pool_route_rows()
+        scale_rows = active_pool_scale_rows()
+        metadata = buffer.token_src_metadata[route_rows].long()
+        all_x = gather_rank_padded(x[0], 0.0)
+        all_x_sf = gather_rank_padded(x[1], 0)
+        expected_x = all_x[metadata[:, 0], metadata[:, 1]]
+        expected_sf = all_x_sf[metadata[:, 0], metadata[:, 1]]
+        assert torch.equal(
+            saved_l1_acts.index_select(0, route_rows),
+            expected_x), 'saved L1 pool must retain exact dispatched FP8 rows'
+        assert torch.equal(
+            saved_l1_acts_sf.index_select(0, scale_rows),
+            expected_sf), 'saved L1 pool must retain exact dispatched UE8M0 scales'
 
     def check_fp8_fp4_predown_regression(
         explicit_y: torch.Tensor,
@@ -692,9 +750,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     ) -> None:
         assert saved_down_unweighted is not None
         if args.require_ring_wrap:
-            assert local_padded_pool_rows > buffer.num_ring_tokens, (
+            assert active_pool_rows > buffer.num_ring_tokens, (
                 'ring-wrap test did not exceed the reusable ring: '
-                f'{local_padded_pool_rows=} '
+                f'{active_pool_rows=} '
                 f'{buffer.num_ring_tokens=}')
         first_down = saved_down_unweighted.clone()
         first_stats = (
@@ -2519,8 +2577,14 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 h_weighted_output=outputs['h_weighted'],
                 x_pool_output=outputs['x_pool'],
                 grad_x_pool_output=outputs['grad_x_pool'],
-                l1_acts=buffer.l1_acts,
-                l1_acts_sf=buffer.l1_acts_sf,
+                l1_acts=(
+                    saved_l1_acts
+                    if saved_l1_acts is not None
+                    else buffer.l1_acts),
+                l1_acts_sf=(
+                    saved_l1_acts_sf
+                    if saved_l1_acts_sf is not None
+                    else buffer.l1_acts_sf),
                 l1_weights=transformed_l1_weights,
                 grad_ye=outputs['grad_ye'],
                 route_weights=route_weights,
@@ -2931,6 +2995,16 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         assert torch.equal(full_inference_y, legacy_low_level_y)
         ran_correctness = True
 
+    if (
+        not is_bf16xbf16 and
+        args.active_saved_pool and
+        num_correctness_tests > 0
+    ):
+        create_inputs()
+        run_fused()
+        check_fp8_fp4_saved_l1_pool()
+        ran_correctness = True
+
     if not ran_correctness:
         create_inputs()
 
@@ -3047,7 +3121,7 @@ if __name__ == '__main__':
     parser.add_argument(
         '--active-saved-pool',
         action='store_true',
-        help='Size BF16 saved pools from an exact route-count exchange')
+        help='Size persistent training pools from an exact route-count exchange')
     parser.add_argument(
         '--no-save-forward-stages',
         dest='save_forward_stages',
