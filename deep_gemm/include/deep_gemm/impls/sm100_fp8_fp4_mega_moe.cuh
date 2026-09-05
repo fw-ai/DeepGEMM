@@ -40,6 +40,7 @@ template <
     bool kSaveL1Preact,
     RouteWeightMode kRouteWeightMode = RouteWeightMode::PreDown,
     bool kSaveDownUnweighted = false,
+    bool kSaveL1Acts = false,
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
     uint32_t L2_SHAPE_N = kHidden,
@@ -56,9 +57,13 @@ template <
 CUTLASS_GLOBAL __launch_bounds__(kNumThreads, 1) void
 sm100_fp8_fp4_mega_moe_impl(void* y,
                             nv_bfloat16* saved_l1_preact,
+                            cutlass::float_e4m3_t* saved_l1_acts,
+                            uint32_t* saved_l1_acts_sf,
                             int* cumulative_local_expert_recv_stats,
                             const uint32_t num_tokens,
                             const uint32_t num_saved_pool_tokens,
+                            const uint32_t num_saved_l1_tokens,
+                            const uint32_t num_saved_l1_sf_tokens,
                             const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts_sf,
@@ -546,12 +551,23 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const auto src_base_ptr = sym_buffer.map(
                 input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(), current_rank_in_expert_idx);
             const auto dst_base_ptr = l1_token_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).get_base_ptr();
+            const auto saved_dst_base_ptr = kSaveL1Acts
+                ? saved_l1_acts + static_cast<uint64_t>(pool_token_idx) * kHidden
+                : nullptr;
             const auto issue_and_wait_pull_store = [&](const uint32_t& i) {
                 ptx::mbarrier_wait_and_flip_phase(pull_mbarrier, pull_mbarrier_phase);
                 ptx::tma_store_1d(
                     math::advance_ptr(dst_base_ptr, i * kNumBytesPerPull),
                     pull_buffer.get_base_ptr(), kNumBytesPerPull
                 );
+                if constexpr (kSaveL1Acts) {
+                    DG_DEVICE_ASSERT(pool_token_idx < num_saved_l1_tokens);
+                    ptx::tma_store_1d(
+                        math::advance_ptr(
+                            saved_dst_base_ptr,
+                            i * kNumBytesPerPull),
+                        pull_buffer.get_base_ptr(), kNumBytesPerPull);
+                }
                 cute::tma_store_arrive();
                 ptx::tma_store_wait<0>();
             };
@@ -580,11 +596,22 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const uint32_t token_idx_in_block = token_idx_in_expert % BLOCK_M;
             const auto sf_ring_token_idx = ring_block_idx * SF_BLOCK_M +
                 transform_sf_token_idx(token_idx_in_block);
+            const auto sf_pool_token_idx = pool_block_idx * SF_BLOCK_M +
+                transform_sf_token_idx(token_idx_in_block);
             #pragma unroll
             for (uint32_t i = 0; i < math::constexpr_ceil_div(kNumSFUint32, 32u); ++ i) {
                 const uint32_t j = i * 32 + lane_idx;
-                if (j < kNumSFUint32)
+                if (j < kNumSFUint32) {
                     local_sf_ptr[j * kNumSFRingTokens + sf_ring_token_idx] = remote_sf_ptr[j];
+                    if constexpr (kSaveL1Acts) {
+                        DG_DEVICE_ASSERT(
+                            sf_pool_token_idx <
+                            num_saved_l1_sf_tokens);
+                        saved_l1_acts_sf[
+                            j * num_saved_l1_sf_tokens +
+                            sf_pool_token_idx] = remote_sf_ptr[j];
+                    }
+                }
             }
             __syncwarp();
 
