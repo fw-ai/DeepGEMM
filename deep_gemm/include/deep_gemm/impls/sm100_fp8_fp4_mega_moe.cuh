@@ -1201,7 +1201,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                 kHidden == 3584 &&
                                 kIntermediateHidden == 3072 &&
                                 kNumExperts == 896 && kNumTopk == 16 &&
-                                (kNumRanks == 8 || kNumRanks == 4) &&
                                 kSituBeta == 4.0f &&
                                 kSituLinearBeta == 25.0f;
                             if constexpr (kActivationType == ActivationType::SiTU) {

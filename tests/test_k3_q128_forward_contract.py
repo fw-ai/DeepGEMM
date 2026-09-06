@@ -116,8 +116,8 @@ def test_post_down_combine_hoists_route_weight_load() -> None:
     assert combine.count("input_topk_weights_buffer.get_base_ptr<float>()") == 1
 
 
-def test_situ_fast_intrinsics_reuse_training_identity() -> None:
-    """Bind optimized arithmetic to the exact EP8 K3 Q128 training contract."""
+def test_situ_fast_intrinsics_reuse_training_identity_for_any_ep_size() -> None:
+    """Bind optimized arithmetic to the K3 Q128 contract, independent of EP."""
     source = KERNEL.read_text()
     situ = _between(
         source,
@@ -133,11 +133,11 @@ def test_situ_fast_intrinsics_reuse_training_identity() -> None:
         "kIntermediateHidden == 3072",
         "kNumExperts == 896",
         "kNumTopk == 16",
-        "kNumRanks == 8",
         "kSituBeta == 4.0f",
         "kSituLinearBeta == 25.0f",
     ):
         assert required in situ
+    assert "kNumRanks" not in situ
     assert "kFastMath || kUseK3Q128FastSiTU" in situ
     assert "!kFastMath && kUseK3Q128FastSiTU" in situ
     assert "__tanhf(gate.x / kSituBeta)" in situ
