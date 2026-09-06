@@ -227,11 +227,30 @@ static void sm100_fp8_fp4_mega_moe(
             saved_down_unweighted->size(0) <=
             num_max_pool_tokens);
     }
+    DG_HOST_ASSERT(
+        saved_l1_acts.has_value() ==
+        saved_l1_acts_sf.has_value());
     if (saved_l1_acts.has_value()) {
         const auto num_saved_tokens =
             static_cast<int>(saved_l1_acts->size(0));
         const auto num_saved_sf_tokens =
             static_cast<int>(saved_l1_acts_sf->size(0));
+        DG_HOST_ASSERT(
+            saved_l1_acts->scalar_type() ==
+            torch::kFloat8_e4m3fn);
+        DG_HOST_ASSERT(saved_l1_acts->is_contiguous());
+        DG_HOST_ASSERT(saved_l1_acts->dim() == 2);
+        DG_HOST_ASSERT(saved_l1_acts->size(1) == hidden);
+        DG_HOST_ASSERT(num_saved_tokens > 0);
+        DG_HOST_ASSERT(num_saved_tokens <= num_max_pool_tokens);
+        DG_HOST_ASSERT(
+            saved_l1_acts_sf->scalar_type() == torch::kInt);
+        DG_HOST_ASSERT(saved_l1_acts_sf->dim() == 2);
+        DG_HOST_ASSERT(
+            saved_l1_acts_sf->size(1) == hidden / 128);
+        DG_HOST_ASSERT(saved_l1_acts_sf->stride(0) == 1);
+        DG_HOST_ASSERT(
+            saved_l1_acts_sf->stride(1) == num_saved_sf_tokens);
         DG_HOST_ASSERT(num_saved_tokens % config.block_m == 0);
         DG_HOST_ASSERT(
             num_saved_sf_tokens ==

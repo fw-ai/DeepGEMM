@@ -3588,13 +3588,19 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
         }
 
         __syncthreads();
-        if constexpr (kCompileW13Dgrad) {
-            // W13 dgrad consumes grad_gate_up rows produced by every CTA in
-            // the preceding L2-dgrad/SwiGLU phase. Cluster synchronization is
-            // insufficient here: an early cluster can otherwise read rows
-            // whose owning cluster has not stored them yet.
+        if constexpr (
+            kCompileW13Dgrad ||
+            (kComputeRouteGrad && !kInputsPrepared)) {
+            // W13 dgrad and PRE_DOWN route reduction both consume rows
+            // produced by every CTA in the preceding L2-dgrad/SwiGLU phase.
+            // Cluster synchronization is insufficient here: an early cluster
+            // can otherwise read rows whose owning cluster has not stored
+            // them yet.  Route-only autograd must take this barrier even when
+            // W13 dgrad is compile-time disabled.
             full_grid_phase_barrier(12);
+        }
 
+        if constexpr (kCompileW13Dgrad) {
             if constexpr (kBF16Mode) {
                 // In phase-ordered mode these outputs may still contain the
                 // forward gate values or reverse-dispatched grad-y in every
@@ -3733,9 +3739,10 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                 }
                 full_grid_phase_barrier(13);
             }
+        }
 
-            if constexpr (
-                kComputeRouteGrad && !kInputsPrepared) {
+        if constexpr (
+            kComputeRouteGrad && !kInputsPrepared) {
                 // The activation epilogue spans multiple N-tile CTAs. Reduce
                 // each route term only after all tiles are visible so the
                 // router gradient has a fixed FP32 summation order instead of
@@ -4152,11 +4159,12 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                     route_pool_block_offset +=
                         math::ceil_div(num_tokens, BLOCK_M);
                 }
-            }
-            if constexpr (
-                kBF16Mode &&
-                kRouteWeightMode == RouteWeightMode::PreDown &&
-                !kInputsPrepared) {
+        }
+        if constexpr (
+            kCompileW13Dgrad &&
+            kBF16Mode &&
+            kRouteWeightMode == RouteWeightMode::PreDown &&
+            !kInputsPrepared) {
                 if (h_act_output == h_weighted_output) {
                     // Every route reduction must consume unweighted h before
                     // the shared storage becomes the W2-wgrad input.
@@ -4211,8 +4219,9 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                 num_tokens, BLOCK_M);
                     }
                 }
-            }
+        }
 
+        if constexpr (kCompileW13Dgrad) {
             // Phase 3: dequantize canonical [W1; W3] once per launch, then
             // consume it as the transposed BF16 operand for W13 dgrad.  This
             // phase starts only after L2 dgrad/SwiGLU has drained both TMEM
