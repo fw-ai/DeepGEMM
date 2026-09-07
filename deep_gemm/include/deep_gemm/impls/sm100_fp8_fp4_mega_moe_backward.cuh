@@ -93,7 +93,7 @@
 #define DG_EXPERIMENTAL_K3_MXFP8_DW13_SHEPHERD_CLUSTERS 32
 #endif
 #ifndef DG_EXPERIMENTAL_K3_MXFP8_WGRAD_OVERLAP
-#define DG_EXPERIMENTAL_K3_MXFP8_WGRAD_OVERLAP 1
+#define DG_EXPERIMENTAL_K3_MXFP8_WGRAD_OVERLAP 0
 #endif
 #ifndef DG_EXPERIMENTAL_K3_MXFP8_DW2_PRODUCER_CLUSTERS
 #define DG_EXPERIMENTAL_K3_MXFP8_DW2_PRODUCER_CLUSTERS 0
@@ -15296,15 +15296,17 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                 // exact-only producer cursor and publish individual feature
                 // masks, so a cluster can transition directly into ready-first
                 // dW work after its own W13 schedule drains.
-                detail::k3_mxfp8_stream_dw2_operands_during_w13<
-                    kHidden, kIntermediateHidden, kNumExperts, BLOCK_M,
-                    kNumSMs, kNumThreads,
-                    true, false, true, true,
-                    kNumSMs +
-                        kK3MxFp8PersistentDW2ProducerCTAs *
-                            kK3MxFp8DW2PersistentEnginesPerCTA>(
-                        smem_buffer + kElasticDW2QuantScratchBegin,
-                        warp_idx, lane_idx);
+                if constexpr (kK3MxFp8WgradOverlap) {
+                    detail::k3_mxfp8_stream_dw2_operands_during_w13<
+                        kHidden, kIntermediateHidden, kNumExperts, BLOCK_M,
+                        kNumSMs, kNumThreads,
+                        true, false, true, true,
+                        kNumSMs +
+                            kK3MxFp8PersistentDW2ProducerCTAs *
+                                kK3MxFp8DW2PersistentEnginesPerCTA>(
+                            smem_buffer + kElasticDW2QuantScratchBegin,
+                            warp_idx, lane_idx);
+                }
             } else if (warp_idx >= kW13EpilogueWarpStart) {
                 const uint32_t epilogue_warp_idx =
                     warp_idx - kW13EpilogueWarpStart -
