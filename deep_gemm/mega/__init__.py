@@ -209,6 +209,8 @@ def fp8_fp4_mega_moe(
     saved_l1_preact: Optional[torch.Tensor] = None,
     route_weight_mode: RouteWeightMode = RouteWeightMode.PRE_DOWN,
     saved_down_unweighted: Optional[torch.Tensor] = None,
+    saved_l1_acts: Optional[torch.Tensor] = None,
+    saved_l1_acts_sf: Optional[torch.Tensor] = None,
     num_config_tokens: Optional[int] = None,
 ):
     """Run MXFP8/FP4 MegaMoE with an explicit route-weight boundary.
@@ -254,6 +256,8 @@ def fp8_fp4_mega_moe(
         saved_l1_preact,
         route_weight_mode.value,
         saved_down_unweighted,
+        saved_l1_acts,
+        saved_l1_acts_sf,
         num_config_tokens,
     )
 

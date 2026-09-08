@@ -264,6 +264,8 @@ static void fp8_fp4_mega_moe(
     const std::optional<torch::Tensor>& saved_l1_preact,
     const std::string& route_weight_mode,
     const std::optional<torch::Tensor>& saved_down_unweighted,
+    const std::optional<torch::Tensor>& saved_l1_acts,
+    const std::optional<torch::Tensor>& saved_l1_acts_sf,
     const std::optional<int>& num_config_tokens_opt
 ) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
@@ -334,6 +336,27 @@ static void fp8_fp4_mega_moe(
             saved_down_unweighted->size(0) <=
             num_max_pool_tokens);
     }
+    DG_HOST_ASSERT(
+        saved_l1_acts.has_value() ==
+        saved_l1_acts_sf.has_value());
+    if (saved_l1_acts.has_value()) {
+        DG_HOST_ASSERT(
+            saved_l1_acts->scalar_type() ==
+            torch::kFloat8_e4m3fn);
+        DG_HOST_ASSERT(saved_l1_acts->is_contiguous());
+        DG_HOST_ASSERT(saved_l1_acts->dim() == 2);
+        DG_HOST_ASSERT(saved_l1_acts->size(1) == hidden);
+        DG_HOST_ASSERT(saved_l1_acts->size(0) > 0);
+        DG_HOST_ASSERT(
+            saved_l1_acts->size(0) <= num_max_pool_tokens);
+
+        const auto& saved_sf = *saved_l1_acts_sf;
+        DG_HOST_ASSERT(saved_sf.scalar_type() == torch::kInt);
+        DG_HOST_ASSERT(saved_sf.dim() == 2);
+        DG_HOST_ASSERT(saved_sf.size(1) == hidden / 128);
+        DG_HOST_ASSERT(saved_sf.stride(0) == 1);
+        DG_HOST_ASSERT(saved_sf.stride(1) == saved_sf.size(0));
+    }
     const auto [expanded_num_required_bytes, slice] =
         get_symm_buffer_size_for_mega_moe_v2(
         num_ranks, num_experts,
@@ -367,7 +390,9 @@ static void fp8_fp4_mega_moe(
                                hidden, intermediate_hidden,
                                activation, activation_clamp, fast_math,
                                route_weight_mode,
-                               saved_down_unweighted);
+                               saved_down_unweighted,
+                               saved_l1_acts,
+                               saved_l1_acts_sf);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -544,6 +569,8 @@ static void register_apis(pybind11::module_& m) {
         py::arg("saved_l1_preact") = py::none(),
         py::arg("route_weight_mode") = "pre_down",
         py::arg("saved_down_unweighted") = py::none(),
+        py::arg("saved_l1_acts") = py::none(),
+        py::arg("saved_l1_acts_sf") = py::none(),
         py::arg("num_config_tokens") = py::none());
     m.def("bf16_mega_moe", &bf16_mega_moe);
 #endif
