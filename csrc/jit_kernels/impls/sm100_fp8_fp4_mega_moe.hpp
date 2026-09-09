@@ -326,7 +326,17 @@ static void sm100_fp8_fp4_mega_moe(
         cumulative_local_expert_recv_stats_ptr = cumulative_local_expert_recv_stats->data_ptr<int>();
 
     // Launch
-    const auto num_sms = device_runtime->get_num_sms();
+    // Reserve a SMALL SM headroom (2). The mega kernel is a cooperative grid whose
+    // grid_sync / nvlink_barrier require all NUM_SMS CTAs resident, so it must not
+    // contend for SMs with concurrent on-GPU kernels at launch. The only such
+    // contender is the disagg KV-transfer `ncclDevKernel_SendRecv`, which is pinned
+    // to 1 CTA per communicator (ProcessGroupNCCL max_ctas=1 in fireworks pg.py) and
+    // for the CONSECUTIVE_SUBRANGE pattern is ~1 co-resident per rank. The earlier
+    // -16 was a DEBUG headroom that masked a *stuck* SendRecv holding an SM forever;
+    // that root cause (cross-generator-group head-of-line blocking) is now fixed in
+    // nccl_kv_cache_transfer.py, so SendRecv completes promptly and 2 SMs of headroom
+    // is ample. (NIXL transfer uses RDMA, no SM-resident kernel, so needs no headroom.)
+    const auto num_sms = device_runtime->get_num_sms() - 2;
     const SM100FP8FP4MegaMoERuntime::Args args = {
         .num_max_tokens_per_rank = num_max_tokens_per_rank,
         .hidden = hidden, .intermediate_hidden = intermediate_hidden,
