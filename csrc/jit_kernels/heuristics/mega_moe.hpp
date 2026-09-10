@@ -193,6 +193,67 @@ static int get_num_experts_per_wave_for_mega_moe(
     return best_num_experts_per_wave;
 }
 
+// Scale factors use an SF_BLOCK_M-padded row for every reachable pool block.
+// A small BLOCK_M expands each scale row substantially, but those block sizes
+// are only selected for small live batches and therefore cannot reach every
+// block in a large token ring. Bound the SF storage by the live pool span
+// instead of charging every block configuration for the full ring.
+static int get_num_required_sf_ring_tokens_for_mega_moe(
+    const int& num_ranks, const int& num_experts_per_rank,
+    const int& num_tokens, const int& num_topk,
+    const int& num_ring_tokens, const int& block_m) {
+    const auto num_live_pool_tokens = layout::get_num_max_pool_tokens(
+        num_ranks, num_tokens, num_topk, num_experts_per_rank);
+    const auto num_reachable_ring_tokens =
+        std::min(num_ring_tokens, num_live_pool_tokens);
+    return layout::get_num_sf_ring_tokens(
+        num_reachable_ring_tokens, block_m);
+}
+
+static int get_num_max_required_sf_ring_tokens_for_mega_moe(
+    const int& num_ranks, const int& num_experts,
+    const int& num_max_tokens_per_rank, const int& num_topk,
+    const int& num_ring_tokens) {
+    DG_HOST_ASSERT(num_experts % num_ranks == 0);
+    const auto num_experts_per_rank = num_experts / num_ranks;
+    int num_sf_ring_tokens = 0;
+
+    // BLOCK_M is monotonic in the live token count. Find the last live batch
+    // selecting each candidate with a binary search, then size that regime by
+    // its largest reachable pool span. This also excludes candidate values
+    // that the MXFP4 heuristic never selects (currently BLOCK_M=8).
+    for (const int candidate_block_m: layout::kCandidateBlockM) {
+        int lower = 0;
+        int upper = num_max_tokens_per_rank;
+        int last_matching_tokens = -1;
+        while (lower <= upper) {
+            const int num_tokens = lower + (upper - lower) / 2;
+            const auto [_cluster_size, block_m, _store_block_m,
+                        _block_k, _num_epilogue_threads] =
+                get_block_config_for_mega_moe(
+                    num_ranks, num_experts,
+                    num_max_tokens_per_rank, num_topk,
+                    num_tokens, MmaKind::MXFP8FP4);
+            if (block_m <= candidate_block_m) {
+                if (block_m == candidate_block_m)
+                    last_matching_tokens = num_tokens;
+                lower = num_tokens + 1;
+            } else {
+                upper = num_tokens - 1;
+            }
+        }
+        if (last_matching_tokens < 0)
+            continue;
+        num_sf_ring_tokens = std::max(
+            num_sf_ring_tokens,
+            get_num_required_sf_ring_tokens_for_mega_moe(
+                num_ranks, num_experts_per_rank,
+                last_matching_tokens, num_topk,
+                num_ring_tokens, candidate_block_m));
+    }
+    return num_sf_ring_tokens;
+}
+
 static std::pair<int, int> get_pipeline_config_for_mega_moe(
     const int& smem_capacity,
     const int& num_experts, const int& hidden,
@@ -269,6 +330,13 @@ static MegaMoEConfig get_mega_moe_config(
     // Block config
     const auto [cluster_size, block_m, store_block_m, block_k, num_epilogue_threads] =
         get_block_config_for_mega_moe(num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens, mma_kind);
+    if (is_mma_with_sf(mma_kind)) {
+        DG_HOST_ASSERT(
+            num_sf_ring_tokens >=
+            get_num_required_sf_ring_tokens_for_mega_moe(
+                num_ranks, num_experts_per_rank, num_tokens, num_topk,
+                num_ring_tokens, block_m));
+    }
     const int block_n = 128;
     const int load_block_m = block_m / 2;
     const int load_block_n = block_n;

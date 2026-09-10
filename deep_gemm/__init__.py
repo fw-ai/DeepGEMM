@@ -96,15 +96,21 @@ from .mega import (
     SymmBuffer,
     get_symm_buffer_for_mega_moe,
     transform_weights_for_mega_moe,
+    transform_side_lora_for_mega_moe,
     fp8_fp4_mega_moe,
+    fp8_fp4_mega_moe_side_lora,
     bf16_mega_moe,
+    bf16_mega_moe_side_lora,
 )
 from .mega.backward import (
+    MegaMoESideLoraBackwardResult,
     bf16_mega_moe_backward_dgrad,
+    bf16_mega_moe_side_lora_backward,
     bf16_mega_moe_backward_w13,
     bf16_mega_moe_backward_w13_combine,
     bf16_mega_moe_backward_w2,
     bf16_mega_moe_backward_w2_combine,
+    fp8_fp4_mega_moe_side_lora_backward,
     fp8_fp4_mega_moe_backward_dgrad_swiglu,
     mega_moe_backward_combine_grad_x,
 )
