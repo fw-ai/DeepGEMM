@@ -296,9 +296,11 @@ static void sm100_bf16_mega_moe(
 
     // Launch
     const auto physical_num_sms = device_runtime->get_num_sms();
+    // Default to the shared headroom-reserving grid size (see
+    // `get_mega_moe_num_sms`); the explicit absolute override is retained.
     const auto num_sms = get_env<int>(
         "DG_BF16_MEGA_MOE_NUM_SMS",
-        physical_num_sms);
+        get_mega_moe_num_sms());
     DG_HOST_ASSERT(num_sms > 0 && num_sms <= physical_num_sms);
     const SM100BF16MegaMoERuntime::Args args = {
         .num_max_tokens_per_rank = num_max_tokens_per_rank,

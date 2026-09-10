@@ -326,7 +326,7 @@ static void sm100_fp8_fp4_mega_moe(
         cumulative_local_expert_recv_stats_ptr = cumulative_local_expert_recv_stats->data_ptr<int>();
 
     // Launch
-    const auto num_sms = device_runtime->get_num_sms();
+    const int num_sms = get_mega_moe_num_sms();
     const SM100FP8FP4MegaMoERuntime::Args args = {
         .num_max_tokens_per_rank = num_max_tokens_per_rank,
         .hidden = hidden, .intermediate_hidden = intermediate_hidden,
