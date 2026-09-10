@@ -743,7 +743,7 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
         dgrad_block_k, load_block_m,
         static_cast<int>(grad_gate_up_output.stride(-2)), 128);
     // Each launch gets a unique readiness epoch; no host memset is required.
-    const int num_sms = device_runtime->get_num_sms();
+    const int num_sms = get_mega_moe_num_sms();
     DG_HOST_ASSERT(num_sms % 2 == 0);
     static std::atomic<uint32_t> next_launch_epoch{1};
     uint32_t launch_epoch =
@@ -953,7 +953,7 @@ static void sm100_mega_moe_backward_combine_grad_x(
         DG_HOST_ASSERT(topk_ids->size(1) == num_topk);
     }
 
-    const int num_sms = device_runtime->get_num_sms();
+    const int num_sms = get_mega_moe_num_sms();
     const SM100MegaMoEBackwardCombineRuntime::Args args = {
         .num_ranks = num_ranks,
         .num_local_experts = num_local_experts,
@@ -1145,7 +1145,7 @@ static void sm100_bf16_mega_moe_backward_post_down_prelude(
         }
     }
 
-    const int num_sms = device_runtime->get_num_sms();
+    const int num_sms = get_mega_moe_num_sms();
     const auto backward_sym_buffer = layout::SymBuffer<>(
         backward_sym_buffer_ptrs, backward_rank);
     const auto backward_workspace = layout::Workspace(
@@ -1605,7 +1605,7 @@ static void sm100_bf16_mega_moe_backward_dgrad(
         static_cast<int>(
             grad_gate_up_output.stride(-2)), 128);
 
-    const int num_sms = device_runtime->get_num_sms();
+    const int num_sms = get_mega_moe_num_sms();
     DG_HOST_ASSERT(num_sms % 2 == 0);
     constexpr int num_trace_sites = 22;
     constexpr int num_trace_values = 5;

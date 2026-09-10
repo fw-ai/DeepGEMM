@@ -975,7 +975,7 @@ static void sm100_bf16_mega_moe_side_lora_backward(
         static_cast<int>(
             grad_gate_up_output.stride(-2)), 128);
 
-    const int num_sms = device_runtime->get_num_sms();
+    const int num_sms = get_mega_moe_num_sms();
     DG_HOST_ASSERT(num_sms % 2 == 0);
     constexpr int num_trace_sites = 22;
     constexpr int num_trace_values = 5;
@@ -1734,7 +1734,7 @@ static void sm100_fp8_fp4_mega_moe_side_lora_backward(
         dgrad_block_k, load_block_m,
         static_cast<int>(grad_gate_up_output.stride(-2)), 128);
     // Each launch gets a unique readiness epoch; no host memset is required.
-    const int num_sms = device_runtime->get_num_sms();
+    const int num_sms = get_mega_moe_num_sms();
     DG_HOST_ASSERT(num_sms % 2 == 0);
     static std::atomic<uint32_t> next_launch_epoch{1};
     uint32_t launch_epoch =

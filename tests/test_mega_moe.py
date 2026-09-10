@@ -439,6 +439,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         global l1_weights_bf16, l2_weights_bf16
         global saved_l1_preact, saved_h_unweighted
         global saved_h_weighted, saved_down_unweighted
+        global saved_l1_acts, saved_l1_acts_sf
         global cumulative_local_expert_recv_stats_fused
         global cumulative_local_expert_recv_stats_baseline
         global precomputed_route_counts, active_pool_rows
@@ -530,8 +531,10 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         active_pool_rows = None
         route_count_mismatch = None
         if args.active_saved_pool:
-            active_pool_rows = int(
-                padded_destination_counts.sum(dim=1).max().item())
+            active_pool_rows = max(
+                int(padded_destination_counts.sum(dim=1).max().item()),
+                pool_block_m,
+            )
         if args.active_saved_pool and is_bf16xbf16:
             precomputed_route_counts = source_route_counts
             route_count_mismatch = torch.zeros(
@@ -551,6 +554,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         saved_h_unweighted = None
         saved_h_weighted = None
         saved_down_unweighted = None
+        saved_l1_acts = None
+        saved_l1_acts_sf = None
         if (
             args.save_l1_preact or args.test_backward
         ):
@@ -586,6 +591,19 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                     buffer.token_src_metadata.size(0),
                     hidden),
                 float('nan'), dtype=torch.bfloat16, device='cuda')
+        if args.active_saved_pool and not is_bf16xbf16:
+            saved_l1_acts = torch.full(
+                (active_pool_rows, hidden),
+                float('nan'), dtype=torch.float8_e4m3fn,
+                device='cuda')
+            scale_block_m = deep_gemm.align(pool_block_m, 128)
+            saved_sf_rows = (
+                active_pool_rows // pool_block_m * scale_block_m)
+            saved_l1_acts_sf = torch.empty_strided(
+                (saved_sf_rows, hidden // 128),
+                (1, saved_sf_rows),
+                dtype=torch.int32, device='cuda')
+            saved_l1_acts_sf.fill_(-1)
 
     # Run fused mega MoE
     # NOTES: copy x into buffer before each call because debug mode zeros the entire buffer
@@ -620,6 +638,11 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 precomputed_route_counts=precomputed_route_counts,
                 active_pool_rows=active_pool_rows,
                 route_count_mismatch=route_count_mismatch,
+                num_config_tokens=num_config_tokens)
+        else:
+            kernel_kwargs.update(
+                saved_l1_acts=saved_l1_acts,
+                saved_l1_acts_sf=saved_l1_acts_sf,
                 num_config_tokens=num_config_tokens)
         (deep_gemm.bf16_mega_moe if is_bf16xbf16 else deep_gemm.fp8_fp4_mega_moe)(**kernel_kwargs)
         if route_count_mismatch is not None:
@@ -674,6 +697,43 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         if destination_rank == rank_idx:
             assert pool_offset == local_padded_pool_rows
         return torch.tensor(rows, dtype=torch.long, device='cuda')
+
+    def active_pool_scale_rows() -> torch.Tensor:
+        rows = []
+        pool_block_offset = 0
+        scale_block_m = deep_gemm.align(pool_block_m, 128)
+        for count in local_expert_counts.cpu().tolist():
+            for token_idx in range(count):
+                block_idx = token_idx // pool_block_m
+                row = token_idx % pool_block_m
+                transformed = (
+                    (row & ~127) + (row & 31) * 4 +
+                    ((row >> 5) & 3))
+                rows.append(
+                    (pool_block_offset + block_idx) *
+                    scale_block_m + transformed)
+            pool_block_offset += (
+                count + pool_block_m - 1) // pool_block_m
+        return torch.tensor(rows, dtype=torch.long, device='cuda')
+
+    def check_fp8_fp4_saved_l1_pool() -> None:
+        assert saved_l1_acts is not None
+        assert saved_l1_acts_sf is not None
+        if args.require_ring_wrap:
+            assert active_pool_rows > buffer.num_ring_tokens
+        route_rows = active_pool_route_rows()
+        scale_rows = active_pool_scale_rows()
+        metadata = buffer.token_src_metadata[route_rows].long()
+        all_x = gather_rank_padded(x[0], 0.0)
+        all_x_sf = gather_rank_padded(x[1], 0)
+        expected_x = all_x[metadata[:, 0], metadata[:, 1]]
+        expected_sf = all_x_sf[metadata[:, 0], metadata[:, 1]]
+        assert torch.equal(
+            saved_l1_acts.index_select(0, route_rows),
+            expected_x), 'saved L1 pool must retain exact dispatched FP8 rows'
+        assert torch.equal(
+            saved_l1_acts_sf.index_select(0, scale_rows),
+            expected_sf), 'saved L1 pool must retain exact dispatched UE8M0 scales'
 
     def check_fp8_fp4_predown_regression(
         explicit_y: torch.Tensor,
@@ -756,9 +816,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     ) -> None:
         assert saved_down_unweighted is not None
         if args.require_ring_wrap:
-            assert local_padded_pool_rows > buffer.num_ring_tokens, (
+            assert active_pool_rows > buffer.num_ring_tokens, (
                 'ring-wrap test did not exceed the reusable ring: '
-                f'{local_padded_pool_rows=} '
+                f'{active_pool_rows=} '
                 f'{buffer.num_ring_tokens=}')
         first_down = saved_down_unweighted.clone()
         first_stats = (
@@ -781,9 +841,10 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             assert padding_rows.numel() == (
                 local_padded_pool_rows -
                 int(local_expert_counts.sum().item()))
-            assert torch.isfinite(
-                first_down[padding_rows].float()).all(), (
-                    'saved pool must retain expert block padding')
+            # Padding is not a logical route: backward bounds every access by
+            # expert_counts.  Leave the NaN sentinel in place so the backward
+            # reference below proves that no route reduction or wgrad consumes
+            # these rows, instead of requiring a bandwidth-only padding write.
             # Rank-uniform allocation may include a tail after this rank's
             # block-padded local pool. It is not a route and must stay
             # untouched; route validity comes from counts, never sentinels.
@@ -791,6 +852,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 assert torch.isnan(
                     first_down[local_padded_pool_rows:].float()).all()
         metadata = buffer.token_src_metadata[active_rows].long()
+        first_metadata = metadata.clone()
 
         def expected_output(
             down_pool: torch.Tensor,
@@ -873,12 +935,37 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             saved_l1_preact=saved_l1_preact,
             route_weight_mode=(
                 deep_gemm.RouteWeightMode.POST_DOWN),
-            saved_down_unweighted=second_down)
+            saved_down_unweighted=second_down,
+            saved_l1_acts=saved_l1_acts,
+            saved_l1_acts_sf=saved_l1_acts_sf,
+            num_config_tokens=num_config_tokens)
         assert torch.isfinite(
             second_down[active_rows].float()).all()
+        second_metadata = (
+            buffer.token_src_metadata[active_rows].long())
+
+        def canonical_down(
+            down: torch.Tensor,
+            route_metadata: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            routes_per_rank = (
+                buffer.num_max_tokens_per_rank * num_topk)
+            keys = (
+                route_metadata[:, 0] * routes_per_rank +
+                route_metadata[:, 1] * num_topk +
+                route_metadata[:, 2])
+            order = torch.argsort(keys)
+            return keys[order], down[active_rows][order]
+
+        first_keys, canonical_first_down = canonical_down(
+            first_down, first_metadata)
+        second_keys, canonical_second_down = canonical_down(
+            second_down, second_metadata)
+        assert torch.equal(first_keys, second_keys), (
+            'changing route scores changed the routed token set')
         assert torch.equal(
-            second_down[active_rows],
-            first_down[active_rows]), (
+            canonical_second_down,
+            canonical_first_down), (
                 'POST_DOWN W2 quantization must not depend on route scores')
         assert torch.equal(
             changed_y,
@@ -2458,10 +2545,11 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         all_topk_weights = gather_rank_padded(topk_weights, 0)
         exact_route_weights = all_topk_weights[
             metadata[:, 0], metadata[:, 1], metadata[:, 2]]
-        assert torch.any(
-            exact_route_weights !=
-            exact_route_weights.to(torch.bfloat16).float()), (
-                'test route scores must exercise non-BF16 FP32 bits')
+        if exact_route_weights.numel() > 0:
+            assert torch.any(
+                exact_route_weights !=
+                exact_route_weights.to(torch.bfloat16).float()), (
+                    'test route scores must exercise non-BF16 FP32 bits')
         route_weights[active_rows] = exact_route_weights
         source_grad_y = torch.randn(
             (num_tokens, hidden),
@@ -2583,8 +2671,14 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 h_weighted_output=outputs['h_weighted'],
                 x_pool_output=outputs['x_pool'],
                 grad_x_pool_output=outputs['grad_x_pool'],
-                l1_acts=buffer.l1_acts,
-                l1_acts_sf=buffer.l1_acts_sf,
+                l1_acts=(
+                    saved_l1_acts
+                    if saved_l1_acts is not None
+                    else buffer.l1_acts),
+                l1_acts_sf=(
+                    saved_l1_acts_sf
+                    if saved_l1_acts_sf is not None
+                    else buffer.l1_acts_sf),
                 l1_weights=transformed_l1_weights,
                 grad_ye=outputs['grad_ye'],
                 route_weights=route_weights,
@@ -2739,31 +2833,73 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             expected_grad_x_planes[rank_idx, :num_tokens])
         assert torch.equal(
             combined_grad_x, expected_combined_grad_x)
-        if num_ranks == 1:
-            fused_grad_w2 = torch.zeros_like(l2_weights_bf16)
-            fused_grad_w13 = torch.zeros_like(l1_weights_bf16)
-            fused_grad_x = torch.empty_like(combined_grad_x)
-            deep_gemm.bf16_mega_moe_backward_w2_combine(
-                fused_grad_w2, combine_outputs['grad_ye'],
-                combine_outputs['h_weighted'],
-                padded_expert_counts, block_m, fused_grad_x,
-                buffer,
-                route_weight_mode=deep_gemm.RouteWeightMode(
-                    args.route_weight_mode))
-            deep_gemm.bf16_mega_moe_backward_w13_combine(
-                fused_grad_w13, combine_outputs['grad_gate_up'],
-                combine_outputs['x_pool'],
-                padded_expert_counts, block_m, fused_grad_x,
-                buffer,
-                combine_order_mode=deep_gemm.CombineOrderMode(
-                    args.combine_order_mode))
-            assert_gradient_close(
-                fused_grad_w2, ref_grad_w2,
-                'single_rank_fused_grad_w2')
-            assert_gradient_close(
-                fused_grad_w13, ref_grad_w13,
-                'single_rank_fused_grad_w13')
-            assert torch.equal(fused_grad_x, expected_combined_grad_x)
+
+        # Validate the production standalone wgrad/combine kernels against
+        # native BF16 grouped-MM on the exact expert-major pool rows.  This is
+        # intentionally independent of the fused-vs-wave FireTitan check: it
+        # covers every local expert, including zero-count experts, on EP8.
+        layout = build_native_route_layout(
+            gather_rank_padded(topk_idx, -1))
+        assert torch.equal(layout['counts'], expert_counts)
+        native_to_pool = native_to_pool_permutation(metadata, layout)
+        pool_indices = active_rows[native_to_pool]
+        offsets = layout['offsets']
+        compact_grad_ye = combine_outputs['grad_ye'][pool_indices]
+        compact_h_weighted = combine_outputs['h_weighted'][pool_indices]
+        compact_grad_gate = combine_outputs['grad_gate_up'][
+            pool_indices, :intermediate_hidden]
+        compact_grad_up = combine_outputs['grad_gate_up'][
+            pool_indices, intermediate_hidden:]
+        compact_x = combine_outputs['x_pool'][pool_indices]
+        ref_grad_w2 = native_bf16_grouped_mm(
+            compact_grad_ye.t(), compact_h_weighted, offsets,
+            rhs_needs_transpose=False, lhs_needs_contiguous=False)
+        ref_grad_w1 = native_bf16_grouped_mm(
+            compact_grad_gate.t(), compact_x, offsets,
+            rhs_needs_transpose=False, lhs_needs_contiguous=False)
+        ref_grad_w3 = native_bf16_grouped_mm(
+            compact_grad_up.t(), compact_x, offsets,
+            rhs_needs_transpose=False, lhs_needs_contiguous=False)
+        inactive = (expert_counts == 0).view(-1, 1, 1)
+        ref_grad_w2.masked_fill_(inactive, 0)
+        ref_grad_w1.masked_fill_(inactive, 0)
+        ref_grad_w3.masked_fill_(inactive, 0)
+        ref_grad_w13 = torch.cat((ref_grad_w1, ref_grad_w3), dim=1)
+        padded_expert_counts = (
+            (expert_counts + block_m - 1) // block_m * block_m)
+        fused_grad_w2 = torch.zeros_like(l2_weights_bf16)
+        fused_grad_w13 = torch.zeros_like(l1_weights_bf16)
+        fused_grad_x = torch.empty_like(combined_grad_x)
+        deep_gemm.bf16_mega_moe_backward_w2_combine(
+            fused_grad_w2, combine_outputs['grad_ye'],
+            combine_outputs['h_weighted'],
+            padded_expert_counts, block_m, fused_grad_x,
+            buffer,
+            route_weight_mode=deep_gemm.RouteWeightMode(
+                args.route_weight_mode))
+        deep_gemm.bf16_mega_moe_backward_w13_combine(
+            fused_grad_w13, combine_outputs['grad_gate_up'],
+            combine_outputs['x_pool'],
+            padded_expert_counts, block_m, fused_grad_x,
+            buffer,
+            combine_order_mode=deep_gemm.CombineOrderMode(
+                args.combine_order_mode))
+
+        def assert_wgrad_close(
+            actual: torch.Tensor,
+            expected: torch.Tensor,
+            name: str,
+        ) -> None:
+            assert torch.isfinite(actual.float()).all(), name
+            similarity = 1.0 - float(calc_diff(actual, expected))
+            assert similarity >= 0.999, (
+                f'{name} similarity {similarity:.9f} is below 0.999')
+
+        assert_wgrad_close(
+            fused_grad_w2, ref_grad_w2, 'fp8_fp4_grad_w2')
+        assert_wgrad_close(
+            fused_grad_w13, ref_grad_w13, 'fp8_fp4_grad_w13')
+        assert torch.equal(fused_grad_x, expected_combined_grad_x)
 
         # Route-gradient production is a W2-side operation and must not force
         # W13 dgrad or a grad-x destination.
@@ -2780,11 +2916,15 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             route_only_kwargs.update(
                 grad_y_unweighted_output=grad_y_unweighted,
                 down_unweighted_output=saved_down_unweighted)
+        # Match FireTitan's route-only launch exactly: Kernel A still receives
+        # one writable grad-x-shaped argument, but aliases it to x_pool because
+        # W13 dgrad is disabled and no grad-x value is logically consumed.
+        route_only_outputs['grad_x_pool'] = route_only_outputs['x_pool']
         run_backward(
             route_only_outputs,
             compute_w13_dgrad=False,
             direct_remote_grad_x=False,
-            write_grad_x_pool=False,
+            write_grad_x_pool=True,
             **route_only_kwargs)
         torch.testing.assert_close(
             route_only_grad[active_rows],
@@ -2995,6 +3135,23 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         assert torch.equal(full_inference_y, legacy_low_level_y)
         ran_correctness = True
 
+    if (
+        not is_bf16xbf16 and
+        args.active_saved_pool and
+        num_correctness_tests > 0
+    ):
+        create_inputs()
+        run_fused()
+        check_fp8_fp4_saved_l1_pool()
+        if args.test_backward and num_ranks > 1:
+            # The generic numerical forward reference is local-only, but the
+            # FP8/FP4 backward reference below explicitly gathers source
+            # tensors and reduces the expected source planes across the EP
+            # group.  Run it for distributed active-pool captures so
+            # --test-backward cannot silently become a forward-only check.
+            run_fp8_fp4_route_backward_test()
+        ran_correctness = True
+
     if not ran_correctness:
         create_inputs()
 
@@ -3111,7 +3268,7 @@ if __name__ == '__main__':
     parser.add_argument(
         '--active-saved-pool',
         action='store_true',
-        help='Size BF16 saved pools from an exact route-count exchange')
+        help='Size persistent training pools from an exact route-count exchange')
     parser.add_argument(
         '--no-save-forward-stages',
         dest='save_forward_stages',

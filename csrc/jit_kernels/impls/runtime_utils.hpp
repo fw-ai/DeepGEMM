@@ -4,12 +4,62 @@
 #include <torch/python.h>
 
 #include "../heuristics/sm90.hpp"
+#include "../../jit/device_runtime.hpp"
 #include "../../jit/handle.hpp"
 #include "../../utils/math.hpp"
 #include "../../utils/system.hpp"
 #include "../../utils/exception.hpp"
 
 namespace deep_gemm {
+
+// Grid size for the cooperative mega-MoE kernels, with SM headroom reserved for
+// co-resident kernels.
+//
+// These kernels launch a persistent grid of one CTA per SM joined by a software
+// whole-grid barrier (`comm/barrier.cuh`) with a hard 60s timeout. The barrier is
+// only satisfiable if every CTA is *simultaneously resident*, but an ordinary
+// launch gives no gang-scheduling guarantee: CUDA places CTAs greedily, so a
+// concurrent kernel holding some (but not all) SMs leaves part of the grid queued
+// while the resident CTAs spin against the deadline and never yield their slots.
+// The result is a mutual deadlock that traps at 60s -> 'DeepGEMM grid sync
+// timeout' (barrier.cuh:39) / 'NVLink barrier timeout' (barrier.cuh:80), which in
+// turn produces Xid 43 and kills the process.
+//
+// Reserving SMs gives a later-arriving co-resident kernel somewhere to land other
+// than an SM the grid needs. How much headroom is enough depends entirely on the
+// competing kernel's footprint, which is deployment-specific:
+//   - disaggregated serving: NCCL `ncclDevKernel_SendRecv` (KV transfer) — 2 was
+//     measured sufficient (yingz/mega-sm-headroom)
+//   - training: FSDP2 all-gather / reduce-scatter / HSDP all-reduce on dedicated
+//     comm streams; a 32-channel collective touches ~8 SMs (one channel = one
+//     512-thread block, 4 blocks/SM), so 8 (with NCCL_MAX_NCHANNELS=8 pinned)
+//     was measured for the INC-1291 shape
+//
+// There is deliberately NO built-in default: the headroom is set exclusively via
+// `DG_MEGA_MOE_SM_HEADROOM`, and an unset variable means 0 (no reservation), i.e.
+// the historical full-device grid. Deployments that run comm kernels concurrently
+// with the mega grid MUST set it; see the INC-1291 RCA (fw-ai/fireworks#47752)
+// for how to size it.
+//
+// The value is clamped even, because these kernels launch 2-CTA clusters (2-SM
+// MMA with a paired TMEM accumulator layout) and several call sites assert
+// `num_sms % 2 == 0`.
+static int get_mega_moe_num_sms() {
+    const int num_device_sms = device_runtime->get_num_sms();
+    // No default: unset env == 0 == the historical full-device grid. The
+    // deployment owns the value (see comment above).
+    int headroom = get_env<int>("DG_MEGA_MOE_SM_HEADROOM", 0);
+
+    DG_HOST_ASSERT(headroom >= 0 and "DG_MEGA_MOE_SM_HEADROOM must be non-negative");
+    // Round up to keep the grid even for the 2-CTA cluster launch.
+    headroom = align(headroom, 2);
+    DG_HOST_ASSERT(headroom < num_device_sms and
+                   "DG_MEGA_MOE_SM_HEADROOM leaves no SMs for the mega-MoE grid");
+
+    const int num_sms = num_device_sms - headroom;
+    DG_HOST_ASSERT(num_sms % 2 == 0);
+    return num_sms;
+}
 
 static std::pair<int, int> get_inner_outer_dims(const cute::UMMA::Major& major, const int& k, const int& mn) {
     return major == cute::UMMA::Major::K ? std::make_pair(k, mn) : std::make_pair(mn, k);
