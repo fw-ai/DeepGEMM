@@ -34,9 +34,20 @@ class SymmBuffer:
                  num_experts: int,
                  num_max_tokens_per_rank: int, num_topk: int,
                  hidden: int, intermediate_hidden: int,
-                 num_ring_tokens: int,
+                 num_ring_tokens: Optional[int] = None,
                  mma_type: str = 'fp8xfp4',
-                 activation: str = 'swiglu'):
+                 activation: str = 'swiglu',
+                 base: Optional['SymmBuffer'] = None,
+                 num_shared_experts: int = 0):
+        # Align token count
+        num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
+
+        if num_ring_tokens is not None and (
+            num_ring_tokens <= 0 or num_ring_tokens % _C.get_token_alignment_for_mega_moe() != 0
+        ):
+            raise ValueError("num_ring_tokens must be positive and satisfy MegaMoE token alignment")
+
+        # Init
         assert activation in ('swiglu', 'geglu'), f'Unsupported activation: `{activation}`'
         self.group = group
         self.num_experts = num_experts
@@ -44,27 +55,37 @@ class SymmBuffer:
         self.num_topk = num_topk
         self.hidden = hidden
         self.intermediate_hidden = intermediate_hidden
-        self.num_ring_tokens = num_ring_tokens
+        self.num_shared_experts = num_shared_experts
+        self.mma_type = mma_type
+        self.activation = activation
 
-        # Allocate a symmetric buffer
-        num_bytes, slice_input_buffers = \
-            _C.get_symm_buffer_size_for_mega_moe_v2(
+        # Allocate or reuse a symmetric buffer
+        num_bytes, slice_input_buffers = _C.get_symm_buffer_size_for_mega_moe_v3(
             group.size(), num_experts,
             num_max_tokens_per_rank, num_topk,
             hidden, intermediate_hidden,
             mma_type, activation,
-            num_ring_tokens
+            num_ring_tokens or 0, num_shared_experts
         )
-        allocator = torch if group.size() == 1 else symm_mem
-        self.buffer = allocator.empty(num_bytes, dtype=torch.int8, device='cuda')
-        self.handle = (
-            types.SimpleNamespace(buffer_ptrs=[self.buffer.data_ptr()])
-            if group.size() == 1
-            else symm_mem.rendezvous(self.buffer, group=group)
-        )
-        self.buffer.zero_()
-        self.group.barrier()
-        torch.cuda.synchronize()
+        if base is None:
+            allocator = torch if group.size() == 1 else symm_mem
+            self.buffer = allocator.empty(num_bytes, dtype=torch.int8, device='cuda')
+            self.handle = (
+                types.SimpleNamespace(buffer_ptrs=[self.buffer.data_ptr()])
+                if group.size() == 1
+                else symm_mem.rendezvous(self.buffer, group=group)
+            )
+            self.buffer.zero_()
+            self.group.barrier()
+            torch.cuda.synchronize()
+        else:
+            assert base.buffer is not None and base.handle is not None and base.group is group, \
+                'Cannot reuse an invalid symmetric buffer'
+            assert num_bytes <= base.buffer.nbytes, \
+                (f'The reused Mega MoE config requires {num_bytes} bytes, '
+                 f'but the symmetric buffer only has {base.buffer.nbytes} bytes')
+            self.buffer = base.buffer
+            self.handle = base.handle
 
         # Create input buffer views
         # `token_src_metadata` exposes the Workspace combine source mapping
@@ -82,7 +103,10 @@ class SymmBuffer:
             self.token_src_metadata,
             self.backward_grad_y,
             self.backward_grad_route,
+            self.shared_l1_acts, self.shared_l1_acts_sf,
+            self.shared_l2_acts, self.shared_l2_acts_sf,
         ) = slice_input_buffers(self.buffer)
+        self.num_ring_tokens = self.l1_acts.size(0)
 
     def destroy(self):
         self.handle = None
@@ -95,6 +119,7 @@ class SymmBuffer:
         self.backward_grad_route = None
 
 
+# TODO: remove this function
 def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
                                  num_experts: int,
                                  num_max_tokens_per_rank: int, num_topk: int,
@@ -102,41 +127,9 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
                                  use_fp8_dispatch: Union[bool, None] = None,
                                  mma_type: str = 'fp8xfp4',
                                  activation: str = 'swiglu',
-                                 num_ring_tokens: Optional[int] = None
+                                 num_ring_tokens: Optional[int] = None,
+                                 num_shared_experts: int = 0
                                  ) -> SymmBuffer:
-    # Align token count
-    num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
-
-    # To save buffer size, we enable ring buffer
-    # TODO: move the wave concept into kernel and dynamically schedule
-    # TODO: currently decoding may consume more memory than prefill
-    # TODO: finer-grained wave
-    num_min_ring_tokens, num_max_ring_tokens = \
-        _C.get_ring_limit_for_mega_moe(num_max_tokens_per_rank, num_experts // group.size(), num_topk, group.size())
-    if num_ring_tokens is not None:
-        if num_ring_tokens % _C.get_token_alignment_for_mega_moe() != 0:
-            raise ValueError(
-                "num_ring_tokens must satisfy MegaMoE token alignment")
-        if not (
-            num_min_ring_tokens <= num_ring_tokens <= num_max_ring_tokens
-        ):
-            raise ValueError(
-                "num_ring_tokens must be within the supported ring limits "
-                f"[{num_min_ring_tokens}, {num_max_ring_tokens}]")
-    elif num_max_tokens_per_rank >= 6144:
-        # We assume must be prefill (decode cannot have such size)
-        # We try to give ~8 GB budget (within V4 Pro config)
-        # And batch size is mostly stable, to save buffer size, we use 1 expert per wave
-        num_ring_tokens = align(768 * 1024, _C.get_token_alignment_for_mega_moe())
-    else:
-        # Otherwise, we must ensure, like for EP64, 4K decoding batch size,
-        # the wave heuristics can select the best number of experts per wave
-        # In this case, the budget is roughly ~18 GB
-        num_ring_tokens = _C.get_ring_limit_for_mega_moe(
-            align(4096, _C.get_token_alignment_for_mega_moe()), 432 // 72, 6, 72)[1]
-    num_ring_tokens = max(num_ring_tokens, num_min_ring_tokens)
-    num_ring_tokens = min(num_ring_tokens, num_max_ring_tokens)
-
     # Backward compat: derive `mma_type` from `use_fp8_dispatch` if provided
     if use_fp8_dispatch is not None:
         assert use_fp8_dispatch == (mma_type.split('x')[0] == 'fp8')
@@ -150,28 +143,42 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
         num_ring_tokens,
-        mma_type=mma_type, activation=activation
+        mma_type=mma_type, activation=activation, num_shared_experts=num_shared_experts
     )
 
 
 def _interleave_weights(t: torch.Tensor, gran: int = 8) -> torch.Tensor:
     # [gate: 0..7, up: 0..7, gate: 8..15, up: 8..15, ...] instead of [gate | up]
+    # Unsqueeze for 2D
+    assert t.dim() in (2, 3)
+    squeeze_group_dim = t.dim() == 2
+    if squeeze_group_dim:
+        t = t.unsqueeze(0)
+
+    # Transpose
     g, n, *rest = t.shape
     half = n // 2
     gate = t[:, :half].reshape(g, half // gran, gran, *rest)
     up = t[:, half:].reshape(g, half // gran, gran, *rest)
-    return torch.empty_like(t).copy_(torch.stack([gate, up], dim=2).reshape(g, n, *rest))
+    result = torch.empty_like(t).copy_(torch.stack([gate, up], dim=2).reshape(g, n, *rest))
+    return result.squeeze(0) if squeeze_group_dim else result
 
 
 def _transpose_sf_for_utccp(sf: torch.Tensor) -> torch.Tensor:
+    # Unsqueeze for 2D
+    assert sf.dtype == torch.int and sf.dim() in (2, 3)
+    squeeze_group_dim = sf.dim() == 2
+    if squeeze_group_dim:
+        sf = sf.unsqueeze(0)
+
+    # Transpose
     num_groups, mn, packed_sf_k = sf.shape
-    assert sf.dtype == torch.int and mn % 128 == 0
-    result = (
-        sf.reshape(num_groups, -1, 4, 32, packed_sf_k)
-        .transpose(2, 3)
-        .reshape(num_groups, mn, packed_sf_k)
-    )
-    return torch.empty_like(sf).copy_(result)
+    assert mn % 128 == 0
+    result = (sf.reshape(num_groups, -1, 4, 32, packed_sf_k)
+                .transpose(2, 3)
+                .reshape(num_groups, mn, packed_sf_k))
+    result = torch.empty_like(sf).copy_(result)
+    return result.squeeze(0) if squeeze_group_dim else result
 
 
 def transform_weights_for_mega_moe(
@@ -183,7 +190,7 @@ def transform_weights_for_mega_moe(
     # Gate/up interleaving is independent of the gated-activation variant
     assert activation in ('swiglu', 'geglu'), f'Unsupported activation: `{activation}`'
     if isinstance(l1_weights, tuple):
-        # FP8: interleave gate/up for weight and SF, then transpose L1 SF for UTCCP
+        # FP8/FP4: interleave gate/up for weight and SF, then transpose L1 SF for UTCCP
         l1_w = _interleave_weights(l1_weights[0])
         l1_sf = _transpose_sf_for_utccp(_interleave_weights(l1_weights[1]))
         l1_transformed = (l1_w, l1_sf)
@@ -212,6 +219,8 @@ def fp8_fp4_mega_moe(
     saved_l1_acts: Optional[torch.Tensor] = None,
     saved_l1_acts_sf: Optional[torch.Tensor] = None,
     num_config_tokens: Optional[int] = None,
+    shared_l1_weights: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    shared_l2_weights: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ):
     """Run MXFP8/FP4 MegaMoE with an explicit route-weight boundary.
 
@@ -224,6 +233,8 @@ def fp8_fp4_mega_moe(
     if num_config_tokens is None:
         num_config_tokens = y.size(0)
     if (
+        (saved_l1_preact is not None or saved_l1_acts is not None or
+         saved_down_unweighted is not None) and
         not has_explicit_config_tokens and
         sym_buffer.group.size() > 1
     ):
@@ -259,6 +270,7 @@ def fp8_fp4_mega_moe(
         saved_l1_acts,
         saved_l1_acts_sf,
         num_config_tokens,
+        shared_l1_weights, shared_l2_weights,
     )
 
 def bf16_mega_moe(y: torch.Tensor,
@@ -280,7 +292,9 @@ def bf16_mega_moe(y: torch.Tensor,
                   active_pool_rows: Optional[int] = None,
                   route_count_mismatch: Optional[torch.Tensor] = None,
                   num_config_tokens: Optional[int] = None,
-                  saved_x: Optional[torch.Tensor] = None):
+                  saved_x: Optional[torch.Tensor] = None,
+                  shared_l1_weights: Optional[torch.Tensor] = None,
+                  shared_l2_weights: Optional[torch.Tensor] = None):
     """Run BF16 MegaMoE with an explicit route-weight boundary.
 
     The optional stage saves expose unweighted/weighted activation and W2
@@ -314,7 +328,9 @@ def bf16_mega_moe(y: torch.Tensor,
     if num_config_tokens is None:
         num_config_tokens = y.size(0)
     if (
-        not has_precomputed_config_tokens
+        (saved_l1_preact is not None or saved_h_unweighted is not None or
+         saved_down_unweighted is not None or saved_x is not None)
+        and not has_precomputed_config_tokens
         and sym_buffer.group.size() > 1
     ):
         # The config selects BLOCK_M, which defines the persistent launch and
@@ -352,4 +368,5 @@ def bf16_mega_moe(y: torch.Tensor,
         active_pool_rows,
         route_count_mismatch,
         saved_x,
+        shared_l1_weights, shared_l2_weights,
     )

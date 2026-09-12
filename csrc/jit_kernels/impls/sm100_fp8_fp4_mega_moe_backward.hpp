@@ -8,13 +8,11 @@
 
 #include <torch/python.h>
 
-#include "../../jit/compiler.hpp"
-#include "../../jit/device_runtime.hpp"
-#include "../../jit/kernel_runtime.hpp"
 #include "../../utils/exception.hpp"
-#include "../../utils/format.hpp"
 #include "../../utils/math.hpp"
 #include "runtime_utils.hpp"
+#include "../../runtime/runtime.hpp"
+#include <format>
 
 #include <deep_gemm/layout/mega_moe.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
@@ -41,9 +39,7 @@ static std::string get_backward_combine_order_mode_name(
     DG_HOST_UNREACHABLE("Unsupported combine order mode");
 }
 
-class SM100MegaMoEBackwardCombineRuntime final
-    : public LaunchRuntime<
-          SM100MegaMoEBackwardCombineRuntime> {
+class SM100MegaMoEBackwardCombineRuntime final {
 public:
     struct Args {
         int num_ranks;
@@ -56,11 +52,11 @@ public:
         uint32_t num_max_tokens;
         uint32_t num_topk;
         uint32_t hidden;
-        LaunchArgs launch_args;
+        deep_jit::cuda::LaunchOptions launch_args;
     };
 
-    static std::string generate_impl(const Args& args) {
-        return fmt::format(R"(
+    static std::string generate(const Args& args) {
+        return std::format(R"(
 #include <deep_gemm/impls/sm100_mega_moe_backward_combine.cuh>
 
 using namespace deep_gemm;
@@ -76,21 +72,16 @@ static void __instantiate_kernel() {{
                 args.combine_order_mode));
     }
 
-    static void launch_impl(
-        const KernelHandle& kernel,
-        const LaunchConfigHandle& config,
-        Args args) {
-        DG_CUDA_UNIFIED_CHECK(launch_kernel(
-            kernel, config, args.grad_x_output,
+    static void launch(const auto& kernel, const Args& args) {
+        jit->launch(
+            kernel, args.launch_args, args.grad_x_output,
             args.combine_buffer, args.topk_ids,
             args.num_tokens, args.num_max_tokens,
-            args.num_topk, args.hidden));
+            args.num_topk, args.hidden);
     }
 };
 
-class SM100BF16MegaMoEBackwardPostDownPreludeRuntime final
-    : public LaunchRuntime<
-          SM100BF16MegaMoEBackwardPostDownPreludeRuntime> {
+class SM100BF16MegaMoEBackwardPostDownPreludeRuntime final {
 public:
     struct Args {
         int hidden;
@@ -123,11 +114,11 @@ public:
         float* route_weights_output;
         const cutlass::bfloat16_t* down_unweighted;
         float* grad_route_output;
-        LaunchArgs launch_args;
+        deep_jit::cuda::LaunchOptions launch_args;
     };
 
-    static std::string generate_impl(const Args& args) {
-        return fmt::format(R"(
+    static std::string generate(const Args& args) {
+        return std::format(R"(
 #include <deep_gemm/impls/sm100_fp8_fp4_mega_moe_backward.cuh>
 
 using namespace deep_gemm;
@@ -154,12 +145,9 @@ static void __instantiate_kernel() {{
             args.route_prelude_threads);
     }
 
-    static void launch_impl(
-        const KernelHandle& kernel,
-        const LaunchConfigHandle& config,
-        Args args) {
-        DG_CUDA_UNIFIED_CHECK(launch_kernel(
-            kernel, config,
+    static void launch(const auto& kernel, const Args& args) {
+        jit->launch(
+            kernel, args.launch_args,
             args.expert_counts,
             args.backward_workspace,
             args.backward_sym_buffer,
@@ -175,12 +163,11 @@ static void __instantiate_kernel() {{
             args.x_pool_output,
             args.route_weights_output,
             args.down_unweighted,
-            args.grad_route_output));
+            args.grad_route_output);
     }
 };
 
-class SM100FP8FP4MegaMoEBackwardWaveRuntime final
-    : public LaunchRuntime<SM100FP8FP4MegaMoEBackwardWaveRuntime> {
+class SM100FP8FP4MegaMoEBackwardWaveRuntime final {
 public:
     struct Args {
         int hidden;
@@ -261,11 +248,11 @@ public:
         uint64_t* kernel_trace = nullptr;
         bool inputs_prepared = false;
         bool dispatch_inputs_prepared = false;
-        LaunchArgs launch_args;
+        deep_jit::cuda::LaunchOptions launch_args;
     };
 
-    static std::string generate_impl(const Args& args) {
-        return fmt::format(R"(
+    static std::string generate(const Args& args) {
+        return std::format(R"(
 #include <deep_gemm/impls/sm100_fp8_fp4_mega_moe_backward.cuh>
 
 using namespace deep_gemm;
@@ -326,12 +313,9 @@ static void __instantiate_kernel() {{
             args.wide_grad_x_store ? "true" : "false");
     }
 
-    static void launch_impl(
-        const KernelHandle& kernel,
-        const LaunchConfigHandle& config,
-        Args args) {
-        DG_CUDA_UNIFIED_CHECK(launch_kernel(
-            kernel, config,
+    static void launch(const auto& kernel, const Args& args) {
+        jit->launch(
+            kernel, args.launch_args,
             args.expert_counts,
             args.backward_sym_buffer,
             args.backward_workspace,
@@ -381,7 +365,7 @@ static void __instantiate_kernel() {{
             args.grid_sync_counter,
             args.launch_epoch,
             args.activation_limit,
-            args.kernel_trace));
+            args.kernel_trace);
     }
 };
 
@@ -440,7 +424,7 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
     const auto [num_experts, intermediate_hidden_2, hidden] =
         check_grouped_ab_fp8_fp4(
             l1_weights, cute::UMMA::Major::K,
-            device_runtime->get_arch_major());
+            jit->device.get_arch_major());
     const int intermediate_hidden = intermediate_hidden_2 / 2;
     const int num_pool_rows = static_cast<int>(grad_ye.size(0));
     const int num_acts_rows = static_cast<int>(acts.size(0));
@@ -454,7 +438,7 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
         : static_cast<int>(backward_sym_buffer_ptrs.size());
     const int num_dispatch_warps = num_ranks > 1 ? 4 : 0;
 
-    DG_HOST_ASSERT(device_runtime->get_arch_major() == 10);
+    DG_HOST_ASSERT(jit->device.get_arch_major() == 10);
     DG_HOST_ASSERT(num_ranks >= 1);
     DG_HOST_ASSERT(
         route_weight_mode == "pre_down" ||
@@ -898,12 +882,12 @@ static void sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu(
         .clear_wgrad_padding = clear_wgrad_padding,
         .compute_route_grad =
             grad_route_output.has_value(),
-        .launch_args = LaunchArgs(
+        .launch_args = make_mega_moe_launch_options(
             num_sms, 1024, smem_size, 2),
     };
     const auto code =
         SM100FP8FP4MegaMoEBackwardWaveRuntime::generate(args);
-    const auto runtime = compiler->build(fmt::format(
+    const auto runtime = jit->compile(std::format(
         "sm100_fp8_fp4_mega_moe_backward_dgrad_swiglu_{}_r{}",
         route_weight_mode,
         grad_route_output.has_value()), code);
@@ -921,7 +905,7 @@ static void sm100_mega_moe_backward_combine_grad_x(
     const std::string& combine_order_mode) {
     const auto [num_tokens, hidden] =
         get_shape<2>(grad_x_output);
-    DG_HOST_ASSERT(device_runtime->get_arch_major() == 10);
+    DG_HOST_ASSERT(jit->device.get_arch_major() == 10);
     DG_HOST_ASSERT(num_ranks >= 1);
     DG_HOST_ASSERT(num_local_experts >= 1);
     DG_HOST_ASSERT(num_max_tokens >= num_tokens);
@@ -973,11 +957,11 @@ static void sm100_mega_moe_backward_combine_grad_x(
             static_cast<uint32_t>(num_max_tokens),
         .num_topk = static_cast<uint32_t>(num_topk),
         .hidden = static_cast<uint32_t>(hidden),
-        .launch_args = LaunchArgs(num_sms, 256),
+        .launch_args = make_mega_moe_launch_options(num_sms, 256),
     };
     const auto code =
         SM100MegaMoEBackwardCombineRuntime::generate(args);
-    const auto runtime = compiler->build(fmt::format(
+    const auto runtime = jit->compile(std::format(
         "sm100_mega_moe_backward_combine_grad_x_r{}_e{}_{}",
         num_ranks, num_local_experts, combine_order_mode),
         code);
@@ -1016,7 +1000,7 @@ static void sm100_bf16_mega_moe_backward_post_down_prelude(
         static_cast<int>(expert_counts.numel());
     const int num_ranks =
         static_cast<int>(backward_sym_buffer_ptrs.size());
-    DG_HOST_ASSERT(device_runtime->get_arch_major() == 10);
+    DG_HOST_ASSERT(jit->device.get_arch_major() == 10);
     DG_HOST_ASSERT(
         combine_order_mode == "fixed_topk" ||
         combine_order_mode == "deepep" ||
@@ -1222,12 +1206,12 @@ static void sm100_bf16_mega_moe_backward_post_down_prelude(
             .grad_route_output =
                 grad_route_output.data_ptr<float>(),
             .launch_args =
-                LaunchArgs(num_sms, 1024, 4096),
+                make_mega_moe_launch_options(num_sms, 1024, 4096),
         };
     const auto code =
         SM100BF16MegaMoEBackwardPostDownPreludeRuntime::
             generate(args);
-    const auto runtime = compiler->build(fmt::format(
+    const auto runtime = jit->compile(std::format(
         "sm100_bf16_mega_moe_backward_prelude_r{}_d{}_w{}_s{}_c{}_b{}_x{}_t{}",
         do_reverse_dispatch, compute_route_dot,
         write_weighted, synchronize_ranks,
@@ -1296,7 +1280,7 @@ static void sm100_bf16_mega_moe_backward_dgrad(
     const int load_block_n = block_n;
     const int num_dispatch_warps = num_ranks > 1 ? 4 : 0;
 
-    DG_HOST_ASSERT(device_runtime->get_arch_major() == 10);
+    DG_HOST_ASSERT(jit->device.get_arch_major() == 10);
     DG_HOST_ASSERT(activation == "swiglu" || activation == "geglu");
     DG_HOST_ASSERT(
         route_weight_mode == "pre_down" ||
@@ -1751,10 +1735,10 @@ static void sm100_bf16_mega_moe_backward_dgrad(
         .clear_wgrad_padding = clear_wgrad_padding,
         .compute_route_grad = true,
         .trace_kernel = kernel_trace.has_value(),
-        .vectorized_grad_x_store = get_env<int>(
+        .vectorized_grad_x_store = deep_jit::get_env<int>(
             "DG_BF16_MEGA_MOE_VECTORIZED_GRAD_X_STORE",
             1) == 1,
-        .wide_grad_x_store = get_env<int>(
+        .wide_grad_x_store = deep_jit::get_env<int>(
             "DG_BF16_MEGA_MOE_WIDE_GRAD_X_STORE",
             0) == 1,
         .kernel_trace =
@@ -1768,12 +1752,12 @@ static void sm100_bf16_mega_moe_backward_dgrad(
         .dispatch_inputs_prepared =
             memory_mode == "phase_ordered",
         .launch_args =
-            LaunchArgs(num_sms, 1024, smem_size, 2),
+            make_mega_moe_launch_options(num_sms, 1024, smem_size, 2),
     };
     const auto code =
         SM100FP8FP4MegaMoEBackwardWaveRuntime::generate(args);
-    const auto runtime = compiler->build(
-        fmt::format(
+    const auto runtime = jit->compile(
+        std::format(
             "sm100_bf16_mega_moe_backward_dgrad_trace{}_vec{}_wide{}",
             kernel_trace.has_value(),
             args.vectorized_grad_x_store,

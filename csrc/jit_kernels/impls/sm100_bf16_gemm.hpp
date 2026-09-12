@@ -1,14 +1,13 @@
 #pragma once
 
+#include <format>
 #include <torch/python.h>
 
-#include "../../jit/compiler.hpp"
-#include "../../jit/device_runtime.hpp"
-#include "../../jit/kernel_runtime.hpp"
+#include "../../runtime/runtime.hpp"
 #include "../../utils/exception.hpp"
-#include "../../utils/format.hpp"
 #include "../../utils/math.hpp"
 #include "../heuristics/sm100.hpp"
+#include "epilogue.hpp"
 #include "runtime_utils.hpp"
 #include <deep_gemm/layout/mega_moe.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
@@ -26,17 +25,18 @@ static std::string get_bf16_gemm_combine_order_mode_name(
     DG_HOST_UNREACHABLE("Unsupported combine order mode");
 }
 
-class SM100BF16GemmRuntime final: public LaunchRuntime<SM100BF16GemmRuntime> {
+class SM100BF16GemmRuntime final {
 public:
     struct Args {
         GemmDesc gemm_desc;
         GemmConfig gemm_config;
-        LaunchArgs launch_args;
+        deep_jit::cuda::LaunchOptions options;
 
         void* grouped_layout;
         CUtensorMap tensor_map_a;
         CUtensorMap tensor_map_b;
         CUtensorMap tensor_map_cd;
+        EpilogueInput epilogue;
         int combine_num_ranks = 1;
         bool fuse_combine = false;
         layout::SymBuffer<> combine_sym_buffer{};
@@ -54,8 +54,8 @@ public:
         uint32_t combine_num_extra_threads = 0;
     };
 
-    static std::string generate_impl(const Args& args) {
-        return fmt::format(R"(
+    static void compile_and_launch(const std::string& tag, const Args& args) {
+        const auto kernel = jit->compile(tag, std::format(R"(
 #include <deep_gemm/impls/sm100_bf16_gemm.cuh>
 
 using namespace deep_gemm;
@@ -72,9 +72,9 @@ static void __instantiate_kernel() {{
         {}, {},
         {},
         {},
-        {},
-        {},
+        {}, {},
         {}, {}, {},
+        {},
         {},
         {}, {}, {}, {}
     >);
@@ -93,18 +93,18 @@ static void __instantiate_kernel() {{
         args.gemm_config.launch_config.num_sms,
         heuristics_runtime->get_mk_alignment_for_contiguous_layout(),
         args.gemm_config.layout.swap_ab, args.gemm_desc.ensure_zero_padding,
-        to_string(args.gemm_desc.gemm_type), args.gemm_desc.with_accumulation, to_string(args.gemm_desc.cd_dtype),
+        to_string(args.gemm_desc.gemm_type), args.gemm_desc.with_accumulation,
+        to_string(args.gemm_desc.cd_dtype),
+        args.epilogue.type,
         args.gemm_desc.tc_util,
         args.combine_num_ranks, args.fuse_combine,
-        get_bf16_gemm_combine_order_mode_name(
-            args.combine_order_mode),
-        args.combine_num_extra_threads);
-    }
+        get_bf16_gemm_combine_order_mode_name(args.combine_order_mode),
+        args.combine_num_extra_threads));
 
-    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        // TODO: optimize `args` copy
-        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
-            args.grouped_layout, args.gemm_desc.m, args.gemm_desc.n, args.gemm_desc.k,
+        // Launch
+        jit->launch(
+            kernel, args.options,
+            args.grouped_layout, args.gemm_desc.m, args.gemm_desc.n, args.gemm_desc.k, args.epilogue.args,
             args.tensor_map_a, args.tensor_map_b,
             args.tensor_map_cd,
             args.combine_sym_buffer, args.combine_workspace,
@@ -112,7 +112,7 @@ static void __instantiate_kernel() {{
             args.combine_buffer, args.combine_topk_ids,
             args.combine_num_tokens,
             args.combine_num_max_tokens, args.combine_num_topk,
-            args.combine_hidden, args.combine_reduce));
+            args.combine_hidden, args.combine_reduce);
     }
 };
 
@@ -122,7 +122,8 @@ static void sm100_bf16_gemm(const torch::Tensor& a,
                             const torch::Tensor& d,
                             const int& m, const int& n, const int& k,
                             const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
-                            const std::string& compiled_dims) {
+                            const std::string& compiled_dims,
+                            const std::optional<float>& alpha) {
     const auto desc = GemmDesc {
         .gemm_type = GemmType::Normal,
         .kernel_type = KernelType::KernelNoSF,
@@ -131,8 +132,9 @@ static void sm100_bf16_gemm(const torch::Tensor& a,
         .cd_dtype = d.scalar_type(),
         .major_a = major_a, .major_b = major_b,
         .with_accumulation = c.has_value(),
-        .num_sms = device_runtime->get_num_sms(),
-        .tc_util = device_runtime->get_tc_util(), .compiled_dims = compiled_dims
+        .num_sms = runtime->get_num_sms(),
+        .tc_util = runtime->get_tc_util(),
+        .compiled_dims = compiled_dims
     };
     const auto config = get_best_config<SM100ArchSpec>(desc);
 
@@ -152,21 +154,22 @@ static void sm100_bf16_gemm(const torch::Tensor& a,
                                                 static_cast<int>(d.stride(-2)), 1,
                                                 config.storage_config.swizzle_cd_mode);
 
-    // Launch
-    const SM100BF16GemmRuntime::Args& args = {
+    // Compile and launch
+    SM100BF16GemmRuntime::compile_and_launch("sm100_bf16_gemm", {
         .gemm_desc = desc,
         .gemm_config = config,
-        .launch_args = LaunchArgs(config.launch_config.num_sms, config.launch_config.num_threads,
-                                  config.pipeline_config.smem_size,
-                                  config.layout.get_cluster_size()),
+        .options = {
+            .num_smem_bytes = config.pipeline_config.smem_size,
+            .grid_dim = dim3(config.launch_config.num_sms, 1, 1),
+            .block_dim = dim3(config.launch_config.num_threads, 1, 1),
+            .cluster_dim = dim3(config.layout.get_cluster_size(), 1, 1),
+        },
         .grouped_layout = nullptr,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
-        .tensor_map_cd = tensor_map_cd
-    };
-    const auto code = SM100BF16GemmRuntime::generate(args);
-    const auto runtime = compiler->build("sm100_bf16_gemm", code);
-    SM100BF16GemmRuntime::launch(runtime, args);
+        .tensor_map_cd = tensor_map_cd,
+        .epilogue = make_epilogue_input(m, n, std::nullopt, alpha)
+    });
 }
 
 static void sm100_m_grouped_bf16_gemm_contiguous(const torch::Tensor& a,
@@ -196,8 +199,9 @@ static void sm100_m_grouped_bf16_gemm_contiguous(const torch::Tensor& a,
         .cd_dtype = d.scalar_type(),
         .major_a = major_a, .major_b = major_b,
         .with_accumulation = false,
-        .num_sms = device_runtime->get_num_sms(),
-        .tc_util = device_runtime->get_tc_util(), .compiled_dims = compiled_dims,
+        .num_sms = runtime->get_num_sms(),
+        .tc_util = runtime->get_tc_util(),
+        .compiled_dims = compiled_dims,
         .ensure_zero_padding = ensure_zero_padding,
         .expected_m = expected_m_for_psum_layout.value_or(m),
         .expected_n = n, .expected_k = k,
@@ -221,21 +225,21 @@ static void sm100_m_grouped_bf16_gemm_contiguous(const torch::Tensor& a,
                                                 static_cast<int>(d.stride(-2)), 1,
                                                 config.storage_config.swizzle_cd_mode);
 
-    // Launch
-    const SM100BF16GemmRuntime::Args args = {
+    // Compile and launch
+    SM100BF16GemmRuntime::compile_and_launch("sm100_bf16_m_grouped_gemm_contiguous", {
         .gemm_desc = desc,
         .gemm_config = config,
-        .launch_args = LaunchArgs(config.launch_config.num_sms, config.launch_config.num_threads,
-                                  config.pipeline_config.smem_size,
-                                  config.layout.get_cluster_size()),
+        .options = {
+            .num_smem_bytes = config.pipeline_config.smem_size,
+            .grid_dim = dim3(config.launch_config.num_sms, 1, 1),
+            .block_dim = dim3(config.launch_config.num_threads, 1, 1),
+            .cluster_dim = dim3(config.layout.get_cluster_size(), 1, 1),
+        },
         .grouped_layout = grouped_layout.data_ptr(),
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_cd = tensor_map_cd
-    };
-    const auto code = SM100BF16GemmRuntime::generate(args);
-    const auto runtime = compiler->build("sm100_bf16_m_grouped_gemm_contiguous", code);
-    SM100BF16GemmRuntime::launch(runtime, args);
+    });
 }
 
 static void sm100_m_grouped_bf16_gemm_masked(const torch::Tensor& a,
@@ -254,8 +258,9 @@ static void sm100_m_grouped_bf16_gemm_masked(const torch::Tensor& a,
         .cd_dtype = d.scalar_type(),
         .major_a = major_a, .major_b = major_b,
         .with_accumulation = false,
-        .num_sms = device_runtime->get_num_sms(),
-        .tc_util = device_runtime->get_tc_util(), .compiled_dims = compiled_dims,
+        .num_sms = runtime->get_num_sms(),
+        .tc_util = runtime->get_tc_util(),
+        .compiled_dims = compiled_dims,
         .expected_m = expected_m, .expected_n = n, .expected_k = k, .expected_num_groups = num_groups
     };
     const auto config = get_best_config<SM100ArchSpec>(desc);
@@ -276,21 +281,21 @@ static void sm100_m_grouped_bf16_gemm_masked(const torch::Tensor& a,
                                                 static_cast<int>(d.stride(-2)), num_groups,
                                                 config.storage_config.swizzle_cd_mode);
 
-    // Launch
-    const SM100BF16GemmRuntime::Args args = {
+    // Compile and launch
+    SM100BF16GemmRuntime::compile_and_launch("sm100_bf16_m_grouped_gemm_masked", {
         .gemm_desc = desc,
         .gemm_config = config,
-        .launch_args = LaunchArgs(config.launch_config.num_sms, config.launch_config.num_threads,
-                                  config.pipeline_config.smem_size,
-                                  config.layout.get_cluster_size()),
+        .options = {
+            .num_smem_bytes = config.pipeline_config.smem_size,
+            .grid_dim = dim3(config.launch_config.num_sms, 1, 1),
+            .block_dim = dim3(config.launch_config.num_threads, 1, 1),
+            .cluster_dim = dim3(config.layout.get_cluster_size(), 1, 1),
+        },
         .grouped_layout = masked_m.data_ptr(),
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_cd = tensor_map_cd
-    };
-    const auto code = SM100BF16GemmRuntime::generate(args);
-    const auto runtime = compiler->build("sm100_bf16_m_grouped_gemm_masked", code);
-    SM100BF16GemmRuntime::launch(runtime, args);
+    });
 }
 
 static void sm100_bf16_k_grouped_gemm(const torch::Tensor& a,
@@ -315,8 +320,9 @@ static void sm100_bf16_k_grouped_gemm(const torch::Tensor& a,
         .cd_dtype = d.scalar_type(),
         .major_a = major_a, .major_b = major_b,
         .with_accumulation = c.has_value(),
-        .num_sms = device_runtime->get_num_sms(),
-        .tc_util = device_runtime->get_tc_util(), .compiled_dims = compiled_dims,
+        .num_sms = runtime->get_num_sms(),
+        .tc_util = runtime->get_tc_util(),
+        .compiled_dims = compiled_dims,
         // NOTES: expected_k is not used in SM100 get_best_config yet.
         .expected_m = m, .expected_n = n, .expected_k = expected_k, .expected_num_groups = num_groups
     };
@@ -333,27 +339,28 @@ static void sm100_bf16_k_grouped_gemm(const torch::Tensor& a,
                                               config.layout.block_k,
                                               static_cast<int>(b.stride(0)), 1,
                                               config.storage_config.swizzle_b_mode);
-    const auto tensor_map_cd = make_tma_cd_desc(d, m, n,
-                                                config.storage_config.store_block_m,
+    const auto tensor_map_cd = make_tma_3d_desc(d, n, m, num_groups,
                                                 config.storage_config.store_block_n,
-                                                static_cast<int>(d.stride(1)), num_groups,
+                                                config.storage_config.store_block_m, 1,
+                                                static_cast<int>(d.stride(1)),
+                                                static_cast<int>(d.stride(0)),
                                                 config.storage_config.swizzle_cd_mode);
 
-    // Launch kernel
-    const SM100BF16GemmRuntime::Args& args = {
+    // Compile and launch
+    SM100BF16GemmRuntime::compile_and_launch("sm100_bf16_k_grouped_gemm", {
         .gemm_desc = desc,
         .gemm_config = config,
-        .launch_args = LaunchArgs(config.launch_config.num_sms, config.launch_config.num_threads,
-                                  config.pipeline_config.smem_size,
-                                  config.layout.get_cluster_size()),
+        .options = {
+            .num_smem_bytes = config.pipeline_config.smem_size,
+            .grid_dim = dim3(config.launch_config.num_sms, 1, 1),
+            .block_dim = dim3(config.launch_config.num_threads, 1, 1),
+            .cluster_dim = dim3(config.layout.get_cluster_size(), 1, 1),
+        },
         .grouped_layout = grouped_layout.data_ptr(),
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_cd = tensor_map_cd
-    };
-    const auto code = SM100BF16GemmRuntime::generate(args);
-    const auto runtime = compiler->build("sm100_bf16_k_grouped_gemm", code);
-    SM100BF16GemmRuntime::launch(runtime, args);
+    });
 }
 
 static void sm100_bf16_bhr_hdr_bhd(const torch::Tensor& tensor_a,
@@ -369,8 +376,9 @@ static void sm100_bf16_bhr_hdr_bhd(const torch::Tensor& tensor_a,
         .cd_dtype = tensor_d.scalar_type(),
         .major_a = cute::UMMA::Major::K, .major_b = cute::UMMA::Major::K,
         .with_accumulation = false,
-        .num_sms = device_runtime->get_num_sms(),
-        .tc_util = device_runtime->get_tc_util(), .compiled_dims = compiled_dims
+        .num_sms = runtime->get_num_sms(),
+        .tc_util = runtime->get_tc_util(),
+        .compiled_dims = compiled_dims
     };
     const auto config = get_best_config<SM100ArchSpec>(desc);
 
@@ -387,21 +395,21 @@ static void sm100_bf16_bhr_hdr_bhd(const torch::Tensor& tensor_a,
                                                 tensor_d.stride(0), tensor_d.stride(1),
                                                 config.storage_config.swizzle_cd_mode);
 
-    // Launch
-    const SM100BF16GemmRuntime::Args& args = {
+    // Compile and launch
+    SM100BF16GemmRuntime::compile_and_launch("sm100_bf16_bhr_hdr_bhd", {
         .gemm_desc = desc,
         .gemm_config = config,
-        .launch_args = LaunchArgs(config.launch_config.num_sms, config.launch_config.num_threads,
-                                  config.pipeline_config.smem_size,
-                                  config.layout.get_cluster_size()),
+        .options = {
+            .num_smem_bytes = config.pipeline_config.smem_size,
+            .grid_dim = dim3(config.launch_config.num_sms, 1, 1),
+            .block_dim = dim3(config.launch_config.num_threads, 1, 1),
+            .cluster_dim = dim3(config.layout.get_cluster_size(), 1, 1),
+        },
         .grouped_layout = nullptr,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_cd = tensor_map_cd
-    };
-    const auto code = SM100BF16GemmRuntime::generate(args);
-    const auto runtime = compiler->build("sm100_bf16_bhr_hdr_bhd", code);
-    SM100BF16GemmRuntime::launch(runtime, args);
+    });
 }
 
 static void sm100_bf16_bhd_hdr_bhr(const torch::Tensor& tensor_a,
@@ -417,8 +425,9 @@ static void sm100_bf16_bhd_hdr_bhr(const torch::Tensor& tensor_a,
         .cd_dtype = tensor_d.scalar_type(),
         .major_a = cute::UMMA::Major::K, .major_b = cute::UMMA::Major::MN,
         .with_accumulation = false,
-        .num_sms = device_runtime->get_num_sms(),
-        .tc_util = device_runtime->get_tc_util(), .compiled_dims = compiled_dims
+        .num_sms = runtime->get_num_sms(),
+        .tc_util = runtime->get_tc_util(),
+        .compiled_dims = compiled_dims
     };
     const auto config = get_best_config<SM100ArchSpec>(desc);
 
@@ -435,21 +444,21 @@ static void sm100_bf16_bhd_hdr_bhr(const torch::Tensor& tensor_a,
                                                 tensor_d.stride(0), tensor_d.stride(1),
                                                 config.storage_config.swizzle_cd_mode);
 
-    // Launch
-    const SM100BF16GemmRuntime::Args& args = {
+    // Compile and launch
+    SM100BF16GemmRuntime::compile_and_launch("sm100_bf16_bhd_hdr_bhr", {
         .gemm_desc = desc,
         .gemm_config = config,
-        .launch_args = LaunchArgs(config.launch_config.num_sms, config.launch_config.num_threads,
-                                  config.pipeline_config.smem_size,
-                                  config.layout.get_cluster_size()),
+        .options = {
+            .num_smem_bytes = config.pipeline_config.smem_size,
+            .grid_dim = dim3(config.launch_config.num_sms, 1, 1),
+            .block_dim = dim3(config.launch_config.num_threads, 1, 1),
+            .cluster_dim = dim3(config.layout.get_cluster_size(), 1, 1),
+        },
         .grouped_layout = nullptr,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_cd = tensor_map_cd
-    };
-    const auto code = SM100BF16GemmRuntime::generate(args);
-    const auto runtime = compiler->build("sm100_bf16_bhd_hdr_bhr", code);
-    SM100BF16GemmRuntime::launch(runtime, args);
+    });
 }
 
 } // namespace deep_gemm

@@ -47,13 +47,14 @@ static void sm100_bf16_mega_moe_wgrad_1sm(
     DG_HOST_ASSERT(
         pool_block_m == 16 || pool_block_m == 32 ||
         pool_block_m == 64 || pool_block_m == 96 ||
-        pool_block_m == 128 || pool_block_m == 192);
-    const int kBlockM = get_env<int>(
+        pool_block_m == 128 || pool_block_m == 192 ||
+        pool_block_m == 240);
+    const int kBlockM = deep_jit::get_env<int>(
         "DG_BF16_MEGA_MOE_WGRAD_BLOCK_M", 128);
     // Amortize each A tile and scheduler assignment across twice as much
     // tensor-core work whenever the output width permits a full 256-column
     // tile. Keep the 128-column fallback for non-divisible model dimensions.
-    const int kBlockN = get_env<int>(
+    const int kBlockN = deep_jit::get_env<int>(
         "DG_BF16_MEGA_MOE_WGRAD_BLOCK_N",
         n % 256 == 0 ? 256 : 128);
     // The K-grouped scheduler addresses each expert in the shared physical
@@ -61,16 +62,20 @@ static void sm100_bf16_mega_moe_wgrad_1sm(
     // final tile of one expert reads rows from the next expert. In particular,
     // BLOCK_M=96 previously contaminated Qwen top-8 wgrads while BLOCK_M=128
     // happened to pass.
-    const int kBlockK = get_env<int>(
+    const int kBlockK = deep_jit::get_env<int>(
         "DG_BF16_MEGA_MOE_WGRAD_BLOCK_K",
         pool_block_m % 64 == 0 ? 64 :
         pool_block_m % 32 == 0 ? 32 : 16);
-    const int kNumStages = get_env<int>(
+    const int kNumStages = deep_jit::get_env<int>(
         "DG_BF16_MEGA_MOE_WGRAD_NUM_STAGES", 4);
     const int kSwizzle =
         kBlockK * static_cast<int>(sizeof(cutlass::bfloat16_t));
-    const int kStoreBlockN = get_env<int>(
+    const int kStoreBlockN = deep_jit::get_env<int>(
         "DG_BF16_MEGA_MOE_WGRAD_STORE_BLOCK_N", 64);
+    // The output store width is independent of the A/B K tile. In particular,
+    // a 240-row pool requires K=16 but still uses the default 64-column store.
+    const int kSwizzleCD = kStoreBlockN * sizeof(cutlass::bfloat16_t);
+    DG_HOST_ASSERT(kSwizzleCD == 32 or kSwizzleCD == 64 or kSwizzleCD == 128);
     constexpr int kNumNonEpilogueThreads = 128;
     constexpr int kNumEpilogueThreads = 128;
     // Production combine always uses four warps: the two original non-MMA
@@ -85,7 +90,7 @@ static void sm100_bf16_mega_moe_wgrad_1sm(
             sizeof(cutlass::bfloat16_t) +
         1024;
 
-    const int num_sms = device_runtime->get_num_sms();
+    const int num_sms = jit->device.get_num_sms();
     const auto desc = GemmDesc{
         .gemm_type = GemmType::KGroupedContiguous,
         .kernel_type = KernelType::KernelNoSF,
@@ -125,7 +130,7 @@ static void sm100_bf16_mega_moe_wgrad_1sm(
                 .store_block_n = kStoreBlockN,
                 .swizzle_a_mode = kSwizzle,
                 .swizzle_b_mode = kSwizzle,
-                .swizzle_cd_mode = kSwizzle,
+                .swizzle_cd_mode = kSwizzleCD,
             },
         .pipeline_config =
             PipelineConfig{
@@ -152,17 +157,18 @@ static void sm100_bf16_mega_moe_wgrad_1sm(
         kBlockN, kBlockK, static_cast<int>(b.stride(0)), 1, kSwizzle);
     const auto tensor_map_d = make_tma_cd_desc(
         d, m, n, kBlockM, kStoreBlockN,
-        static_cast<int>(d.stride(1)), num_groups, kSwizzle);
+        static_cast<int>(d.stride(1)), num_groups, kSwizzleCD);
 
     const SM100BF16GemmRuntime::Args args = {
         .gemm_desc = desc,
         .gemm_config = config,
-        .launch_args =
-            LaunchArgs(num_sms, num_threads, kSmemSize, 1),
+        .options =
+            make_mega_moe_launch_options(num_sms, num_threads, kSmemSize, 1),
         .grouped_layout = padded_expert_counts.data_ptr(),
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_cd = tensor_map_d,
+        .epilogue = EpilogueInput{},
         .combine_num_ranks = combine.num_ranks,
         .fuse_combine = combine.enabled,
         .combine_sym_buffer = combine.sym_buffer,
@@ -179,10 +185,7 @@ static void sm100_bf16_mega_moe_wgrad_1sm(
         .combine_num_extra_threads =
             static_cast<uint32_t>(num_extra_combine_threads),
     };
-    const auto code = SM100BF16GemmRuntime::generate(args);
-    const auto runtime =
-        compiler->build("sm100_bf16_mega_moe_wgrad_1sm", code);
-    SM100BF16GemmRuntime::launch(runtime, args);
+    SM100BF16GemmRuntime::compile_and_launch("sm100_bf16_mega_moe_wgrad_1sm", args);
 }
 
-}  // namespace deep_gemm
+} // namespace deep_gemm
