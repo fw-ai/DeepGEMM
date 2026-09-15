@@ -1,8 +1,12 @@
-# Upstream sync through PR #432
+# Upstream sync through PR #441
 
 This fork incorporates upstream commit
-`66081d4c9c7d7c44f13fea402e5b622aa0f409c2` (Public Release 26/09),
-including the preceding July release and tensormap race fix.
+`78b69000794d0937b47ae3387eff7663410264d1` (Mega MoE task info slot release
+ordering), including Public Release 26/09, the preceding July release, and
+the tensormap race fix.
+
+The scheduler completes task metadata reads before signaling that its slot
+can be reused. This ordering fix applies to both BF16 and FP8/FP4 Mega MoE.
 
 The fork's GeGLU activation, native MXFP4/BF16 training backward kernels,
 activation saves across ring wraps, route-weight and combine modes, strided
