@@ -434,21 +434,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 op=dist.ReduceOp.MAX,
                 group=group)
         num_config_tokens = int(num_config_tokens_tensor.item())
-        expected_tokens_per_expert = (
-            num_config_tokens * num_ranks * num_topk /
-            num_experts)
-        if expected_tokens_per_expert <= 8.5:
-            pool_block_m = 16
-        elif expected_tokens_per_expert <= 16.5:
-            pool_block_m = 32
-        elif expected_tokens_per_expert <= 32.5:
-            pool_block_m = 64
-        elif expected_tokens_per_expert <= 64.5:
-            pool_block_m = 96
-        elif expected_tokens_per_expert <= 96.5:
-            pool_block_m = 128
-        else:
-            pool_block_m = 192
+        pool_block_m = deep_gemm._C.get_block_m_for_mega_moe(
+            num_ranks, num_experts, buffer.num_max_tokens_per_rank,
+            num_config_tokens, num_topk, args.mma_type)
         if args.expect_block_m:
             assert pool_block_m == args.expect_block_m, (
                 f'expected BLOCK_M={args.expect_block_m}, '
@@ -1550,28 +1538,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     def run_bf16_backward_test():
         backward_base_allocated = torch.cuda.memory_allocated()
         torch.cuda.reset_peak_memory_stats()
-        config_num_tokens = torch.tensor(
-            num_tokens, dtype=torch.int32, device='cuda')
-        if num_ranks > 1:
-            dist.all_reduce(
-                config_num_tokens,
-                op=dist.ReduceOp.MAX,
-                group=group)
-        expected_tokens_per_expert = (
-            int(config_num_tokens.item()) *
-            num_ranks * num_topk / num_experts)
-        if expected_tokens_per_expert <= 8.5:
-            block_m = 16
-        elif expected_tokens_per_expert <= 16.5:
-            block_m = 32
-        elif expected_tokens_per_expert <= 32.5:
-            block_m = 64
-        elif expected_tokens_per_expert <= 64.5:
-            block_m = 96
-        elif expected_tokens_per_expert <= 96.5:
-            block_m = 128
-        else:
-            block_m = 192
+        block_m = pool_block_m
 
         all_topk_idx = gather_rank_padded(topk_idx, -1)
         all_topk_weights = gather_rank_padded(topk_weights, 0)
@@ -3194,7 +3161,7 @@ if __name__ == '__main__':
         '--expect-block-m',
         type=int,
         default=0,
-        choices=[0, 16, 32, 64, 96, 128, 192],
+        choices=[0, 16, 32, 64, 96, 128, 192, 240],
         help='Assert the rank-uniform forward/backward BLOCK_M selection')
     parser.add_argument('--masked-ratio', type=float, default=0.0, help='Mask some expert selections')
     parser.add_argument('--routing', choices=['random', 'balanced', 'skew', 'extreme'], default='random')

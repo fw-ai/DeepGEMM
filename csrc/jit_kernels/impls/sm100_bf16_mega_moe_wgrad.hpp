@@ -155,9 +155,12 @@ static void sm100_bf16_mega_moe_wgrad_1sm(
     const auto tensor_map_b = make_tma_b_desc(
         cute::UMMA::Major::MN, b, n, pool_rows_b,
         kBlockN, kBlockK, static_cast<int>(b.stride(0)), 1, kSwizzle);
-    const auto tensor_map_d = make_tma_cd_desc(
-        d, m, n, kBlockM, kStoreBlockN,
-        static_cast<int>(d.stride(1)), num_groups, kSwizzleCD);
+    // Upstream K-grouped epilogues address [N, M, group] with a 3D TMA
+    // store. A flattened 2D descriptor compiles but traps on the first store.
+    const auto tensor_map_d = make_tma_3d_desc(
+        d, n, m, num_groups, kStoreBlockN, kBlockM, 1,
+        static_cast<int>(d.stride(1)), static_cast<int>(d.stride(0)),
+        kSwizzleCD);
 
     const SM100BF16GemmRuntime::Args args = {
         .gemm_desc = desc,
