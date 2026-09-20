@@ -10,7 +10,7 @@
 #include <deep_gemm/common/utils.cuh>
 #include <deep_gemm/comm/barrier.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
-#include <deep_gemm/layout/mega_moe.cuh>
+#include <deep_gemm/layout/mega_moe_side_lora.cuh>
 #include <deep_gemm/mma/sm100.cuh>
 #include <deep_gemm/scheduler/mega_moe_side_lora.cuh>
 #include <deep_gemm/ptx/tcgen05.cuh>
@@ -142,7 +142,7 @@ sm100_bf16_mega_moe_side_lora_forward_impl(void* y,
     }
 
     // Workspaces
-    const auto workspace = layout::Workspace(
+    const auto workspace = layout::SideLoraWorkspace(
         sym_buffer.get_base_ptr(), kNumRanks, kNumExperts, kNumMaxTokensPerRank, kNumTopk, kNumRingTokens);
 
     // Token and buffer layouts
@@ -991,18 +991,18 @@ sm100_bf16_mega_moe_side_lora_forward_impl(void* y,
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
 
         // GEMM TMA load warp for tokens
-        scheduler.for_each_block([&](const sched::BlockPhase& block_phase,
+        scheduler.for_each_block([&](const sched::SideLoraBlockPhase& block_phase,
                                      const uint32_t& local_expert_idx,
                                      const uint32_t& num_k_blocks,
                                      const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
             const cute::TmaDescriptor* tensor_map_a_ptr =
                 &tensor_map_l1_acts;
-            if (block_phase == sched::BlockPhase::LoraL1Expand)
+            if (block_phase == sched::SideLoraBlockPhase::LoraL1Expand)
                 tensor_map_a_ptr = &tensor_map_lora_l1_scratch;
-            else if (block_phase == sched::BlockPhase::LoraL2Shrink ||
-                     block_phase == sched::BlockPhase::Linear2)
+            else if (block_phase == sched::SideLoraBlockPhase::LoraL2Shrink ||
+                     block_phase == sched::SideLoraBlockPhase::Linear2)
                 tensor_map_a_ptr = &tensor_map_l2_acts;
-            else if (block_phase == sched::BlockPhase::LoraL2Expand)
+            else if (block_phase == sched::SideLoraBlockPhase::LoraL2Expand)
                 tensor_map_a_ptr = &tensor_map_lora_l2_scratch;
 
             // Compute pool block offset for this expert
@@ -1010,13 +1010,13 @@ sm100_bf16_mega_moe_side_lora_forward_impl(void* y,
             const uint32_t ring_block_idx = pool_block_idx % kNumRingBlocks;
 
             // Wait the token arrival
-            if (block_phase == sched::BlockPhase::LoraL1Shrink ||
-                block_phase == sched::BlockPhase::Linear1) {
+            if (block_phase == sched::SideLoraBlockPhase::LoraL1Shrink ||
+                block_phase == sched::SideLoraBlockPhase::Linear1) {
                 const auto ptr = workspace.get_l1_full_count_ptr(ring_block_idx);
                 const auto num_expected_tokens = BLOCK_M * (pool_block_idx / kNumRingBlocks + 1);
                 while (ptx::ld_acq(ptr) != num_expected_tokens);
                 if constexpr (kHasSideLora) {
-                    if (block_phase == sched::BlockPhase::Linear1) {
+                    if (block_phase == sched::SideLoraBlockPhase::Linear1) {
                         const auto generation =
                             pool_block_idx / kNumRingBlocks + 1;
                         while (ptx::ld_acq(
@@ -1025,18 +1025,18 @@ sm100_bf16_mega_moe_side_lora_forward_impl(void* y,
                                2 * generation);
                     }
                 }
-            } else if (block_phase == sched::BlockPhase::LoraL1Expand) {
+            } else if (block_phase == sched::SideLoraBlockPhase::LoraL1Expand) {
                 const auto generation = pool_block_idx / kNumRingBlocks + 1;
                 while (ptx::ld_acq(
                     reinterpret_cast<const uint32_t*>(side_lora_ready) +
                         ring_block_idx) < 2 * generation);
-            } else if (block_phase == sched::BlockPhase::LoraL2Shrink ||
-                       block_phase == sched::BlockPhase::Linear2) {
+            } else if (block_phase == sched::SideLoraBlockPhase::LoraL2Shrink ||
+                       block_phase == sched::SideLoraBlockPhase::Linear2) {
                 const auto ptr = workspace.get_l2_full_count_ptr(ring_block_idx);
                 const auto num_expected_blocks = L2_SHAPE_K / (BLOCK_N / 2) * (pool_block_idx / kNumRingBlocks + 1);
                 while (ptx::ld_acq(ptr) != num_expected_blocks);
                 if constexpr (kHasSideLora) {
-                    if (block_phase == sched::BlockPhase::Linear2) {
+                    if (block_phase == sched::SideLoraBlockPhase::Linear2) {
                         const auto generation =
                             pool_block_idx / kNumRingBlocks + 1;
                         while (ptx::ld_acq(
@@ -1060,13 +1060,13 @@ sm100_bf16_mega_moe_side_lora_forward_impl(void* y,
 
                 // Compute token offset from ring block index
                 const uint32_t base_k_blocks =
-                    block_phase == sched::BlockPhase::Linear1 ?
+                    block_phase == sched::SideLoraBlockPhase::Linear1 ?
                         L1_SHAPE_K / BLOCK_K :
-                    block_phase == sched::BlockPhase::Linear2 ?
+                    block_phase == sched::SideLoraBlockPhase::Linear2 ?
                         L2_SHAPE_K / BLOCK_K : 0;
                 const bool is_linear_side_expand = kHasSideLora &&
-                    (block_phase == sched::BlockPhase::Linear1 ||
-                     block_phase == sched::BlockPhase::Linear2) &&
+                    (block_phase == sched::SideLoraBlockPhase::Linear1 ||
+                     block_phase == sched::SideLoraBlockPhase::Linear2) &&
                     k_block_idx >= base_k_blocks;
                 const uint32_t logical_k_block_idx =
                     is_linear_side_expand ?
@@ -1075,7 +1075,7 @@ sm100_bf16_mega_moe_side_lora_forward_impl(void* y,
                     tensor_map_a_ptr;
                 if (is_linear_side_expand)
                     current_tensor_map_a_ptr =
-                        block_phase == sched::BlockPhase::Linear1 ?
+                        block_phase == sched::SideLoraBlockPhase::Linear1 ?
                             &tensor_map_lora_l1_scratch :
                             &tensor_map_lora_l2_scratch;
 
@@ -1084,7 +1084,7 @@ sm100_bf16_mega_moe_side_lora_forward_impl(void* y,
                     : ring_block_idx * BLOCK_M;
                 uint32_t k_idx = logical_k_block_idx * BLOCK_K;
                 if (is_linear_side_expand &&
-                    block_phase == sched::BlockPhase::Linear1) {
+                    block_phase == sched::SideLoraBlockPhase::Linear1) {
                     constexpr uint32_t kRankBlocks =
                         kSideLoraRank / BLOCK_K;
                     const uint32_t projection_idx =
@@ -1093,7 +1093,7 @@ sm100_bf16_mega_moe_side_lora_forward_impl(void* y,
                         logical_k_block_idx % kRankBlocks;
                     k_idx = projection_idx * kSideLoraRank +
                         rank_block_idx * BLOCK_K;
-                } else if (block_phase == sched::BlockPhase::LoraL1Expand) {
+                } else if (block_phase == sched::SideLoraBlockPhase::LoraL1Expand) {
                     k_idx += (n_block_idx & 1u) * kSideLoraRank;
                 }
 
@@ -1120,7 +1120,7 @@ sm100_bf16_mega_moe_side_lora_forward_impl(void* y,
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
 
         // GEMM TMA load warp for weights
-        scheduler.for_each_block([&](const sched::BlockPhase& block_phase,
+        scheduler.for_each_block([&](const sched::SideLoraBlockPhase& block_phase,
                                      const uint32_t& local_expert_idx,
                                      const uint32_t& num_k_blocks,
                                      const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
@@ -1128,24 +1128,24 @@ sm100_bf16_mega_moe_side_lora_forward_impl(void* y,
                 &tensor_map_l1_weights;
             uint32_t shape_n = L1_SHAPE_N;
             uint32_t expert_n_block_idx = n_block_idx;
-            if (block_phase == sched::BlockPhase::LoraL1Shrink) {
+            if (block_phase == sched::SideLoraBlockPhase::LoraL1Shrink) {
                 tensor_map_b_ptr = (n_block_idx & 1u) ?
                     &tensor_map_lora_a3 : &tensor_map_lora_a1;
                 shape_n = kSideLoraRank;
                 expert_n_block_idx = 0;
-            } else if (block_phase == sched::BlockPhase::LoraL1Expand) {
+            } else if (block_phase == sched::SideLoraBlockPhase::LoraL1Expand) {
                 tensor_map_b_ptr = (n_block_idx & 1u) ?
                     &tensor_map_lora_b3 : &tensor_map_lora_b1;
                 shape_n = kIntermediateHidden;
                 expert_n_block_idx = n_block_idx / 2;
-            } else if (block_phase == sched::BlockPhase::LoraL2Shrink) {
+            } else if (block_phase == sched::SideLoraBlockPhase::LoraL2Shrink) {
                 tensor_map_b_ptr = &tensor_map_lora_a2;
                 shape_n = kSideLoraRank;
                 expert_n_block_idx = 0;
-            } else if (block_phase == sched::BlockPhase::LoraL2Expand) {
+            } else if (block_phase == sched::SideLoraBlockPhase::LoraL2Expand) {
                 tensor_map_b_ptr = &tensor_map_lora_b2;
                 shape_n = kHidden;
-            } else if (block_phase == sched::BlockPhase::Linear2) {
+            } else if (block_phase == sched::SideLoraBlockPhase::Linear2) {
                 tensor_map_b_ptr = &tensor_map_l2_weights;
                 shape_n = L2_SHAPE_N;
             }
@@ -1155,13 +1155,13 @@ sm100_bf16_mega_moe_side_lora_forward_impl(void* y,
                 shared_storage.empty_barriers[stage_idx].wait(phase ^ 1);
 
                 const uint32_t base_k_blocks =
-                    block_phase == sched::BlockPhase::Linear1 ?
+                    block_phase == sched::SideLoraBlockPhase::Linear1 ?
                         L1_SHAPE_K / BLOCK_K :
-                    block_phase == sched::BlockPhase::Linear2 ?
+                    block_phase == sched::SideLoraBlockPhase::Linear2 ?
                         L2_SHAPE_K / BLOCK_K : 0;
                 const bool is_linear_side_expand = kHasSideLora &&
-                    (block_phase == sched::BlockPhase::Linear1 ||
-                     block_phase == sched::BlockPhase::Linear2) &&
+                    (block_phase == sched::SideLoraBlockPhase::Linear1 ||
+                     block_phase == sched::SideLoraBlockPhase::Linear2) &&
                     k_block_idx >= base_k_blocks;
                 const uint32_t logical_k_block_idx =
                     is_linear_side_expand ?
@@ -1171,7 +1171,7 @@ sm100_bf16_mega_moe_side_lora_forward_impl(void* y,
                 uint32_t current_shape_n = shape_n;
                 uint32_t current_expert_n_block_idx = expert_n_block_idx;
                 if (is_linear_side_expand) {
-                    if (block_phase == sched::BlockPhase::Linear1) {
+                    if (block_phase == sched::SideLoraBlockPhase::Linear1) {
                         constexpr uint32_t kRankBlocks =
                             kSideLoraRank / BLOCK_K;
                         const uint32_t projection_idx =
@@ -1188,8 +1188,8 @@ sm100_bf16_mega_moe_side_lora_forward_impl(void* y,
 
                 // Compute weight offset
                 const bool shared_side_weight =
-                    block_phase == sched::BlockPhase::LoraL1Shrink ||
-                    (block_phase == sched::BlockPhase::Linear2 &&
+                    block_phase == sched::SideLoraBlockPhase::LoraL1Shrink ||
+                    (block_phase == sched::SideLoraBlockPhase::Linear2 &&
                      is_linear_side_expand);
                 uint32_t n_idx =
                     (shared_side_weight ? 0 :
@@ -1197,7 +1197,7 @@ sm100_bf16_mega_moe_side_lora_forward_impl(void* y,
                     current_expert_n_block_idx * BLOCK_N;
                 uint32_t k_idx = logical_k_block_idx * BLOCK_K;
                 if (is_linear_side_expand &&
-                    block_phase == sched::BlockPhase::Linear1) {
+                    block_phase == sched::SideLoraBlockPhase::Linear1) {
                     constexpr uint32_t kRankBlocks =
                         kSideLoraRank / BLOCK_K;
                     k_idx = (logical_k_block_idx % kRankBlocks) * BLOCK_K;
@@ -1205,7 +1205,7 @@ sm100_bf16_mega_moe_side_lora_forward_impl(void* y,
 
                 // TMA copy weights
                 const bool is_l1_expand = is_linear_side_expand &&
-                    block_phase == sched::BlockPhase::Linear1;
+                    block_phase == sched::SideLoraBlockPhase::Linear1;
                 if (is_l1_expand) {
                     constexpr uint32_t kRankBlocks =
                         kSideLoraRank / BLOCK_K;
@@ -1280,7 +1280,7 @@ sm100_bf16_mega_moe_side_lora_forward_impl(void* y,
             // Persistently schedule over blocks
             uint32_t current_iter_idx = 0;
             uint32_t side_empty_wait_phase[2] = {1, 1};
-            scheduler.for_each_block([&](const sched::BlockPhase& block_phase,
+            scheduler.for_each_block([&](const sched::SideLoraBlockPhase& block_phase,
                                          const uint32_t& local_expert_idx,
                                          const uint32_t& num_k_blocks,
                                          const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
@@ -1324,13 +1324,13 @@ sm100_bf16_mega_moe_side_lora_forward_impl(void* y,
                     const auto a_desc_base_lo = ptx::exchange(a_desc_lo, stage_idx);
                     const auto b_desc_base_lo = ptx::exchange(b_desc_lo, stage_idx);
                     const uint32_t base_k_blocks =
-                        block_phase == sched::BlockPhase::Linear1 ?
+                        block_phase == sched::SideLoraBlockPhase::Linear1 ?
                             L1_SHAPE_K / BLOCK_K :
-                        block_phase == sched::BlockPhase::Linear2 ?
+                        block_phase == sched::SideLoraBlockPhase::Linear2 ?
                             L2_SHAPE_K / BLOCK_K : 0;
                     const bool is_linear_side_expand = kHasSideLora &&
-                        (block_phase == sched::BlockPhase::Linear1 ||
-                         block_phase == sched::BlockPhase::Linear2) &&
+                        (block_phase == sched::SideLoraBlockPhase::Linear1 ||
+                         block_phase == sched::SideLoraBlockPhase::Linear2) &&
                         k_block_idx >= base_k_blocks;
                     const uint32_t logical_k_block_idx =
                         is_linear_side_expand ?
@@ -1431,7 +1431,7 @@ sm100_bf16_mega_moe_side_lora_forward_impl(void* y,
 
         // Persistently schedule over blocks
         uint32_t current_iter_idx = 0;
-        scheduler.for_each_block([&](const sched::BlockPhase& block_phase,
+        scheduler.for_each_block([&](const sched::SideLoraBlockPhase& block_phase,
                                      const uint32_t& local_expert_idx,
                                      const uint32_t& num_k_blocks,
                                      const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
@@ -1454,28 +1454,28 @@ sm100_bf16_mega_moe_side_lora_forward_impl(void* y,
                 shared_storage.tmem_empty_barriers[accum_stage_idx]
                     .arrive(0u);
                 if constexpr (kHasSideLora) {
-                    if (block_phase == sched::BlockPhase::Linear1 ||
-                        block_phase == sched::BlockPhase::Linear2)
+                    if (block_phase == sched::SideLoraBlockPhase::Linear1 ||
+                        block_phase == sched::SideLoraBlockPhase::Linear2)
                         shared_storage.tmem_empty_barriers[
                             1 - accum_stage_idx].arrive(0u);
                 }
             };
 
             const bool is_lora_phase =
-                block_phase == sched::BlockPhase::LoraL1Shrink ||
-                block_phase == sched::BlockPhase::LoraL2Shrink;
+                block_phase == sched::SideLoraBlockPhase::LoraL1Shrink ||
+                block_phase == sched::SideLoraBlockPhase::LoraL2Shrink;
 
             if (is_lora_phase) {
                 // Materialize tensor-core side GEMMs at BF16 boundaries.  The
                 // L2 shrink uses both CTAs for the 256-column UMMA shape, but
                 // the second half is a duplicate and is discarded.
                 const bool do_store =
-                    block_phase != sched::BlockPhase::LoraL2Shrink ||
+                    block_phase != sched::SideLoraBlockPhase::LoraL2Shrink ||
                     n_block_idx == 0;
                 const cute::TmaDescriptor* tensor_map_d_ptr =
                     &tensor_map_lora_l1_scratch_store;
                 uint32_t out_n_idx = n_block_idx * BLOCK_N;
-                if (block_phase == sched::BlockPhase::LoraL2Shrink) {
+                if (block_phase == sched::SideLoraBlockPhase::LoraL2Shrink) {
                     tensor_map_d_ptr = &tensor_map_lora_l2_scratch_store;
                     out_n_idx = 0;
                 }
@@ -1584,11 +1584,11 @@ sm100_bf16_mega_moe_side_lora_forward_impl(void* y,
                 if (do_store && epilogue_warp_idx == 0 &&
                     cute::elect_one_sync()) {
                     uint32_t ready_plane = 0;
-                    if (block_phase == sched::BlockPhase::LoraL1Expand)
+                    if (block_phase == sched::SideLoraBlockPhase::LoraL1Expand)
                         ready_plane = 1;
-                    else if (block_phase == sched::BlockPhase::LoraL2Shrink)
+                    else if (block_phase == sched::SideLoraBlockPhase::LoraL2Shrink)
                         ready_plane = 2;
-                    else if (block_phase == sched::BlockPhase::LoraL2Expand)
+                    else if (block_phase == sched::SideLoraBlockPhase::LoraL2Expand)
                         ready_plane = 3;
                     ptx::red_add_rel(
                         reinterpret_cast<uint32_t*>(side_lora_ready) +
@@ -1596,7 +1596,7 @@ sm100_bf16_mega_moe_side_lora_forward_impl(void* y,
                         1u);
                 }
                 __syncwarp();
-            } else if (block_phase == sched::BlockPhase::Linear1) {
+            } else if (block_phase == sched::SideLoraBlockPhase::Linear1) {
                 // Wait L2 block empty
                 const auto l2_empty_ptr = workspace.get_l2_empty_count_ptr(ring_block_idx);
                 const auto num_expected_blocks = (L2_SHAPE_N / BLOCK_N) * (pool_block_idx / kNumRingBlocks);

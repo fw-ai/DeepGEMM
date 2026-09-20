@@ -1552,6 +1552,12 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
 
     extern __shared__ __align__(1024) uint8_t smem_buffer[];
     auto* smem_gemm_base = smem_buffer + SMEM_DISPATCH_SIZE;
+    struct OutputStorage {
+        using cd_dtype = cd_dtype_t;
+        cd_dtype_t cd[kNumTMAStoreStages][STORE_BLOCK_M * STORE_BLOCK_N];
+    };
+    DG_STATIC_ASSERT(sizeof(OutputStorage) == SMEM_CD_SIZE, "Backward output storage must preserve the shared memory layout");
+    auto& output_storage = *reinterpret_cast<OutputStorage*>(smem_gemm_base);
     auto smem_cd = utils::PatternVisitor([=](const uint32_t& i) {
         return reinterpret_cast<cd_dtype_t*>(
             smem_gemm_base + i * SMEM_CD_SIZE_PER_STAGE);
@@ -2271,14 +2277,15 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                 BLOCK_M, BLOCK_N, STORE_BLOCK_M,
                 STORE_BLOCK_N, kSwizzleCDMode,
                 kNumTMAStoreStages, kNumEpilogueThreads,
-                GemmType::Normal, false, cd_dtype_t,
-                epilogue::transform::EpilogueIdentity>(
-                smem_cd, tma_stage_idx,
+                0, GemmType::Normal, false>(
+                output_storage, tma_stage_idx,
                 accum_stage * UMMA_N,
                 (pool_block_offset + m_block_idx) * BLOCK_M,
-                n_block_idx * BLOCK_N, 0,
+                n_block_idx * BLOCK_N, 0, false,
                 math::align(valid_m, 16u),
                 epilogue_warp_idx, lane_idx,
+                epilogue::transform::EpilogueIdentity{}, false,
+                tmem_empty_barriers[accum_stage],
                 tmem_empty_barriers[accum_stage],
                 tensor_map_output);
         });

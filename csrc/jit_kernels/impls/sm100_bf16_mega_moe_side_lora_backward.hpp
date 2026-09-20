@@ -8,11 +8,9 @@
 
 #include <torch/python.h>
 
-#include "../../jit/compiler.hpp"
-#include "../../jit/device_runtime.hpp"
-#include "../../jit/kernel_runtime.hpp"
 #include "../../utils/exception.hpp"
-#include "../../utils/format.hpp"
+#include <format>
+#include "mega_moe_side_lora_launch.hpp"
 #include "../../utils/math.hpp"
 #include "runtime_utils.hpp"
 #include "sm100_bf16_mega_moe_wgrad.hpp"
@@ -79,8 +77,8 @@ static void sm100_bf16_mega_moe_side_lora_rank_gemm(
         .major_a = major_a,
         .major_b = major_b,
         .with_accumulation = false,
-        .num_sms = device_runtime->get_num_sms(),
-        .tc_util = device_runtime->get_tc_util(),
+        .num_sms = runtime->get_num_sms(),
+        .tc_util = runtime->get_tc_util(),
         .compiled_dims = "nk",
         .ensure_zero_padding = false,
         .expected_m = num_pool_rows / num_groups,
@@ -109,7 +107,7 @@ static void sm100_bf16_mega_moe_side_lora_rank_gemm(
     const SM100BF16GemmRuntime::Args args{
         .gemm_desc = desc,
         .gemm_config = config,
-        .launch_args = LaunchArgs(
+        .options = side_lora_launch_options(
             config.launch_config.num_sms,
             config.launch_config.num_threads,
             config.pipeline_config.smem_size,
@@ -118,11 +116,9 @@ static void sm100_bf16_mega_moe_side_lora_rank_gemm(
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_cd = tensor_map_d,
+        .epilogue = make_epilogue_input(num_pool_rows, n, std::nullopt, std::nullopt),
     };
-    const auto code = SM100BF16GemmRuntime::generate(args);
-    const auto runtime = compiler->build(
-        "sm100_bf16_mega_moe_side_lora_rank_gemm", code);
-    SM100BF16GemmRuntime::launch(runtime, args);
+    SM100BF16GemmRuntime::compile_and_launch("sm100_bf16_mega_moe_side_lora_rank_gemm", args);
 }
 
 // Shared A1/A3/B2 factors are one matrix for the whole EP-local route pool.
@@ -138,7 +134,7 @@ static void sm100_bf16_mega_moe_side_lora_shared_gemm(
     const std::string& compiled_dims = "mnk") {
     sm100_bf16_gemm(
         a, b, std::nullopt, d, m, n, k,
-        get_major_type_ab(a), get_major_type_ab(b), compiled_dims);
+        get_major_type_ab(a), get_major_type_ab(b), compiled_dims, std::nullopt);
 }
 
 static std::string get_side_lora_backward_route_weight_mode_name(
@@ -161,8 +157,7 @@ static std::string get_side_lora_backward_combine_order_mode_name(
     DG_HOST_UNREACHABLE("Unsupported combine order mode");
 }
 
-class SM100BF16MegaMoESideLoraBackwardWaveRuntime final
-    : public LaunchRuntime<SM100BF16MegaMoESideLoraBackwardWaveRuntime> {
+class SM100BF16MegaMoESideLoraBackwardWaveRuntime final {
 public:
     struct Args {
         int hidden;
@@ -245,11 +240,11 @@ public:
         uint64_t* kernel_trace = nullptr;
         bool inputs_prepared = false;
         bool dispatch_inputs_prepared = false;
-        LaunchArgs launch_args;
+        deep_jit::cuda::LaunchOptions launch_args;
     };
 
-    static std::string generate_impl(const Args& args) {
-        return fmt::format(R"(
+    static std::string generate(const Args& args) {
+        return std::format(R"(
 #include <deep_gemm/impls/sm100_bf16_mega_moe_side_lora_backward.cuh>
 
 using namespace deep_gemm;
@@ -312,12 +307,8 @@ static void __instantiate_kernel() {{
             args.gate_up_prepared ? "true" : "false");
     }
 
-    static void launch_impl(
-        const KernelHandle& kernel,
-        const LaunchConfigHandle& config,
-        Args args) {
-        DG_CUDA_UNIFIED_CHECK(launch_kernel(
-            kernel, config,
+    static void launch(const std::shared_ptr<deep_jit::cuda::Kernel>& kernel, const Args& args) {
+        jit->launch(kernel, args.launch_args,
             args.expert_counts,
             args.backward_sym_buffer,
             args.backward_workspace,
@@ -368,12 +359,11 @@ static void __instantiate_kernel() {{
             args.launch_epoch,
             args.activation_limit,
             args.side_lora,
-            args.kernel_trace));
+            args.kernel_trace);
     }
 };
 
-class SM100BF16MegaMoESideLoraGradXRuntime final
-    : public LaunchRuntime<SM100BF16MegaMoESideLoraGradXRuntime> {
+class SM100BF16MegaMoESideLoraGradXRuntime final {
 public:
     struct Args {
         int hidden;
@@ -394,11 +384,11 @@ public:
         layout::Workspace workspace;
         uint32_t num_pool_rows;
         uint32_t num_topk;
-        LaunchArgs launch_args;
+        deep_jit::cuda::LaunchOptions launch_args;
     };
 
-    static std::string generate_impl(const Args& args) {
-        return fmt::format(R"(
+    static std::string generate(const Args& args) {
+        return std::format(R"(
 #include <deep_gemm/impls/sm100_bf16_mega_moe_side_lora_backward.cuh>
 using namespace deep_gemm;
 static void __instantiate_kernel() {{
@@ -412,33 +402,28 @@ static void __instantiate_kernel() {{
             args.direct_remote_grad_x ? "true" : "false");
     }
 
-    static void launch_impl(
-        const KernelHandle& kernel,
-        const LaunchConfigHandle& config,
-        Args args) {
-        DG_CUDA_UNIFIED_CHECK(launch_kernel(
-            kernel, config, args.expert_counts, args.grad_x_pool,
+    static void launch(const std::shared_ptr<deep_jit::cuda::Kernel>& kernel, const Args& args) {
+        jit->launch(kernel, args.launch_args, args.expert_counts, args.grad_x_pool,
             args.side_grad_x_scratch1, args.side_grad_x_scratch3,
             args.side_lora_scale,
             args.token_src_metadata, args.combine_buffer,
             args.sym_buffer, args.workspace, args.num_pool_rows,
-            args.num_topk));
+            args.num_topk);
     }
 };
 
-class SM100BF16MegaMoESideLoraScaleGradsRuntime final
-    : public LaunchRuntime<SM100BF16MegaMoESideLoraScaleGradsRuntime> {
+class SM100BF16MegaMoESideLoraScaleGradsRuntime final {
 public:
     struct Args {
         int hidden;
         int intermediate_hidden;
         int num_experts;
         MegaMoESideLoraBackwardParams side_lora;
-        LaunchArgs launch_args;
+        deep_jit::cuda::LaunchOptions launch_args;
     };
 
-    static std::string generate_impl(const Args& args) {
-        return fmt::format(R"(
+    static std::string generate(const Args& args) {
+        return std::format(R"(
 #include <deep_gemm/impls/sm100_bf16_mega_moe_side_lora_backward.cuh>
 using namespace deep_gemm;
 static void __instantiate_kernel() {{
@@ -448,17 +433,12 @@ static void __instantiate_kernel() {{
 )", args.hidden, args.intermediate_hidden, args.num_experts);
     }
 
-    static void launch_impl(
-        const KernelHandle& kernel,
-        const LaunchConfigHandle& config,
-        Args args) {
-        DG_CUDA_UNIFIED_CHECK(launch_kernel(
-            kernel, config, args.side_lora));
+    static void launch(const std::shared_ptr<deep_jit::cuda::Kernel>& kernel, const Args& args) {
+        jit->launch(kernel, args.launch_args, args.side_lora);
     }
 };
 
-class SM100BF16MegaMoESideLoraAxpy2Runtime final
-    : public LaunchRuntime<SM100BF16MegaMoESideLoraAxpy2Runtime> {
+class SM100BF16MegaMoESideLoraAxpy2Runtime final {
 public:
     struct Args {
         int num_sms;
@@ -467,10 +447,10 @@ public:
         const cutlass::bfloat16_t* src3;
         uint64_t num_elements;
         float scale;
-        LaunchArgs launch_args;
+        deep_jit::cuda::LaunchOptions launch_args;
     };
-    static std::string generate_impl(const Args& args) {
-        return fmt::format(R"(
+    static std::string generate(const Args& args) {
+        return std::format(R"(
 #include <deep_gemm/impls/sm100_bf16_mega_moe_side_lora_backward.cuh>
 using namespace deep_gemm;
 static void __instantiate_kernel() {{
@@ -479,17 +459,13 @@ static void __instantiate_kernel() {{
 }}
 )", args.num_sms);
     }
-    static void launch_impl(
-        const KernelHandle& kernel, const LaunchConfigHandle& config,
-        Args args) {
-        DG_CUDA_UNIFIED_CHECK(launch_kernel(
-            kernel, config, args.dst, args.src1, args.src3,
-            args.num_elements, args.scale));
+    static void launch(const std::shared_ptr<deep_jit::cuda::Kernel>& kernel, const Args& args) {
+        jit->launch(kernel, args.launch_args, args.dst, args.src1, args.src3,
+            args.num_elements, args.scale);
     }
 };
 
-class SM100BF16MegaMoESideLoraClearPaddingRuntime final
-    : public LaunchRuntime<SM100BF16MegaMoESideLoraClearPaddingRuntime> {
+class SM100BF16MegaMoESideLoraClearPaddingRuntime final {
 public:
     struct Args {
         int hidden;
@@ -506,11 +482,11 @@ public:
         cutlass::bfloat16_t* t2;
         cutlass::bfloat16_t* x_pool;
         cutlass::bfloat16_t* grad_ye;
-        LaunchArgs launch_args;
+        deep_jit::cuda::LaunchOptions launch_args;
     };
 
-    static std::string generate_impl(const Args& args) {
-        return fmt::format(R"(
+    static std::string generate(const Args& args) {
+        return std::format(R"(
 #include <deep_gemm/impls/sm100_bf16_mega_moe_side_lora_backward.cuh>
 using namespace deep_gemm;
 static void __instantiate_kernel() {{
@@ -521,14 +497,10 @@ static void __instantiate_kernel() {{
             args.num_sms);
     }
 
-    static void launch_impl(
-        const KernelHandle& kernel,
-        const LaunchConfigHandle& config,
-        Args args) {
-        DG_CUDA_UNIFIED_CHECK(launch_kernel(
-            kernel, config, args.expert_counts, args.num_pool_rows, args.saved_h,
+    static void launch(const std::shared_ptr<deep_jit::cuda::Kernel>& kernel, const Args& args) {
+        jit->launch(kernel, args.launch_args, args.expert_counts, args.num_pool_rows, args.saved_h,
             args.q13, args.q2, args.t13, args.t2,
-            args.x_pool, args.grad_ye));
+            args.x_pool, args.grad_ye);
     }
 };
 
@@ -612,7 +584,7 @@ static void sm100_bf16_mega_moe_side_lora_backward(
     const int load_block_n = block_n;
     const int num_dispatch_warps = num_ranks > 1 ? 4 : 0;
 
-    DG_HOST_ASSERT(device_runtime->get_arch_major() == 10);
+    DG_HOST_ASSERT(jit->device.get_arch_major() == 10);
     DG_HOST_ASSERT(activation == "swiglu" || activation == "geglu");
     DG_HOST_ASSERT(
         route_weight_mode == "pre_down" ||
@@ -1188,10 +1160,10 @@ static void sm100_bf16_mega_moe_side_lora_backward(
         .clear_wgrad_padding = clear_wgrad_padding,
         .compute_route_grad = true,
         .trace_kernel = kernel_trace.has_value(),
-        .vectorized_grad_x_store = get_env<int>(
+        .vectorized_grad_x_store = deep_jit::get_env<int>(
             "DG_BF16_MEGA_MOE_VECTORIZED_GRAD_X_STORE",
             1) == 1,
-        .wide_grad_x_store = get_env<int>(
+        .wide_grad_x_store = deep_jit::get_env<int>(
             "DG_BF16_MEGA_MOE_WIDE_GRAD_X_STORE",
             0) == 1,
         .kernel_trace =
@@ -1206,12 +1178,12 @@ static void sm100_bf16_mega_moe_side_lora_backward(
             memory_mode == "phase_ordered" ||
             memory_mode == "dispatch_prepared",
         .launch_args =
-            LaunchArgs(num_sms, 1024, smem_size, 2),
+            side_lora_launch_options(num_sms, 1024, smem_size, 2),
     };
     const auto code =
         SM100BF16MegaMoESideLoraBackwardWaveRuntime::generate(args);
-    const auto runtime = compiler->build(
-        fmt::format(
+    const auto runtime = jit->compile(
+        std::format(
             "sm100_bf16_mega_moe_side_lora_backward_trace{}_vec{}_wide{}",
             kernel_trace.has_value(),
             args.vectorized_grad_x_store,
@@ -1264,11 +1236,11 @@ static void sm100_bf16_mega_moe_side_lora_backward(
             x_pool_output.data_ptr<at::BFloat16>()),
         .grad_ye = reinterpret_cast<cutlass::bfloat16_t*>(
             grad_ye.data_ptr<at::BFloat16>()),
-        .launch_args = LaunchArgs(num_sms, 256, 0, 1),
+        .launch_args = side_lora_launch_options(num_sms, 256, 0, 1),
     };
     const auto clear_code =
         SM100BF16MegaMoESideLoraClearPaddingRuntime::generate(clear_args);
-    const auto clear_runtime = compiler->build(
+    const auto clear_runtime = jit->compile(
         "sm100_bf16_mega_moe_side_lora_clear_padding", clear_code);
     SM100BF16MegaMoESideLoraClearPaddingRuntime::launch(
         clear_runtime, clear_args);
@@ -1314,11 +1286,11 @@ static void sm100_bf16_mega_moe_side_lora_backward(
         .workspace = backward_workspace,
         .num_pool_rows = static_cast<uint32_t>(num_pool_rows),
         .num_topk = static_cast<uint32_t>(num_topk),
-        .launch_args = LaunchArgs(num_sms, 256, 0, 1),
+        .launch_args = side_lora_launch_options(num_sms, 256, 0, 1),
     };
     const auto grad_x_code =
         SM100BF16MegaMoESideLoraGradXRuntime::generate(grad_x_args);
-    const auto grad_x_runtime = compiler->build(
+    const auto grad_x_runtime = jit->compile(
         "sm100_bf16_mega_moe_side_lora_grad_x", grad_x_code);
     SM100BF16MegaMoESideLoraGradXRuntime::launch(
         grad_x_runtime, grad_x_args);
@@ -1352,11 +1324,11 @@ static void sm100_bf16_mega_moe_side_lora_backward(
         .intermediate_hidden = intermediate_hidden,
         .num_experts = num_experts,
         .side_lora = side_lora_params,
-        .launch_args = LaunchArgs(num_sms, 256, 0, 1),
+        .launch_args = side_lora_launch_options(num_sms, 256, 0, 1),
     };
     const auto scale_code =
         SM100BF16MegaMoESideLoraScaleGradsRuntime::generate(scale_args);
-    const auto scale_runtime = compiler->build(
+    const auto scale_runtime = jit->compile(
         "sm100_bf16_mega_moe_side_lora_scale_grads", scale_code);
     SM100BF16MegaMoESideLoraScaleGradsRuntime::launch(
         scale_runtime, scale_args);
@@ -1436,7 +1408,7 @@ static void sm100_fp8_fp4_mega_moe_side_lora_backward(
     const auto [num_experts, intermediate_hidden_2, hidden] =
         check_grouped_ab_fp8_fp4(
             l1_weights, cute::UMMA::Major::K,
-            device_runtime->get_arch_major());
+            jit->device.get_arch_major());
     const int intermediate_hidden = intermediate_hidden_2 / 2;
     const int num_pool_rows = static_cast<int>(grad_ye.size(0));
     const int num_acts_rows = static_cast<int>(acts.size(0));
@@ -1450,7 +1422,7 @@ static void sm100_fp8_fp4_mega_moe_side_lora_backward(
         : static_cast<int>(backward_sym_buffer_ptrs.size());
     const int num_dispatch_warps = num_ranks > 1 ? 4 : 0;
 
-    DG_HOST_ASSERT(device_runtime->get_arch_major() == 10);
+    DG_HOST_ASSERT(jit->device.get_arch_major() == 10);
     DG_HOST_ASSERT(num_ranks >= 1);
     DG_HOST_ASSERT(activation == "swiglu" || activation == "geglu");
     DG_HOST_ASSERT(
@@ -1999,12 +1971,12 @@ static void sm100_fp8_fp4_mega_moe_side_lora_backward(
         .gate_up_prepared = true,
         .inputs_prepared = route_weight_mode == "post_down",
         .dispatch_inputs_prepared = true,
-        .launch_args = LaunchArgs(
+        .launch_args = side_lora_launch_options(
             num_sms, 1024, smem_size, 2),
     };
     const auto code =
         SM100BF16MegaMoESideLoraBackwardWaveRuntime::generate(args);
-    const auto runtime = compiler->build(fmt::format(
+    const auto runtime = jit->compile(std::format(
         "sm100_fp8_fp4_mega_moe_side_lora_backward_{}_fast{}_{}_r{}",
         activation, fast_math, route_weight_mode,
         grad_route_output.has_value()), code);
@@ -2053,11 +2025,11 @@ static void sm100_fp8_fp4_mega_moe_side_lora_backward(
             x_pool_output.data_ptr<at::BFloat16>()),
         .grad_ye = reinterpret_cast<cutlass::bfloat16_t*>(
             grad_ye.data_ptr<at::BFloat16>()),
-        .launch_args = LaunchArgs(num_sms, 256, 0, 1),
+        .launch_args = side_lora_launch_options(num_sms, 256, 0, 1),
     };
     const auto clear_code =
         SM100BF16MegaMoESideLoraClearPaddingRuntime::generate(clear_args);
-    const auto clear_runtime = compiler->build(
+    const auto clear_runtime = jit->compile(
         "sm100_fp8_fp4_mega_moe_side_lora_clear_padding", clear_code);
     SM100BF16MegaMoESideLoraClearPaddingRuntime::launch(
         clear_runtime, clear_args);
@@ -2103,11 +2075,11 @@ static void sm100_fp8_fp4_mega_moe_side_lora_backward(
         .workspace = backward_workspace,
         .num_pool_rows = static_cast<uint32_t>(num_pool_rows),
         .num_topk = static_cast<uint32_t>(num_topk),
-        .launch_args = LaunchArgs(num_sms, 256, 0, 1),
+        .launch_args = side_lora_launch_options(num_sms, 256, 0, 1),
     };
     const auto grad_x_code =
         SM100BF16MegaMoESideLoraGradXRuntime::generate(grad_x_args);
-    const auto grad_x_runtime = compiler->build(
+    const auto grad_x_runtime = jit->compile(
         "sm100_fp8_fp4_mega_moe_side_lora_grad_x", grad_x_code);
     SM100BF16MegaMoESideLoraGradXRuntime::launch(
         grad_x_runtime, grad_x_args);
@@ -2138,11 +2110,11 @@ static void sm100_fp8_fp4_mega_moe_side_lora_backward(
         .intermediate_hidden = intermediate_hidden,
         .num_experts = num_experts,
         .side_lora = side_lora_params,
-        .launch_args = LaunchArgs(num_sms, 256, 0, 1),
+        .launch_args = side_lora_launch_options(num_sms, 256, 0, 1),
     };
     const auto scale_code =
         SM100BF16MegaMoESideLoraScaleGradsRuntime::generate(scale_args);
-    const auto scale_runtime = compiler->build(
+    const auto scale_runtime = jit->compile(
         "sm100_fp8_fp4_mega_moe_side_lora_scale_grads", scale_code);
     SM100BF16MegaMoESideLoraScaleGradsRuntime::launch(
         scale_runtime, scale_args);

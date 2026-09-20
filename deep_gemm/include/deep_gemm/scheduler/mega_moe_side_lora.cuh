@@ -3,14 +3,14 @@
 #include <deep_gemm/common/cute_tie.cuh>
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/types.cuh>
-#include <deep_gemm/layout/mega_moe.cuh>
+#include <deep_gemm/layout/mega_moe_side_lora.cuh>
 #include <deep_gemm/ptx/ld_st.cuh>
 #include <deep_gemm/ptx/utils.cuh>
 
 namespace deep_gemm::sched {
 
 // Computation phase for the current block
-enum class BlockPhase {
+enum class SideLoraBlockPhase {
     None = 0,
     LoraL1Shrink = 1,
     LoraL1Expand = 2,
@@ -61,10 +61,10 @@ struct SideLoraMegaMoEScheduler {
     static constexpr uint32_t kNumLoraL2ExpandBlockNs = kNumL2BlockNs;
 
     // Arrival counts
-    const layout::Workspace& workspace;
+    const layout::SideLoraWorkspace& workspace;
 
     // Scheduler state
-    BlockPhase next_phase = kHasSideLora ? BlockPhase::LoraL1Shrink : BlockPhase::Linear1;
+    SideLoraBlockPhase next_phase = kHasSideLora ? SideLoraBlockPhase::LoraL1Shrink : SideLoraBlockPhase::Linear1;
 
     // Current expert and block indices
     uint32_t current_local_expert_idx = 0;
@@ -78,7 +78,7 @@ struct SideLoraMegaMoEScheduler {
     // Layout: `stored_num_tokens_per_expert[i]` holds expert (i * 32 + lane_idx)'s count
     uint32_t stored_num_tokens_per_expert[kNumExpertsPerLane] = {};
 
-    CUTLASS_DEVICE explicit SideLoraMegaMoEScheduler(const layout::Workspace& workspace): workspace(workspace) {
+    CUTLASS_DEVICE explicit SideLoraMegaMoEScheduler(const layout::SideLoraWorkspace& workspace): workspace(workspace) {
         block_idx = blockIdx.x;
     }
 
@@ -150,27 +150,27 @@ struct SideLoraMegaMoEScheduler {
         return false;
     }
 
-    CUTLASS_DEVICE uint32_t get_phase_num_n_blocks(const BlockPhase phase) const {
-        if (phase == BlockPhase::LoraL1Shrink)
+    CUTLASS_DEVICE uint32_t get_phase_num_n_blocks(const SideLoraBlockPhase phase) const {
+        if (phase == SideLoraBlockPhase::LoraL1Shrink)
             return kNumLoraL1ShrinkBlockNs;
-        if (phase == BlockPhase::LoraL1Expand)
+        if (phase == SideLoraBlockPhase::LoraL1Expand)
             return kNumLoraL1ExpandBlockNs;
-        if (phase == BlockPhase::Linear1)
+        if (phase == SideLoraBlockPhase::Linear1)
             return kNumL1BlockNs;
-        if (phase == BlockPhase::LoraL2Shrink)
+        if (phase == SideLoraBlockPhase::LoraL2Shrink)
             return kNumLoraL2ShrinkBlockNs;
         return kNumL2BlockNs;
     }
 
-    CUTLASS_DEVICE uint32_t get_phase_num_k_blocks(const BlockPhase phase) const {
-        if (phase == BlockPhase::LoraL1Shrink)
+    CUTLASS_DEVICE uint32_t get_phase_num_k_blocks(const SideLoraBlockPhase phase) const {
+        if (phase == SideLoraBlockPhase::LoraL1Shrink)
             return kNumLoraL1ShrinkBlockKs;
-        if (phase == BlockPhase::LoraL1Expand ||
-            phase == BlockPhase::LoraL2Expand)
+        if (phase == SideLoraBlockPhase::LoraL1Expand ||
+            phase == SideLoraBlockPhase::LoraL2Expand)
             return kNumLoraExpandBlockKs;
-        if (phase == BlockPhase::LoraL2Shrink)
+        if (phase == SideLoraBlockPhase::LoraL2Shrink)
             return kNumLoraL2ShrinkBlockKs;
-        if (phase == BlockPhase::Linear2)
+        if (phase == SideLoraBlockPhase::Linear2)
             return kNumL2BlockKs +
                 (kHasSideLora ? kNumLoraExpandBlockKs : 0);
         return kNumL1BlockKs +
@@ -180,23 +180,23 @@ struct SideLoraMegaMoEScheduler {
             (kHasSideLora ? 2 * kNumLoraExpandBlockKs : 0);
     }
 
-    CUTLASS_DEVICE BlockPhase get_phase_after(const BlockPhase phase) const {
+    CUTLASS_DEVICE SideLoraBlockPhase get_phase_after(const SideLoraBlockPhase phase) const {
         if constexpr (kHasSideLora) {
-            if (phase == BlockPhase::LoraL1Shrink)
-                return BlockPhase::Linear1;
-            if (phase == BlockPhase::Linear1)
-                return BlockPhase::LoraL2Shrink;
-            if (phase == BlockPhase::LoraL2Shrink)
-                return BlockPhase::Linear2;
-            return BlockPhase::LoraL1Shrink;
+            if (phase == SideLoraBlockPhase::LoraL1Shrink)
+                return SideLoraBlockPhase::Linear1;
+            if (phase == SideLoraBlockPhase::Linear1)
+                return SideLoraBlockPhase::LoraL2Shrink;
+            if (phase == SideLoraBlockPhase::LoraL2Shrink)
+                return SideLoraBlockPhase::Linear2;
+            return SideLoraBlockPhase::LoraL1Shrink;
         } else {
-            return phase == BlockPhase::Linear1 ?
-                BlockPhase::Linear2 : BlockPhase::Linear1;
+            return phase == SideLoraBlockPhase::Linear1 ?
+                SideLoraBlockPhase::Linear2 : SideLoraBlockPhase::Linear1;
         }
     }
 
     // Core state machine: assigns the next block
-    CUTLASS_DEVICE cute::tuple<BlockPhase, uint32_t, uint32_t, uint32_t> get_next_block() {
+    CUTLASS_DEVICE cute::tuple<SideLoraBlockPhase, uint32_t, uint32_t, uint32_t> get_next_block() {
         while (true) {
             if (current_local_expert_idx >= kNumExpertsPerRank)
                 break;
@@ -211,14 +211,14 @@ struct SideLoraMegaMoEScheduler {
                 next_phase = get_phase_after(phase);
                 // Every side/base phase in a wave revisits the same experts.
                 // Linear2 is the last phase and advances to the next wave.
-                if (phase != BlockPhase::Linear2)
+                if (phase != SideLoraBlockPhase::Linear2)
                     set_expert_idx(math::align<uint32_t, false>(
                         current_local_expert_idx - 1, kNumExpertsPerWave));
             }
         }
 
         // All waves and experts are fully processed
-        return {BlockPhase::None, 0, 0, 0};
+        return {SideLoraBlockPhase::None, 0, 0, 0};
     }
 
     CUTLASS_DEVICE void fetch_expert_recv_count() {
@@ -249,7 +249,7 @@ struct SideLoraMegaMoEScheduler {
         // TODO: add swizzle within expert waves for better L2 cache utilization
         while (true) {
             CUTE_TIE_DECL(get_next_block(), block_phase, current_local_expert_idx, m_block_idx, n_block_idx);
-            if (block_phase == BlockPhase::None)
+            if (block_phase == SideLoraBlockPhase::None)
                 break;
 
             func(block_phase, current_local_expert_idx,

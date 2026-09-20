@@ -32,18 +32,20 @@ class TestMegaMoEHeadroom(unittest.TestCase):
 #define DG_HOST_ASSERT(condition) \
     do { if (!(condition)) throw std::runtime_error("invalid headroom"); } while (0)
 struct Runtime { int sms; int get_num_sms() { return sms; } };
-Runtime runtime;
-Runtime* device_runtime = &runtime;
+Runtime runtime_storage;
+Runtime* runtime = &runtime_storage;
+namespace deep_jit {
 template <typename T> T get_env(const char* name, T fallback) {
     const char* value = std::getenv(name);
     return value ? static_cast<T>(std::atoi(value)) : fallback;
+}
 }
 int align(int value, int multiple) {
     return (value + multiple - 1) / multiple * multiple;
 }
 ''' + helper + r'''
 int main(int argc, char** argv) {
-    runtime.sms = std::atoi(argv[1]);
+    runtime->sms = std::atoi(argv[1]);
     try { std::cout << get_mega_moe_num_sms(); }
     catch (const std::runtime_error&) { return 2; }
 }
@@ -95,7 +97,7 @@ int main(int argc, char** argv) {
         self.assertNotIn("const int num_sms = device_runtime->get_num_sms();", source)
         # The ordinary dense GEMM helper has no whole-grid barrier and keeps
         # its own occupancy heuristic; do not indiscriminately cap every GEMM.
-        self.assertIn(".num_sms = device_runtime->get_num_sms(),", source)
+        self.assertIn(".num_sms = runtime->get_num_sms(),", source)
 
 
 if __name__ == "__main__":

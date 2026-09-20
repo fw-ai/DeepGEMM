@@ -21,19 +21,10 @@ from deep_gemm.utils import (
 from deep_gemm.utils.dist import init_dist
 
 
-def _block_m(tokens: int, ranks: int, topk: int, experts: int) -> int:
-    expected = tokens * ranks * topk / experts
-    if expected <= 8.5:
-        return 16
-    if expected <= 16.5:
-        return 32
-    if expected <= 32.5:
-        return 64
-    if expected <= 64.5:
-        return 96
-    if expected <= 96.5:
-        return 128
-    return 192
+def _block_m(tokens: int, ranks: int, topk: int, experts: int, mma_type="bf16xbf16") -> int:
+    capacity = deep_gemm.align(tokens, deep_gemm._C.get_token_alignment_for_mega_moe())
+    return deep_gemm._C.get_block_m_for_mega_moe(
+        ranks, experts, capacity, tokens, topk, mma_type)
 
 
 def _active_rows(counts: torch.Tensor, padded: torch.Tensor) -> torch.Tensor:
@@ -467,7 +458,7 @@ def run_bf16_correctness(local_rank: int, world: int, args) -> None:
     block_m = _block_m(tokens, ranks, topk, experts)
     buffer = deep_gemm.get_symm_buffer_for_mega_moe(
         group, experts, tokens, topk, hidden, intermediate,
-        mma_type="bf16xbf16", activation=args.activation)
+        mma_type="bf16xbf16", activation=args.activation, side_lora=True)
 
     x = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16) * 0.1
     w13 = torch.randn(local_experts, 2 * intermediate, hidden, device="cuda", dtype=torch.bfloat16) * 0.02
@@ -752,10 +743,10 @@ def run_mxfp4_correctness(local_rank: int, world: int, args) -> None:
     tokens, hidden, intermediate = args.tokens, args.hidden, args.intermediate
     experts, topk = args.experts, args.topk
     local_experts = experts // ranks
-    block_m = _block_m(tokens, ranks, topk, experts)
+    block_m = _block_m(tokens, ranks, topk, experts, "fp8xfp4")
     buffer = deep_gemm.get_symm_buffer_for_mega_moe(
         group, experts, tokens, topk, hidden, intermediate,
-        mma_type="fp8xfp4", activation=args.activation)
+        mma_type="fp8xfp4", activation=args.activation, side_lora=True)
 
     x_bf16 = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16) * 0.1
     x_fp8 = per_token_cast_to_fp8(

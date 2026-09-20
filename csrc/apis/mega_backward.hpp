@@ -477,7 +477,6 @@ static void bf16_mega_moe_backward_w13_combine(
 }
 
 static void register_apis(pybind11::module_& m) {
-#if DG_TENSORMAP_COMPATIBLE
     m.def(
         "fp8_fp4_mega_moe_side_lora_backward",
         &deep_gemm::sm100_fp8_fp4_mega_moe_side_lora_backward);
@@ -751,7 +750,6 @@ static void register_apis(pybind11::module_& m) {
           py::arg("num_topk"),
           py::arg("topk_ids") = py::none(),
           py::arg("combine_order_mode") = "fixed_topk");
-#endif
 }
 
 }  // namespace deep_gemm::mega_backward

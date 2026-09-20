@@ -2,16 +2,15 @@
 
 #include <torch/python.h>
 
-#include "../../jit/compiler.hpp"
-#include "../../jit/kernel_runtime.hpp"
 #include "../../utils/exception.hpp"
-#include "../../utils/format.hpp"
+#include <format>
+#include "mega_moe_side_lora_launch.hpp"
 #include "runtime_utils.hpp"
 
 #include <deep_gemm/layout/mega_moe.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
 
-#include "../heuristics/mega_moe.hpp"
+#include "../heuristics/mega_moe_side_lora.hpp"
 
 namespace deep_gemm {
 
@@ -35,7 +34,7 @@ static std::string get_mxfp4_side_lora_route_weight_mode_name(
     DG_HOST_UNREACHABLE("Unsupported route weight mode");
 }
 
-class SM100FP8FP4MegaMoESideLoraForwardRuntime final : public LaunchRuntime<SM100FP8FP4MegaMoESideLoraForwardRuntime> {
+class SM100FP8FP4MegaMoESideLoraForwardRuntime final {
 public:
     struct Args {
         // Templated arguments
@@ -50,7 +49,7 @@ public:
         std::string route_weight_mode;
         bool save_down_unweighted;
         int side_lora_rank;
-        MegaMoEConfig config;
+        SideLoraMegaMoEConfig config;
 
         // Runtime arguments
         void* y;
@@ -90,11 +89,11 @@ public:
         CUtensorMap tensor_map_lora_l2_scratch_store;
 
         // Launch configs
-        LaunchArgs launch_args;
+        deep_jit::cuda::LaunchOptions launch_args;
     };
 
-    static std::string generate_impl(const Args& args) {
-        return fmt::format(R"(
+    static std::string generate(const Args& args) {
+        return std::format(R"(
 #include <deep_gemm/impls/sm100_fp8_fp4_mega_moe_side_lora_forward.cuh>
 
 using namespace deep_gemm;
@@ -135,7 +134,7 @@ static void __instantiate_kernel() {{
     args.config.num_stages,
     args.config.num_bytes_per_pull,
     args.config.num_dispatch_threads, args.config.num_non_epilogue_threads, args.config.num_epilogue_threads,
-    args.launch_args.grid_dim.first, args.num_ranks,
+    args.launch_args.grid_dim->x, args.num_ranks,
     to_string(args.activation_clamp),
     args.fast_math ? "true" : "false",
     get_mxfp4_side_lora_activation_type_name(args.activation),
@@ -146,9 +145,9 @@ static void __instantiate_kernel() {{
     args.side_lora_rank);
     }
 
-    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
+    static void launch(const std::shared_ptr<deep_jit::cuda::Kernel>& kernel, const Args& args) {
         // TODO: optimize `args` copy
-        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
+        jit->launch(kernel, args.launch_args,
             args.y,
             args.saved_l1_preact,
             args.saved_x,
@@ -182,7 +181,7 @@ static void __instantiate_kernel() {{
             args.tensor_map_lora_l2_scratch,
             args.tensor_map_lora_l1_scratch_store,
             args.tensor_map_lora_l2_scratch_store
-        ));
+        );
     }
 };
 
@@ -234,7 +233,7 @@ static void sm100_fp8_fp4_mega_moe_side_lora_forward(
         side_lora_l2_scratch.has_value() && side_lora_ready.has_value());
 
     // Heuristics
-    const auto config = get_mega_moe_config(
+    const auto config = get_side_lora_mega_moe_config(
         num_ranks, num_experts, num_experts_per_rank,
         num_max_tokens_per_rank, num_config_tokens, num_topk,
         hidden, intermediate_hidden,
@@ -504,13 +503,13 @@ static void sm100_fp8_fp4_mega_moe_side_lora_forward(
             tensor_map_lora_l1_scratch_store,
         .tensor_map_lora_l2_scratch_store =
             tensor_map_lora_l2_scratch_store,
-        .launch_args = LaunchArgs(num_sms,
+        .launch_args = side_lora_launch_options(num_sms,
                                   config.num_dispatch_threads + config.num_non_epilogue_threads + config.num_epilogue_threads,
                                   config.smem_size, 2)
     };
 
     const auto code = SM100FP8FP4MegaMoESideLoraForwardRuntime::generate(args);
-    const auto runtime = compiler->build("sm100_fp8_fp4_mega_moe_side_lora_forward", code);
+    const auto runtime = jit->compile("sm100_fp8_fp4_mega_moe_side_lora_forward", code);
     SM100FP8FP4MegaMoESideLoraForwardRuntime::launch(runtime, args);
 }
 

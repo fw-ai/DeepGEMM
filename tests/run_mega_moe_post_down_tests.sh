@@ -2,7 +2,7 @@
 set -euo pipefail
 
 common=(
-  tests/test_mega_moe.py
+  tests/test_mega_moe_training.py
   --hidden 1024
   --intermediate-hidden 1024
   --num-experts 8
