@@ -55,6 +55,12 @@ def cases():
                 "cutlass::bfloat16_t", "epilogue::transform::EpilogueIdentity", 100,
                 2, combine, "CombineOrderMode::DeepEPV1", 64 if combine else 0]
         yield f"wgrad_combine{int(combine)}", "sm100_bf16_gemm", "sm100_bf16_gemm_impl", args
+        masked_args = args.copy()
+        masked_args[7] = 64
+        masked_args[9:11] = [128, 128]
+        masked_args[18] = 128
+        masked_args.append(True)
+        yield f"wgrad_masked_tail_combine{int(combine)}", "sm100_bf16_gemm", "sm100_bf16_gemm_impl", masked_args
 
     for layout in (1, 2):
         yield (f"psum_layout{layout}", "smxx_layout", "transpose_and_pack_strided_fp32_into_ue8m0",
