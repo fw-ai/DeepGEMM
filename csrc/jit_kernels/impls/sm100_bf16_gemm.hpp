@@ -53,6 +53,7 @@ public:
         std::string combine_order_mode = "fixed_topk";
         uint32_t combine_num_extra_threads = 0;
         bool mask_grouped_k_tail = false;
+        int k_alignment_override = 0;
     };
 
     static void compile_and_launch(const std::string& tag, const Args& args) {
@@ -92,7 +93,8 @@ static void __instantiate_kernel() {{
         args.gemm_config.launch_config.num_non_epilogue_threads, args.gemm_config.launch_config.num_epilogue_threads,
         args.gemm_config.layout.get_cluster_size(), args.gemm_config.layout.cluster_n > 1,
         args.gemm_config.launch_config.num_sms,
-        heuristics_runtime->get_mk_alignment_for_contiguous_layout(),
+        args.k_alignment_override != 0 ? args.k_alignment_override :
+            heuristics_runtime->get_mk_alignment_for_contiguous_layout(),
         args.gemm_config.layout.swap_ab, args.gemm_desc.ensure_zero_padding,
         to_string(args.gemm_desc.gemm_type), args.gemm_desc.with_accumulation,
         to_string(args.gemm_desc.cd_dtype),

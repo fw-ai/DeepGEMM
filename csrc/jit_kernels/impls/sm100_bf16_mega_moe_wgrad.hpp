@@ -192,6 +192,10 @@ static void sm100_bf16_mega_moe_wgrad_1sm(
         .combine_num_extra_threads =
             static_cast<uint32_t>(num_extra_combine_threads),
         .mask_grouped_k_tail = mask_grouped_k_tail,
+        // Count-based BF16 groups use explicit physical offsets and no SF.
+        // Do not inherit unrelated global grouped-GEMM alignment (e.g. 224),
+        // which need not be divisible by this kernel's K tile.
+        .k_alignment_override = kBlockK,
     };
     SM100BF16GemmRuntime::compile_and_launch(kernel_name, args);
 }
