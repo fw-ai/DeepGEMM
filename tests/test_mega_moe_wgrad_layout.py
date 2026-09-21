@@ -77,3 +77,18 @@ def test_wgrad_rejects_invalid_k_tile(monkeypatch):
     output = torch.empty(1, 128, 128, dtype=torch.bfloat16, device="cuda")
     with pytest.raises(RuntimeError, match="kBlockK"):
         deep_gemm.bf16_mega_moe_backward_w13(output, a, a, counts, 240)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a Blackwell GPU")
+def test_wgrad_independent_of_global_grouped_alignment(monkeypatch):
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("requires SM100/SM103")
+    previous = deep_gemm.get_mk_alignment_for_contiguous_layout()
+    try:
+        # Dense/grouped BF16 users may select 224; MegaMoE's physical pool
+        # must remain independent, and its wgrad must not mutate that setting.
+        deep_gemm.set_mk_alignment_for_contiguous_layout(224)
+        test_wgrad_wide_k_masks_expert_tail(monkeypatch, 240, 128)
+        assert deep_gemm.get_mk_alignment_for_contiguous_layout() == 224
+    finally:
+        deep_gemm.set_mk_alignment_for_contiguous_layout(previous)
