@@ -63,23 +63,21 @@ static void sm100_bf16_mega_moe_wgrad_1sm(
     const int kBlockN = deep_jit::get_env<int>(
         "DG_BF16_MEGA_MOE_WGRAD_BLOCK_N",
         n % 256 == 0 ? 256 : 128);
-    // The K-grouped scheduler addresses each expert in the shared physical
-    // pool. Its K tile must divide the forward pool alignment; otherwise the
-    // final tile of one expert reads rows from the next expert. In particular,
-    // BLOCK_M=96 previously contaminated Qwen top-8 wgrads while BLOCK_M=128
-    // happened to pass.
+    // Preserve the physical expert offsets while amortizing TMA/barrier cost
+    // over K=64. For pools such as 96/240, mask whole 16-wide MMA atoms in the
+    // final tile rather than accumulating rows from the following expert.
     const int kBlockK = deep_jit::get_env<int>(
-        "DG_BF16_MEGA_MOE_WGRAD_BLOCK_K",
-        pool_block_m % 64 == 0 ? 64 :
-        pool_block_m % 32 == 0 ? 32 : 16);
+        "DG_BF16_MEGA_MOE_WGRAD_BLOCK_K", 64);
+    DG_HOST_ASSERT(kBlockK == 16 or kBlockK == 32 or kBlockK == 64);
+    DG_HOST_ASSERT(pool_block_m % 16 == 0);
+    const bool mask_grouped_k_tail = pool_block_m % kBlockK != 0;
     const int kNumStages = deep_jit::get_env<int>(
         "DG_BF16_MEGA_MOE_WGRAD_NUM_STAGES", 4);
     const int kSwizzle =
         kBlockK * static_cast<int>(sizeof(cutlass::bfloat16_t));
     const int kStoreBlockN = deep_jit::get_env<int>(
         "DG_BF16_MEGA_MOE_WGRAD_STORE_BLOCK_N", 64);
-    // The output store width is independent of the A/B K tile. In particular,
-    // a 240-row pool requires K=16 but still uses the default 64-column store.
+    // The output store width is independent of the A/B K tile.
     const int kSwizzleCD = kStoreBlockN * sizeof(cutlass::bfloat16_t);
     DG_HOST_ASSERT(kSwizzleCD == 32 or kSwizzleCD == 64 or kSwizzleCD == 128);
     constexpr int kNumNonEpilogueThreads = 128;
@@ -193,6 +191,7 @@ static void sm100_bf16_mega_moe_wgrad_1sm(
         .combine_order_mode = combine.order_mode,
         .combine_num_extra_threads =
             static_cast<uint32_t>(num_extra_combine_threads),
+        .mask_grouped_k_tail = mask_grouped_k_tail,
     };
     SM100BF16GemmRuntime::compile_and_launch(kernel_name, args);
 }

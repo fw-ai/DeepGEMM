@@ -52,6 +52,7 @@ public:
         bool combine_reduce = false;
         std::string combine_order_mode = "fixed_topk";
         uint32_t combine_num_extra_threads = 0;
+        bool mask_grouped_k_tail = false;
     };
 
     static void compile_and_launch(const std::string& tag, const Args& args) {
@@ -76,7 +77,7 @@ static void __instantiate_kernel() {{
         {}, {}, {},
         {},
         {},
-        {}, {}, {}, {}
+        {}, {}, {}, {}, {}
     >);
 }};
 )",
@@ -99,7 +100,7 @@ static void __instantiate_kernel() {{
         args.gemm_desc.tc_util,
         args.combine_num_ranks, args.fuse_combine,
         get_bf16_gemm_combine_order_mode_name(args.combine_order_mode),
-        args.combine_num_extra_threads));
+        args.combine_num_extra_threads, args.mask_grouped_k_tail));
 
         // Launch
         jit->launch(

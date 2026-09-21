@@ -37,7 +37,8 @@ template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
           uint64_t kTensorCoreUtilControl,
           uint32_t kCombineNumRanks, bool kFuseCombine,
           CombineOrderMode kCombineOrderMode,
-          uint32_t kNumExtraCombineThreads>
+          uint32_t kNumExtraCombineThreads,
+          bool kMaskGroupedKTail = false>
 CUTLASS_GLOBAL void __launch_bounds__(
     kNumNonEpilogueThreads + kNumEpilogueThreads +
         kNumExtraCombineThreads,
@@ -92,6 +93,10 @@ sm100_bf16_gemm_impl(int* grouped_layout,
         "Invalid block K");
     DG_STATIC_ASSERT(BLOCK_K % UMMA_K == 0, "Block K must be divisible by UMMA K");
     DG_STATIC_ASSERT(not is_k_grouped_contiguous(kGemmType) or kKAlignment % BLOCK_K == 0, "K alignment must be divisible by block K");
+    DG_STATIC_ASSERT(not kMaskGroupedKTail or
+                     (kGemmType == GemmType::KGroupedContiguous and
+                      kMajorA == cute::UMMA::Major::MN and kMajorB == cute::UMMA::Major::MN),
+                     "Masked K tails require physical count-based MN-major groups");
     DG_STATIC_ASSERT(kNumMulticast == 1 or kNumMulticast == 2, "Only support 1/2 multicast");
     DG_STATIC_ASSERT((kSwapAB and BLOCK_N == LAYOUT_AD_M) or
                      (not kSwapAB and (BLOCK_M == 32 or BLOCK_M == 64 or BLOCK_M == LAYOUT_AD_M)), "Invalid block size");
@@ -321,6 +326,17 @@ sm100_bf16_gemm_impl(int* grouped_layout,
                 if (cute::elect_one_sync()) {
                     #pragma unroll
                     for (uint32_t umma_k_idx = 0; umma_k_idx < BLOCK_K / UMMA_K; ++ umma_k_idx) {
+                        // MegaMoE groups are padded to at least UMMA_K, not
+                        // necessarily BLOCK_K (e.g. 240-row pools). TMA may
+                        // read the next group's rows in the final tile, but
+                        // those entire 16-wide MMA atoms must not contribute.
+                        // Keep the existing empty-group initialization path;
+                        // the epilogue explicitly writes zeros for that group.
+                        if constexpr (kMaskGroupedKTail) {
+                            if (scheduler.current_shape_k != 0 and
+                                k_block_idx * BLOCK_K + umma_k_idx * UMMA_K >= scheduler.current_shape_k)
+                                continue;
+                        }
                         const uint32_t atom_k_idx = umma_k_idx * UMMA_K / BLOCK_ATOM_K;
                         const uint32_t inner_k_idx = umma_k_idx * UMMA_K % BLOCK_ATOM_K;
                         a_desc.lo = mma::sm100::advance_umma_desc_lo<kMajorA, LOAD_BLOCK_M, kSwizzleAMode, cutlass::bfloat16_t>(
