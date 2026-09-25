@@ -10,6 +10,8 @@
 #include "../runtime/runtime.hpp"
 #include "../jit_kernels/impls/sm100_bf16_mega_moe.hpp"
 #include "../jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp"
+#include "../jit_kernels/impls/sm100_bf16_mega_moe_side_lora_forward.hpp"
+#include "../jit_kernels/impls/sm100_fp8_fp4_mega_moe_side_lora_forward.hpp"
 
 namespace deep_gemm::mega {
 
@@ -43,6 +45,30 @@ static int get_block_m_for_mega_moe(
     return block_m;
 }
 
+static int get_num_ring_tokens_for_mega_moe(
+    const int num_ranks, const int num_experts,
+    const int num_max_tokens_per_rank, const int num_topk,
+    const int hidden, const int intermediate_hidden) {
+    DG_HOST_ASSERT(num_ranks > 0 && num_experts > 0 && num_experts % num_ranks == 0);
+    // Ring capacity: worst-case live pool blocks over all candidate BLOCK_M; mirrors the kernel assert.
+    // TODO: we temporarily assume the SM count is consistent with the runtime value
+    const auto num_sms = get_mega_moe_num_sms();
+    const auto num_experts_per_rank = num_experts / num_ranks;
+    const auto num_active_topk = std::min(num_topk, num_experts_per_rank);
+    const auto num_max_routed_tokens = num_max_tokens_per_rank * num_ranks * num_active_topk;
+
+    // Iterate all block candidates to get the maximum ring size
+    int num_ring_tokens = 0;
+    for (const auto& block_m: layout::kCandidateBlockM) {
+        const auto num_pool_blocks = ceil_div(num_max_routed_tokens, block_m) + num_experts_per_rank;
+        const auto num_live_pool_blocks = sched::get_num_max_live_pool_blocks(
+            num_pool_blocks, num_sms, hidden, intermediate_hidden);
+        num_ring_tokens = std::max(num_ring_tokens, num_live_pool_blocks * block_m);
+    }
+    num_ring_tokens = math::align(num_ring_tokens, layout::kLCMCandidateBlockM);
+    return num_ring_tokens;
+}
+
 static std::tuple<
     int64_t,
     std::function<MegaMoESharedSlices(const torch::Tensor&)>>
@@ -58,25 +84,10 @@ get_symm_buffer_size_for_mega_moe_v3(
     DG_HOST_ASSERT(activation == "swiglu" or activation == "geglu");
     DG_HOST_ASSERT(num_shared_experts >= 0);
 
-    // Ring capacity: worst-case live pool blocks over all candidate BLOCK_M; mirrors the kernel assert.
-    // TODO: we temporarily assume the SM count is consistent with the runtime value
-    const auto num_sms = get_mega_moe_num_sms();
     const auto num_experts_per_rank = num_experts / num_ranks;
-    const auto num_active_topk = std::min(num_topk, num_experts_per_rank);
-    const auto num_max_routed_tokens = num_max_tokens_per_rank * num_ranks * num_active_topk;
-
-    // Shared
     const int shared_intermediate_hidden = intermediate_hidden * num_shared_experts;
-
-    // Iterate all block candidates to get the maximum ring size
-    int num_ring_tokens = 0;
-    for (const auto& block_m: layout::kCandidateBlockM) {
-        const auto num_pool_blocks = ceil_div(num_max_routed_tokens, block_m) + num_experts_per_rank;
-        const auto num_live_pool_blocks = sched::get_num_max_live_pool_blocks(
-            num_pool_blocks, num_sms, hidden, intermediate_hidden);
-        num_ring_tokens = std::max(num_ring_tokens, num_live_pool_blocks * block_m);
-    }
-    num_ring_tokens = math::align(num_ring_tokens, layout::kLCMCandidateBlockM);
+    int num_ring_tokens = get_num_ring_tokens_for_mega_moe(
+        num_ranks, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden);
     DG_HOST_ASSERT(requested_num_ring_tokens >= 0);
     if (requested_num_ring_tokens > 0) {
         DG_HOST_ASSERT(requested_num_ring_tokens % layout::kLCMCandidateBlockM == 0);
@@ -267,6 +278,43 @@ get_symm_buffer_size_for_mega_moe(
     return {
         expanded_num_bytes - route_plane_bytes,
         legacy_slicer};
+}
+
+
+using MegaMoESideLoraSlices = decltype(std::tuple_cat(
+    std::declval<MegaMoESharedSlices>(), std::declval<std::tuple<torch::Tensor>>()));
+
+// Side-LoRA retains its own fused phase scheduler. Its wave must fit at
+// least one expert's worst-case input, in addition to the upstream ring bound.
+static std::tuple<int64_t, std::function<MegaMoESideLoraSlices(const torch::Tensor&)>>
+get_symm_buffer_size_for_mega_moe_side_lora(
+    const int num_ranks, const int num_experts,
+    const int num_max_tokens_per_rank, const int num_topk,
+    const int hidden, const int intermediate_hidden,
+    const std::string& mma_type, const std::string& activation,
+    const int requested_num_ring_tokens) {
+    const auto minimum = std::max(
+        num_ranks * num_max_tokens_per_rank,
+        get_num_ring_tokens_for_mega_moe(
+            num_ranks, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden));
+    const auto ring_tokens = requested_num_ring_tokens > 0 ? requested_num_ring_tokens : minimum;
+    DG_HOST_ASSERT(ring_tokens >= minimum);
+    const auto [base_bytes, base_slice] = get_symm_buffer_size_for_mega_moe_v3(
+        num_ranks, num_experts, num_max_tokens_per_rank, num_topk,
+        hidden, intermediate_hidden, mma_type, activation, ring_tokens, 0);
+    const bool with_sf = is_mma_with_sf(parse_mma_kind(mma_type));
+    const int64_t extra_bytes = with_sf ? int64_t(num_max_tokens_per_rank) * hidden * 2 : 0;
+    auto slice = [=](const torch::Tensor& buffer) {
+        DG_HOST_ASSERT(int64_t(buffer.nbytes()) >= base_bytes + extra_bytes);
+        auto views = base_slice(buffer);
+        auto source = with_sf ? torch::from_blob(
+            math::advance_ptr(buffer.data_ptr(), base_bytes),
+            {num_max_tokens_per_rank, hidden},
+            torch::TensorOptions().dtype(torch::kBFloat16).device(buffer.device()))
+            : std::get<0>(views);
+        return std::tuple_cat(views, std::make_tuple(source));
+    };
+    return {base_bytes + extra_bytes, slice};
 }
 
 static void fp8_fp4_mega_moe(
@@ -639,7 +687,347 @@ static void bf16_mega_moe(
         sym_buffer.zero_();
 }
 
+static void fp8_fp4_mega_moe_side_lora(
+    const torch::Tensor& y,
+    const std::tuple<torch::Tensor, torch::Tensor>& l1_weights_tuple,
+    const std::tuple<torch::Tensor, torch::Tensor>& l2_weights_tuple,
+    const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
+    const torch::Tensor& sym_buffer,
+    const std::vector<int64_t>& sym_buffer_ptrs, const int& rank_idx,
+    const int& num_max_tokens_per_rank,
+    const int& num_experts, const int& num_topk,
+    const std::tuple<int, int, int>& recipe,
+    const std::string& activation,
+    const std::optional<float>& activation_clamp_opt,
+    const bool& fast_math,
+    const int& num_ring_tokens,
+    const std::optional<torch::Tensor>& saved_l1_preact,
+    const std::string& route_weight_mode,
+    const std::optional<torch::Tensor>& saved_down_unweighted,
+    const std::optional<int>& num_config_tokens_opt,
+    const torch::Tensor& saved_x,
+    const torch::Tensor& saved_h_unweighted,
+    const torch::Tensor& side_lora_a1,
+    const torch::Tensor& side_lora_b1,
+    const torch::Tensor& side_lora_a3,
+    const torch::Tensor& side_lora_b3,
+    const torch::Tensor& side_lora_a2,
+    const torch::Tensor& side_lora_b2,
+    const torch::Tensor& side_lora_l1_scratch,
+    const torch::Tensor& side_lora_l2_scratch,
+    const torch::Tensor& side_lora_ready,
+    const float& side_lora_scale
+) {
+    const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
+    const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
+
+    // Config checks
+    const auto num_tokens = static_cast<int>(y.size(0));
+    const auto num_config_tokens =
+        num_config_tokens_opt.value_or(num_tokens);
+    const auto [rm, rn, rk] = recipe;
+    DG_HOST_ASSERT(rm == 1 and rn == 1 and rk == 32);
+    DG_HOST_ASSERT(activation == "swiglu" or activation == "geglu");
+    DG_HOST_ASSERT(
+        route_weight_mode == "pre_down" ||
+        route_weight_mode == "post_down");
+
+    // Activation checks
+    const auto activation_clamp =
+        activation_clamp_opt.value_or(std::numeric_limits<float>::infinity());
+    DG_HOST_ASSERT(activation_clamp >= 0);
+
+    // Tensor checks
+    DG_HOST_ASSERT(get_major_type_ab(l1_weights) == cute::UMMA::Major::K);
+    DG_HOST_ASSERT(get_major_type_ab(l2_weights) == cute::UMMA::Major::K);
+    const auto arch_major = jit->device.get_arch_major();
+    const auto [num_experts_per_rank, intermediate_hidden_2, hidden] =
+        check_grouped_ab_fp8_fp4(l1_weights, cute::UMMA::Major::K, arch_major);
+    const auto [num_experts_per_rank_, hidden_, intermediate_hidden] =
+        check_grouped_ab_fp8_fp4(l2_weights, cute::UMMA::Major::K, arch_major);
+    DG_HOST_ASSERT(num_tokens <= num_max_tokens_per_rank);
+    DG_HOST_ASSERT(num_experts_per_rank == num_experts_per_rank_);
+    DG_HOST_ASSERT(hidden == hidden_);
+    DG_HOST_ASSERT(intermediate_hidden_2 == 2 * intermediate_hidden);
+    DG_HOST_ASSERT(l1_weights.is_contiguous() and l2_weights.is_contiguous());
+    DG_HOST_ASSERT(num_config_tokens >= num_tokens);
+    DG_HOST_ASSERT(num_config_tokens <= num_max_tokens_per_rank);
+
+    // Check weight SF layout for UE8M0 packing, MN-major, and TMA alignment
+    constexpr int kGranMN = 1, kGranK = 32;
+    check_sf_layout(l1_weights_sf, intermediate_hidden * 2, hidden, kGranMN, kGranK,
+                    num_experts_per_rank, true, false, torch::kInt);
+    check_sf_layout(l2_weights_sf, hidden, intermediate_hidden, kGranMN, kGranK,
+                    num_experts_per_rank, true, false, torch::kInt);
+
+    // Check stats counter
+    if (cumulative_local_expert_recv_stats.has_value()) {
+        DG_HOST_ASSERT(cumulative_local_expert_recv_stats->scalar_type() == torch::kInt);
+        DG_HOST_ASSERT(cumulative_local_expert_recv_stats->numel() == num_experts_per_rank);
+        DG_HOST_ASSERT(cumulative_local_expert_recv_stats->is_contiguous());
+    }
+
+    // Check buffer bytes
+    const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
+    const auto num_experts_ = num_experts_per_rank * num_ranks;
+    const auto num_max_pool_tokens =
+        layout::get_num_max_pool_tokens(
+            num_ranks, num_max_tokens_per_rank, num_topk,
+            num_experts_per_rank);
+    if (saved_down_unweighted.has_value()) {
+        DG_HOST_ASSERT(
+            saved_down_unweighted->scalar_type() ==
+            torch::kBFloat16);
+        DG_HOST_ASSERT(saved_down_unweighted->is_contiguous());
+        DG_HOST_ASSERT(saved_down_unweighted->dim() == 2);
+        DG_HOST_ASSERT(saved_down_unweighted->size(1) == hidden);
+        DG_HOST_ASSERT(saved_down_unweighted->size(0) > 0);
+        DG_HOST_ASSERT(
+            saved_down_unweighted->size(0) <=
+            num_max_pool_tokens);
+    }
+    const auto [expanded_num_required_bytes, slice] =
+        get_symm_buffer_size_for_mega_moe_side_lora(
+        num_ranks, num_experts,
+        num_max_tokens_per_rank, num_topk,
+        hidden, intermediate_hidden,
+        "fp8xfp4", activation, num_ring_tokens);
+    const auto num_required_bytes = expanded_num_required_bytes;
+    DG_HOST_ASSERT(sym_buffer.nbytes() >= static_cast<size_t>(num_required_bytes));
+    DG_HOST_ASSERT(num_experts == num_experts_);
+
+    // Already registered tensors
+    const auto [x, x_sf, topk_idx, topk_weights, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf,
+                token_src_metadata, backward_grad_y, _backward_grad_route,
+                _shared_l1, _shared_l1_sf, _shared_l2, _shared_l2_sf,
+                side_lora_source] = slice(sym_buffer);
+
+    // Dispatch into different architectures
+    if (arch_major == 10) {
+        sm100_fp8_fp4_mega_moe_side_lora_forward(y,
+                               saved_l1_preact,
+                               l1_acts, l1_acts_sf,
+                               l2_acts, l2_acts_sf,
+                               l1_weights, l2_weights,
+                               l1_weights_sf, l2_weights_sf,
+                               cumulative_local_expert_recv_stats,
+                               sym_buffer_ptrs,
+                               rank_idx, num_max_tokens_per_rank,
+                               num_experts_per_rank,
+                               num_tokens, num_config_tokens, num_topk,
+                               hidden, intermediate_hidden,
+                               activation, activation_clamp, fast_math,
+                               route_weight_mode,
+                               saved_down_unweighted,
+                               side_lora_source,
+                               saved_x,
+                               saved_h_unweighted,
+                               side_lora_a1, side_lora_b1,
+                               side_lora_a3, side_lora_b3,
+                               side_lora_a2, side_lora_b2,
+                               side_lora_l1_scratch,
+                               side_lora_l2_scratch,
+                               side_lora_ready,
+                               side_lora_scale);
+    } else {
+        DG_HOST_UNREACHABLE("Unsupported architecture");
+    }
+
+    // Zero the entire symmetric buffer for debug mode
+    // NOTES: caller must re-copy inputs into the buffer before each kernel call
+    if (deep_jit::get_env<int>("DG_COMM_KERNEL_DEBUG"))
+        sym_buffer.zero_();
+}
+
+
+static void bf16_mega_moe_side_lora(
+    const torch::Tensor& y,
+    const torch::Tensor& l1_weights,
+    const torch::Tensor& l2_weights,
+    const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
+    const torch::Tensor& sym_buffer,
+    const std::vector<int64_t>& sym_buffer_ptrs, const int& rank_idx,
+    const int& num_max_tokens_per_rank,
+    const int& num_experts, const int& num_topk,
+    const std::string& activation,
+    const std::optional<float>& activation_clamp_opt,
+    const bool& fast_math,
+    const int& num_ring_tokens,
+    const std::optional<torch::Tensor>& saved_l1_preact,
+    const std::string& route_weight_mode,
+    const std::optional<torch::Tensor>& saved_h_unweighted,
+    const std::optional<torch::Tensor>& saved_h_weighted,
+    const std::optional<torch::Tensor>& saved_down_unweighted,
+    const int& num_config_tokens,
+    const std::string& combine_order_mode,
+    const std::optional<torch::Tensor>& precomputed_route_counts,
+    const std::optional<int>& active_pool_rows,
+    const std::optional<torch::Tensor>& route_count_mismatch,
+    const std::optional<torch::Tensor>& saved_x,
+    const std::optional<torch::Tensor>& side_lora_a1,
+    const std::optional<torch::Tensor>& side_lora_b1,
+    const std::optional<torch::Tensor>& side_lora_a3,
+    const std::optional<torch::Tensor>& side_lora_b3,
+    const std::optional<torch::Tensor>& side_lora_a2,
+    const std::optional<torch::Tensor>& side_lora_b2,
+    const std::optional<torch::Tensor>& side_lora_l1_scratch,
+    const std::optional<torch::Tensor>& side_lora_l2_scratch,
+    const std::optional<torch::Tensor>& side_lora_ready,
+    const float& side_lora_scale
+) {
+    // Config checks
+    const auto num_tokens = static_cast<int>(y.size(0));
+    DG_HOST_ASSERT(activation == "swiglu" or activation == "geglu");
+    DG_HOST_ASSERT(
+        route_weight_mode == "pre_down" ||
+        route_weight_mode == "post_down");
+    DG_HOST_ASSERT(
+        combine_order_mode == "fixed_topk" ||
+        combine_order_mode == "deepep" ||
+        combine_order_mode == "deepep_v1");
+
+    // Activation checks
+    const auto activation_clamp =
+        activation_clamp_opt.value_or(std::numeric_limits<float>::infinity());
+    DG_HOST_ASSERT(activation_clamp >= 0);
+
+    // Tensor checks
+    DG_HOST_ASSERT(get_major_type_ab(l1_weights) == cute::UMMA::Major::K);
+    DG_HOST_ASSERT(get_major_type_ab(l2_weights) == cute::UMMA::Major::K);
+    const auto arch_major = jit->device.get_arch_major();
+    const auto [num_experts_per_rank, intermediate_hidden_2, hidden] = get_shape<3>(l1_weights);
+    const auto [num_experts_per_rank_, hidden_, intermediate_hidden] = get_shape<3>(l2_weights);
+    DG_HOST_ASSERT(l1_weights.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(l2_weights.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(y.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(y.is_contiguous());
+    DG_HOST_ASSERT(y.sizes() == torch::IntArrayRef({num_tokens, hidden}));
+    DG_HOST_ASSERT(num_tokens <= num_max_tokens_per_rank);
+    DG_HOST_ASSERT(num_config_tokens >= num_tokens);
+    DG_HOST_ASSERT(num_config_tokens <= num_max_tokens_per_rank);
+    DG_HOST_ASSERT(num_experts_per_rank == num_experts_per_rank_);
+    DG_HOST_ASSERT(hidden == hidden_);
+    DG_HOST_ASSERT(intermediate_hidden_2 == 2 * intermediate_hidden);
+    DG_HOST_ASSERT(l1_weights.is_contiguous() and l2_weights.is_contiguous());
+
+    // Check stats counter
+    if (cumulative_local_expert_recv_stats.has_value()) {
+        DG_HOST_ASSERT(cumulative_local_expert_recv_stats->scalar_type() == torch::kInt);
+        DG_HOST_ASSERT(cumulative_local_expert_recv_stats->numel() == num_experts_per_rank);
+        DG_HOST_ASSERT(cumulative_local_expert_recv_stats->is_contiguous());
+    }
+    DG_HOST_ASSERT(
+        precomputed_route_counts.has_value() ==
+        active_pool_rows.has_value());
+    DG_HOST_ASSERT(
+        precomputed_route_counts.has_value() ==
+        route_count_mismatch.has_value());
+    if (precomputed_route_counts.has_value()) {
+        DG_HOST_ASSERT(
+            precomputed_route_counts->scalar_type() ==
+            torch::kInt);
+        DG_HOST_ASSERT(
+            precomputed_route_counts->numel() == num_experts);
+        DG_HOST_ASSERT(precomputed_route_counts->is_contiguous());
+        DG_HOST_ASSERT(
+            route_count_mismatch->scalar_type() == torch::kInt);
+        DG_HOST_ASSERT(route_count_mismatch->numel() == 1);
+        DG_HOST_ASSERT(route_count_mismatch->is_contiguous());
+        DG_HOST_ASSERT(*active_pool_rows > 0);
+    }
+
+    // Check buffer bytes
+    const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
+    const auto num_experts_ = num_experts_per_rank * num_ranks;
+    const auto [expanded_num_required_bytes, slice] =
+        get_symm_buffer_size_for_mega_moe_side_lora(
+        num_ranks, num_experts,
+        num_max_tokens_per_rank, num_topk,
+        hidden, intermediate_hidden,
+        "bf16xbf16", activation, num_ring_tokens);
+    DG_HOST_ASSERT(
+        sym_buffer.nbytes() >=
+        static_cast<size_t>(expanded_num_required_bytes));
+    DG_HOST_ASSERT(num_experts == num_experts_);
+
+    // Already registered tensors
+    const auto [x, _x_sf, topk_idx, topk_weights, l1_acts, _l1_acts_sf,
+                l2_acts, _l2_acts_sf, _token_src_metadata,
+                _backward_grad_y, _backward_grad_route,
+                _shared_l1, _shared_l1_sf, _shared_l2, _shared_l2_sf,
+                _side_lora_source] =
+        slice(sym_buffer);
+
+    // Dispatch into different architectures
+    if (arch_major == 10) {
+        sm100_bf16_mega_moe_side_lora_forward(y,
+                            saved_l1_preact,
+                            l1_acts, l2_acts,
+                            l1_weights, l2_weights,
+                            cumulative_local_expert_recv_stats,
+                            sym_buffer_ptrs,
+                            rank_idx, num_max_tokens_per_rank,
+                            num_experts_per_rank,
+                            num_tokens, num_config_tokens, num_topk,
+                            hidden, intermediate_hidden,
+                            activation,
+                            activation_clamp, fast_math,
+                            route_weight_mode,
+                            saved_h_unweighted,
+                            saved_h_weighted,
+                            saved_down_unweighted,
+                            combine_order_mode,
+                            precomputed_route_counts,
+                            active_pool_rows,
+                            route_count_mismatch,
+                            saved_x,
+                            side_lora_a1,
+                            side_lora_b1,
+                            side_lora_a3,
+                            side_lora_b3,
+                            side_lora_a2,
+                            side_lora_b2,
+                            side_lora_l1_scratch,
+                            side_lora_l2_scratch,
+                            side_lora_ready,
+                            side_lora_scale);
+    } else {
+        DG_HOST_UNREACHABLE("Unsupported architecture");
+    }
+
+    // Zero the entire symmetric buffer for debug mode
+    // NOTES: caller must re-copy inputs into the buffer before each kernel call
+    if (deep_jit::get_env<int>("DG_COMM_KERNEL_DEBUG"))
+        sym_buffer.zero_();
+}
+
+
 static void register_apis(pybind11::module_& m) {
+    m.def("bf16_mega_moe_side_lora", &bf16_mega_moe_side_lora);
+    m.def("get_symm_buffer_size_for_mega_moe_side_lora", &get_symm_buffer_size_for_mega_moe_side_lora);
+    m.def("get_num_ring_tokens_for_mega_moe", &get_num_ring_tokens_for_mega_moe);
+    m.def(
+        "fp8_fp4_mega_moe_side_lora",
+        &fp8_fp4_mega_moe_side_lora,
+        py::arg("y"), py::arg("l1_weights_tuple"),
+        py::arg("l2_weights_tuple"),
+        py::arg("cumulative_local_expert_recv_stats"),
+        py::arg("sym_buffer"), py::arg("sym_buffer_ptrs"),
+        py::arg("rank_idx"), py::arg("num_max_tokens_per_rank"),
+        py::arg("num_experts"), py::arg("num_topk"),
+        py::arg("recipe"), py::arg("activation"),
+        py::arg("activation_clamp_opt"), py::arg("fast_math"),
+        py::arg("num_ring_tokens"), py::arg("saved_l1_preact"),
+        py::arg("route_weight_mode"),
+        py::arg("saved_down_unweighted"),
+        py::arg("num_config_tokens"), py::arg("saved_x"),
+        py::arg("saved_h_unweighted"), py::arg("side_lora_a1"),
+        py::arg("side_lora_b1"), py::arg("side_lora_a3"),
+        py::arg("side_lora_b3"), py::arg("side_lora_a2"),
+        py::arg("side_lora_b2"), py::arg("side_lora_l1_scratch"),
+        py::arg("side_lora_l2_scratch"), py::arg("side_lora_ready"),
+        py::arg("side_lora_scale"));
+
     m.def("get_symm_buffer_size_for_mega_moe_v3", &get_symm_buffer_size_for_mega_moe_v3);
     m.def("get_token_alignment_for_mega_moe", &get_token_alignment_for_mega_moe);
     m.def("get_block_m_for_mega_moe", &get_block_m_for_mega_moe);

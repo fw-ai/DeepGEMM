@@ -29,7 +29,9 @@ static void sm100_bf16_mega_moe_wgrad_1sm(
     const torch::Tensor& d,
     const torch::Tensor& padded_expert_counts,
     const int pool_block_m,
-    const MegaMoEBackwardCombineArgs& combine = {}) {
+    const MegaMoEBackwardCombineArgs& combine = {},
+    const bool allow_row_strided_inputs = false,
+    const std::string& kernel_name = "sm100_bf16_mega_moe_wgrad_1sm") {
     const auto [num_groups, m, n] = get_shape<3>(d);
     const auto [pool_rows_a, m_] = get_shape<2>(a);
     const auto [pool_rows_b, n_] = get_shape<2>(b);
@@ -42,7 +44,11 @@ static void sm100_bf16_mega_moe_wgrad_1sm(
         a.scalar_type() == torch::kBFloat16 and
         b.scalar_type() == torch::kBFloat16 and
         d.scalar_type() == torch::kBFloat16);
-    DG_HOST_ASSERT(a.is_contiguous() and b.is_contiguous() and d.is_contiguous());
+    DG_HOST_ASSERT(d.is_contiguous());
+    DG_HOST_ASSERT(
+        allow_row_strided_inputs
+            ? (a.stride(1) == 1 and b.stride(1) == 1)
+            : (a.is_contiguous() and b.is_contiguous()));
 
     DG_HOST_ASSERT(
         pool_block_m == 16 || pool_block_m == 32 ||
@@ -191,7 +197,7 @@ static void sm100_bf16_mega_moe_wgrad_1sm(
         // which need not be divisible by this kernel's K tile.
         .k_alignment_override = kBlockK,
     };
-    SM100BF16GemmRuntime::compile_and_launch("sm100_bf16_mega_moe_wgrad_1sm", args);
+    SM100BF16GemmRuntime::compile_and_launch(kernel_name, args);
 }
 
 } // namespace deep_gemm

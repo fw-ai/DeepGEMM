@@ -86,3 +86,40 @@ def test_symm_buffer_keeps_ring_argument_and_exposes_shared_views(monkeypatch):
     assert buffer.backward_grad_route is views[10]
     assert buffer.shared_l1_acts is views[11]
     assert buffer.shared_l2_acts_sf is views[14]
+
+
+@pytest.mark.parametrize("mma_type", ["bf16xbf16", "fp8xfp4"])
+def test_side_buffer_is_explicit_and_keeps_upstream_views(monkeypatch, mma_type):
+    group = SimpleNamespace(size=lambda: 1)
+    base = SimpleNamespace(buffer=torch.empty(32, dtype=torch.int8), handle=object(), group=group)
+    views = [torch.full((2, 4), i) for i in range(16)]
+    if mma_type == "bf16xbf16":
+        views[-1] = views[0]
+    calls = []
+
+    def size_and_slicer(*args):
+        calls.append(args)
+        return 32, lambda buffer: views
+
+    monkeypatch.setattr(deep_gemm._C, "get_token_alignment_for_mega_moe", lambda: 1920)
+    monkeypatch.setattr(deep_gemm._C, "get_symm_buffer_size_for_mega_moe_side_lora", size_and_slicer)
+    buffer = deep_gemm.SymmBuffer(
+        group, 4, 128, 2, 4, 4, mma_type=mma_type, base=base, side_lora=True,
+    )
+    assert calls == [(1, 4, 1920, 2, 4, 4, mma_type, "swiglu", 0)]
+    assert buffer.side_lora_source is views[15]
+    assert buffer.token_src_metadata is views[8]
+    assert buffer.backward_grad_y is views[9]
+    assert buffer.backward_grad_route is views[10]
+    assert buffer.shared_l2_acts_sf is views[14]
+    with pytest.raises(ValueError, match="in-kernel shared experts"):
+        deep_gemm.SymmBuffer(
+            group, 4, 128, 2, 4, 4, base=base, side_lora=True, num_shared_experts=1,
+        )
+
+
+def test_bf16_side_forward_rejects_ordinary_buffer():
+    buffer = _buffer()
+    buffer.side_lora_source = None
+    with pytest.raises(ValueError, match="side_lora=True"):
+        deep_gemm.bf16_mega_moe_side_lora(torch.empty(2, 4), None, None, buffer)
