@@ -244,6 +244,7 @@ public:
     };
 
     static std::string generate(const Args& args) {
+        DG_HOST_ASSERT(args.bf16_mode || args.gate_up_prepared);
         return std::format(R"(
 #include <deep_gemm/impls/sm100_bf16_mega_moe_side_lora_backward.cuh>
 
@@ -680,11 +681,9 @@ static void sm100_bf16_mega_moe_side_lora_backward(
     DG_HOST_ASSERT(
         x_pool_output.sizes() ==
         torch::IntArrayRef({num_pool_rows, hidden}));
+    DG_HOST_ASSERT(write_grad_x_pool);
     DG_HOST_ASSERT(
-        write_grad_x_pool
-            ? grad_x_pool_output.sizes() == x_pool_output.sizes()
-            : grad_x_pool_output.sizes() ==
-                  torch::IntArrayRef({0, hidden}));
+        grad_x_pool_output.sizes() == x_pool_output.sizes());
     DG_HOST_ASSERT(grad_ye.sizes() == x_pool_output.sizes());
     DG_HOST_ASSERT(
         grad_y_unweighted_output.sizes() ==
@@ -713,7 +712,6 @@ static void sm100_bf16_mega_moe_side_lora_backward(
     DG_HOST_ASSERT(
         token_src_metadata.size(0) >= num_pool_rows &&
         token_src_metadata.size(1) == 3);
-    DG_HOST_ASSERT(write_grad_x_pool || direct_remote_grad_x);
     DG_HOST_ASSERT(side_lora_a1.sizes() == torch::IntArrayRef(
         {side_lora_rank, hidden}));
     DG_HOST_ASSERT(side_lora_a3.sizes() == side_lora_a1.sizes());
@@ -949,7 +947,7 @@ static void sm100_bf16_mega_moe_side_lora_backward(
 
     const int num_sms = get_mega_moe_num_sms();
     DG_HOST_ASSERT(num_sms % 2 == 0);
-    constexpr int num_trace_sites = 22;
+    constexpr int num_trace_sites = 23;
     constexpr int num_trace_values = 5;
     if (kernel_trace.has_value()) {
         DG_HOST_ASSERT(
@@ -1156,7 +1154,7 @@ static void sm100_bf16_mega_moe_side_lora_backward(
         // The side publisher sends the final base+side value once. Emitting
         // the base value remotely here would only be overwritten later.
         .direct_remote_grad_x = false,
-        .write_grad_x_pool = true,
+        .write_grad_x_pool = write_grad_x_pool,
         .clear_wgrad_padding = clear_wgrad_padding,
         .compute_route_grad = true,
         .trace_kernel = kernel_trace.has_value(),
@@ -1570,9 +1568,8 @@ static void sm100_fp8_fp4_mega_moe_side_lora_backward(
                  (hidden / block_n)) +
             2);
     DG_HOST_ASSERT(grid_sync_counter.is_contiguous());
-    if (compute_w13_dgrad)
-        DG_HOST_ASSERT(write_grad_x_pool || direct_remote_grad_x);
-    else
+    DG_HOST_ASSERT(write_grad_x_pool);
+    if (!compute_w13_dgrad)
         DG_HOST_ASSERT(!direct_remote_grad_x);
     if (direct_remote_grad_x) {
         DG_HOST_ASSERT(compute_w13_dgrad);
@@ -1961,7 +1958,7 @@ static void sm100_fp8_fp4_mega_moe_side_lora_backward(
         .side_lora = side_lora_params,
         .compute_w13_dgrad = compute_w13_dgrad,
         .direct_remote_grad_x = false,
-        .write_grad_x_pool = true,
+        .write_grad_x_pool = write_grad_x_pool,
         .clear_wgrad_padding = clear_wgrad_padding,
         .compute_route_grad =
             grad_route_output.has_value(),

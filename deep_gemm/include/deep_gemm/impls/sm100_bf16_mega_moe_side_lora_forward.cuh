@@ -465,20 +465,22 @@ sm100_bf16_mega_moe_side_lora_forward_impl(void* y,
                             kDispatchBarrierIdx);
                     });
 
-                if (
-                    global_warp_idx < kNumExperts &&
-                    lane_idx == 0) {
-                    uint32_t prefix = 0;
-                    for (uint32_t source_warp = 0;
-                         source_warp < kNumGlobalWarps;
-                         ++source_warp) {
-                        auto count_ptr =
-                            warp_expert_prefix +
-                            source_warp * kNumExperts +
-                            global_warp_idx;
-                        const uint32_t count = *count_ptr;
-                        *count_ptr = prefix;
-                        prefix += count;
+                if (lane_idx == 0) {
+                    for (uint32_t expert_idx = global_warp_idx;
+                         expert_idx < kNumExperts;
+                         expert_idx += kNumGlobalWarps) {
+                        uint32_t prefix = 0;
+                        for (uint32_t source_warp = 0;
+                             source_warp < kNumGlobalWarps;
+                             ++source_warp) {
+                            auto count_ptr =
+                                warp_expert_prefix +
+                                source_warp * kNumExperts +
+                                expert_idx;
+                            const uint32_t count = *count_ptr;
+                            *count_ptr = prefix;
+                            prefix += count;
+                        }
                     }
                 }
 

@@ -36,6 +36,9 @@ _BF16_BACKWARD_KERNEL_TRACE_SITES = (
     "kernel_final_cluster_sync",
     "w13_compute_and_grad_x_publication",
 )
+_BF16_SIDE_LORA_BACKWARD_KERNEL_TRACE_SITES = _BF16_BACKWARD_KERNEL_TRACE_SITES + (
+    "canonical_gate_up_grad_deinterleave_handoff",
+)
 _BF16_BACKWARD_KERNEL_TRACE_FIELDS = (
     "begin_cycle",
     "end_cycle",
@@ -61,6 +64,24 @@ def _timed_cuda_phase(name: str, operation: Callable[[], Any]) -> Any:
     end.record()
     hook(name, start, end, wall_ms)
     return result
+
+
+def _allocate_backward_kernel_trace(
+    sites: tuple[str, ...], device: torch.device,
+) -> tuple[torch.Tensor, float]:
+    properties = torch.cuda.get_device_properties(device)
+    return (
+        torch.zeros(
+            (
+                len(sites),
+                properties.multi_processor_count,
+                len(_BF16_BACKWARD_KERNEL_TRACE_FIELDS),
+            ),
+            dtype=torch.int64,
+            device=device,
+        ),
+        float(properties.clock_rate),
+    )
 
 
 def _storage_byte_range(tensor: torch.Tensor) -> tuple[int, int]:
@@ -579,17 +600,11 @@ def bf16_mega_moe_backward_dgrad(
     kernel_trace = None
     trace_clock_rate_khz = 0.0
     if kernel_trace_hook is not None:
-        properties = torch.cuda.get_device_properties(grad_y.device)
-        kernel_trace = torch.zeros(
-            (
-                len(_BF16_BACKWARD_KERNEL_TRACE_SITES),
-                properties.multi_processor_count,
-                len(_BF16_BACKWARD_KERNEL_TRACE_FIELDS),
-            ),
-            dtype=torch.int64,
-            device=grad_y.device,
+        kernel_trace, trace_clock_rate_khz = (
+            _allocate_backward_kernel_trace(
+                _BF16_BACKWARD_KERNEL_TRACE_SITES, grad_y.device,
+            )
         )
-        trace_clock_rate_khz = float(properties.clock_rate)
     _timed_cuda_phase(
         "kernel_a_dgrad",
         lambda: _C.bf16_mega_moe_backward_dgrad_v2(
@@ -973,6 +988,8 @@ def _allocate_side_lora_backward_outputs(
     reuse_gate_for_grad_x: bool = False,
     saved_x_pool: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, ...]:
+    if not write_grad_x_pool:
+        raise ValueError("side-LoRA backward requires write_grad_x_pool=True")
     pool_rows = gate_up.size(0)
     options = dict(dtype=torch.bfloat16, device=gate_up.device)
     grad_ye = torch.empty((pool_rows, hidden), **options)
@@ -995,18 +1012,14 @@ def _allocate_side_lora_backward_outputs(
         x_pool = saved_x_pool
     else:
         x_pool = torch.empty_like(grad_ye)
-    if write_grad_x_pool and reuse_gate_for_grad_x:
+    if reuse_gate_for_grad_x:
         if gate_up.numel() != pool_rows * hidden:
             raise ValueError(
                 "gate_up storage cannot cover the grad-x pool"
             )
         grad_x_pool = gate_up.view(pool_rows, hidden)
     else:
-        grad_x_pool = (
-            torch.empty_like(grad_ye)
-            if write_grad_x_pool
-            else torch.empty((0, hidden), **options)
-        )
+        grad_x_pool = torch.empty_like(grad_ye)
     route_weights = torch.empty(
         pool_rows, dtype=torch.float32, device=gate_up.device)
     grad_route = torch.empty_like(route_weights)
@@ -1055,7 +1068,7 @@ def bf16_mega_moe_side_lora_backward(
     side_lora_scale: float = 1.0,
     direct_remote_grad_x: Optional[bool] = None,
     combine_grad_x: bool = True,
-    write_grad_x_pool: Optional[bool] = None,
+    write_grad_x_pool: bool = True,
     out: Optional[MegaMoESideLoraBackwardResult] = None,
     grid_sync_counter: Optional[torch.Tensor] = None,
     expert_psum_rows: Optional[torch.Tensor] = None,
@@ -1078,14 +1091,11 @@ def bf16_mega_moe_side_lora_backward(
         raise ValueError("side_lora must be a rank-128 transformed tuple")
     if direct_remote_grad_x is None:
         direct_remote_grad_x = sym_buffer.group.size() > 1
-    if write_grad_x_pool is None:
-        write_grad_x_pool = not direct_remote_grad_x
-    if not write_grad_x_pool and not direct_remote_grad_x:
-        raise ValueError("grad-x requires a local or direct remote output")
+    if not write_grad_x_pool:
+        raise ValueError("side-LoRA backward requires write_grad_x_pool=True")
     # The native specialization materializes the base dgrad pool, folds both
     # side branches into it, then publishes the final value once. This is the
     # ordinary base-dgrad output, not an additional side-LoRA wide scratch.
-    write_grad_x_pool = True
     outputs = (
         _allocate_side_lora_backward_outputs(
             gate_up_output, side_lora, w13_weights.size(2),
@@ -1102,7 +1112,6 @@ def bf16_mega_moe_side_lora_backward(
      grad_side_lora) = outputs
     if saved_x_pool is not None and x_pool.data_ptr() != saved_x_pool.data_ptr():
         raise ValueError("out.x_pool must alias saved_x_pool when it is provided")
-    _direct_grad_x_planes(sym_buffer).zero_()
     sym_buffer.backward_grad_y[:grad_y.size(0)].copy_(
         grad_y.to(torch.bfloat16).contiguous())
     sym_buffer.backward_grad_route.zero_()
@@ -1128,6 +1137,16 @@ def bf16_mega_moe_side_lora_backward(
         sym_buffer.group.rank(), sym_buffer.num_topk, block_m,
         combine_order_mode.value, True, False, False, True, True,
         False, saved_x_pool is not None, 256)
+    kernel_trace_hook = _BF16_BACKWARD_KERNEL_TRACE_HOOK
+    kernel_trace = None
+    trace_clock_rate_khz = 0.0
+    if kernel_trace_hook is not None:
+        kernel_trace, trace_clock_rate_khz = (
+            _allocate_backward_kernel_trace(
+                _BF16_SIDE_LORA_BACKWARD_KERNEL_TRACE_SITES,
+                grad_y.device,
+            )
+        )
     _C.bf16_mega_moe_side_lora_backward(
         gate_up_output, grad_h, grad_gate_up, h_act, h_weighted,
         x_pool, grad_x_pool, grad_route, grad_ye, grad_ye,
@@ -1143,7 +1162,14 @@ def bf16_mega_moe_side_lora_backward(
         sym_buffer.group.rank(), sym_buffer.num_max_tokens_per_rank,
         sym_buffer.num_topk, "dispatch_prepared", *side_lora, q13, q2, saved_h,
         t13, t2, *grad_side_lora, expert_psum_rows,
-        padded_expert_counts, float(side_lora_scale), None)
+        padded_expert_counts, float(side_lora_scale), kernel_trace)
+    if kernel_trace_hook is not None:
+        kernel_trace_hook(
+            kernel_trace,
+            trace_clock_rate_khz,
+            expert_counts,
+            block_m,
+        )
     grad_x = None
     if direct_remote_grad_x and combine_grad_x:
         grad_x = (
@@ -1183,7 +1209,7 @@ def fp8_fp4_mega_moe_side_lora_backward(
     side_lora_scale: float = 1.0,
     direct_remote_grad_x: Optional[bool] = None,
     combine_grad_x: bool = True,
-    write_grad_x_pool: Optional[bool] = None,
+    write_grad_x_pool: bool = True,
     out: Optional[MegaMoESideLoraBackwardResult] = None,
     grid_sync_counter: Optional[torch.Tensor] = None,
     expert_psum_rows: Optional[torch.Tensor] = None,
@@ -1201,11 +1227,8 @@ def fp8_fp4_mega_moe_side_lora_backward(
         raise ValueError("side_lora must be a rank-128 transformed tuple")
     if direct_remote_grad_x is None:
         direct_remote_grad_x = sym_buffer.group.size() > 1
-    if write_grad_x_pool is None:
-        write_grad_x_pool = not direct_remote_grad_x
-    if not write_grad_x_pool and not direct_remote_grad_x:
-        raise ValueError("grad-x requires a local or direct remote output")
-    write_grad_x_pool = True
+    if not write_grad_x_pool:
+        raise ValueError("side-LoRA backward requires write_grad_x_pool=True")
     hidden = w2_weights[0].size(1)
     intermediate_hidden = w2_dequant_scratch.size(2)
     expected_down_shape = (gate_up_output.size(0), hidden)
@@ -1249,7 +1272,6 @@ def fp8_fp4_mega_moe_side_lora_backward(
             raise ValueError(
                 "reuse_gate_grad_x requires grad_x_pool to reuse gate_up"
             )
-    _direct_grad_x_planes(sym_buffer).zero_()
     sym_buffer.backward_grad_y[:grad_y.size(0)].copy_(
         grad_y.to(torch.bfloat16).contiguous())
     sym_buffer.backward_grad_route.zero_()

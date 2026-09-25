@@ -1832,6 +1832,9 @@ sm100_bf16_mega_moe_side_lora_backward_wave_impl(
     DG_STATIC_ASSERT(SF_BLOCK_N == BLOCK_N, "Invalid SFB block");
     DG_STATIC_ASSERT(kHidden % BLOCK_K == 0, "Invalid hidden size");
     DG_STATIC_ASSERT(kNumSMs % 2 == 0, "2-CTA clusters require an even SM count");
+    DG_STATIC_ASSERT(
+        kBF16Mode || kGateUpPrepared,
+        "MXFP4 side-LoRA backward requires prepared gate/up inputs");
 
     constexpr uint32_t kNumW13WeightTileStates =
         kNumExperts *

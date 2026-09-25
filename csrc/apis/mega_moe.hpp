@@ -945,11 +945,9 @@ static void bf16_mega_moe_side_lora(
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
         "bf16xbf16", activation, num_ring_tokens);
-    const auto num_required_bytes =
-        expanded_num_required_bytes -
-        static_cast<int64_t>(num_max_tokens_per_rank) *
-            num_topk * sizeof(float);
-    DG_HOST_ASSERT(sym_buffer.nbytes() >= static_cast<size_t>(num_required_bytes));
+    DG_HOST_ASSERT(
+        sym_buffer.nbytes() >=
+        static_cast<size_t>(expanded_num_required_bytes));
     DG_HOST_ASSERT(num_experts == num_experts_);
 
     // Already registered tensors
