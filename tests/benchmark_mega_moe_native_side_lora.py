@@ -198,7 +198,8 @@ def run_bf16(local_rank: int, world: int, args) -> None:
         side_gate, side_hw, side_down, q13, q2, side,
         w2, transformed_w13, counts, padded, grad_y, buffer, block_m,
         fast_math=True, side_lora_scale=args.scale,
-        direct_remote_grad_x=True, write_grad_x_pool=True)
+        direct_remote_grad_x=True, write_grad_x_pool=True,
+        rank_uniform_block_m=True)
     side_grid = torch.zeros_like(grid)
     expert_psum = padded.cumsum(0).to(torch.int32)
 
@@ -210,7 +211,7 @@ def run_bf16(local_rank: int, world: int, args) -> None:
             fast_math=True, side_lora_scale=args.scale,
             direct_remote_grad_x=True, write_grad_x_pool=True,
             out=side_result, grid_sync_counter=side_grid,
-            expert_psum_rows=expert_psum)
+            expert_psum_rows=expert_psum, rank_uniform_block_m=True)
         # The caller represents the replicated 2-D A1/A3/B2
         # factors as DTensors with Partial gradients. Include those reductions
         # so this is an end-to-end EP training comparison, not only kernel time.

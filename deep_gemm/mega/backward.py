@@ -1046,6 +1046,25 @@ def _allocate_side_lora_backward_outputs(
     )
 
 
+def _side_backward_block_m(
+    block_m: int,
+    sym_buffer: Any,
+    device: torch.device,
+    rank_uniform_block_m: bool,
+) -> int:
+    """Match ordinary backward's rank-uniform persistent-grid contract.
+
+    Callers that retained a rank-uniform forward tile may opt out, avoiding
+    a duplicate collective and host scalar read (including during capture).
+    Otherwise the MAX reduction must precede both prelude and native wave.
+    """
+    if rank_uniform_block_m or sym_buffer.group.size() == 1:
+        return block_m
+    uniform = torch.tensor(block_m, dtype=torch.int32, device=device)
+    dist.all_reduce(uniform, op=dist.ReduceOp.MAX, group=sym_buffer.group)
+    return int(uniform.item())
+
+
 def bf16_mega_moe_side_lora_backward(
     gate_up_output: torch.Tensor,
     saved_h: torch.Tensor,
@@ -1073,6 +1092,8 @@ def bf16_mega_moe_side_lora_backward(
     grid_sync_counter: Optional[torch.Tensor] = None,
     expert_psum_rows: Optional[torch.Tensor] = None,
     saved_x_pool: Optional[torch.Tensor] = None,
+    *,
+    rank_uniform_block_m: bool = False,
 ) -> MegaMoESideLoraBackwardResult:
     """Run the dedicated BF16 base-dgrad + rank-128 LoRA backward.
 
@@ -1081,6 +1102,11 @@ def bf16_mega_moe_side_lora_backward(
     gradient scratch buffers. ``w13_weights`` uses the same 8-row gate/up
     interleave returned by :func:`transform_weights_for_mega_moe`; the
     internal ``grad_gate_up`` result is emitted in that matching interleave.
+
+    ``rank_uniform_block_m=True`` requires a caller-retained forward tile
+    proven identical across all EP ranks, including recomputed forwards. It
+    skips the default MAX collective/host read, as in ordinary backward, and
+    is the capture-safe path; never set it for a local token-derived tile.
     """
     route_weight_mode = RouteWeightMode(route_weight_mode)
     combine_order_mode = CombineOrderMode(combine_order_mode)
@@ -1093,6 +1119,8 @@ def bf16_mega_moe_side_lora_backward(
         direct_remote_grad_x = sym_buffer.group.size() > 1
     if not write_grad_x_pool:
         raise ValueError("side-LoRA backward requires write_grad_x_pool=True")
+    block_m = _side_backward_block_m(
+        block_m, sym_buffer, grad_y.device, rank_uniform_block_m)
     # The native specialization materializes the base dgrad pool, folds both
     # side branches into it, then publishes the final value once. This is the
     # ordinary base-dgrad output, not an additional side-LoRA wide scratch.
@@ -1215,8 +1243,14 @@ def fp8_fp4_mega_moe_side_lora_backward(
     expert_psum_rows: Optional[torch.Tensor] = None,
     reuse_gate_for_grad_x: bool = False,
     saved_x_pool: Optional[torch.Tensor] = None,
+    *,
+    rank_uniform_block_m: bool = False,
 ) -> MegaMoESideLoraBackwardResult:
-    """Run the dedicated MXFP4 base-dgrad + BF16 side-LoRA backward."""
+    """Run the dedicated MXFP4 base-dgrad + BF16 side-LoRA backward.
+
+    ``rank_uniform_block_m=True`` has the same caller-proven forward-tile
+    contract and capture-safe collective bypass as the BF16 side wrapper.
+    """
     if activation not in ("swiglu", "geglu"):
         raise ValueError(f"unsupported activation: {activation}")
     route_weight_mode = RouteWeightMode(route_weight_mode)
@@ -1229,6 +1263,8 @@ def fp8_fp4_mega_moe_side_lora_backward(
         direct_remote_grad_x = sym_buffer.group.size() > 1
     if not write_grad_x_pool:
         raise ValueError("side-LoRA backward requires write_grad_x_pool=True")
+    block_m = _side_backward_block_m(
+        block_m, sym_buffer, grad_y.device, rank_uniform_block_m)
     hidden = w2_weights[0].size(1)
     intermediate_hidden = w2_dequant_scratch.size(2)
     expected_down_shape = (gate_up_output.size(0), hidden)

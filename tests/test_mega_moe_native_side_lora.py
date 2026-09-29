@@ -456,6 +456,10 @@ def run_bf16_correctness(local_rank: int, world: int, args) -> None:
     experts, topk = args.experts, args.topk
     local_experts = experts // ranks
     block_m = _block_m(tokens, ranks, topk, experts)
+    if getattr(args, "check_local_backward_tile", False):
+        assert ranks > 1 and block_m > 16, (ranks, block_m)
+        if rank == 0:
+            print(f"Uniform forward fixture; injected backward tiles rank0=16, peers={block_m}", flush=True)
     buffer = deep_gemm.get_symm_buffer_for_mega_moe(
         group, experts, tokens, topk, hidden, intermediate,
         mma_type="bf16xbf16", activation=args.activation, side_lora=True)
@@ -591,7 +595,8 @@ def run_bf16_correctness(local_rank: int, world: int, args) -> None:
         saved_h_weighted if args.route_weight_mode == "pre_down" else saved_h,
         saved_down, q13, q2, side,
         w2, transformed_w13, counts, padded, grad_y, buffer,
-        block_m, activation_limit=args.activation_limit,
+        (16 if getattr(args, "check_local_backward_tile", False) and rank == 0 else block_m),
+        activation_limit=args.activation_limit,
         activation=args.activation, fast_math=False,
         route_weight_mode=args.route_weight_mode,
         side_lora_scale=args.scale, direct_remote_grad_x=ranks > 1,
@@ -744,6 +749,10 @@ def run_mxfp4_correctness(local_rank: int, world: int, args) -> None:
     experts, topk = args.experts, args.topk
     local_experts = experts // ranks
     block_m = _block_m(tokens, ranks, topk, experts, "fp8xfp4")
+    if getattr(args, "check_local_backward_tile", False):
+        assert ranks > 1 and block_m > 16, (ranks, block_m)
+        if rank == 0:
+            print(f"Uniform forward fixture; injected backward tiles rank0=16, peers={block_m}", flush=True)
     buffer = deep_gemm.get_symm_buffer_for_mega_moe(
         group, experts, tokens, topk, hidden, intermediate,
         mma_type="fp8xfp4", activation=args.activation, side_lora=True)
@@ -929,7 +938,8 @@ def run_mxfp4_correctness(local_rank: int, world: int, args) -> None:
             buffer.l1_acts[:pool_rows], buffer.l1_acts_sf,
             transformed_w13, backward_w13, backward_w2,
             w13_dequant_scratch, w2_dequant_scratch,
-            counts, padded, grad_y, buffer, block_m,
+            counts, padded, grad_y, buffer,
+            (16 if getattr(args, "check_local_backward_tile", False) and rank == 0 else block_m),
             activation_limit=args.activation_limit,
             activation=args.activation,
             fast_math=False,
@@ -1303,6 +1313,9 @@ if __name__ == "__main__":
     parser.add_argument("--check-short-saved-down", action="store_true")
     parser.add_argument("--check-repeatability", action="store_true")
     parser.add_argument("--reuse-saved-x-pool", action="store_true")
+    parser.add_argument(
+        "--check-local-backward-tile", action="store_true",
+        help="Probe public backward rank-uniform guard with rank0's local tile16; forward pool stays uniform")
     args = parser.parse_args()
     if args.experts % args.num_processes:
         parser.error("experts must be divisible by num-processes")

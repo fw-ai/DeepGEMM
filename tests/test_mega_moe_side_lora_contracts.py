@@ -6,6 +6,9 @@ without a compiled extension or a GPU.
 
 import ast
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 BACKWARD_PY = ROOT / "deep_gemm/mega/backward.py"
@@ -216,3 +219,59 @@ def test_side_lora_remote_grad_x_clear_is_kernel_owned() -> None:
     assert "reinterpret_cast<uint4*>(combine_buffer)[vector_idx]" in kernel
     assert "make_uint4(0, 0, 0, 0);" in kernel
     assert "comm::nvlink_barrier<kNumRanks, kNumSMs, 256, 1, 73>" in kernel
+
+
+@pytest.mark.parametrize("local_block_m", [16, 32, 64])
+def test_side_backward_canonicalizes_empty_short_and_full_rank_tiles(local_block_m):
+    tree = ast.parse(BACKWARD_PY.read_text())
+    function = _python_function(tree, "_side_backward_block_m")
+    calls = []
+    group = SimpleNamespace(size=lambda: 3)
+
+    class Scalar:
+        def __init__(self, value):
+            self.value = value
+
+        def item(self):
+            calls.append("item")
+            return self.value
+
+    def tensor(value, *, dtype, device):
+        assert value == local_block_m
+        assert dtype == "int32" and device == "test-device"
+        calls.append("tensor")
+        return Scalar(value)
+
+    def all_reduce(value, *, op, group):
+        assert op == "MAX"
+        assert group.size() == 3
+        calls.append("all_reduce")
+        value.value = 64
+
+    namespace = {
+        "Any": object,
+        "torch": SimpleNamespace(tensor=tensor, int32="int32", device=object),
+        "dist": SimpleNamespace(all_reduce=all_reduce, ReduceOp=SimpleNamespace(MAX="MAX")),
+    }
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(BACKWARD_PY), "exec"), namespace)
+    helper = namespace["_side_backward_block_m"]
+    assert helper(local_block_m, SimpleNamespace(group=group), "test-device", False) == 64
+    assert calls == ["tensor", "all_reduce", "item"]
+    calls.clear()
+    # Uniform forward metadata is the caller-owned capture-safe fast path.
+    assert helper(64, SimpleNamespace(group=group), "test-device", True) == 64
+    assert calls == []
+    assert helper(local_block_m, SimpleNamespace(group=SimpleNamespace(size=lambda: 1)), "test-device", False) == local_block_m
+    assert calls == []
+
+
+def test_both_side_wrappers_canonicalize_before_any_native_launch():
+    source = BACKWARD_PY.read_text()
+    tree = ast.parse(source)
+    for name in ("bf16_mega_moe_side_lora_backward", "fp8_fp4_mega_moe_side_lora_backward"):
+        function = _python_function(tree, name)
+        assert _default(function, "rank_uniform_block_m") is False
+        assert "rank_uniform_block_m" in [arg.arg for arg in function.args.kwonlyargs]
+        body = ast.get_source_segment(source, function)
+        assert body.count("_side_backward_block_m(") == 1
+        assert body.index("block_m = _side_backward_block_m(") < body.index("_C.")
