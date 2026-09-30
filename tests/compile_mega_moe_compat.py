@@ -12,6 +12,37 @@ import subprocess
 def cases():
     for kind in ("bf16", "fp8_fp4"):
         for block_m in (32, 240):
+            args = [1920, 512, 256, 4, 2, 2, block_m, 128,
+                    64 if kind == "bf16" else 128, 16 if block_m == 32 else 40]
+            if kind == "fp8_fp4":
+                args += [128 if block_m == 32 else 256, 128]
+            args += [3840]
+            if kind == "fp8_fp4":
+                args += [61440]
+            args += [3, 1024 if kind == "bf16" else 512, 128, 128, 256,
+                     8, 2, "__builtin_inff()", False, "ActivationType::SwiGLU", True]
+            if kind == "bf16":
+                args += [True]
+            args += ["RouteWeightMode::PreDown"]
+            if kind == "bf16":
+                args += ["CombineOrderMode::FixedTopK"]
+            args += [True]
+            if kind == "bf16":
+                args += [True]
+            args += [128]
+            header = f"sm100_{kind}_mega_moe_side_lora_forward"
+            yield f"side_{kind}_m{block_m}", header, header + "_impl", args
+
+    for bf16 in (False, True):
+        args = [512, 256, 4, 32, 128, 128, 128, 128, 3, 8, 2,
+                True, bf16, "ActivationType::SwiGLU", False,
+                "RouteWeightMode::PreDown", "CombineOrderMode::FixedTopK",
+                False, False, True, False, True, True, False, False, False, True]
+        yield (f"side_backward_b{int(bf16)}", "sm100_bf16_mega_moe_side_lora_backward",
+               "sm100_bf16_mega_moe_side_lora_backward_wave_impl", args)
+
+    for kind in ("bf16", "fp8_fp4"):
+        for block_m in (32, 240):
             for shared, training in ((0, False), (1, False), (0, True)):
                 args = [1920, 512, 256, 4, shared, 2, block_m, 128,
                         64 if kind == "bf16" else 128, 16 if block_m == 32 else 40]
