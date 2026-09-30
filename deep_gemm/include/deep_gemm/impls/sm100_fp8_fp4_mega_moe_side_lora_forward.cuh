@@ -438,14 +438,236 @@ sm100_fp8_fp4_mega_moe_side_lora_forward_impl(void* y,
         }
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
-        // Write source indices (~2 us with 512 tokens)
-        read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
-            const auto dst_rank_idx = expert_idx / kNumExpertsPerRank;
-            const auto dst_slot_idx = atomicAdd_block(shared_storage.expert_token_count + expert_idx, 1);
-            const auto dst_ptr = workspace.get_src_token_topk_idx_ptr(
-                expert_idx % kNumExpertsPerRank, sym_buffer.rank_idx, dst_slot_idx);
-            *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;
-        });
+        if constexpr (kHasSideLora && kSaveL1Preact) {
+            // Stabilize source-rank-local token/top-k slots for side training.
+            // Keep the existing round-robin rank transport below. Partition
+            // the source routes into contiguous global-warp ranges, build an
+            // expert prefix for every range, then compact each range in route
+            // order. This preserves the exact order without making every
+            // expert warp rescan the complete route tensor.
+            const uint32_t global_warp_idx =
+                sm_idx * kNumDispatchWarps + warp_idx;
+            constexpr uint32_t kNumGlobalWarps =
+                kNumSMs * kNumDispatchWarps;
+            constexpr uint32_t kWarpSize = 32;
+            constexpr uint32_t kScratchValues =
+                kNumGlobalWarps * kNumExperts;
+            // This metadata storage is idle until dispatch pull rewrites it.
+            // The final dispatch grid sync and NVLink barrier below finish
+            // every prefix-table reader before that later metadata write.
+            static_assert(sizeof(layout::TokenSrcMetadata) ==
+                          3 * sizeof(uint32_t));
+            const bool use_parallel_stable_compaction =
+                kNumBytesPerPull >= kNumExperts * sizeof(uint32_t) &&
+                3 * workspace.num_max_pool_tokens >= kScratchValues;
+            if (use_parallel_stable_compaction) {
+                auto warp_expert_prefix = reinterpret_cast<uint32_t*>(
+                    workspace.get_token_src_metadata_ptr());
+                const uint32_t num_routes = num_tokens * kNumTopk;
+                const uint32_t routes_per_warp = math::align(
+                    math::ceil_div(num_routes, kNumGlobalWarps),
+                    kWarpSize);
+                const uint32_t route_begin =
+                    global_warp_idx * routes_per_warp;
+                const uint32_t route_end =
+                    cute::min(route_begin + routes_per_warp, num_routes);
+                auto warp_prefix_row =
+                    warp_expert_prefix +
+                    global_warp_idx * kNumExperts;
+
+                auto local_expert_count =
+                    reinterpret_cast<uint32_t*>(
+                        shared_storage
+                            .dispatch_send_buffer[warp_idx]);
+                for (uint32_t expert_idx = lane_idx;
+                     expert_idx < kNumExperts;
+                     expert_idx += kWarpSize) {
+                    local_expert_count[expert_idx] = 0;
+                }
+                __syncwarp();
+                for (uint32_t route_base = route_begin;
+                     route_base < route_end;
+                     route_base += kWarpSize) {
+                    const uint32_t token_topk_idx =
+                        route_base + lane_idx;
+                    int expert_idx = -1;
+                    if (token_topk_idx < route_end) {
+                        expert_idx = static_cast<int>(
+                            __ldg(
+                                input_topk_idx_buffer
+                                    .get_base_ptr<int64_t>() +
+                                token_topk_idx));
+                    }
+                    if (expert_idx >= 0)
+                        atomicAdd_block(
+                            local_expert_count + expert_idx, 1u);
+                }
+                __syncwarp();
+                for (uint32_t expert_idx = lane_idx;
+                     expert_idx < kNumExperts;
+                     expert_idx += kWarpSize) {
+                    warp_prefix_row[expert_idx] =
+                        local_expert_count[expert_idx];
+                }
+
+                comm::grid_sync<
+                    kNumSMs, kDispatchGridSyncIndex>(
+                    workspace, sm_idx, thread_idx,
+                    [=]() {
+                        ptx::sync_aligned(
+                            kNumDispatchThreads,
+                            kDispatchBarrierIdx);
+                    });
+
+                if (lane_idx == 0) {
+                    for (uint32_t expert_idx = global_warp_idx;
+                         expert_idx < kNumExperts;
+                         expert_idx += kNumGlobalWarps) {
+                        uint32_t prefix = 0;
+                        for (uint32_t source_warp = 0;
+                             source_warp < kNumGlobalWarps;
+                             ++source_warp) {
+                            auto count_ptr =
+                                warp_expert_prefix +
+                                source_warp * kNumExperts +
+                                expert_idx;
+                            const uint32_t count = *count_ptr;
+                            *count_ptr = prefix;
+                            prefix += count;
+                        }
+                    }
+                }
+
+                comm::grid_sync<
+                    kNumSMs, kDispatchGridSyncIndex>(
+                    workspace, sm_idx, thread_idx,
+                    [=]() {
+                        ptx::sync_aligned(
+                            kNumDispatchThreads,
+                            kDispatchBarrierIdx);
+                    });
+
+                for (uint32_t expert_idx = lane_idx;
+                     expert_idx < kNumExperts;
+                     expert_idx += kWarpSize) {
+                    local_expert_count[expert_idx] = 0;
+                }
+                __syncwarp();
+
+                for (uint32_t route_base = route_begin;
+                     route_base < route_end;
+                     route_base += kWarpSize) {
+                    const uint32_t token_topk_idx =
+                        route_base + lane_idx;
+                    int expert_idx = -1;
+                    if (token_topk_idx < route_end) {
+                        expert_idx = static_cast<int>(
+                            __ldg(
+                                input_topk_idx_buffer
+                                    .get_base_ptr<int64_t>() +
+                                token_topk_idx));
+                    }
+                    const uint32_t active_mask =
+                        __ballot_sync(
+                            0xffffffff, expert_idx >= 0);
+                    if (expert_idx >= 0) {
+                        const uint32_t matches =
+                            __match_any_sync(
+                                active_mask, expert_idx);
+                        const uint32_t lanes_before =
+                            (1u << lane_idx) - 1u;
+                        const uint32_t dst_slot_idx =
+                            warp_prefix_row[expert_idx] +
+                            local_expert_count[expert_idx] +
+                            __popc(matches & lanes_before);
+                        const uint32_t dst_rank_idx =
+                            expert_idx / kNumExpertsPerRank;
+                        const auto dst_ptr =
+                            workspace
+                                .get_src_token_topk_idx_ptr(
+                                    expert_idx %
+                                        kNumExpertsPerRank,
+                                    sym_buffer.rank_idx,
+                                    dst_slot_idx);
+                        *sym_buffer.map(
+                            dst_ptr, dst_rank_idx) =
+                            token_topk_idx;
+                        if (
+                            lane_idx ==
+                            static_cast<uint32_t>(
+                                __ffs(matches) - 1)) {
+                            local_expert_count[expert_idx] +=
+                                __popc(matches);
+                        }
+                    }
+                    __syncwarp();
+                }
+            } else {
+                // Tiny workspaces cannot hold the global-warp prefix table;
+                // wide expert sets may exceed each warp's shared counters.
+                // Retain the original one-warp-per-expert exact path.
+                for (uint32_t target_expert = global_warp_idx;
+                     target_expert < kNumExperts;
+                     target_expert += kNumGlobalWarps) {
+                    uint32_t dst_slot_base = 0;
+                    for (uint32_t route_base = 0;
+                         route_base < num_tokens * kNumTopk;
+                         route_base += kWarpSize) {
+                        const uint32_t token_topk_idx =
+                            route_base + lane_idx;
+                        int expert_idx = -1;
+                        if (
+                            token_topk_idx <
+                            num_tokens * kNumTopk) {
+                            expert_idx = static_cast<int>(
+                                __ldg(
+                                    input_topk_idx_buffer
+                                        .get_base_ptr<int64_t>() +
+                                    token_topk_idx));
+                        }
+                        const uint32_t matches =
+                            __ballot_sync(
+                                0xffffffff,
+                                expert_idx ==
+                                    static_cast<int>(
+                                        target_expert));
+                        if (
+                            expert_idx ==
+                            static_cast<int>(target_expert)) {
+                            const uint32_t lanes_before =
+                                (1u << lane_idx) - 1u;
+                            const uint32_t dst_slot_idx =
+                                dst_slot_base +
+                                __popc(
+                                    matches & lanes_before);
+                            const uint32_t dst_rank_idx =
+                                target_expert /
+                                kNumExpertsPerRank;
+                            const auto dst_ptr =
+                                workspace
+                                    .get_src_token_topk_idx_ptr(
+                                        target_expert %
+                                            kNumExpertsPerRank,
+                                        sym_buffer.rank_idx,
+                                        dst_slot_idx);
+                            *sym_buffer.map(
+                                dst_ptr, dst_rank_idx) =
+                                token_topk_idx;
+                        }
+                        dst_slot_base += __popc(matches);
+                    }
+                }
+            }
+        } else {
+            // Write source indices (~2 us with 512 tokens)
+            read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
+                const auto dst_rank_idx = expert_idx / kNumExpertsPerRank;
+                const auto dst_slot_idx = atomicAdd_block(shared_storage.expert_token_count + expert_idx, 1);
+                const auto dst_ptr = workspace.get_src_token_topk_idx_ptr(
+                    expert_idx % kNumExpertsPerRank, sym_buffer.rank_idx, dst_slot_idx);
+                *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;
+            });
+        }
 
         // Grid sync
         comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(

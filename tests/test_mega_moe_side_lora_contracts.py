@@ -275,3 +275,23 @@ def test_both_side_wrappers_canonicalize_before_any_native_launch():
         body = ast.get_source_segment(source, function)
         assert body.count("_side_backward_block_m(") == 1
         assert body.index("block_m = _side_backward_block_m(") < body.index("_C.")
+
+
+def test_mxfp4_stable_slots_are_side_training_only_and_keep_transport():
+    source = (
+        ROOT / "deep_gemm/include/deep_gemm/impls/"
+        "sm100_fp8_fp4_mega_moe_side_lora_forward.cuh"
+    ).read_text()
+    start = source.index("if constexpr (kHasSideLora && kSaveL1Preact)")
+    slot_assignment = source[start:source.index("// Grid sync", start)]
+    assert "3 * workspace.num_max_pool_tokens >= kScratchValues" in slot_assignment
+    assert "static_assert(sizeof(layout::TokenSrcMetadata) ==" in slot_assignment
+    assert "kNumBytesPerPull >= kNumExperts * sizeof(uint32_t)" in slot_assignment
+    assert "Dispatch scratch is too small for stable counters" not in slot_assignment
+    assert "expert_idx += kNumGlobalWarps" in slot_assignment
+    assert "target_expert += kNumGlobalWarps" in slot_assignment
+    assert "__popc(matches & lanes_before)" in slot_assignment
+    atomic_else = slot_assignment.rsplit("} else {", 1)[1]
+    assert "atomicAdd_block(shared_storage.expert_token_count + expert_idx, 1)" in atomic_else
+    assert "Round-robin rank selection via iterative min-peeling" in source
+    assert "Match native DeepEP's rank-major stable route order" not in source
