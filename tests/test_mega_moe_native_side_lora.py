@@ -21,6 +21,25 @@ from deep_gemm.utils import (
 from deep_gemm.utils.dist import init_dist
 
 
+def _reference_adapters(adapters: tuple) -> tuple:
+    # Shared A1/A3/B2 collect contributions from every expert. Accumulate
+    # those in FP32, like the native shared wgrad, not repeatedly into BF16.
+    return tuple(
+        (tensor.detach().clone().float() if index in (0, 2, 5)
+         else tensor.detach().clone()).requires_grad_(True)
+        for index, tensor in enumerate(adapters))
+
+
+def _reference_expert_adapters(adapters: tuple, expert: int) -> tuple:
+    # Create a separate cast node for EACH expert. A shared cast outside the
+    # loop would accumulate in BF16 before converting the sum back to FP32.
+    # Forward operands and per-expert materialization boundaries stay BF16.
+    return (
+        adapters[0].to(torch.bfloat16), adapters[1][expert],
+        adapters[2].to(torch.bfloat16), adapters[3][expert],
+        adapters[4][expert], adapters[5].to(torch.bfloat16))
+
+
 def _block_m(tokens: int, ranks: int, topk: int, experts: int, mma_type="bf16xbf16") -> int:
     capacity = deep_gemm.align(tokens, deep_gemm._C.get_token_alignment_for_mega_moe())
     return deep_gemm._C.get_block_m_for_mega_moe(
@@ -529,17 +548,14 @@ def run_bf16_correctness(local_rank: int, world: int, args) -> None:
     route_ref = all_route_weights[
         metadata[:, 0], metadata[:, 1], metadata[:, 2]
     ].to(torch.bfloat16).detach().clone().requires_grad_(True)
-    adapter_ref = tuple(t.detach().clone().requires_grad_(True) for t in adapters)
+    adapter_ref = _reference_adapters(adapters)
     output_rows, down_rows = [], []
     gate_rows, up_rows, h_rows, h_weighted_rows = [], [], [], []
     q1_rows, q3_rows, q2_rows = [], [], []
     cursor = 0
     for expert, count in enumerate(counts.cpu().tolist()):
         xe = x_ref[cursor:cursor + count]
-        a1, b1, a3, b3, a2, b2 = (
-            adapter_ref[0], adapter_ref[1][expert],
-            adapter_ref[2], adapter_ref[3][expert],
-            adapter_ref[4][expert], adapter_ref[5])
+        a1, b1, a3, b3, a2, b2 = _reference_expert_adapters(adapter_ref, expert)
         gate_base = (xe @ w13[expert, :intermediate].t()).to(torch.bfloat16)
         up_base = (xe @ w13[expert, intermediate:].t()).to(torch.bfloat16)
         q1 = (xe @ a1).to(torch.bfloat16)
@@ -822,8 +838,7 @@ def run_mxfp4_correctness(local_rank: int, world: int, args) -> None:
         metadata[:, 0], metadata[:, 1]
     ].detach().clone().requires_grad_(True)
     x_side_ref = saved_x[active].detach().clone().requires_grad_(True)
-    adapter_ref = tuple(
-        tensor.detach().clone().requires_grad_(True) for tensor in adapters)
+    adapter_ref = _reference_adapters(adapters)
     grad_y = torch.randn_like(y)
     all_grad_y = _all_gather_equal(grad_y, group)
     route_ref = all_route_weights[
@@ -839,10 +854,7 @@ def run_mxfp4_correctness(local_rank: int, world: int, args) -> None:
     for expert, count in enumerate(counts.cpu().tolist()):
         xe_side = x_side_ref[cursor:cursor + count]
         xe_base = x_base_ref[cursor:cursor + count]
-        a1, b1, a3, b3, a2, b2 = (
-            adapter_ref[0], adapter_ref[1][expert],
-            adapter_ref[2], adapter_ref[3][expert],
-            adapter_ref[4][expert], adapter_ref[5])
+        a1, b1, a3, b3, a2, b2 = _reference_expert_adapters(adapter_ref, expert)
         q1 = (xe_side @ a1).to(torch.bfloat16)
         q3 = (xe_side @ a3).to(torch.bfloat16)
         gate = torch.add(
