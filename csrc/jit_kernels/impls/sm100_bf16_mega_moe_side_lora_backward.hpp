@@ -116,7 +116,7 @@ static void sm100_bf16_mega_moe_side_lora_rank_gemm(
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_cd = tensor_map_d,
-        .epilogue = make_epilogue_input(num_pool_rows, n, std::nullopt, std::nullopt),
+        .epilogue_class = std::make_shared<IdentityEpilogue>(),
     };
     SM100BF16GemmRuntime::compile_and_launch("sm100_bf16_mega_moe_side_lora_rank_gemm", args);
 }

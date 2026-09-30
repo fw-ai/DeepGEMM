@@ -127,7 +127,7 @@ static void __instantiate_kernel() {{
     args.num_experts, args.num_topk,
     args.config.num_experts_per_wave,
     args.config.block_m, args.config.block_n, args.config.block_k,
-    args.config.store_block_m,
+    args.config.store_block_m_l1,
     args.config.sf_block_m, args.config.sf_block_n,
     args.config.num_ring_tokens,
     args.config.num_sf_ring_tokens,
@@ -335,7 +335,7 @@ static void sm100_fp8_fp4_mega_moe_side_lora_forward(
     // so the swizzle mode is also halved (128 -> 64).
     const auto tensor_map_l1_output = make_tma_2d_desc(l2_acts,
                                                        intermediate_hidden, config.num_ring_tokens,
-                                                       config.block_n / 2, config.store_block_m,
+                                                       config.block_n / 2, config.store_block_m_l1,
                                                        static_cast<int>(l2_acts.stride(-2)),
                                                        config.swizzle_acts_mode / 2);
     const auto tensor_map_l2_acts = make_tma_2d_desc(l2_acts,
@@ -363,7 +363,7 @@ static void sm100_fp8_fp4_mega_moe_side_lora_forward(
         ? make_tma_2d_desc(
               *saved_down_unweighted,
               hidden, saved_down_unweighted->size(0),
-              config.block_n, config.store_block_m,
+              config.block_n, config.store_block_m_l1,
               static_cast<int>(
                   saved_down_unweighted->stride(-2)),
               config.swizzle_acts_mode)
@@ -432,12 +432,12 @@ static void sm100_fp8_fp4_mega_moe_side_lora_forward(
     // shared-memory tile whenever a full M block is present.
     const auto tensor_map_lora_l1_scratch_store = has_side_lora
         ? make_tma_2d_desc(*side_lora_l1_scratch, 2 * side_lora_rank,
-              num_saved_pool_tokens, kSideBlockK, config.store_block_m,
+              num_saved_pool_tokens, kSideBlockK, config.store_block_m_l1,
               static_cast<int>(side_lora_l1_scratch->stride(0)), 128)
         : tensor_map_l1_acts;
     const auto tensor_map_lora_l2_scratch_store = has_side_lora
         ? make_tma_2d_desc(*side_lora_l2_scratch, side_lora_rank,
-              num_saved_pool_tokens, kSideBlockK, config.store_block_m,
+              num_saved_pool_tokens, kSideBlockK, config.store_block_m_l1,
               static_cast<int>(side_lora_l2_scratch->stride(0)), 128)
         : tensor_map_l2_acts;
 

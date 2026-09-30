@@ -181,7 +181,7 @@ static void sm100_bf16_mega_moe_wgrad_1sm(
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_cd = tensor_map_d,
-        .epilogue = EpilogueInput{},
+        .epilogue_class = std::make_shared<IdentityEpilogue>(),
         .combine_num_ranks = combine.num_ranks,
         .fuse_combine = combine.enabled,
         .combine_sym_buffer = combine.sym_buffer,

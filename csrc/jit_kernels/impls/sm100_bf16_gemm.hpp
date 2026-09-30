@@ -7,7 +7,7 @@
 #include "../../utils/exception.hpp"
 #include "../../utils/math.hpp"
 #include "../heuristics/sm100.hpp"
-#include "epilogue.hpp"
+#include "epilogue_class.hpp"
 #include "runtime_utils.hpp"
 #include <deep_gemm/layout/mega_moe.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
@@ -36,7 +36,7 @@ public:
         CUtensorMap tensor_map_a;
         CUtensorMap tensor_map_b;
         CUtensorMap tensor_map_cd;
-        EpilogueInput epilogue;
+        std::shared_ptr<EpilogueClass> epilogue_class;
         int combine_num_ranks = 1;
         bool fuse_combine = false;
         layout::SymBuffer<> combine_sym_buffer{};
@@ -98,16 +98,16 @@ static void __instantiate_kernel() {{
         args.gemm_config.layout.swap_ab, args.gemm_desc.ensure_zero_padding,
         to_string(args.gemm_desc.gemm_type), args.gemm_desc.with_accumulation,
         to_string(args.gemm_desc.cd_dtype),
-        args.epilogue.type,
+        args.epilogue_class->get_epilogue_operator_type(),
         args.gemm_desc.tc_util,
         args.combine_num_ranks, args.fuse_combine,
         get_bf16_gemm_combine_order_mode_name(args.combine_order_mode),
-        args.combine_num_extra_threads, args.mask_grouped_k_tail));
+        args.combine_num_extra_threads, args.mask_grouped_k_tail), args.epilogue_class->compiler_options());
 
         // Launch
         jit->launch(
             kernel, args.options,
-            args.grouped_layout, args.gemm_desc.m, args.gemm_desc.n, args.gemm_desc.k, args.epilogue.args,
+            args.grouped_layout, args.gemm_desc.m, args.gemm_desc.n, args.gemm_desc.k, args.epilogue_class->make_epilogue_operator_args(args.gemm_desc.m, args.gemm_desc.n),
             args.tensor_map_a, args.tensor_map_b,
             args.tensor_map_cd,
             args.combine_sym_buffer, args.combine_workspace,
@@ -126,7 +126,7 @@ static void sm100_bf16_gemm(const torch::Tensor& a,
                             const int& m, const int& n, const int& k,
                             const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                             const std::string& compiled_dims,
-                            const std::optional<float>& alpha) {
+                            const std::shared_ptr<EpilogueClass>& epilogue_class) {
     const auto desc = GemmDesc {
         .gemm_type = GemmType::Normal,
         .kernel_type = KernelType::KernelNoSF,
@@ -171,7 +171,7 @@ static void sm100_bf16_gemm(const torch::Tensor& a,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_cd = tensor_map_cd,
-        .epilogue = make_epilogue_input(m, n, std::nullopt, alpha)
+        .epilogue_class = epilogue_class
     });
 }
 
@@ -184,7 +184,8 @@ static void sm100_m_grouped_bf16_gemm_contiguous(const torch::Tensor& a,
                                                  const std::string& compiled_dims,
                                                  const bool& use_psum_layout,
                                                  const bool& ensure_zero_padding,
-                                                 const std::optional<int>& expected_m_for_psum_layout) {
+                                                 const std::optional<int>& expected_m_for_psum_layout,
+                                                 const std::shared_ptr<EpilogueClass>& epilogue_class) {
     const auto gemm_type = use_psum_layout ?
         GemmType::MGroupedContiguousWithPsumLayout : GemmType::MGroupedContiguous;
 
@@ -241,7 +242,8 @@ static void sm100_m_grouped_bf16_gemm_contiguous(const torch::Tensor& a,
         .grouped_layout = grouped_layout.data_ptr(),
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
-        .tensor_map_cd = tensor_map_cd
+        .tensor_map_cd = tensor_map_cd,
+        .epilogue_class = epilogue_class
     });
 }
 
@@ -252,7 +254,8 @@ static void sm100_m_grouped_bf16_gemm_masked(const torch::Tensor& a,
                                              const int& num_groups, const int& m, const int& n, const int& k,
                                              const int& expected_m,
                                              const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
-                                             const std::string& compiled_dims) {
+                                             const std::string& compiled_dims,
+                                             const std::shared_ptr<EpilogueClass>& epilogue_class) {
     const auto desc = GemmDesc {
         .gemm_type = GemmType::MGroupedMasked,
         .kernel_type = KernelType::KernelNoSF,
@@ -297,7 +300,8 @@ static void sm100_m_grouped_bf16_gemm_masked(const torch::Tensor& a,
         .grouped_layout = masked_m.data_ptr(),
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
-        .tensor_map_cd = tensor_map_cd
+        .tensor_map_cd = tensor_map_cd,
+        .epilogue_class = epilogue_class
     });
 }
 
@@ -309,7 +313,8 @@ static void sm100_bf16_k_grouped_gemm(const torch::Tensor& a,
                                       const torch::Tensor& grouped_layout,
                                       const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                       const std::string& compiled_dims,
-                                      const bool& use_psum_layout) {
+                                      const bool& use_psum_layout,
+                                      const std::shared_ptr<EpilogueClass>& epilogue_class) {
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::MN and major_b == cute::UMMA::Major::MN);
 
     const auto sum_k = static_cast<int>(a.size(0));
@@ -362,15 +367,18 @@ static void sm100_bf16_k_grouped_gemm(const torch::Tensor& a,
         .grouped_layout = grouped_layout.data_ptr(),
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
-        .tensor_map_cd = tensor_map_cd
+        .tensor_map_cd = tensor_map_cd,
+        .epilogue_class = epilogue_class
     });
 }
 
 static void sm100_bf16_bhr_hdr_bhd(const torch::Tensor& tensor_a,
                                    const torch::Tensor& tensor_b,
+                                   const std::optional<torch::Tensor>& tensor_c,
                                    const torch::Tensor& tensor_d,
                                    const int& b, const int& h, const int& r, const int& d,
-                                   const std::string& compiled_dims = "nk") {
+                                   const std::string& compiled_dims,
+                                   const std::shared_ptr<EpilogueClass>& epilogue_class) {
     const auto desc = GemmDesc {
         .gemm_type = GemmType::Batched,
         .kernel_type = KernelType::KernelNoSF,
@@ -378,7 +386,7 @@ static void sm100_bf16_bhr_hdr_bhd(const torch::Tensor& tensor_a,
         .a_dtype = tensor_a.scalar_type(), .b_dtype = tensor_b.scalar_type(),
         .cd_dtype = tensor_d.scalar_type(),
         .major_a = cute::UMMA::Major::K, .major_b = cute::UMMA::Major::K,
-        .with_accumulation = false,
+        .with_accumulation = tensor_c.has_value(),
         .num_sms = runtime->get_num_sms(),
         .tc_util = runtime->get_tc_util(),
         .compiled_dims = compiled_dims
@@ -411,15 +419,18 @@ static void sm100_bf16_bhr_hdr_bhd(const torch::Tensor& tensor_a,
         .grouped_layout = nullptr,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
-        .tensor_map_cd = tensor_map_cd
+        .tensor_map_cd = tensor_map_cd,
+        .epilogue_class = epilogue_class
     });
 }
 
 static void sm100_bf16_bhd_hdr_bhr(const torch::Tensor& tensor_a,
                                    const torch::Tensor& tensor_b,
+                                   const std::optional<torch::Tensor>& tensor_c,
                                    const torch::Tensor& tensor_d,
                                    const int& b, const int& h, const int& r, const int& d,
-                                   const std::string& compiled_dims = "nk") {
+                                   const std::string& compiled_dims,
+                                   const std::shared_ptr<EpilogueClass>& epilogue_class) {
     const auto desc = GemmDesc {
         .gemm_type = GemmType::Batched,
         .kernel_type = KernelType::KernelNoSF,
@@ -427,7 +438,7 @@ static void sm100_bf16_bhd_hdr_bhr(const torch::Tensor& tensor_a,
         .a_dtype = tensor_a.scalar_type(), .b_dtype = tensor_b.scalar_type(),
         .cd_dtype = tensor_d.scalar_type(),
         .major_a = cute::UMMA::Major::K, .major_b = cute::UMMA::Major::MN,
-        .with_accumulation = false,
+        .with_accumulation = tensor_c.has_value(),
         .num_sms = runtime->get_num_sms(),
         .tc_util = runtime->get_tc_util(),
         .compiled_dims = compiled_dims
@@ -460,7 +471,8 @@ static void sm100_bf16_bhd_hdr_bhr(const torch::Tensor& tensor_a,
         .grouped_layout = nullptr,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
-        .tensor_map_cd = tensor_map_cd
+        .tensor_map_cd = tensor_map_cd,
+        .epilogue_class = epilogue_class
     });
 }
 

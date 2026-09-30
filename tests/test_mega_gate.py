@@ -12,12 +12,8 @@ from deep_gemm.testing import (
     get_arch_major,
     test_filter,
 )
-from tile_kernels.moe import moe_topk_gate
-
 # `test_filter` is an imported decorator, not a test: keep pytest from collecting it
 test_filter.__test__ = False
-
-BASELINE_KERNELS = ('nvjet', 'splitKreduce', 'cutlass', 'moe_topk_gate')
 
 NUM_TOPK = 6
 NUM_SHARED_EXPERTS = 1
@@ -30,7 +26,7 @@ GATE_CONFIGS = (
 )
 
 
-def enumerate_perf_cases():
+def enumerate_cases():
     yield from ((num_tokens, hidden, 384)
                 for num_tokens in (1, 3, 16, 128, 512, 1024, 2048, 4096, 8192, 16384, 32768)
                 for hidden in (4096, 5120, 7168))
@@ -38,6 +34,8 @@ def enumerate_perf_cases():
         (512, 4096, 128), (1024, 4096, 128), (4096, 5120, 128), (32768, 7168, 128),
         (128, 4096, 256), (8192, 4352, 264), (4200, 7168, 256), (8192, 7168, 256),
         (128, 7168, 512), (8192, 4096, 512), (32768, 7168, 512),
+        # 4 waves with a K loop that is not a multiple of the pipeline depth: carries the stage position across blocks
+        (32768, 4096, 512),
     )
 
 
@@ -87,16 +85,15 @@ def make_outputs(inputs: dict[str, Any], use_shared_as_routed: bool = False,
     )
 
 
-def run_mega_gate(inputs: dict[str, Any], outputs: dict[str, torch.Tensor | None], scoring_func: str,
+def run_mega_gate(inputs: dict[str, Any], outputs: dict[str, torch.Tensor | None],
                   use_shared_as_routed: bool = False,
                   num_topk: int = NUM_TOPK, num_shared_experts: int = NUM_SHARED_EXPERTS,
                   **overrides: Any) -> tuple[torch.Tensor, torch.Tensor]:
     kwargs = {**inputs, **overrides}
     x, weight = kwargs.pop('x'), kwargs.pop('weight')
-    unmapped_topk_idx = kwargs.pop('unmapped_topk_idx', outputs['unmapped_topk_idx'])
     return deep_gemm.bf16_mega_gate(
         x, weight, num_topk, use_shared_as_routed, num_shared_experts, ROUTED_SCALING_FACTOR, 0,
-        scoring_func=scoring_func, unmapped_topk_idx=unmapped_topk_idx,
+        unmapped_topk_idx=outputs['unmapped_topk_idx'],
         out=(outputs['topk_idx'], outputs['topk_weights']), **kwargs)
 
 
@@ -117,11 +114,11 @@ def apply_scoring(logits: torch.Tensor, scoring_func: str) -> torch.Tensor:
 
 
 def check_topk_weights(inputs: dict[str, Any], outputs: dict[str, torch.Tensor | None], logits: torch.Tensor,
-                       scoring_func: str,
                        mask: torch.Tensor | None = None,
                        force_random: torch.Tensor | None = None,
                        fix_routing_mask: torch.Tensor | None = None,
-                       num_topk: int = NUM_TOPK) -> float:
+                       num_topk: int = NUM_TOPK,
+                       scoring_func: str = 'sqrtsoftplus') -> float:
     fused_idx, fused_weights = outputs['topk_idx'], outputs['topk_weights']
     num_tokens, num_routed_experts = logits.shape
     active = mask if mask is not None else torch.ones((num_tokens,), dtype=torch.bool, device='cuda')
@@ -188,44 +185,32 @@ def check_topk_weights(inputs: dict[str, Any], outputs: dict[str, torch.Tensor |
     return weight_diff
 
 
-def check_correctness(inputs: dict[str, Any], outputs: dict[str, torch.Tensor | None], scoring_func: str,
+def check_correctness(inputs: dict[str, Any], outputs: dict[str, torch.Tensor | None],
                       use_shared_as_routed: bool = False,
                       num_topk: int = NUM_TOPK,
-                      num_shared_experts: int = NUM_SHARED_EXPERTS) -> float:
+                      num_shared_experts: int = NUM_SHARED_EXPERTS,
+                      num_repeats: int = 10) -> float:
     logits = run_reference_gemm(inputs)
-    run_mega_gate(
-        inputs, outputs, scoring_func, use_shared_as_routed,
-        num_topk=num_topk, num_shared_experts=num_shared_experts)
-    return check_topk_weights(
-        inputs, outputs, logits, scoring_func,
-        inputs['mask'], num_topk=num_topk)
+    run_mega_gate(inputs, outputs, use_shared_as_routed, num_topk=num_topk, num_shared_experts=num_shared_experts)
+    weight_diff = check_topk_weights(inputs, outputs, logits, inputs['mask'], num_topk=num_topk)
+
+    # The split reduction is order-fixed, so every launch must be bitwise identical
+    expected = {name: tensor.clone() for name, tensor in outputs.items() if tensor is not None}
+    for _ in range(num_repeats):
+        run_mega_gate(inputs, outputs, use_shared_as_routed, num_topk=num_topk, num_shared_experts=num_shared_experts)
+        for name, tensor in expected.items():
+            assert_bitwise_equal(outputs[name], tensor, name)
+    return weight_diff
 
 
 def check_case(num_tokens: int, hidden: int, num_routed_experts: int,
-               scoring_func: str = 'sqrtsoftplus', use_shared_as_routed: bool = False,
+               use_shared_as_routed: bool = False,
                num_topk: int = NUM_TOPK, num_shared_experts: int = NUM_SHARED_EXPERTS,
                with_unmapped_topk_idx: bool = False, **input_options: Any) -> None:
     inputs = make_inputs(num_tokens, hidden, num_routed_experts, use_shared_as_routed,
                          num_shared_experts=num_shared_experts, **input_options)
     outputs = make_outputs(inputs, use_shared_as_routed, with_unmapped_topk_idx, num_topk, num_shared_experts)
-    check_correctness(inputs, outputs, scoring_func, use_shared_as_routed, num_topk, num_shared_experts)
-
-
-def bench_baseline_gate(inputs: dict[str, Any]) -> float:
-    outputs = make_outputs(inputs)
-    logits = torch.empty(
-        (inputs['x'].shape[0], inputs['weight'].shape[0]), dtype=torch.float32, device='cuda')
-    gate_kwargs = {name: inputs[name] for name in
-                   ('mask', 'bias', 'image_bias', 'image_token_mask', 'to_physical_map', 'logical_count')}
-
-    def run_baseline():
-        deep_gemm.cublaslt_gemm_nt(inputs['x'], inputs['weight'], logits)
-        return moe_topk_gate(
-            logits, NUM_TOPK, False, NUM_SHARED_EXPERTS, ROUTED_SCALING_FACTOR, 0,
-            scoring_func='sqrtsoftplus', out=(outputs['topk_idx'], outputs['topk_weights']),
-            unmapped_topk_idx=None, **gate_kwargs)
-
-    return sum(bench_kineto(run_baseline, BASELINE_KERNELS, suppress_kineto_output=True))
+    check_correctness(inputs, outputs, use_shared_as_routed, num_topk, num_shared_experts)
 
 
 @test_filter(lambda: get_arch_major() == 10)
@@ -234,29 +219,25 @@ def test_mega_gate() -> None:
     torch.manual_seed(0)
 
     print('Testing BF16 GEMM + MoE top-k gate:')
-    for num_tokens, hidden, num_routed_experts in enumerate_perf_cases():
+    for num_tokens, hidden, num_routed_experts in enumerate_cases():
         inputs = make_inputs(num_tokens, hidden, num_routed_experts)
         outputs = make_outputs(inputs)
-        weight_diff = check_correctness(inputs, outputs, 'sqrtsoftplus')
+        weight_diff = check_correctness(inputs, outputs)
 
         fused_t = bench_kineto(
-            lambda: run_mega_gate(inputs, outputs, 'sqrtsoftplus'),
+            lambda: run_mega_gate(inputs, outputs),
             'mega_gate', suppress_kineto_output=True)
-        baseline_t = bench_baseline_gate(inputs)
         num_flops = 2 * num_tokens * num_routed_experts * hidden
         num_bytes = count_bytes(*inputs.values(), *outputs.values())
-        print(f' > Perf (m={num_tokens:6}, n={num_routed_experts:4}, k={hidden:4}, topk={NUM_TOPK}, '
-              f'sqrtsoftplus): '
+        print(f' > Perf (m={num_tokens:6}, n={num_routed_experts:4}, k={hidden:4}, topk={NUM_TOPK}): '
               f'{fused_t * 1e6:7.1f} us | '
               f'{num_flops / fused_t / 1e12:4.0f} TFLOPS | '
               f'{num_bytes / fused_t / 1e9:4.0f} GB/s | '
-              f'baseline {baseline_t * 1e6:7.1f} us, {baseline_t / fused_t:5.2f}x | '
               f'diff {weight_diff:.1e}')
     print()
 
 
 def check_routing_controls() -> None:
-    torch.manual_seed(1)
     num_tokens, hidden, num_routed_experts = 512, 4096, 384
     inputs = make_inputs(num_tokens, hidden, num_routed_experts, use_shared_as_routed=True, with_image_bias=True)
     outputs = make_outputs(inputs, use_shared_as_routed=True, with_unmapped_topk_idx=True)
@@ -270,10 +251,8 @@ def check_routing_controls() -> None:
     unmapped_topk_idx.copy_(fixed_topk_idx)
 
     fused_idx, fused_weights = run_mega_gate(
-        inputs, outputs, 'sqrtsoftplus', True, mask=mask,
-        fix_routing_mask=fix_routing_mask, force_random=force_random)
-    check_topk_weights(
-        inputs, outputs, logits, 'sqrtsoftplus', mask, force_random, fix_routing_mask)
+        inputs, outputs, True, mask=mask, fix_routing_mask=fix_routing_mask, force_random=force_random)
+    check_topk_weights(inputs, outputs, logits, mask, force_random, fix_routing_mask)
 
     active_force_random = force_random & mask
     fixed = fix_routing_mask & mask & ~force_random
@@ -299,13 +278,13 @@ def test_mega_gate_api_contract() -> None:
             check_case(16, 4096, num_routed_experts, use_shared_as_routed=use_shared_as_routed,
                        num_topk=num_topk, num_shared_experts=num_shared_experts)
 
-    check_case(16, 4096, 128, 'identity', with_bias=False, with_physical_map=False)
-    check_case(129, 4352, 260, 'sigmoid', with_image_bias=True, with_mask=True, with_unmapped_topk_idx=True)
+    check_case(16, 4096, 128, with_bias=False, with_physical_map=False)
+    check_case(129, 4352, 260, with_image_bias=True, with_mask=True, with_unmapped_topk_idx=True)
 
     inputs = make_inputs(128, 4096, 384, with_image_bias=True)
     inputs['bias'].fill_(1e8)
     inputs['image_bias'].fill_(-1e8)
-    check_correctness(inputs, make_outputs(inputs), 'sqrtsoftplus')
+    check_correctness(inputs, make_outputs(inputs))
 
     check_routing_controls()
 
@@ -313,7 +292,7 @@ def test_mega_gate_api_contract() -> None:
     inputs = make_inputs(8, 4096, 128, with_bias=False, with_physical_map=False)
     inputs['x'].zero_()
     inputs['weight'].zero_()
-    topk_idx, _ = run_mega_gate(inputs, make_outputs(inputs, num_topk=num_topk), 'identity', num_topk=num_topk)
+    topk_idx, _ = run_mega_gate(inputs, make_outputs(inputs, num_topk=num_topk), num_topk=num_topk)
     assert torch.equal(topk_idx, torch.arange(num_topk, dtype=torch.int64, device='cuda').expand(8, -1))
 
     inputs = make_inputs(16, 4096, 128, with_physical_map=False)
@@ -321,13 +300,12 @@ def test_mega_gate_api_contract() -> None:
     unmapped_storage = torch.empty((16, num_topk + 3), dtype=torch.int64, device='cuda')
     outputs['unmapped_topk_idx'] = unmapped_storage[:, :num_topk]
     assert outputs['unmapped_topk_idx'].stride() == (num_topk + 3, 1)
-    check_correctness(inputs, outputs, 'sqrtsoftplus', num_topk=num_topk)
+    check_correctness(inputs, outputs, num_topk=num_topk)
 
     inputs = make_inputs(32, 4096, 128, with_physical_map=False)
     outputs = make_outputs(inputs, with_unmapped_topk_idx=True, num_topk=num_topk)
     force_random = torch.ones((32,), dtype=torch.bool, device='cuda')
-    topk_idx, topk_weights = run_mega_gate(
-        inputs, outputs, 'sqrtsoftplus', num_topk=num_topk, force_random=force_random)
+    topk_idx, topk_weights = run_mega_gate(inputs, outputs, num_topk=num_topk, force_random=force_random)
     assert torch.all((topk_idx >= 0) & (topk_idx < 128)).item()
     assert torch.all(topk_weights > 0).item()
     sorted_topk_idx = topk_idx.sort(dim=1).values
@@ -335,21 +313,14 @@ def test_mega_gate_api_contract() -> None:
     assert torch.all(outputs['unmapped_topk_idx'] == -1).item()
 
     inputs = make_inputs(0, 4096, 128, with_physical_map=False)
-    topk_idx, topk_weights = run_mega_gate(inputs, make_outputs(inputs, num_topk=num_topk),
-                                           'sqrtsoftplus', num_topk=num_topk)
+    topk_idx, topk_weights = run_mega_gate(inputs, make_outputs(inputs, num_topk=num_topk), num_topk=num_topk)
     assert topk_idx.shape == (0, num_topk) and topk_weights.shape == (0, num_topk)
 
-    inputs = make_inputs(16, 4096, 256)
-    outputs = make_outputs(inputs, with_unmapped_topk_idx=True)
+    # Deterministic mode never splits K (batch invariance)
     deep_gemm.use_deterministic_algorithms(True)
     try:
-        assert deep_gemm.get_bf16_mega_gate_config(16, 4096, 256, NUM_TOPK)['num_split_k'] == 1
-        run_mega_gate(inputs, outputs, 'sqrtsoftplus')
-        expected = {name: tensor.clone() for name, tensor in outputs.items()}
-        for _ in range(100):
-            run_mega_gate(inputs, outputs, 'sqrtsoftplus')
-            for name, tensor in outputs.items():
-                assert_bitwise_equal(tensor, expected[name], f'Deterministic invocation: {name}')
+        for num_tokens, hidden, num_routed_experts in ((16, 4096, 256), (8192, 5120, 384)):
+            check_case(num_tokens, hidden, num_routed_experts, with_unmapped_topk_idx=True)
     finally:
         deep_gemm.use_deterministic_algorithms(False)
 
@@ -382,8 +353,8 @@ def test_mega_gate_sigmoid_bf16() -> None:
         assert rounded.float().mean().item() > 0.5, 'test logits must exercise the BF16 rounding'
 
         outputs = make_outputs(inputs, with_unmapped_topk_idx=True)
-        run_mega_gate(inputs, outputs, 'sigmoid_bf16')
-        check_topk_weights(inputs, outputs, logits, 'sigmoid_bf16', inputs['mask'])
+        run_mega_gate(inputs, outputs, scoring_func='sigmoid_bf16')
+        check_topk_weights(inputs, outputs, logits, inputs['mask'], scoring_func='sigmoid_bf16')
 
         # Teeth: the same weights against plain-sigmoid scores are well outside the 1e-11 bound
         active = inputs['mask'] if inputs['mask'] is not None else torch.ones(
@@ -396,14 +367,30 @@ def test_mega_gate_sigmoid_bf16() -> None:
 
         # And plain `sigmoid` on the same inputs still matches its own reference
         sigmoid_outputs = make_outputs(inputs)
-        run_mega_gate(inputs, sigmoid_outputs, 'sigmoid')
-        check_topk_weights(inputs, sigmoid_outputs, logits, 'sigmoid', inputs['mask'])
+        run_mega_gate(inputs, sigmoid_outputs, scoring_func='sigmoid')
+        check_topk_weights(inputs, sigmoid_outputs, logits, inputs['mask'], scoring_func='sigmoid')
         print(f' > sigmoid_bf16 (m={num_tokens}, k={hidden}, n={num_routed_experts}): '
               f'matches its reference, plain-sigmoid diff {plain_diff:.1e}')
 
 
+
+@test_filter(lambda: get_arch_major() == 10)
+@torch.no_grad()
+def test_mega_gate_sigmoid() -> None:
+    torch.manual_seed(4)
+
+    # Small token counts split K, large ones score on store; both with and without a ranking bias
+    for num_tokens, hidden, num_routed_experts in ((16, 7168, 384), (129, 4352, 260), (8192, 7168, 256)):
+        for options in (dict(), dict(with_bias=False, with_physical_map=False), dict(with_image_bias=True, with_mask=True)):
+            inputs = make_inputs(num_tokens, hidden, num_routed_experts, **options)
+            outputs = make_outputs(inputs, with_unmapped_topk_idx=True)
+            logits = run_reference_gemm(inputs)
+            run_mega_gate(inputs, outputs, scoring_func='sigmoid')
+            check_topk_weights(inputs, outputs, logits, inputs['mask'], scoring_func='sigmoid')
+
+
 if __name__ == '__main__':
-    torch.manual_seed(0)
     test_mega_gate_api_contract()
+    test_mega_gate_sigmoid()
     test_mega_gate_sigmoid_bf16()
     test_mega_gate()

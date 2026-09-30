@@ -83,7 +83,7 @@ def cases():
         args = ["cute::UMMA::Major::MN", "cute::UMMA::Major::MN", 512, 256, 0,
                 128, 256, 16, 4, 32, 32, 128, 4, 128, 128, 1, False, 8, 32,
                 False, False, "GemmType::KGroupedContiguous", False,
-                "cutlass::bfloat16_t", "epilogue::transform::EpilogueIdentity", 100,
+                "cutlass::bfloat16_t", "epilogue::operators::Identity", 100,
                 2, combine, "CombineOrderMode::DeepEPV1", 64 if combine else 0]
         yield f"wgrad_combine{int(combine)}", "sm100_bf16_gemm", "sm100_bf16_gemm_impl", args
         masked_args = args.copy()

@@ -14,7 +14,7 @@
 #include <deep_gemm/comm/barrier.cuh>
 #include <deep_gemm/epilogue/sm100_store_cd.cuh>
 #include <deep_gemm/epilogue/sm100_store_cd_swap_ab.cuh>
-#include <deep_gemm/epilogue/transform.cuh>
+#include <deep_gemm/epilogue/operators.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
 #include <deep_gemm/mma/sm100.cuh>
 #include <deep_gemm/ptx/tma.cuh>
@@ -2669,7 +2669,7 @@ sm100_bf16_mega_moe_side_lora_backward_wave_impl(
                 STORE_BLOCK_N, kSwizzleCDMode,
                 kNumTMAStoreStages, kNumEpilogueThreads,
                 GemmType::Normal, false, cd_dtype_t,
-                epilogue::transform::EpilogueIdentity>(
+                epilogue::operators::Identity>(
                 smem_cd, tma_stage_idx,
                 accum_stage * UMMA_N,
                 (pool_block_offset + m_block_idx) * BLOCK_M,
