@@ -291,6 +291,8 @@ def test_mxfp4_stable_slots_are_side_training_only_and_keep_transport():
     assert "expert_idx += kNumGlobalWarps" in slot_assignment
     assert "target_expert += kNumGlobalWarps" in slot_assignment
     assert "__popc(matches & lanes_before)" in slot_assignment
+    assert slot_assignment.index("__syncwarp(active_mask)") < slot_assignment.index(
+        "local_expert_count[expert_idx] +=")
     atomic_else = slot_assignment.rsplit("} else {", 1)[1]
     assert "atomicAdd_block(shared_storage.expert_token_count + expert_idx, 1)" in atomic_else
     assert "Round-robin rank selection via iterative min-peeling" in source

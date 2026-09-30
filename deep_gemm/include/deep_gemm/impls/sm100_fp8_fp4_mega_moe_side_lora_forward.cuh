@@ -592,6 +592,10 @@ sm100_fp8_fp4_mega_moe_side_lora_forward_impl(void* y,
                         *sym_buffer.map(
                             dst_ptr, dst_rank_idx) =
                             token_topk_idx;
+                        // Every active lane must finish reading the shared
+                        // count before its matching group's leader updates it.
+                        // Do not rely on implicit warp lockstep on Volta+.
+                        __syncwarp(active_mask);
                         if (
                             lane_idx ==
                             static_cast<uint32_t>(
