@@ -133,3 +133,6 @@ __version__ = '2.8.0'
 
 # Optional BF16-logit sigmoid scoring, preserving low-latency router precision.
 bf16_mega_gate_supports_sigmoid_bf16 = True
+
+# Installed together with the mega-mHC graph-replay barrier reset.
+mega_mhc_supports_graph_replay = True
