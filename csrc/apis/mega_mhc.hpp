@@ -232,6 +232,12 @@ static void mega_mhc(const torch::Tensor& x,
                                       x.options().dtype(torch::kByte));
     const auto& split_barriers = get_split_barriers(x.options());
 
+    // CUDA graph replays reuse %gridid. Clear the active barrier lines on the
+    // launch stream so consumers cannot observe a previous replay's completed
+    // state before the current grid initializes its tags. The mega kernel's
+    // cudaGridDependencySynchronize() also orders this reset when PDL is enabled.
+    split_barriers.narrow(1, 0, num_m_blocks).zero_();
+
     // Shifted FP8 is derived from rounded BF16, so FP8-only calls borrow the scratch tail for that numerical boundary.
     const auto y_bf16_storage = needs_bf16_scratch ? scratch.narrow(0, num_mhc_scratch_bytes, num_bf16_scratch_bytes).
                                                      view(torch::kBFloat16).view({num_tokens, hidden})
