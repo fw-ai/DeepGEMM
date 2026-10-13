@@ -20,6 +20,8 @@ static std::string get_activation_type_name(const std::string& activation) {
         return "ActivationType::SwiGLU";
     if (activation == "geglu")
         return "ActivationType::GeGLU";
+    if (activation == "situ")
+        return "ActivationType::SiTU";
     DG_HOST_UNREACHABLE("Unsupported activation");
 }
 
@@ -53,6 +55,8 @@ static void sm100_fp8_fp4_mega_moe(
     const int& hidden, const int& intermediate_hidden,
     const std::string& activation,
     const float& activation_clamp,
+    const float& situ_beta,
+    const float& situ_linear_beta,
     const bool& fast_math,
     const std::string& route_weight_mode,
     const std::optional<torch::Tensor>& saved_down_unweighted,
@@ -284,7 +288,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {},
         {},
-        {}, {}, {}, {}, {}, {}
+        {}, {}, {}, {}, {}, {}, {}, {}
     >);
 }};
 )", num_max_tokens_per_rank,
@@ -304,7 +308,8 @@ static void __instantiate_kernel() {{
         fast_math ? "true" : "false",
         to_string(l1_weights.scalar_type()),
         get_activation_type_name(activation), saved_l1_preact.has_value(),
-        get_fp8_fp4_route_weight_mode_name(route_weight_mode), saved_down_unweighted.has_value(), saved_l1_acts.has_value()));
+        get_fp8_fp4_route_weight_mode_name(route_weight_mode), saved_down_unweighted.has_value(), saved_l1_acts.has_value(),
+        to_string(situ_beta), to_string(situ_linear_beta)));
 
     // Launch
     jit->launch(

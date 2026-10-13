@@ -42,6 +42,8 @@ template <
     RouteWeightMode kRouteWeightMode = RouteWeightMode::PreDown,
     bool kSaveDownUnweighted = false,
     bool kSaveL1Acts = false,
+    float kSituBeta = 1.0f,
+    float kSituLinearBeta = cute::numeric_limits<float>::infinity(),
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -1037,7 +1039,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     while (ptx::ld_acq(l2_empty_ptr) != num_expected_blocks);
                 }
 
-                // Unified L1 epilogue: gated activation (SwiGLU/GeGLU) in-place using
+                // Unified L1 epilogue: gated activation (SwiGLU/GeGLU/SiTU) in-place using
                 // granularity 8 interleaved weights.
                 // With `SM100_TMEM_LOAD_16dp256b1x`, gate/up pairs are:
                 float stored_cached_weight = 1.0f;
@@ -1088,7 +1090,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             shared_storage.tmem_empty_barriers[accum_stage_idx].arrive(0u);
                         }
 
-                        // Apply gated activation: act(gate) * up (SwiGLU or GeGLU)
+                        // Apply gated activation: act(gate) * up (SwiGLU, GeGLU, or SiTU)
                         auto fp32_values = reinterpret_cast<float2*>(raw_values);
                         #pragma unroll
                         for (uint32_t k = 0; k < 2; ++ k) {
@@ -1192,25 +1194,40 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                 z = gate;
                             }
 
+                            // SiTU keeps sigmoid(gate), replacing its numerator and optionally up.
+                            auto gate_numerator = gate;
+                            auto activated_up = up;
+                            if constexpr (kActivationType == ActivationType::SiTU) {
+                                const auto gate_tanh = make_float2(
+                                    kFastMath ? __tanhf(gate.x / kSituBeta) : tanhf(gate.x / kSituBeta),
+                                    kFastMath ? __tanhf(gate.y / kSituBeta) : tanhf(gate.y / kSituBeta));
+                                gate_numerator = __fmul2_rn({kSituBeta, kSituBeta}, gate_tanh);
+                                if constexpr (kSituLinearBeta != cute::numeric_limits<float>::infinity()) {
+                                    const auto up_tanh = make_float2(
+                                        kFastMath ? __tanhf(up.x / kSituLinearBeta) : tanhf(up.x / kSituLinearBeta),
+                                        kFastMath ? __tanhf(up.y / kSituLinearBeta) : tanhf(up.y / kSituLinearBeta));
+                                    activated_up = __fmul2_rn({kSituLinearBeta, kSituLinearBeta}, up_tanh);
+                                }
+                            }
                             const auto neg_exp = make_float2(
                                 kFastMath ? __expf(-z.x) : expf(-z.x),
                                 kFastMath ? __expf(-z.y) : expf(-z.y));
                             const auto denom = __fadd2_rn({1.0f, 1.0f}, neg_exp);
                             float2 activated;
                             if constexpr (kFastMath) {
-                                activated = __fmul2_rn(gate, {math::fast_rcp(denom.x), math::fast_rcp(denom.y)});
+                                activated = __fmul2_rn(gate_numerator, {math::fast_rcp(denom.x), math::fast_rcp(denom.y)});
                             } else {
-                                activated = {gate.x / denom.x, gate.y / denom.y};
+                                activated = {gate_numerator.x / denom.x, gate_numerator.y / denom.y};
                             }
                             if constexpr (
                                 kRouteWeightMode ==
                                 RouteWeightMode::PreDown) {
                                 // Keep the legacy expression intact: PRE_DOWN
                                 // must remain bitwise identical.
-                                activation_values[i][k] = __fmul2_rn(__fmul2_rn(activated, up), weights);
+                                activation_values[i][k] = __fmul2_rn(__fmul2_rn(activated, activated_up), weights);
                             } else {
                                 activation_values[i][k] =
-                                    __fmul2_rn(activated, up);
+                                    __fmul2_rn(activated, activated_up);
                             }
                         }
 
