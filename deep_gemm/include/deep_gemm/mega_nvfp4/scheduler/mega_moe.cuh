@@ -1,4 +1,4 @@
-#pragma once // Derived from sgl-project/DeepGEMM@ec226bcf400c11d62755137b916fae9ee359c684:deep_gemm/include/deep_gemm/scheduler/mega_moe.cuh (Copyright (c) 2025 DeepSeek and sgl-project/DeepGEMM contributors, MIT License, see LICENSE). Fireworks port: moved into namespace `deep_gemm::mega_nvfp4` with includes of copied headers redirected to `deep_gemm/mega_nvfp4/`; otherwise unchanged.
+#pragma once // Derived from sgl-project/DeepGEMM@ec226bcf400c11d62755137b916fae9ee359c684:deep_gemm/include/deep_gemm/scheduler/mega_moe.cuh (Copyright (c) 2025 DeepSeek and sgl-project/DeepGEMM contributors, MIT License, see LICENSE). Fireworks port: moved into namespace `deep_gemm::mega_nvfp4` with includes of copied headers redirected to `deep_gemm/mega_nvfp4/`; plus the upstream DeepGEMM #441 task-info slot release fence (78b6900), which sgl ec226bc predates; otherwise unchanged.
 
 #include <cutlass/arch/barrier.h>
 #include <deep_gemm/common/cute_tie.cuh>
@@ -278,6 +278,8 @@ struct MegaMoEScheduler {
     }
 
     CUTLASS_DEVICE void release_task_info() const {
+        // Complete metadata reads before the scheduler can overwrite this slot.
+        ptx::fence_acq_rel_cta();
         task_info_empty_barriers[sched_stage_idx ^ 1].arrive(0u);
     }
 

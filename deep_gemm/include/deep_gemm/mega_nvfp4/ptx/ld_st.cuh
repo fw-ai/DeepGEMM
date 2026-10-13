@@ -1,4 +1,4 @@
-#pragma once // Derived from sgl-project/DeepGEMM@ec226bcf400c11d62755137b916fae9ee359c684:deep_gemm/include/deep_gemm/ptx/ld_st.cuh (Copyright (c) 2025 DeepSeek and sgl-project/DeepGEMM contributors, MIT License, see LICENSE). Fireworks port: moved into namespace `deep_gemm::mega_nvfp4` with includes of copied headers redirected to `deep_gemm/mega_nvfp4/`; otherwise unchanged.
+#pragma once // Derived from sgl-project/DeepGEMM@ec226bcf400c11d62755137b916fae9ee359c684:deep_gemm/include/deep_gemm/ptx/ld_st.cuh (Copyright (c) 2025 DeepSeek and sgl-project/DeepGEMM contributors, MIT License, see LICENSE). Fireworks port: moved into namespace `deep_gemm::mega_nvfp4` with includes of copied headers redirected to `deep_gemm/mega_nvfp4/`; plus the upstream DeepGEMM #441 task-info slot release fence (78b6900), which sgl ec226bc predates; otherwise unchanged.
 
 #include <cuda/std/cstdint>
 #include <cuda_bf16.h>
@@ -97,6 +97,11 @@ struct SM100_U8x8_STSM_T {
                      :: "l"(__cvta_generic_to_shared(smem_dst)), "r"(src[0]), "r"(src[1]));
     }
 };
+
+/// Memory ordering
+CUTLASS_DEVICE void fence_acq_rel_cta() {
+    asm volatile("fence.acq_rel.cta;" ::: "memory");
+}
 
 /// Shared memory
 CUTLASS_DEVICE uint32_t ld_shared(const uint32_t* ptr) {
