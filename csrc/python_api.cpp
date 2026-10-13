@@ -14,6 +14,7 @@
 #include "apis/mega_mhc.hpp"
 #include "apis/mega_gate.hpp"
 #include "apis/mega_backward.hpp"
+#include "apis/mega_nvfp4.hpp"
 
 #ifndef TORCH_EXTENSION_NAME
 #define TORCH_EXTENSION_NAME _C
@@ -40,4 +41,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     deep_gemm::mega_mhc::register_apis(m);
     deep_gemm::mega_gate::register_apis(m);
     deep_gemm::mega_backward::register_apis(m);
+    deep_gemm::mega_nvfp4::register_apis(m);
 }
