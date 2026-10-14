@@ -143,7 +143,7 @@ _C.init(os.path.dirname(os.path.abspath(__file__)))
 # Release handles and workspaces while Python, PyTorch and CUDA are still available.
 atexit.register(shutdown)
 
-__version__ = '2.8.1'
+__version__ = '2.8.2'
 
 # Optional BF16-logit sigmoid scoring, preserving low-latency router precision.
 bf16_mega_gate_supports_sigmoid_bf16 = True
