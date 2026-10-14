@@ -14,6 +14,9 @@ from deep_gemm.testing import (
 )
 from tile_kernels.moe import moe_topk_gate
 
+# `test_filter` is an imported decorator, not a test: keep pytest from collecting it
+test_filter.__test__ = False
+
 BASELINE_KERNELS = ('nvjet', 'splitKreduce', 'cutlass', 'moe_topk_gate')
 
 NUM_TOPK = 6
@@ -105,7 +108,10 @@ def run_reference_gemm(inputs: dict[str, Any]) -> torch.Tensor:
 
 
 def apply_scoring(logits: torch.Tensor, scoring_func: str) -> torch.Tensor:
-    assert scoring_func in ('sigmoid', 'sqrtsoftplus', 'identity')
+    assert scoring_func in ('sigmoid', 'sigmoid_bf16', 'sqrtsoftplus', 'identity')
+    if scoring_func == 'sigmoid_bf16':
+        # Low-latency routers round the logit to BF16 before the sigmoid
+        return torch.sigmoid(logits.bfloat16().float())
     return (torch.sigmoid(logits) if scoring_func == 'sigmoid' else
             F.softplus(logits).sqrt() if scoring_func == 'sqrtsoftplus' else logits)
 
@@ -348,7 +354,56 @@ def test_mega_gate_api_contract() -> None:
         deep_gemm.use_deterministic_algorithms(False)
 
 
+def make_exact_logit_inputs(num_tokens: int, hidden: int, num_routed_experts: int, **input_options: Any) -> dict[str, Any]:
+    """Inputs whose FP32 logits are exact under any summation order (small integers times 1/1024), so the kernel
+    and the reference GEMM agree bitwise and the BF16 rounding of `sigmoid_bf16` is the only difference left.
+    Most such logits need more than BF16's 8 significant bits, so the rounding is visible."""
+    inputs = make_inputs(num_tokens, hidden, num_routed_experts, **input_options)
+    inputs['x'] = torch.randint(-2, 3, (num_tokens, hidden), device='cuda').bfloat16()
+    inputs['weight'] = (torch.randint(-64, 65, (num_routed_experts, hidden), device='cuda') / 1024).bfloat16()
+    return inputs
+
+
+@test_filter(lambda: get_arch_major() == 10)
+@torch.no_grad()
+def test_mega_gate_sigmoid_bf16() -> None:
+    torch.manual_seed(3)
+    assert deep_gemm.bf16_mega_gate_supports_sigmoid_bf16 is True
+
+    for num_tokens, hidden, num_routed_experts, options in (
+            (16, 4096, 256, dict()),
+            (129, 4352, 260, dict(with_image_bias=True, with_mask=True)),
+            (512, 7168, 384, dict()),
+            (2048, 4096, 128, dict(with_physical_map=False))):
+        inputs = make_exact_logit_inputs(num_tokens, hidden, num_routed_experts, **options)
+        logits = run_reference_gemm(inputs)
+        assert torch.equal(logits * 1024, (logits * 1024).round()), 'logits must stay exact multiples of 1/1024'
+        rounded = logits.bfloat16().float() != logits
+        assert rounded.float().mean().item() > 0.5, 'test logits must exercise the BF16 rounding'
+
+        outputs = make_outputs(inputs, with_unmapped_topk_idx=True)
+        run_mega_gate(inputs, outputs, 'sigmoid_bf16')
+        check_topk_weights(inputs, outputs, logits, 'sigmoid_bf16', inputs['mask'])
+
+        # Teeth: the same weights against plain-sigmoid scores are well outside the 1e-11 bound
+        active = inputs['mask'] if inputs['mask'] is not None else torch.ones(
+            (num_tokens,), dtype=torch.bool, device='cuda')
+        selected = outputs['unmapped_topk_idx'][active]
+        plain = torch.sigmoid(logits[active]).gather(1, selected)
+        plain = plain / (plain.sum(dim=1, keepdim=True) + 1e-20) * ROUTED_SCALING_FACTOR
+        plain_diff = float(calc_diff(outputs['topk_weights'][active, :NUM_TOPK], plain))
+        assert plain_diff > 1e-9, f'sigmoid_bf16 indistinguishable from sigmoid: {plain_diff=}'
+
+        # And plain `sigmoid` on the same inputs still matches its own reference
+        sigmoid_outputs = make_outputs(inputs)
+        run_mega_gate(inputs, sigmoid_outputs, 'sigmoid')
+        check_topk_weights(inputs, sigmoid_outputs, logits, 'sigmoid', inputs['mask'])
+        print(f' > sigmoid_bf16 (m={num_tokens}, k={hidden}, n={num_routed_experts}): '
+              f'matches its reference, plain-sigmoid diff {plain_diff:.1e}')
+
+
 if __name__ == '__main__':
     torch.manual_seed(0)
     test_mega_gate_api_contract()
+    test_mega_gate_sigmoid_bf16()
     test_mega_gate()

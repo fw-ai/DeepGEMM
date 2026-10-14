@@ -19,6 +19,8 @@ namespace deep_gemm::mega_gate {
 static int get_scoring_type(const std::string& scoring_func) {
     if (scoring_func == "sigmoid")
         return static_cast<int>(mega_gate_layout::ScoringType::Sigmoid);
+    if (scoring_func == "sigmoid_bf16")
+        return static_cast<int>(mega_gate_layout::ScoringType::SigmoidBF16);
     if (scoring_func == "sqrtsoftplus")
         return static_cast<int>(mega_gate_layout::ScoringType::SqrtSoftplus);
     if (scoring_func == "identity")

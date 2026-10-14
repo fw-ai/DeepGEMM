@@ -28,6 +28,7 @@ static constexpr uint32_t kNumMaxMetadataCacheBytes = 4 * 1024;
 enum class ScoringType : uint32_t {
     Sigmoid = 0,
     SqrtSoftplus = 1,
+    SigmoidBF16 = 2,
     Identity = 3,
 };
 

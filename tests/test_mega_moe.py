@@ -7,9 +7,12 @@ import torch.distributed as dist
 from typing import Optional, Tuple
 
 import deep_gemm
-from deep_gemm.utils import align, per_token_cast_to_fp4, per_token_cast_to_fp8
+from deep_gemm.utils import align, cast_back_from_fp4, cast_back_from_fp8, per_token_cast_to_fp4, per_token_cast_to_fp8
 from deep_gemm.utils.dist import dist_print, init_dist, uneven_all_gather
-from deep_gemm.testing import bench_kineto, calc_diff
+from deep_gemm.testing import bench_kineto, calc_diff, get_arch_major, test_filter
+
+# `test_filter` is an imported decorator, not a test: keep pytest from collecting it
+test_filter.__test__ = False
 
 
 def import_baseline():
@@ -413,6 +416,153 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     buffer.destroy()
     ep_buffer.destroy() if is_legacy_loaded else None
     dist.destroy_process_group()
+
+
+# The benchmark/correctness entry point above takes spawn arguments; keep pytest from collecting it.
+test.__test__ = False
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Gated activations (SwiGLU / GeGLU / SiTU) vs. a dequantized PyTorch reference.
+#
+# SiTU (Kimi K3) replaces SiLU's numerator and optionally squashes `up`:
+#   act = situ_beta * tanh(gate / situ_beta) * sigmoid(gate) * (situ_linear_beta * tanh(up / situ_linear_beta))
+# with `up` left as is when `situ_linear_beta` is unset (+inf). The reference follows the kernel's numerical
+# boundaries: exact FP8/FP4 dequantization, FP32 GEMMs, BF16 rounding of the L1 output before the activation,
+# the route weight applied before the L2 input (`pre_down`), per-32 UE8M0 FP8 requantization of the L2 input,
+# BF16 L2 output per (token, expert) and an FP32 top-k sum rounded to BF16.
+# ---------------------------------------------------------------------------------------------------------------
+
+_ACT_HIDDEN, _ACT_INTERMEDIATE, _ACT_EXPERTS, _ACT_TOPK, _ACT_TOKENS = 4096, 1536, 16, 4, 96
+
+
+def _gated_activation_reference(gate: torch.Tensor, up: torch.Tensor, activation: str,
+                                situ_beta: Optional[float] = None,
+                                situ_linear_beta: Optional[float] = None) -> torch.Tensor:
+    if activation == 'swiglu':
+        return gate * torch.sigmoid(gate) * up
+    if activation == 'geglu':
+        return 0.5 * gate * (1 + torch.tanh(0.7978845608028654 * (gate + 0.044715 * gate ** 3))) * up
+    assert activation == 'situ'
+    beta = 1.0 if situ_beta is None else situ_beta
+    act = beta * torch.tanh(gate / beta) * torch.sigmoid(gate)
+    if situ_linear_beta is not None:
+        up = situ_linear_beta * torch.tanh(up / situ_linear_beta)
+    return act * up
+
+
+def _mega_moe_reference(x_deq, topk_idx, topk_weights, l1_deq, l2_deq, activation, **situ_kwargs):
+    num_tokens, hidden = x_deq.shape
+    inter = l2_deq.shape[2]
+    y = torch.zeros((num_tokens, hidden), dtype=torch.float, device='cuda')
+    for expert in range(l1_deq.shape[0]):
+        rows, slots = (topk_idx == expert).nonzero(as_tuple=True)
+        if rows.numel() == 0:
+            continue
+        l1 = (x_deq[rows] @ l1_deq[expert].T).bfloat16().float()
+        act = _gated_activation_reference(l1[:, :inter], l1[:, inter:], activation, **situ_kwargs)
+        act = act * topk_weights[rows, slots].unsqueeze(1)
+        act_fp8, act_sf = per_token_cast_to_fp8(act, use_ue8m0=True, gran_k=32)
+        l2 = (cast_back_from_fp8(act_fp8, act_sf, gran_k=32) @ l2_deq[expert].T).bfloat16().float()
+        y.index_add_(0, rows, l2)
+    return y.bfloat16()
+
+
+def _activation_worker(local_rank: int, num_ranks: int):
+    rank_idx, num_ranks, group = init_dist(local_rank, num_ranks)
+    hidden, inter, num_experts, num_topk, num_tokens = (
+        _ACT_HIDDEN, _ACT_INTERMEDIATE, _ACT_EXPERTS, _ACT_TOPK, _ACT_TOKENS)
+    num_experts_per_rank = num_experts // num_ranks
+    expert_lo = rank_idx * num_experts_per_rank
+
+    # All ranks draw every expert from one seed, so each rank can build the full reference for its own tokens.
+    # Weights are scaled so `|gate|` reaches several units and SiTU's tanh saturation is visible.
+    torch.manual_seed(1234)
+    l1_all = torch.randn((num_experts, 2 * inter, hidden), dtype=torch.bfloat16, device='cuda') * (2 / hidden ** 0.5)
+    l2_all = torch.randn((num_experts, hidden, inter), dtype=torch.bfloat16, device='cuda') * (1 / inter ** 0.5)
+
+    def cast_fp4(w):
+        packed = torch.empty((w.shape[0], w.shape[1], w.shape[2] // 2), dtype=torch.int8, device='cuda')
+        sf = torch.empty((w.shape[0], w.shape[1], w.shape[2] // 32), dtype=torch.float, device='cuda')
+        for i in range(w.shape[0]):
+            packed[i], sf[i] = per_token_cast_to_fp4(w[i], use_ue8m0=True, gran_k=32)
+        deq = torch.stack([cast_back_from_fp4(packed[i], sf[i], gran_k=32) for i in range(w.shape[0])])
+        return packed, sf, deq
+
+    l1_q, l1_sf, l1_deq = cast_fp4(l1_all)
+    l2_q, l2_sf, l2_deq = cast_fp4(l2_all)
+    del l1_all, l2_all
+    local = slice(expert_lo, expert_lo + num_experts_per_rank)
+    l1_local = (l1_q[local].contiguous(), deep_gemm.transform_sf_into_required_layout(
+        l1_sf[local].contiguous(), 2 * inter, hidden, (1, 32), num_experts_per_rank))
+    l2_local = (l2_q[local].contiguous(), deep_gemm.transform_sf_into_required_layout(
+        l2_sf[local].contiguous(), hidden, inter, (1, 32), num_experts_per_rank))
+
+    torch.manual_seed(100 + rank_idx)
+    x = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+    scores = torch.randn((num_tokens, num_experts), dtype=torch.float, device='cuda')
+    topk_weights, topk_idx = torch.topk(scores.softmax(dim=-1), num_topk, dim=-1, sorted=False)
+    x_fp8, x_sf = per_token_cast_to_fp8(x, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
+    x_deq = cast_back_from_fp8(x_fp8, x_sf, gran_k=32, use_packed_ue8m0=True)
+
+    def run(activation, **kwargs):
+        buffer = deep_gemm.get_symm_buffer_for_mega_moe(
+            group, num_experts, num_tokens, num_topk, hidden, inter,
+            use_fp8_dispatch=True, activation=activation)
+        l1, l2 = deep_gemm.transform_weights_for_mega_moe(l1_local, l2_local, activation=activation)
+        buffer.x[:num_tokens].copy_(x_fp8)
+        buffer.x_sf[:num_tokens].copy_(x_sf)
+        buffer.topk_idx[:num_tokens].copy_(topk_idx)
+        buffer.topk_weights[:num_tokens].copy_(topk_weights)
+        y = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+        deep_gemm.fp8_fp4_mega_moe(y, l1, l2, buffer, recipe=(1, 1, 32), activation=activation,
+                                   activation_clamp=None, fast_math=True, **kwargs)
+        torch.cuda.synchronize()
+        dist.barrier()
+        buffer.destroy()
+        return y
+
+    def reference(activation, **situ_kwargs):
+        return _mega_moe_reference(x_deq, topk_idx, topk_weights, l1_deq, l2_deq, activation, **situ_kwargs)
+
+    tolerance = 2e-4
+    swiglu_ref = reference('swiglu')
+    for activation in ('swiglu', 'geglu'):
+        # Unset SiTU parameters leave SwiGLU / GeGLU exactly as before; SiTU parameters are ignored by them
+        y = run(activation)
+        diff = calc_diff(y, reference(activation))
+        assert diff < tolerance, f'{activation}: {diff=}'
+        assert torch.equal(y, run(activation, situ_beta=None, situ_linear_beta=None)), activation
+        assert torch.equal(y, run(activation, situ_beta=4.0, situ_linear_beta=25.0)), activation
+        dist_print(f' > {activation}: diff vs reference {diff:.2e}', once_in_node=True)
+
+    for situ_beta, situ_linear_beta in ((4.0, 25.0), (4.0, None), (2.0, 3.0)):
+        y = run('situ', situ_beta=situ_beta, situ_linear_beta=situ_linear_beta)
+        diff = calc_diff(y, reference('situ', situ_beta=situ_beta, situ_linear_beta=situ_linear_beta))
+        swiglu_diff = calc_diff(y, swiglu_ref)
+        assert diff < tolerance, f'situ({situ_beta}, {situ_linear_beta}): {diff=}'
+        # Teeth: the SiTU output must be far from SwiGLU's, so the check above is not vacuous
+        assert swiglu_diff > 50 * tolerance, f'situ({situ_beta}, {situ_linear_beta}) ~ swiglu: {swiglu_diff=}'
+        dist_print(f' > situ(beta={situ_beta}, linear_beta={situ_linear_beta}): diff vs reference {diff:.2e}, '
+                   f'vs swiglu {swiglu_diff:.2e}', once_in_node=True)
+
+    dist.barrier()
+    dist.destroy_process_group()
+
+
+def _spawn_activation_test(num_ranks: int) -> None:
+    os.environ.setdefault('MASTER_PORT', str(29500 + random.randint(0, 999)))
+    torch.multiprocessing.spawn(_activation_worker, args=(num_ranks,), nprocs=num_ranks)
+
+
+@test_filter(lambda: get_arch_major() == 10)
+def test_mega_moe_gated_activations() -> None:
+    _spawn_activation_test(1)
+
+
+@test_filter(lambda: get_arch_major() == 10 and torch.cuda.device_count() >= 2)
+def test_mega_moe_gated_activations_ep2() -> None:
+    _spawn_activation_test(2)
 
 
 if __name__ == '__main__':

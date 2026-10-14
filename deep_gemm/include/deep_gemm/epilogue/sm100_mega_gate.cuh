@@ -17,6 +17,9 @@ template <uint32_t kScoringType> CUTLASS_DEVICE float apply_scoring(const float&
     using ScoringType = layout::mega_gate::ScoringType;
     if constexpr (kScoringType == static_cast<uint32_t>(ScoringType::Sigmoid)) {
         return 1.0f / (1.0f + expf(-value));
+    } else if constexpr (kScoringType == static_cast<uint32_t>(ScoringType::SigmoidBF16)) {
+        // Preserve the BF16 logit boundary of low-latency sigmoid routers.
+        return 1.0f / (1.0f + expf(-static_cast<float>(cutlass::bfloat16_t(value))));
     } else if constexpr (kScoringType == static_cast<uint32_t>(ScoringType::SqrtSoftplus)) {
         const auto softplus_precise = log1pf(expf(value));
         const auto softplus = value > 20.0f ? value : softplus_precise;
@@ -29,11 +32,15 @@ template <uint32_t kScoringType> CUTLASS_DEVICE float apply_scoring(const float&
 template <uint32_t kScoringType, uint32_t kNumValues>
 CUTLASS_DEVICE void apply_scoring(float (&values)[kNumValues]) {
     using ScoringType = layout::mega_gate::ScoringType;
-    if constexpr (kScoringType == static_cast<uint32_t>(ScoringType::Sigmoid)) {
+    if constexpr (kScoringType == static_cast<uint32_t>(ScoringType::Sigmoid) or
+                  kScoringType == static_cast<uint32_t>(ScoringType::SigmoidBF16)) {
         float exponentials[kNumValues];
         #pragma unroll
-        for (uint32_t value_idx = 0; value_idx < kNumValues; ++ value_idx)
-            exponentials[value_idx] = expf(-values[value_idx]);
+        for (uint32_t value_idx = 0; value_idx < kNumValues; ++ value_idx) {
+            const auto value = kScoringType == static_cast<uint32_t>(ScoringType::SigmoidBF16)
+                ? static_cast<float>(cutlass::bfloat16_t(values[value_idx])) : values[value_idx];
+            exponentials[value_idx] = expf(-value);
+        }
         #pragma unroll
         for (uint32_t value_idx = 0; value_idx < kNumValues; ++ value_idx)
             values[value_idx] = 1.0f / (1.0f + exponentials[value_idx]);

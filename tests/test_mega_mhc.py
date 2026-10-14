@@ -14,6 +14,9 @@ from deep_gemm.testing import (
 )
 from deep_gemm.utils import align
 
+# `test_filter` is an imported decorator, not a test: keep pytest from collecting it
+test_filter.__test__ = False
+
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'third-party'))
 from tilelang_ops import ref_mhc  # noqa: E402
 
@@ -261,6 +264,49 @@ def test_mega_mhc() -> None:
     print()
 
 
+@test_filter(lambda: get_arch_major() == 10)
+@torch.no_grad()
+def test_mega_mhc_graph_replay() -> None:
+    # Replays of one captured graph reuse %gridid; `mega_mhc` clears the active split-barrier lines on every
+    # call (captured with the kernel), so a replay cannot observe the previous replay's completed tags.
+    # Back-to-back replays with different inputs (stream-ordered copies, no host sync) make stale partials
+    # visible if that reset is missing: with it disabled, about half of these replays differ from eager.
+    assert deep_gemm.mega_mhc_supports_graph_replay is True
+    num_replays = 8
+    for is_shifted in (False, True):
+        for sf_layout, num_tokens, hidden in (('bf16', 64, 4096), ('col', 200, 4096), ('extra', 1025, 7168)):
+            static_inputs, _ = make_inputs(num_tokens, hidden, 3000, is_shifted)
+            graph_outputs = make_outputs(static_inputs, sf_layout)
+            capture_stream = torch.cuda.Stream()
+            capture_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(capture_stream):
+                run_mega_mhc(static_inputs, graph_outputs)
+            capture_stream.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=capture_stream):
+                run_mega_mhc(static_inputs, graph_outputs)
+
+            replay_inputs = [make_inputs(num_tokens, hidden, 3001 + i, is_shifted)[0] for i in range(num_replays)]
+            replay_outputs = []
+            for inputs in replay_inputs:
+                for name, value in inputs.items():
+                    if isinstance(value, torch.Tensor):
+                        static_inputs[name].copy_(value)
+                graph.replay()
+                replay_outputs.append({name: tensor.clone() for name, tensor in logical_outputs(graph_outputs).items()})
+            torch.cuda.synchronize()
+
+            for replay_idx, (inputs, actual) in enumerate(zip(replay_inputs, replay_outputs)):
+                eager_outputs = make_outputs(inputs, sf_layout)
+                run_mega_mhc(inputs, eager_outputs)
+                for name, tensor in logical_outputs(eager_outputs).items():
+                    assert_bitwise_equal(actual[name], tensor,
+                                         f'Replay {replay_idx} ({sf_layout}, T={num_tokens}, '
+                                         f'shifted={is_shifted}): {name}')
+            print(f' > graph replay x{num_replays}: {sf_layout:5} T={num_tokens:5}, H={hidden}, '
+                  f'shifted={int(is_shifted)}: bitwise equal to eager')
+
 if __name__ == '__main__':
     test_mega_mhc_api_contract()
+    test_mega_mhc_graph_replay()
     test_mega_mhc()

@@ -49,7 +49,7 @@ class SymmBuffer:
             raise ValueError("num_ring_tokens must be positive and satisfy MegaMoE token alignment")
 
         # Init
-        assert activation in ('swiglu', 'geglu'), f'Unsupported activation: `{activation}`'
+        assert activation in ('swiglu', 'geglu', 'situ'), f'Unsupported activation: `{activation}`'
         self.group = group
         self.num_experts = num_experts
         self.num_max_tokens_per_rank = num_max_tokens_per_rank
@@ -76,7 +76,8 @@ class SymmBuffer:
             )
         if base is None:
             allocator = torch if group.size() == 1 else symm_mem
-            self.buffer = allocator.empty(num_bytes, dtype=torch.int8, device='cuda')
+            device = torch.device('cuda', torch.cuda.current_device())
+            self.buffer = allocator.empty(num_bytes, dtype=torch.int8, device=device)
             self.handle = (
                 types.SimpleNamespace(buffer_ptrs=[self.buffer.data_ptr()])
                 if group.size() == 1
@@ -204,7 +205,7 @@ def transform_weights_for_mega_moe(
 ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
              Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]:
     # Gate/up interleaving is independent of the gated-activation variant
-    assert activation in ('swiglu', 'geglu'), f'Unsupported activation: `{activation}`'
+    assert activation in ('swiglu', 'geglu', 'situ'), f'Unsupported activation: `{activation}`'
     if isinstance(l1_weights, tuple):
         # FP8/FP4: interleave gate/up for weight and SF, then transpose L1 SF for UTCCP
         l1_w = _interleave_weights(l1_weights[0])
@@ -287,6 +288,9 @@ def fp8_fp4_mega_moe(
     num_config_tokens: Optional[int] = None,
     shared_l1_weights: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     shared_l2_weights: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    *,
+    situ_beta: Optional[float] = None,
+    situ_linear_beta: Optional[float] = None,
 ):
     """Run MXFP8/FP4 MegaMoE with an explicit route-weight boundary.
 
@@ -315,6 +319,9 @@ def fp8_fp4_mega_moe(
             op=dist.ReduceOp.MAX,
             group=sym_buffer.group)
         num_config_tokens = int(rank_uniform_num_tokens.item())
+    situ_kwargs = {}
+    if situ_beta is not None or situ_linear_beta is not None:
+        situ_kwargs = dict(situ_beta_opt=situ_beta, situ_linear_beta_opt=situ_linear_beta)
     _C.fp8_fp4_mega_moe(
         y,
         l1_weights,
@@ -337,6 +344,7 @@ def fp8_fp4_mega_moe(
         saved_l1_acts_sf,
         num_config_tokens,
         shared_l1_weights, shared_l2_weights,
+        **situ_kwargs,
     )
 
 

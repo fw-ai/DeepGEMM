@@ -29,7 +29,8 @@ static const torch::Tensor& get_split_barriers(const torch::TensorOptions& optio
     static std::unordered_map<c10::cuda::CUDAStream, torch::Tensor> split_barriers_by_stream;
     auto& split_barriers = split_barriers_by_stream[stream];
     if (not split_barriers.defined()) {
-        // Warm up each stream before capture so one-time zeroing is not replayed with the graph.
+        // Allocate (and zero) each stream's barriers outside of capture, so the allocation is not owned by a
+        // graph. Every call still clears the lines it uses below, and that reset is captured and replayed.
         DG_HOST_ASSERT(c10::cuda::currentStreamCaptureStatusMayInitCtx() == c10::cuda::CaptureStatus::None);
         split_barriers = torch::zeros(
             {mhc_layout::kNumSplitBarriers, mhc_layout::kNumMaxMBlocks, mhc_layout::kSplitBarrierLineBytes},
@@ -231,6 +232,12 @@ static void mega_mhc(const torch::Tensor& x,
     const auto scratch = torch::empty({static_cast<int64_t>(num_mhc_scratch_bytes) + num_bf16_scratch_bytes},
                                       x.options().dtype(torch::kByte));
     const auto& split_barriers = get_split_barriers(x.options());
+
+    // CUDA graph replays reuse %gridid. Clear the active barrier lines on the
+    // launch stream so consumers cannot observe a previous replay's completed
+    // state before the current grid initializes its tags. The mega kernel's
+    // cudaGridDependencySynchronize() also orders this reset when PDL is enabled.
+    split_barriers.narrow(1, 0, num_m_blocks).zero_();
 
     // Shifted FP8 is derived from rounded BF16, so FP8-only calls borrow the scratch tail for that numerical boundary.
     const auto y_bf16_storage = needs_bf16_scratch ? scratch.narrow(0, num_mhc_scratch_bytes, num_bf16_scratch_bytes).

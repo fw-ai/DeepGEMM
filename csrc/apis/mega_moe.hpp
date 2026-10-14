@@ -81,7 +81,7 @@ get_symm_buffer_size_for_mega_moe_v3(
     const int& num_shared_experts = 0) {
     DG_HOST_ASSERT(num_ranks > 0 and num_experts > 0 and num_topk > 0);
     DG_HOST_ASSERT(num_experts % num_ranks == 0);
-    DG_HOST_ASSERT(activation == "swiglu" or activation == "geglu");
+    DG_HOST_ASSERT(activation == "swiglu" or activation == "geglu" or activation == "situ");
     DG_HOST_ASSERT(num_shared_experts >= 0);
 
     const auto num_experts_per_rank = num_experts / num_ranks;
@@ -338,7 +338,9 @@ static void fp8_fp4_mega_moe(
     const std::optional<torch::Tensor>& saved_l1_acts_sf,
     const std::optional<int>& num_config_tokens_opt,
     const std::optional<std::tuple<torch::Tensor, torch::Tensor>>& shared_l1_weights_tuple_opt,
-    const std::optional<std::tuple<torch::Tensor, torch::Tensor>>& shared_l2_weights_tuple_opt
+    const std::optional<std::tuple<torch::Tensor, torch::Tensor>>& shared_l2_weights_tuple_opt,
+    const std::optional<float>& situ_beta_opt,
+    const std::optional<float>& situ_linear_beta_opt
 ) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
@@ -349,13 +351,17 @@ static void fp8_fp4_mega_moe(
         num_config_tokens_opt.value_or(num_tokens);
     const auto [rm, rn, rk] = recipe;
     DG_HOST_ASSERT(rm == 1 and rn == 1 and rk == 32);
-    DG_HOST_ASSERT(activation == "swiglu" or activation == "geglu");
+    DG_HOST_ASSERT(activation == "swiglu" or activation == "geglu" or activation == "situ");
     DG_HOST_ASSERT(
         route_weight_mode == "pre_down" ||
         route_weight_mode == "post_down");
     DG_HOST_ASSERT(shared_l1_weights_tuple_opt.has_value() == shared_l2_weights_tuple_opt.has_value());
 
     // Activation checks
+    const auto situ_beta = situ_beta_opt.value_or(1.0f);
+    const auto situ_linear_beta = situ_linear_beta_opt.value_or(std::numeric_limits<float>::infinity());
+    DG_HOST_ASSERT(situ_beta > 0);
+    DG_HOST_ASSERT(situ_linear_beta > 0);
     const auto activation_clamp =
         activation_clamp_opt.value_or(std::numeric_limits<float>::infinity());
     DG_HOST_ASSERT(activation_clamp >= 0);
@@ -499,7 +505,7 @@ static void fp8_fp4_mega_moe(
                                num_shared_experts,
                                num_tokens, num_config_tokens, num_topk,
                                hidden, intermediate_hidden,
-                               activation, activation_clamp, fast_math,
+                               activation, activation_clamp, situ_beta, situ_linear_beta, fast_math,
                                route_weight_mode,
                                saved_down_unweighted,
                                saved_l1_acts,
@@ -1058,7 +1064,9 @@ static void register_apis(pybind11::module_& m) {
         py::arg("saved_l1_acts_sf") = py::none(),
         py::arg("num_config_tokens") = py::none(),
         py::arg("shared_l1_weights_tuple_opt") = py::none(),
-        py::arg("shared_l2_weights_tuple_opt") = py::none());
+        py::arg("shared_l2_weights_tuple_opt") = py::none(),
+        py::arg("situ_beta_opt") = py::none(),
+        py::arg("situ_linear_beta_opt") = py::none());
     m.def("bf16_mega_moe", &bf16_mega_moe,
         py::arg("y"),
         py::arg("l1_weights"),
