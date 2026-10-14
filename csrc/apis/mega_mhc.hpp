@@ -29,7 +29,8 @@ static const torch::Tensor& get_split_barriers(const torch::TensorOptions& optio
     static std::unordered_map<c10::cuda::CUDAStream, torch::Tensor> split_barriers_by_stream;
     auto& split_barriers = split_barriers_by_stream[stream];
     if (not split_barriers.defined()) {
-        // Warm up each stream before capture so one-time zeroing is not replayed with the graph.
+        // Allocate (and zero) each stream's barriers outside of capture, so the allocation is not owned by a
+        // graph. Every call still clears the lines it uses below, and that reset is captured and replayed.
         DG_HOST_ASSERT(c10::cuda::currentStreamCaptureStatusMayInitCtx() == c10::cuda::CaptureStatus::None);
         split_barriers = torch::zeros(
             {mhc_layout::kNumSplitBarriers, mhc_layout::kNumMaxMBlocks, mhc_layout::kSplitBarrierLineBytes},
