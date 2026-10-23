@@ -94,7 +94,13 @@ static void sm100_bf16_mega_moe_wgrad_1sm(
             sizeof(cutlass::bfloat16_t) +
         1024;
 
-    const int num_sms = jit->device.get_num_sms();
+    // Join the shared MegaMoE headroom policy: the combine warps enter a
+    // whole-grid NVLink barrier (sm100_bf16_gemm.cuh), so this grid must
+    // reserve SMs for concurrent communication kernels like every other
+    // cooperative mega launch. `jit->device.get_num_sms()` would ignore both
+    // the DG_MEGA_MOE_SM_HEADROOM env and the process-wide set_num_sms
+    // override and always launch a full-device grid (INC-1291).
+    const int num_sms = get_mega_moe_num_sms();
     const auto desc = GemmDesc{
         .gemm_type = GemmType::KGroupedContiguous,
         .kernel_type = KernelType::KernelNoSF,
