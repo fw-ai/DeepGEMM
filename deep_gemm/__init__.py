@@ -77,6 +77,9 @@ from ._C import (
     get_paged_sparse_mqa_logits_metadata,
     fp8_fp4_sparse_mqa_logits,
     fp8_fp4_paged_sparse_mqa_logits,
+    # Legacy attention kernels
+    fp8_mqa_logits,
+    fp8_paged_mqa_logits,
     # Hyperconnection kernels
     mega_mhc,
     tf32_hc_prenorm_gemm,
