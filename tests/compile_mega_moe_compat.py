@@ -44,10 +44,13 @@ def cases():
     for kind in ("bf16", "fp8_fp4"):
         for block_m in (32, 240):
             for shared, training in ((0, False), (1, False), (0, True)):
-                args = [1920, 512, 256, 4, shared, 2, block_m, 128,
-                        64 if kind == "bf16" else 128, 16 if block_m == 32 else 40]
+                args = [1920, 512, 256, 4, shared, 2, block_m, 128, 64 if kind == "bf16" else 128]
                 if kind == "fp8_fp4":
+                    # Asymmetric L1/L2 store blocks, as `get_block_config_for_mega_moe` selects them
+                    args += [16, 16] if block_m == 32 else [24, 8]
                     args += [128 if block_m == 32 else 256, 128]
+                else:
+                    args += [16 if block_m == 32 else 40]
                 args += [1920]
                 if kind == "fp8_fp4":
                     args += [30720]

@@ -2261,6 +2261,8 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
         const uint32_t epilogue_warp_idx = warp_idx - 4;
         uint32_t current_iter = 0;
         uint32_t tma_stage_idx = 0;
+        const EpilogueOperatorArgs identity_epilogue_args{};
+        epilogue::operators::Identity identity_epilogue(identity_epilogue_args);
 
         for_each_block([&](const uint32_t&, const uint32_t& pool_block_offset,
                            const uint32_t& m_block_idx,
@@ -2284,7 +2286,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                 n_block_idx * BLOCK_N, 0, false,
                 math::align(valid_m, 16u),
                 epilogue_warp_idx, lane_idx,
-                epilogue::operators::Identity{}, false,
+                identity_epilogue, false,
                 tmem_empty_barriers[accum_stage],
                 tmem_empty_barriers[accum_stage],
                 tensor_map_output);
