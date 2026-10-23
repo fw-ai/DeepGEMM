@@ -364,10 +364,9 @@ def test_mega_mhc() -> None:
 @test_filter(lambda: get_arch_major() == 10)
 @torch.no_grad()
 def test_mega_mhc_graph_replay() -> None:
-    # Replays of one captured graph reuse %gridid; `mega_mhc` clears the active split-barrier lines on every
-    # call (captured with the kernel), so a replay cannot observe the previous replay's completed tags.
+    # Replays of one captured graph reuse %gridid, so the split barriers are tagged by an epoch instead.
     # Back-to-back replays with different inputs (stream-ordered copies, no host sync) make stale partials
-    # visible if that reset is missing: with it disabled, about half of these replays differ from eager.
+    # visible if replays could observe the previous replay's completed tags.
     assert deep_gemm.mega_mhc_supports_graph_replay is True
     num_replays = 8
     for is_shifted in (False, True):

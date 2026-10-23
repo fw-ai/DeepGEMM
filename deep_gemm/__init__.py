@@ -148,5 +148,5 @@ __version__ = '2.8.2'
 # Optional BF16-logit sigmoid scoring, preserving low-latency router precision.
 bf16_mega_gate_supports_sigmoid_bf16 = True
 
-# Installed together with the mega-mHC graph-replay barrier reset.
+# Mega-mHC split barriers are tagged by an epoch, so CUDA graph replays are safe.
 mega_mhc_supports_graph_replay = True
