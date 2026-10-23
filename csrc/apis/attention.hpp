@@ -144,6 +144,35 @@ static torch::Tensor get_mqa_logits_metadata(const torch::Tensor& cu_seq_len_k_s
 }
 
 
+// Checks shared by the sparse APIs
+static void check_mqa_logits_q_and_weights(const torch::Tensor& q_fp, const std::optional<torch::Tensor>& q_sf,
+                                           const torch::Tensor& weights,
+                                           const int& num_q_tokens, const int& num_heads, const int& head_dim,
+                                           const int& arch_major) {
+    const bool is_fp4 = q_fp.scalar_type() == kPackedFP4;
+    const bool is_mx_sf = q_sf.has_value();
+    DG_HOST_ASSERT(not is_fp4 or is_mx_sf);
+
+    // Check Q
+    DG_HOST_ASSERT((not is_fp4 and head_dim == 32) or head_dim == 64 or head_dim == 128);
+    DG_HOST_ASSERT(q_fp.is_contiguous());
+    DG_HOST_ASSERT(q_fp.scalar_type() == (is_fp4 ? kPackedFP4 : torch::kFloat8_e4m3fn));
+
+    // Check SF Q (SM100 uses MX scale factors, SM90 per-token float KV scales)
+    DG_HOST_ASSERT(is_mx_sf == (arch_major == 10));
+    if (is_mx_sf) {
+        DG_HOST_ASSERT(q_sf->sizes() == q_fp.sizes().slice(0, q_fp.dim() - 1));
+        DG_HOST_ASSERT(q_sf->is_contiguous());
+        DG_HOST_ASSERT(q_sf->scalar_type() == torch::kInt32);
+    }
+
+    // Check weights: rows are loaded by TMA, so the row stride must be 16-byte aligned (pad `num_heads` up)
+    const auto [_num_q_tokens, _num_heads] = get_shape<2>(weights);
+    DG_HOST_ASSERT(num_q_tokens == _num_q_tokens and num_heads == _num_heads);
+    DG_HOST_ASSERT(weights.stride(1) == 1 and (weights.stride(0) * weights.element_size()) % 16 == 0);
+    DG_HOST_ASSERT(weights.scalar_type() == (arch_major == 10 ? torch::kBFloat16 : torch::kFloat32));
+}
+
 static const torch::Tensor& get_sparse_mqa_logits_workspace(const torch::TensorOptions& options,
                                                             const int num_q_tokens) {
     using namespace layout::sparse_mqa_logits;

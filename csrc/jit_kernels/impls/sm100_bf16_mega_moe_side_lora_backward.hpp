@@ -134,7 +134,7 @@ static void sm100_bf16_mega_moe_side_lora_shared_gemm(
     const std::string& compiled_dims = "mnk") {
     sm100_bf16_gemm(
         a, b, std::nullopt, d, m, n, k,
-        get_major_type_ab(a), get_major_type_ab(b), compiled_dims, std::nullopt);
+        get_major_type_ab(a), get_major_type_ab(b), compiled_dims, std::make_shared<IdentityEpilogue>());
 }
 
 static std::string get_side_lora_backward_route_weight_mode_name(
