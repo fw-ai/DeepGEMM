@@ -1376,8 +1376,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 fused_y,
                 reference_stages['final_expert'])
         if saved_l1_preact is None:
-            if final_mismatches != 0:
-                print(f'[gate] SOFTENED parity: final_mismatches={final_mismatches}', flush=True)
+            assert final_mismatches == 0, (
+                'native grouped-MM final output must be bitwise equal')
             return
 
         valid_rows = torch.isfinite(
@@ -1487,8 +1487,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         dist_print(
             f' > First differing stage: {first_difference}',
             once_in_node=True)
-        if first_difference is not None:
-            print(f'[gate] SOFTENED parity: first_difference={first_difference}', flush=True)
+        assert first_difference is None, (
+            f'first native grouped-MM difference: {first_difference}')
 
     def check_bf16_parity(fused_y: torch.Tensor, ref_y: torch.Tensor):
         report_forward_stage_parity(fused_y, ref_y)
