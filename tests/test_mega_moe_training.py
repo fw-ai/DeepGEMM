@@ -1984,14 +1984,23 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                         f'actual={float(actual[index]):.9g}, '
                         f'expected={float(expected[index]):.9g}',
                         once_in_node=True)
+            # [gate] LOCAL ONLY: keep barrier counts symmetric across ranks.
+            # The upstream guard calls dist_print (an implicit dist.barrier)
+            # only on ranks whose local mismatch_count is nonzero; when ranks
+            # disagree (e.g. B300 denormal-FTZ diffs on h_act/h_weighted), the
+            # extra barrier desynchronizes peers and the following cross-rank
+            # combine kernel traps at its NVLink barrier waiting for a kernel
+            # the lagging rank never launched.
             if mismatch_count:
                 gradient_mismatches[name] = mismatch_count
                 similarity = 1.0 - float(calc_diff(actual, expected))
                 gradient_similarities[name] = similarity
-                dist_print(
-                    f' > {name}: symmetric cosine similarity='
-                    f'{similarity:.9f}',
-                    once_in_node=False)
+            else:
+                similarity = 1.0
+            dist_print(
+                f' > {name}: symmetric cosine similarity='
+                f'{similarity:.9f}',
+                once_in_node=False)
 
         def wgrad_observable(tensor: torch.Tensor) -> torch.Tensor:
             # Phase-ordered outputs alias forward scratch. Kernel B consumes
