@@ -7,6 +7,7 @@
 
 #include "../utils/compatibility.hpp"
 
+#include "../jit_kernels/impls/sm100_bf16_mqa_logits.hpp"
 #include "../jit_kernels/impls/sm100_mqa_logits.hpp"
 #include "../jit_kernels/impls/sm100_sparse_mqa_logits.hpp"
 #include "../jit_kernels/impls/sm90_fp8_mqa_logits.hpp"
@@ -80,7 +81,11 @@ static torch::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::Tensor, std::opt
 
     // Allocate output
     DG_HOST_ASSERT(num_heads > 0 and num_heads <= 128 and num_heads % 4 == 0);
-    constexpr int block_kv = 256;
+    // On SM100, MX scales with BF16 weights and BF16 logits, uncleaned, unscheduled and compressed by `max_seqlen_k`,
+    // take `sm100_bf16_mqa_logits` (separate KV / SF producers, 384-token splits)
+    const bool bf16_mqa_kernel = arch_major == 10 and is_mx_sf and weights.scalar_type() == torch::kBFloat16 and
+        logits_dtype == torch::kBFloat16 and max_seqlen_k > 0 and not clean_logits and not schedule_meta.has_value();
+    const int block_kv = bf16_mqa_kernel ? kBF16MQALogitsSplitKV : 256;
     const int block_q = 128 / num_heads;
 
     torch::Tensor logits;
@@ -102,9 +107,14 @@ static torch::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::Tensor, std::opt
     // NOTES: the logits cleaning is fused into the kernels
     if (arch_major == 10) {
         DG_HOST_ASSERT(qk_dtype == torch::kFloat8_e4m3fn or qk_dtype == kPackedFP4);
-        sm100_mqa_logits(q_fp, q_sf, kv_fp, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end, logits, logits_dtype,
-                         seq_len, seq_len_kv, max_seqlen_k, stride_logits, num_heads, head_dim, block_q, block_kv,
-                         clean_logits, is_mx_sf, qk_dtype, schedule_meta);
+        if (bf16_mqa_kernel) {
+            sm100_bf16_mqa_logits(q_fp, q_sf.value(), kv_fp, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end, logits,
+                                  seq_len, seq_len_kv, stride_logits, num_heads, head_dim, block_q, qk_dtype);
+        } else {
+            sm100_mqa_logits(q_fp, q_sf, kv_fp, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end, logits, logits_dtype,
+                             seq_len, seq_len_kv, max_seqlen_k, stride_logits, num_heads, head_dim, block_q, block_kv,
+                             clean_logits, is_mx_sf, qk_dtype, schedule_meta);
+        }
     } else if (arch_major == 9) {
         DG_HOST_ASSERT(not schedule_meta.has_value());
         DG_HOST_ASSERT(not is_mx_sf);
