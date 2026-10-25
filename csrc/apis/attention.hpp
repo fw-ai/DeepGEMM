@@ -7,9 +7,6 @@
 
 #include "../utils/compatibility.hpp"
 
-#include "../jit_kernels/impls/sm90_fp8_gemm_1d1d.hpp"
-#include "../jit_kernels/impls/sm90_fp8_gemm_1d2d.hpp"
-#include "../jit_kernels/impls/sm100_fp8_fp4_gemm_1d1d.hpp"
 #include "../jit_kernels/impls/sm100_mqa_logits.hpp"
 #include "../jit_kernels/impls/sm100_sparse_mqa_logits.hpp"
 #include "../jit_kernels/impls/sm90_fp8_mqa_logits.hpp"
@@ -18,62 +15,6 @@
 
 namespace deep_gemm::attention {
 
-static void fp8_gemm_nt_skip_head_mid(const std::pair<torch::Tensor, torch::Tensor>& a,
-                                      const std::pair<torch::Tensor, torch::Tensor>& b,
-                                      const torch::Tensor& d,
-                                      const std::tuple<int, int, int>& head_splits,
-                                      std::optional<std::tuple<int, int, int>> recipe,
-                                      const std::string& compiled_dims,
-                                      const bool& disable_ue8m0_cast) {
-    // Shape must be `[M, K] @ [N, K].T`
-    const auto major_a = get_major_type_ab(a.first);
-    const auto major_b = get_major_type_ab(b.first);
-    if (fp8_fp4_requires_k_major(a.first, b.first)) {
-        DG_HOST_ASSERT(major_a == cute::UMMA::Major::K);
-        DG_HOST_ASSERT(major_b == cute::UMMA::Major::K);
-    }
-
-    // D must be N-major
-    check_major_type_cd(d);
-
-    // Type and shape checks
-    const auto [m , k ] = get_shape<2>(a.first);
-    const auto [n , k_] = get_shape<2>(b.first);
-    const auto [m_, n_] = get_shape<2>(d);
-    DG_HOST_ASSERT(m == m_ and k == k_);
-    DG_HOST_ASSERT(n > 0 and k > 0);
-    DG_HOST_ASSERT(a.first.scalar_type() == torch::kFloat8_e4m3fn);
-    DG_HOST_ASSERT(b.first.scalar_type() == torch::kFloat8_e4m3fn);
-    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 or d.scalar_type() == torch::kFloat);
-
-    // Check head splits and N
-    const auto [left, mid, right] = head_splits;
-    DG_HOST_ASSERT(n % (left + right) == 0 and n_ == n + n / (left + right) * mid);
-
-    // Do nothing if the problem is empty
-    if (m == 0)
-        return;
-
-    // Transform SFA and SFB into compute-required layout
-    const auto [sfa, sfb, gran_k_a, gran_k_b] = layout::transform_sf_pair_into_required_layout(
-        a.second, b.second, m, n, k, recipe, std::nullopt, std::nullopt,
-        std::nullopt, std::nullopt, disable_ue8m0_cast);
-    DG_HOST_ASSERT(gran_k_a == 128 and gran_k_b == 128);
-
-    // Dispatch into different implements
-    const auto arch_major = jit->device.get_arch_major();
-    const auto epilogue_type = std::format("epilogue::transform::EpilogueHeadSplits<{}, {}, {}>", left, mid, right);
-    if (arch_major == 9 and sfa.scalar_type() == torch::kFloat and std::get<1>(recipe.value()) != 1) {
-        const auto major_sfb = get_major_type_ab(sfb);
-        sm90_fp8_gemm_1d2d(a.first, sfa, b.first, sfb, std::nullopt, d, m, n, k, major_a, major_b, major_sfb, compiled_dims, epilogue_type);
-    } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
-        // NOTES: Only granularity 128 and FP8 are exposed in the API
-        sm100_fp8_fp4_gemm_1d1d(a.first, sfa, b.first, sfb, std::nullopt, d, m, n, k,
-                                128, 128, major_a, major_b, compiled_dims, epilogue_type);
-    } else {
-        DG_HOST_UNREACHABLE("Unsupported architecture or scaling factor types");
-    }
-}
 
 static torch::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::Tensor, std::optional<torch::Tensor>>& q,
                                         const std::tuple<torch::Tensor, torch::Tensor>& kv,
@@ -202,6 +143,36 @@ static torch::Tensor get_mqa_logits_metadata(const torch::Tensor& cu_seq_len_k_s
     return schedule_meta;
 }
 
+
+// Checks shared by the sparse APIs
+static void check_mqa_logits_q_and_weights(const torch::Tensor& q_fp, const std::optional<torch::Tensor>& q_sf,
+                                           const torch::Tensor& weights,
+                                           const int& num_q_tokens, const int& num_heads, const int& head_dim,
+                                           const int& arch_major) {
+    const bool is_fp4 = q_fp.scalar_type() == kPackedFP4;
+    const bool is_mx_sf = q_sf.has_value();
+    DG_HOST_ASSERT(not is_fp4 or is_mx_sf);
+
+    // Check Q
+    DG_HOST_ASSERT((not is_fp4 and head_dim == 32) or head_dim == 64 or head_dim == 128);
+    DG_HOST_ASSERT(q_fp.is_contiguous());
+    DG_HOST_ASSERT(q_fp.scalar_type() == (is_fp4 ? kPackedFP4 : torch::kFloat8_e4m3fn));
+
+    // Check SF Q (SM100 uses MX scale factors, SM90 per-token float KV scales)
+    DG_HOST_ASSERT(is_mx_sf == (arch_major == 10));
+    if (is_mx_sf) {
+        DG_HOST_ASSERT(q_sf->sizes() == q_fp.sizes().slice(0, q_fp.dim() - 1));
+        DG_HOST_ASSERT(q_sf->is_contiguous());
+        DG_HOST_ASSERT(q_sf->scalar_type() == torch::kInt32);
+    }
+
+    // Check weights: rows are loaded by TMA, so the row stride must be 16-byte aligned (pad `num_heads` up)
+    const auto [_num_q_tokens, _num_heads] = get_shape<2>(weights);
+    DG_HOST_ASSERT(num_q_tokens == _num_q_tokens and num_heads == _num_heads);
+    DG_HOST_ASSERT(weights.stride(1) == 1 and (weights.stride(0) * weights.element_size()) % 16 == 0);
+    DG_HOST_ASSERT(weights.scalar_type() == (arch_major == 10 ? torch::kBFloat16 : torch::kFloat32));
+}
+
 static const torch::Tensor& get_sparse_mqa_logits_workspace(const torch::TensorOptions& options,
                                                             const int num_q_tokens) {
     using namespace layout::sparse_mqa_logits;
@@ -303,23 +274,16 @@ static torch::Tensor fp8_fp4_sparse_mqa_logits(const std::tuple<torch::Tensor, s
     DG_HOST_ASSERT(sparse_block_kv == 8 or sparse_block_kv == 16);
     const auto& q_sf = q_sf_optional.value();
     const auto qk_dtype = q_fp.scalar_type();
-    const bool is_fp4 = qk_dtype == kPackedFP4;
 
     const auto [num_q_tokens, num_heads, head_dim] = get_logical_shape<3>(q_fp);
-    DG_HOST_ASSERT(num_q_tokens > 0 and num_heads == kNumHeads and head_dim == kHeadDim);
-    DG_HOST_ASSERT((is_fp4 or qk_dtype == torch::kFloat8_e4m3fn) and q_fp.is_contiguous());
-    const auto [_num_q_tokens_sf, _num_heads_sf] = get_shape<2>(q_sf);
-    DG_HOST_ASSERT(_num_q_tokens_sf == num_q_tokens and _num_heads_sf == num_heads);
-    DG_HOST_ASSERT(q_sf.scalar_type() == torch::kInt32 and q_sf.is_contiguous());
+    DG_HOST_ASSERT(num_q_tokens > 0 and head_dim == kHeadDim);
+    DG_HOST_ASSERT(num_heads > 0 and static_cast<uint32_t>(num_heads) <= kNumMaxHeads and num_heads % 4 == 0);
+    check_mqa_logits_q_and_weights(q_fp, q_sf_optional, weights, num_q_tokens, num_heads, head_dim, 10);
 
     const auto [num_kv_tokens, kv_head_dim] = get_logical_shape<2>(kv_fp);
     DG_HOST_ASSERT(num_kv_tokens > 0 and kv_head_dim == head_dim and kv_fp.scalar_type() == qk_dtype and kv_fp.is_contiguous());
     const auto [_num_kv_tokens_sf] = get_shape<1>(kv_sf);
     DG_HOST_ASSERT(_num_kv_tokens_sf == num_kv_tokens and kv_sf.scalar_type() == torch::kInt32 and kv_sf.is_contiguous());
-
-    const auto [_num_q_tokens_weights, _num_heads_weights] = get_shape<2>(weights);
-    DG_HOST_ASSERT(_num_q_tokens_weights == num_q_tokens and _num_heads_weights == num_heads);
-    DG_HOST_ASSERT(weights.scalar_type() == torch::kBFloat16 and weights.stride(1) == 1);
 
     const int num_output_tokens = num_max_sparse_blocks * sparse_block_kv;
     const int logits_stride = align(num_output_tokens, 1024 / static_cast<int>(sizeof(nv_bfloat16)));
@@ -347,22 +311,18 @@ static torch::Tensor fp8_fp4_paged_sparse_mqa_logits(const std::tuple<torch::Ten
     const bool is_fp4 = qk_dtype == kPackedFP4;
 
     const auto [num_q_tokens, next_n, num_heads, head_dim] = get_logical_shape<4>(q_fp);
-    DG_HOST_ASSERT(num_q_tokens > 0 and next_n == 1 and num_heads == kNumHeads and head_dim == kHeadDim);
-    DG_HOST_ASSERT((is_fp4 or qk_dtype == torch::kFloat8_e4m3fn) and q_fp.is_contiguous());
-    const auto [_num_q_tokens_sf, _next_n_sf, _num_heads_sf] = get_shape<3>(q_sf);
-    DG_HOST_ASSERT(_num_q_tokens_sf == num_q_tokens and _next_n_sf == 1 and _num_heads_sf == num_heads);
-    DG_HOST_ASSERT(q_sf.scalar_type() == torch::kInt32 and q_sf.is_contiguous());
+    DG_HOST_ASSERT(num_q_tokens > 0 and next_n == 1 and head_dim == kHeadDim);
+    DG_HOST_ASSERT(num_heads > 0 and static_cast<uint32_t>(num_heads) <= kNumMaxHeads and num_heads % 4 == 0);
+    check_mqa_logits_q_and_weights(q_fp, q_sf_optional, weights, num_q_tokens, num_heads, head_dim, 10);
 
     const auto [num_kv_pages, page_kv, num_kv_heads, head_dim_with_sf] = get_shape<4>(fused_kv_cache);
     DG_HOST_ASSERT(num_kv_pages > 0 and page_kv > 0 and page_kv % sparse_block_kv == 0 and num_kv_heads == 1 and
                    head_dim_with_sf == (is_fp4 ? head_dim / 2 : head_dim) + static_cast<int>(sizeof(int)));
     DG_HOST_ASSERT(fused_kv_cache.scalar_type() == torch::kUInt8 and fused_kv_cache.stride(1) == head_dim_with_sf and
                    fused_kv_cache.stride(3) == 1 and fused_kv_cache.stride(0) <= std::numeric_limits<int>::max() and
-                   fused_kv_cache.stride(0) % 512 == 0);
-
-    const auto [_num_q_tokens_weights, _num_heads_weights] = get_shape<2>(weights);
-    DG_HOST_ASSERT(_num_q_tokens_weights == num_q_tokens and _num_heads_weights == num_heads);
-    DG_HOST_ASSERT(weights.scalar_type() == torch::kBFloat16 and weights.stride(1) == 1);
+                   fused_kv_cache.stride(0) % 128 == 0);
+    // The kernel copies KV and SF with 16-byte `cp.async`, so the page base must be aligned as well
+    DG_HOST_ASSERT(reinterpret_cast<std::uintptr_t>(fused_kv_cache.data_ptr()) % 16 == 0);
 
     const int num_output_tokens = num_max_sparse_blocks * sparse_block_kv;
     const int logits_stride = align(num_output_tokens, 1024 / static_cast<int>(sizeof(nv_bfloat16)));
@@ -372,6 +332,7 @@ static torch::Tensor fp8_fp4_paged_sparse_mqa_logits(const std::tuple<torch::Ten
                                    weights, metadata, logits);
     return logits;
 }
+
 
 static torch::Tensor get_paged_mqa_logits_metadata(const torch::Tensor& context_lens, int block_kv, int num_sms, const std::optional<torch::Tensor>& indices) {
     // NOTES: Only 2D context lens is supported for now
@@ -572,11 +533,6 @@ static torch::Tensor fp8_paged_mqa_logits(const torch::Tensor& q,
                                     max_context_len, clean_logits, torch::kFloat, indices);
 }
 static void register_apis(pybind11::module_& m) {
-    m.def("fp8_gemm_nt_skip_head_mid", &fp8_gemm_nt_skip_head_mid,
-          py::arg("a"), py::arg("b"), py::arg("d"), py::arg("head_splits"),
-          py::arg("recipe") = std::nullopt,
-          py::arg("compiled_dims") = "nk",
-          py::arg("disable_ue8m0_cast") = false);
     m.def("fp8_fp4_mqa_logits", &fp8_fp4_mqa_logits,
           py::arg("q"), py::arg("kv"), py::arg("weights"),
           py::arg("cu_seq_len_k_start"), py::arg("cu_seq_len_k_end"),

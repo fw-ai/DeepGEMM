@@ -89,7 +89,8 @@ static SideLoraMegaMoEConfig get_side_lora_mega_moe_config(
     const auto base = get_mega_moe_config(
         num_ranks, num_experts, num_experts_per_rank, num_max_tokens_per_rank,
         num_tokens, num_topk, hidden, intermediate_hidden,
-        num_ring_tokens, num_sf_ring_tokens, mma_kind);
+        num_ring_tokens, num_sf_ring_tokens, mma_kind, true);
+    DG_HOST_ASSERT(base.store_block_m_l1 == base.store_block_m_l2);
     const int experts_per_wave = get_num_experts_per_wave_for_mega_moe(
         num_experts_per_rank, num_tokens, num_topk, intermediate_hidden,
         base.block_m, base.block_n, get_mega_moe_num_sms(),

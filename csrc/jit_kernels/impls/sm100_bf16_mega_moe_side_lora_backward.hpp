@@ -116,7 +116,7 @@ static void sm100_bf16_mega_moe_side_lora_rank_gemm(
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_cd = tensor_map_d,
-        .epilogue = make_epilogue_input(num_pool_rows, n, std::nullopt, std::nullopt),
+        .epilogue_class = std::make_shared<IdentityEpilogue>(),
     };
     SM100BF16GemmRuntime::compile_and_launch("sm100_bf16_mega_moe_side_lora_rank_gemm", args);
 }
@@ -134,7 +134,7 @@ static void sm100_bf16_mega_moe_side_lora_shared_gemm(
     const std::string& compiled_dims = "mnk") {
     sm100_bf16_gemm(
         a, b, std::nullopt, d, m, n, k,
-        get_major_type_ab(a), get_major_type_ab(b), compiled_dims, std::nullopt);
+        get_major_type_ab(a), get_major_type_ab(b), compiled_dims, std::make_shared<IdentityEpilogue>());
 }
 
 static std::string get_side_lora_backward_route_weight_mode_name(

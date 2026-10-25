@@ -12,7 +12,7 @@
 #include <deep_gemm/comm/barrier.cuh>
 #include <deep_gemm/epilogue/sm100_store_cd.cuh>
 #include <deep_gemm/epilogue/sm100_store_cd_swap_ab.cuh>
-#include <deep_gemm/epilogue/transform.cuh>
+#include <deep_gemm/epilogue/operators.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
 #include <deep_gemm/mma/sm100.cuh>
 #include <deep_gemm/ptx/tma.cuh>
@@ -2261,6 +2261,8 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
         const uint32_t epilogue_warp_idx = warp_idx - 4;
         uint32_t current_iter = 0;
         uint32_t tma_stage_idx = 0;
+        const EpilogueOperatorArgs identity_epilogue_args{};
+        epilogue::operators::Identity identity_epilogue(identity_epilogue_args);
 
         for_each_block([&](const uint32_t&, const uint32_t& pool_block_offset,
                            const uint32_t& m_block_idx,
@@ -2284,7 +2286,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                 n_block_idx * BLOCK_N, 0, false,
                 math::align(valid_m, 16u),
                 epilogue_warp_idx, lane_idx,
-                epilogue::transform::EpilogueIdentity{}, false,
+                identity_epilogue, false,
                 tmem_empty_barriers[accum_stage],
                 tmem_empty_barriers[accum_stage],
                 tensor_map_output);

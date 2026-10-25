@@ -14,7 +14,7 @@
 #include <deep_gemm/comm/barrier.cuh>
 #include <deep_gemm/epilogue/sm100_store_cd.cuh>
 #include <deep_gemm/epilogue/sm100_store_cd_swap_ab.cuh>
-#include <deep_gemm/epilogue/transform.cuh>
+#include <deep_gemm/epilogue/operators.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
 #include <deep_gemm/mma/sm100.cuh>
 #include <deep_gemm/ptx/tma.cuh>
@@ -1953,6 +1953,12 @@ sm100_bf16_mega_moe_side_lora_backward_wave_impl(
         return reinterpret_cast<cd_dtype_t*>(
             smem_gemm_base + i * SMEM_CD_SIZE_PER_STAGE);
     });
+    struct OutputStorage {
+        using cd_dtype = cd_dtype_t;
+        cd_dtype_t cd[kNumTMAStoreStages][STORE_BLOCK_M * STORE_BLOCK_N];
+    };
+    DG_STATIC_ASSERT(sizeof(OutputStorage) == SMEM_CD_SIZE, "Output storage must preserve the shared memory layout");
+    auto& output_storage = *reinterpret_cast<OutputStorage*>(smem_gemm_base);
     auto smem_a = utils::PatternVisitor([=](const uint32_t& i) {
         return reinterpret_cast<a_dtype_t*>(
             smem_gemm_base + SMEM_CD_SIZE +
@@ -2664,18 +2670,21 @@ sm100_bf16_mega_moe_side_lora_backward_wave_impl(
             tmem_full_barriers[accum_stage]->wait(accum_phase);
             ptx::tcgen05_after_thread_sync();
 
+            const EpilogueOperatorArgs identity_epilogue_args{};
+            epilogue::operators::Identity identity_epilogue(identity_epilogue_args);
             epilogue::sm100_store_cd_swap_ab<
                 BLOCK_M, BLOCK_N, STORE_BLOCK_M,
                 STORE_BLOCK_N, kSwizzleCDMode,
                 kNumTMAStoreStages, kNumEpilogueThreads,
-                GemmType::Normal, false, cd_dtype_t,
-                epilogue::transform::EpilogueIdentity>(
-                smem_cd, tma_stage_idx,
+                0, GemmType::Normal, false>(
+                output_storage, tma_stage_idx,
                 accum_stage * UMMA_N,
                 (pool_block_offset + m_block_idx) * BLOCK_M,
-                n_block_idx * BLOCK_N, 0,
+                n_block_idx * BLOCK_N, 0, false,
                 math::align(valid_m, 16u),
                 epilogue_warp_idx, lane_idx,
+                identity_epilogue, false,
+                tmem_empty_barriers[accum_stage],
                 tmem_empty_barriers[accum_stage],
                 tensor_map_output);
         });

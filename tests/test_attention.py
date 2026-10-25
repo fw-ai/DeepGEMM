@@ -16,52 +16,6 @@ from deep_gemm.utils import ceil_div, per_custom_dims_cast_to_fp8, per_token_cas
 from generators import generate_normal, get_ue8m0_usage, get_kernel_types, MajorTypeAB
 
 
-def apply_skip_head_mid(d: torch.Tensor, head_splits: Tuple[int, int, int]):
-    left, mid, right = head_splits
-    m, n = d.shape
-    assert n % (left + right) == 0
-    num_heads = n // (left + right)
-
-    # Split and insert padding tensor
-    d = d.view(m, num_heads, -1)
-    d_left = d[:, :, :left]
-    d_right = d[:, :, -right:]
-
-    d_mid = torch.zeros((m, num_heads, mid), dtype=d.dtype, device=d.device)
-    return torch.cat([d_left, d_mid, d_right], dim=2).view(m, -1)
-
-
-def test_gemm_skip_head_mid() -> None:
-    print('Testing GEMM skip head mid:')
-    head_splits = (128, 64, 128)
-
-    major_a, major_b = MajorTypeAB.KMajor,  MajorTypeAB.KMajor
-    out_dtype, accumulate = torch.bfloat16, False
-
-    for kernel_type in get_kernel_types(dtype=torch.float8_e4m3fn):
-        for m in (128, 4096):
-            for n, k in [(32768, 512), (8192, 512)]:
-                kernel_opt = f'1D1D' if kernel_type.is_1d1d() else '1D2D'
-                use_ue8m0 = get_ue8m0_usage(kernel_type)
-                disable_ue8m0_cast = not use_ue8m0
-
-                a, b, _, d, ref_d = generate_normal(m, n, k, major_a, major_b, accumulate, out_dtype, kernel_type, use_ue8m0=use_ue8m0)
-                d = apply_skip_head_mid(d, head_splits)
-                ref_d = apply_skip_head_mid(ref_d, head_splits)
-
-                deep_gemm.fp8_gemm_nt_skip_head_mid(a, b, d, head_splits, disable_ue8m0_cast=disable_ue8m0_cast)
-                diff = calc_diff(d, ref_d)
-                assert diff < 0.001, f'{m=}, {n=}, {k=}, {kernel_opt}, {diff:.5f}'
-
-                t = bench_kineto(lambda: deep_gemm.fp8_gemm_nt_skip_head_mid(a, b, d, head_splits, disable_ue8m0_cast=disable_ue8m0_cast),
-                                 'gemm_', suppress_kineto_output=True)
-                print(f' > Perf (m={m:5}, n={n:5}, k={k:5}, {kernel_opt}): '
-                      f'{t * 1e6:4.0f} us | '
-                      f'{2 * m * n * k / t / 1e12:4.0f} TFLOPS | '
-                      f'{(count_bytes(a, b, d)) / 1e9 / t:4.0f} GB/s')
-    print()
-
-
 def sample_mqa_cases(name: str, cases: List[tuple]) -> List[tuple]:
     num_cases = os.getenv('DG_MQA_NUM_CASES')
     if num_cases is None:
@@ -572,13 +526,11 @@ def make_sparse_kv_block_indices(context_lens: List[int], request_indices: List[
 
 @test_filter(lambda: get_arch_major() == 10)
 def test_sparse_mqa_logits() -> None:
-    num_heads, head_dim = 32, 128
-    page_kv = 64
+    head_dim, page_kv = 128, 64
 
     def enumerate_sparse_mqa_logits():
         avg_kv_lens = (4 * 1024, 8 * 1024, 16 * 1024, 32 * 1024, 64 * 1024, 128 * 1024, 256 * 1024)
         num_sms = deep_gemm.get_num_sms()
-
         for fmt in ('mxfp4', 'mxfp8'):
             # Contiguous KV
             for num_max_sparse_blocks in (2048, 1024, 512):
@@ -627,8 +579,9 @@ def test_sparse_mqa_logits() -> None:
     print('Testing MXFP4/MXFP8 Sparse MQA Logits:')
     torch.manual_seed(0)
     cases = sample_mqa_cases('sparse', list(enumerate_sparse_mqa_logits()))
+    cases = [(num_heads, *case) for case in cases for num_heads in (8, 12, 20, 32)]
     aligned_sparse_times = {}
-    for fmt, is_paged, num_q_tokens, avg_kv_len, sparse_block_kv, num_max_sparse_blocks, use_unaligned_ks in cases:
+    for num_heads, fmt, is_paged, num_q_tokens, avg_kv_len, sparse_block_kv, num_max_sparse_blocks, use_unaligned_ks in cases:
         is_mxfp4 = fmt == 'mxfp4'
         cast_fwd = per_token_cast_to_fp4 if is_mxfp4 else per_token_cast_to_fp8
         kv_cache_cast = kv_cache_cast_to_mxfp4 if is_mxfp4 else kv_cache_cast_to_mxfp8
@@ -690,7 +643,7 @@ def test_sparse_mqa_logits() -> None:
             num_pages_per_request = [ceil_div(context_len, page_kv) for context_len in max_context_lens]
             max_num_pages, num_pages = max(num_pages_per_request), sum(num_pages_per_request)
             page_bytes = page_kv * (elem_dim + 4)
-            page_stride_bytes = ceil_div(page_bytes, 512) * 512
+            page_stride_bytes = ceil_div(page_bytes, 128) * 128
             kv_storage = torch.empty((num_pages, page_stride_bytes), device='cuda', dtype=torch.uint8)
             kv_cache = kv_storage.as_strided((num_pages, page_kv, 1, elem_dim + 4),
                                              (page_stride_bytes, elem_dim + 4, elem_dim + 4, 1))
@@ -775,7 +728,7 @@ def test_sparse_mqa_logits() -> None:
         full_t = bench_kineto(run_full, full_kernel_name)
         comparison = ''
         if not is_paged:
-            key = fmt, num_q_tokens, avg_kv_len, sparse_block_kv, num_max_sparse_blocks
+            key = num_heads, fmt, num_q_tokens, avg_kv_len, sparse_block_kv, num_max_sparse_blocks
             if use_unaligned_ks and key in aligned_sparse_times:
                 comparison = f', unaligned/aligned {sparse_t / aligned_sparse_times[key]:.2f}x'
             elif not use_unaligned_ks:
@@ -793,8 +746,8 @@ def test_sparse_mqa_logits() -> None:
         total_bytes = count_bytes(q, weights, metadata) + sparse_output_bytes + num_union_blocks * kv_bytes_per_block
         tflops = 2 * num_sum_blocks * sparse_block_kv * num_heads * head_dim / 1e12
         reduce_relus = num_sum_blocks * sparse_block_kv * num_heads
-        relu_per_sm_cycle = reduce_relus / (sparse_t * deep_gemm.get_num_sms() * 1.95 * 1e9)
-        print(f' > Fmt={fmt:5}, {case}, KV={avg_kv_len:7}, SPARSE_BLOCK_KV={sparse_block_kv:2}, '
+        relu_per_sm_cycle = reduce_relus / (sparse_t * deep_gemm.get_num_sms() * 1.9 * 1e9)
+        print(f' > Fmt={fmt:5}, H={num_heads:2}, {case}, KV={avg_kv_len:7}, SPARSE_BLOCK_KV={sparse_block_kv:2}, '
               f'MAX_BLOCKS={num_max_sparse_blocks:4}: sparse {sparse_t * 1e6:5.1f} us, '
               f'{tflops / sparse_t:4.0f} TFLOPS, '
               f'{total_bytes / sparse_t / 1e9:4.0f} GB/s, '
@@ -804,13 +757,10 @@ def test_sparse_mqa_logits() -> None:
     print()
 
 
-
-
 if __name__ == '__main__':
     torch.manual_seed(0)
     random.seed(0)
 
-    test_gemm_skip_head_mid()
     test_mqa_logits()
     test_paged_mqa_logits()
     test_sparse_mqa_logits()
