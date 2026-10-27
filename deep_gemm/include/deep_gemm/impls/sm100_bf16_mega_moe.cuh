@@ -44,6 +44,7 @@ template <
     float kSituBeta = 4.0f,
     float kSituLinearBeta = cute::numeric_limits<float>::infinity(),
     bool kSeparateL1 = false,
+    bool kUseLocalityDomains = true,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -88,9 +89,11 @@ sm100_bf16_mega_moe_impl(void* y,
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::TMEM::Allocator2Sm;
 
-    // Use one domain when clusters cannot split evenly across device locality domains
+    // Per-domain warmup assumes balanced scheduler counts. A partial grid may
+    // place unequal numbers of clusters in the two domains, so use one queue
+    // when the host reserves SMs for concurrent communication.
     constexpr uint32_t kNumLocalityDomains =
-        L1_SHAPE_N % (BLOCK_N * 2 * kNumDeviceLocalityDomains) == 0 and
+        kUseLocalityDomains and L1_SHAPE_N % (BLOCK_N * 2 * kNumDeviceLocalityDomains) == 0 and
         L2_SHAPE_N % (BLOCK_N * 2 * kNumDeviceLocalityDomains) == 0 ? kNumDeviceLocalityDomains : 1;
 
     // Template checks
