@@ -97,6 +97,8 @@ def cases():
                     suffix = "linear" if linear_beta == "8.0f" else "unbounded"
                     yield (f"situ_bwd_m{block_m}_{suffix}", "sm100_fp8_fp4_mega_moe_backward",
                            "sm100_fp8_fp4_mega_moe_backward_wave_impl", situ_args)
+                    yield (f"situ_bwd_separate_m{block_m}_{suffix}", "sm100_fp8_fp4_mega_moe_backward",
+                           "sm100_fp8_fp4_mega_moe_backward_wave_impl", situ_args + [True])
 
     for combine in (False, True):
         args = ["cute::UMMA::Major::MN", "cute::UMMA::Major::MN", 512, 256, 0,

@@ -188,6 +188,7 @@ public:
         int num_sms;
         int num_ranks;
         bool bf16_mode = false;
+        bool separate_w13 = false;
         std::string activation = "swiglu";
         float situ_beta = 4.0f;
         float situ_linear_beta = std::numeric_limits<float>::infinity();
@@ -286,7 +287,7 @@ static void __instantiate_kernel() {{
             {},
             {},
             {},
-            {}, {}, {}
+            {}, {}, {}, {}
         >);
 }};
 )",
@@ -316,7 +317,8 @@ static void __instantiate_kernel() {{
             args.trace_kernel ? "true" : "false",
             args.vectorized_grad_x_store ? "true" : "false",
             args.wide_grad_x_store ? "true" : "false",
-            to_string(args.situ_beta), to_string(args.situ_linear_beta));
+            to_string(args.situ_beta), to_string(args.situ_linear_beta),
+            args.separate_w13 ? "true" : "false");
     }
 
     static void launch(const auto& kernel, const Args& args) {
@@ -1266,7 +1268,8 @@ static void sm100_bf16_mega_moe_backward_dgrad(
     const std::optional<torch::Tensor>& kernel_trace =
         std::nullopt,
     const float situ_beta = 4.0f,
-    const float situ_linear_beta = std::numeric_limits<float>::infinity()) {
+    const float situ_linear_beta = std::numeric_limits<float>::infinity(),
+    const std::optional<torch::Tensor>& w3_weights = std::nullopt) {
     constexpr int block_n = 128;
     constexpr int block_k = 128;
     constexpr int dgrad_block_k = 64;
@@ -1275,10 +1278,11 @@ static void sm100_bf16_mega_moe_backward_dgrad(
     constexpr int num_epilogue_stages = 2;
     constexpr int num_tma_store_stages = 2;
 
-    const auto [num_experts, intermediate_hidden_2, hidden] =
+    const auto [num_experts, weight_rows, hidden] =
         get_shape<3>(w13_weights);
     const auto [num_experts_w2, hidden_w2, intermediate_hidden] =
         get_shape<3>(w2_weights);
+    const int intermediate_hidden_2 = 2 * intermediate_hidden;
     const int num_pool_rows = static_cast<int>(grad_ye.size(0));
     const int num_ranks =
         static_cast<int>(backward_sym_buffer_ptrs.size());
@@ -1308,7 +1312,7 @@ static void sm100_bf16_mega_moe_backward_dgrad(
         backward_rank >= 0 && backward_rank < num_ranks);
     DG_HOST_ASSERT(num_experts == num_experts_w2);
     DG_HOST_ASSERT(hidden == hidden_w2);
-    DG_HOST_ASSERT(intermediate_hidden_2 == 2 * intermediate_hidden);
+    DG_HOST_ASSERT(weight_rows == (w3_weights.has_value() ? intermediate_hidden : 2 * intermediate_hidden));
     DG_HOST_ASSERT(block_m % 16 == 0);
     DG_HOST_ASSERT(hidden % 256 == 0);
     DG_HOST_ASSERT(intermediate_hidden % 256 == 0);
@@ -1332,6 +1336,11 @@ static void sm100_bf16_mega_moe_backward_dgrad(
     check_bf16_contiguous(down_unweighted_output);
     check_bf16_contiguous(w2_weights);
     check_bf16_contiguous(w13_weights);
+    if (w3_weights.has_value()) {
+        check_bf16_contiguous(*w3_weights);
+        DG_HOST_ASSERT(w3_weights->sizes() == w13_weights.sizes());
+        DG_HOST_ASSERT(w3_weights->device() == w13_weights.device());
+    }
     check_bf16_contiguous(backward_grad_y);
     check_bf16_contiguous(backward_x);
     DG_HOST_ASSERT(backward_topk_weights.scalar_type() == torch::kFloat);
@@ -1576,14 +1585,21 @@ static void sm100_bf16_mega_moe_backward_dgrad(
         static_cast<int>(x_pool_output.stride(-2)), 128);
     const auto tensor_map_w13 = make_tma_2d_desc(
         w13_weights, hidden,
-        num_experts * intermediate_hidden_2,
+        num_experts * weight_rows,
         block_k, load_block_n,
         static_cast<int>(w13_weights.stride(-2)), 128);
     const auto tensor_map_w13_dgrad = make_tma_2d_desc(
         w13_weights, hidden,
-        num_experts * intermediate_hidden_2,
+        num_experts * weight_rows,
         load_block_n, dgrad_block_k,
         static_cast<int>(w13_weights.stride(-2)), 128);
+    // The FP4 weight descriptor is unused in BF16 mode. Reuse that argument
+    // slot for the optional separate up-weight dgrad descriptor.
+    const auto tensor_map_w3_dgrad = w3_weights.has_value()
+        ? make_tma_2d_desc(*w3_weights, hidden, num_experts * intermediate_hidden,
+                           load_block_n, dgrad_block_k,
+                           static_cast<int>(w3_weights->stride(-2)), 128)
+        : tensor_map_w13;
     const auto tensor_map_gate_up = make_tma_2d_desc(
         gate_up_output, intermediate_hidden_2, num_pool_rows,
         block_n, store_block_m,
@@ -1651,6 +1667,7 @@ static void sm100_bf16_mega_moe_backward_dgrad(
         .num_sms = num_sms,
         .num_ranks = num_ranks,
         .bf16_mode = true,
+        .separate_w13 = w3_weights.has_value(),
         .activation = activation,
         .situ_beta = situ_beta,
         .situ_linear_beta = situ_linear_beta,
@@ -1688,7 +1705,7 @@ static void sm100_bf16_mega_moe_backward_dgrad(
         .tensor_map_w2_weights = tensor_map_w2,
         .tensor_map_w2_scales = tensor_map_w2,
         .tensor_map_w13_dequant = tensor_map_w13_dgrad,
-        .tensor_map_w13_weights = tensor_map_w13,
+        .tensor_map_w13_weights = tensor_map_w3_dgrad,
         .tensor_map_w13_scales = tensor_map_w13,
         .tensor_map_grad_gate_up =
             tensor_map_grad_gate_up,

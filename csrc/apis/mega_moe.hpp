@@ -1019,6 +1019,7 @@ static void bf16_mega_moe_side_lora(
 
 static void register_apis(pybind11::module_& m) {
     m.attr("BF16_MEGAMOE_SITU") = true;
+    m.attr("BF16_MEGAMOE_SEPARATE_W13") = true;
     m.def("bf16_mega_moe_side_lora", &bf16_mega_moe_side_lora);
     m.def("get_symm_buffer_size_for_mega_moe_side_lora", &get_symm_buffer_size_for_mega_moe_side_lora);
     m.def("get_num_ring_tokens_for_mega_moe", &get_num_ring_tokens_for_mega_moe);
