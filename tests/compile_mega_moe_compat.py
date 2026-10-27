@@ -90,6 +90,12 @@ def cases():
                    "sm100_fp8_fp4_mega_moe_backward_wave_impl", args)
 
             if bf16:
+                for activation in ("GeGLU", "SwiGLU"):
+                    separate_args = args.copy()
+                    separate_args[separate_args.index("ActivationType::GeGLU")] = f"ActivationType::{activation}"
+                    separate_args += [False, False, False, "4.0f", "__builtin_inff()", True]
+                    yield (f"separate_bwd_m{block_m}_{activation}", "sm100_fp8_fp4_mega_moe_backward",
+                           "sm100_fp8_fp4_mega_moe_backward_wave_impl", separate_args)
                 for linear_beta in ("__builtin_inff()", "8.0f"):
                     situ_args = args.copy()
                     situ_args[situ_args.index("ActivationType::GeGLU")] = "ActivationType::SiTU"
@@ -97,6 +103,8 @@ def cases():
                     suffix = "linear" if linear_beta == "8.0f" else "unbounded"
                     yield (f"situ_bwd_m{block_m}_{suffix}", "sm100_fp8_fp4_mega_moe_backward",
                            "sm100_fp8_fp4_mega_moe_backward_wave_impl", situ_args)
+                    yield (f"situ_bwd_separate_m{block_m}_{suffix}", "sm100_fp8_fp4_mega_moe_backward",
+                           "sm100_fp8_fp4_mega_moe_backward_wave_impl", situ_args + [True])
 
     for combine in (False, True):
         args = ["cute::UMMA::Major::MN", "cute::UMMA::Major::MN", 512, 256, 0,

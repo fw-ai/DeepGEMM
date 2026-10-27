@@ -17,6 +17,7 @@ except ImportError:
 from . import _C
 
 BF16_MEGAMOE_SITU = bool(getattr(_C, "BF16_MEGAMOE_SITU", False))
+BF16_MEGAMOE_SEPARATE_W13 = bool(getattr(_C, "BF16_MEGAMOE_SEPARATE_W13", False))
 from ._C import (
     shutdown,
     set_num_sms,

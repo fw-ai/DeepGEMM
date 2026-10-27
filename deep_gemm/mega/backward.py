@@ -258,6 +258,7 @@ def bf16_mega_moe_backward_dgrad(
     x_prepared: bool = False,
     situ_beta: float = 4.0,
     situ_linear_beta: Optional[float] = None,
+    w3_weights: Optional[torch.Tensor] = None,
 ) -> None:
     """Run BF16 reverse dispatch, dgrad, activation, and direct grad-x.
 
@@ -272,6 +273,12 @@ def bf16_mega_moe_backward_dgrad(
     """
     situ_kwargs = _situ_kwargs(activation, situ_beta, situ_linear_beta,
                                route_weight_mode, activation_limit, fast_math)
+    # With a separate up weight, w13_weights is the gate tensor [E, I, H].
+    # Preserve the packed ABI when callers do not request this layout.
+    if w3_weights is not None:
+        if python_numerical_correction:
+            raise ValueError("separate weights do not support Python numerical correction")
+        situ_kwargs["w3_weights"] = w3_weights
     if activation == "situ" and python_numerical_correction:
         raise ValueError("SiTU does not support Python numerical correction")
     route_weight_mode = RouteWeightMode(route_weight_mode)

@@ -1325,6 +1325,7 @@ template <
     bool kWideGradXStore = false,
     float kSituBeta = 4.0f,
     float kSituLinearBeta = cute::numeric_limits<float>::infinity(),
+    bool kSeparateW13 = false,
     uint32_t kNumNonEpilogueThreads = 128,
     uint32_t kNumEpilogueThreads = 128,
     uint32_t kNumThreads =
@@ -1527,6 +1528,10 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
         cute::prefetch_tma_descriptor(&tensor_map_w2_dequant);
         cute::prefetch_tma_descriptor(&tensor_map_w13_dequant);
         cute::prefetch_tma_descriptor(&tensor_map_grad_gate_up);
+        if constexpr (kSeparateW13) {
+            static_assert(kBF16Mode);
+            cute::prefetch_tma_descriptor(&tensor_map_w13_weights);
+        }
         if constexpr (!kBF16Mode) {
             cute::prefetch_tma_descriptor(&tensor_map_acts);
             cute::prefetch_tma_descriptor(&tensor_map_acts_sf);
@@ -4478,18 +4483,21 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                             sizeof(
                                                 dgrad_b_dtype_t),
                                         dgrad_b_dtype_t>(
-                                        &tensor_map_w13_dequant,
+                                        // Each dgrad K tile is wholly gate or up.
+                                        // Preserve accumulation order; only its source changes.
+                                        kSeparateW13 && global_k_block_idx * DGRAD_BLOCK_K >= kIntermediateHidden
+                                            ? &tensor_map_w13_weights : &tensor_map_w13_dequant,
                                         full_barriers[
                                             stage_idx],
                                         smem_dgrad_b[
                                             stage_idx],
                                         n_block_idx *
                                             BLOCK_N,
-                                        expert_idx *
-                                                (2 *
-                                                 kIntermediateHidden) +
-                                            global_k_block_idx *
-                                                DGRAD_BLOCK_K,
+                                        kSeparateW13
+                                            ? expert_idx * kIntermediateHidden +
+                                                  (global_k_block_idx * DGRAD_BLOCK_K) % kIntermediateHidden
+                                            : expert_idx * (2 * kIntermediateHidden) +
+                                                  global_k_block_idx * DGRAD_BLOCK_K,
                                         2);
                                     if (is_leader_cta) {
                                         full_barriers[
