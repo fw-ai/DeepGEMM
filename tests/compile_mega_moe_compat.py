@@ -67,13 +67,17 @@ def cases():
                 args += [training, training]
                 header = f"sm100_{kind}_mega_moe"
                 yield f"{kind}_m{block_m}_s{shared}_t{int(training)}", header, header + "_impl", args
+                if kind == "bf16" and shared == 0:
+                    yield (f"separate_fwd_m{block_m}_t{int(training)}", header, header + "_impl",
+                           args + ["4.0f", "__builtin_inff()", True])
                 if kind == "bf16" and training:
-                    for linear_beta in ("__builtin_inff()", "8.0f"):
+                    for linear_beta in ("__builtin_inff()", "8.0f", "25.0f"):
                         situ_args = args.copy()
                         situ_args[situ_args.index("ActivationType::GeGLU")] = "ActivationType::SiTU"
                         situ_args += ["4.0f", linear_beta]
-                        suffix = "linear" if linear_beta == "8.0f" else "unbounded"
+                        suffix = "unbounded" if linear_beta == "__builtin_inff()" else f"linear{linear_beta[:-3]}"
                         yield f"situ_fwd_m{block_m}_{suffix}", header, header + "_impl", situ_args
+                        yield f"situ_fwd_separate_m{block_m}_{suffix}", header, header + "_impl", situ_args + [True]
                 if kind == "fp8_fp4" and not training:
                     fp8_args = args.copy()
                     fp8_args[fp8_args.index("cutlass::detail::float_e2m1_unpacksmem_t")] = "cutlass::float_e4m3_t"

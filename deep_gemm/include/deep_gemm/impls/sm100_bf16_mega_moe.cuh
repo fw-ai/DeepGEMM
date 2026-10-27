@@ -43,6 +43,7 @@ template <
     bool kSaveX,
     float kSituBeta = 4.0f,
     float kSituLinearBeta = cute::numeric_limits<float>::infinity(),
+    bool kSeparateL1 = false,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -1057,8 +1058,40 @@ sm100_bf16_mega_moe_impl(void* y,
 
                 // TMA copy weights
                 if (cute::elect_one_sync()) {
-                    tma::copy_nd<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t, 4>(
-                        tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_b[stage_idx], 2, k_idx, half_n_idx, half_idx, expert_idx);
+                    if (kSeparateL1 && task_info.block_phase == sched::BlockPhase::Linear1) {
+                        // Recreate the existing eight-row gate/up interleave
+                        // directly in SMEM. K atoms keep their original stride
+                        // across the full N tile, so MMA and its epilogue see
+                        // exactly the packed layout and accumulation order.
+                        static_assert(LOAD_BLOCK_N % 16 == 0);
+                        constexpr uint32_t kAtomK =
+                            tma::get_inner_block_atom_size<BLOCK_K, kSwizzleBMode, 1, b_dtype_t>();
+                        #pragma unroll
+                        for (uint32_t atom = 0; atom < BLOCK_K / kAtomK; ++atom) {
+                            #pragma unroll
+                            for (uint32_t row = 0; row < LOAD_BLOCK_N; row += 16) {
+                                const uint32_t source_row = (n_idx + row) / 2;
+                                const uint32_t source_half = source_row >= kIntermediateHidden / 2;
+                                const uint32_t source_half_row =
+                                    source_row - source_half * (kIntermediateHidden / 2);
+                                auto* dst = shared_storage.smem_b[stage_idx] +
+                                    atom * LOAD_BLOCK_N * kAtomK + row * kAtomK;
+                                tma::copy_nd<kAtomK, 8, kSwizzleBMode, b_dtype_t, 4>(
+                                    &tensor_map_l1_weights, &shared_storage.full_barriers[stage_idx],
+                                    dst, 2, k_idx + atom * kAtomK,
+                                    source_half_row, source_half, expert_idx);
+                                // Separate routed weights require no fused
+                                // shared expert; borrow its unused descriptor.
+                                tma::copy_nd<kAtomK, 8, kSwizzleBMode, b_dtype_t, 4>(
+                                    &tensor_map_shared_l1_weights, &shared_storage.full_barriers[stage_idx],
+                                    dst + 8 * kAtomK, 2, k_idx + atom * kAtomK,
+                                    source_half_row, source_half, expert_idx);
+                            }
+                        }
+                    } else {
+                        tma::copy_nd<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t, 4>(
+                            tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_b[stage_idx], 2, k_idx, half_n_idx, half_idx, expert_idx);
+                    }
                     if (is_leader_cta) {
                         shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(sizeof(shared_storage.smem_b[0]) * 2);
                     } else {
