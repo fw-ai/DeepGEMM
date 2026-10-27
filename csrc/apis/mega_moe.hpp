@@ -546,7 +546,8 @@ static void bf16_mega_moe(
     const std::optional<torch::Tensor>& saved_x,
     const std::optional<torch::Tensor>& shared_l1_weights_opt,
     const std::optional<torch::Tensor>& shared_l2_weights_opt,
-    const float situ_beta, const float situ_linear_beta
+    const float situ_beta, const float situ_linear_beta,
+    const std::optional<torch::Tensor>& l1_up_weights
 ) {
     // Config checks
     const auto num_tokens = static_cast<int>(y.size(0));
@@ -590,7 +591,15 @@ static void bf16_mega_moe(
     DG_HOST_ASSERT(num_config_tokens <= num_max_tokens_per_rank);
     DG_HOST_ASSERT(num_experts_per_rank == num_experts_per_rank_);
     DG_HOST_ASSERT(hidden == hidden_);
-    DG_HOST_ASSERT(intermediate_hidden_2 == 2 * intermediate_hidden);
+    DG_HOST_ASSERT(intermediate_hidden_2 == (l1_up_weights.has_value() ? 1 : 2) * intermediate_hidden);
+    if (l1_up_weights.has_value()) {
+        DG_HOST_ASSERT(!shared_l1_weights_opt.has_value());
+        DG_HOST_ASSERT(l1_weights.dim() == 3 && l2_weights.dim() == 3);
+        DG_HOST_ASSERT(l1_up_weights->sizes() == l1_weights.sizes());
+        DG_HOST_ASSERT(l1_up_weights->scalar_type() == torch::kBFloat16);
+        DG_HOST_ASSERT(l1_up_weights->is_contiguous());
+        DG_HOST_ASSERT(l1_up_weights->device() == l1_weights.device());
+    }
 
     int num_shared_experts = 0, shared_intermediate_hidden = 0;
     torch::Tensor shared_l1_weights, shared_l2_weights;
@@ -691,7 +700,7 @@ static void bf16_mega_moe(
                             precomputed_route_counts,
                             active_pool_rows,
                             route_count_mismatch,
-                            saved_x, situ_beta, situ_linear_beta);
+                            saved_x, situ_beta, situ_linear_beta, l1_up_weights);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -1020,6 +1029,7 @@ static void bf16_mega_moe_side_lora(
 static void register_apis(pybind11::module_& m) {
     m.attr("BF16_MEGAMOE_SITU") = true;
     m.attr("BF16_MEGAMOE_SEPARATE_W13") = true;
+    m.attr("BF16_MEGAMOE_SEPARATE_L1") = true;
     m.def("bf16_mega_moe_side_lora", &bf16_mega_moe_side_lora);
     m.def("get_symm_buffer_size_for_mega_moe_side_lora", &get_symm_buffer_size_for_mega_moe_side_lora);
     m.def("get_num_ring_tokens_for_mega_moe", &get_num_ring_tokens_for_mega_moe);
@@ -1107,7 +1117,8 @@ static void register_apis(pybind11::module_& m) {
         py::arg("shared_l1_weights_opt") = py::none(),
         py::arg("shared_l2_weights_opt") = py::none(),
         py::arg("situ_beta") = 4.0f,
-        py::arg("situ_linear_beta") = std::numeric_limits<float>::infinity());
+        py::arg("situ_linear_beta") = std::numeric_limits<float>::infinity(),
+        py::arg("l1_up_weights") = py::none());
 }
 
 } // namespace deep_gemm::mega

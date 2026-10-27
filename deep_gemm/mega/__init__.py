@@ -471,7 +471,8 @@ def bf16_mega_moe(y: torch.Tensor,
                   shared_l1_weights: Optional[torch.Tensor] = None,
                   shared_l2_weights: Optional[torch.Tensor] = None,
                   situ_beta: float = 4.0,
-                  situ_linear_beta: Optional[float] = None):
+                  situ_linear_beta: Optional[float] = None,
+                  l1_up_weights: Optional[torch.Tensor] = None):
     """Run BF16 MegaMoE with an explicit route-weight boundary.
 
     The optional stage saves expose unweighted/weighted activation and W2
@@ -483,9 +484,20 @@ def bf16_mega_moe(y: torch.Tensor,
     pools from actual receive counts. The kernel publishes the precomputed
     counts, verifies them against its internal dispatch count, and sets the
     flag before any caller can accept a truncated result.
+
+    ``l1_up_weights`` selects separate contiguous gate/up tensors instead of
+    an eight-row-interleaved ``l1_weights`` tensor. Fused shared experts are
+    not supported with this layout. MMA and activation rounding are unchanged.
     """
     situ_kwargs = _situ_kwargs(activation, situ_beta, situ_linear_beta,
                                route_weight_mode, activation_clamp, fast_math)
+    weight_kwargs = {}
+    if l1_up_weights is not None:
+        if not getattr(_C, "BF16_MEGAMOE_SEPARATE_L1", False):
+            raise RuntimeError("separate forward weights require a matching DeepGEMM build")
+        if shared_l1_weights is not None:
+            raise ValueError("separate forward weights require shared experts outside MegaMoE")
+        weight_kwargs["l1_up_weights"] = l1_up_weights
     if activation == "situ" and shared_l1_weights is not None:
         raise ValueError("SiTU shared experts must run outside MegaMoE")
     route_weight_mode = RouteWeightMode(route_weight_mode)
@@ -551,6 +563,7 @@ def bf16_mega_moe(y: torch.Tensor,
         saved_x,
         shared_l1_weights, shared_l2_weights,
         **situ_kwargs,
+        **weight_kwargs,
     )
 
 def bf16_mega_moe_side_lora(y: torch.Tensor,
