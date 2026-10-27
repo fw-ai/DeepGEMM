@@ -226,7 +226,7 @@ static void __instantiate_kernel() {{
         {}, {}, {},
         {}, {},
         {},
-        {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+        {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
     >);
 }};
 )", num_max_tokens_per_rank,
@@ -245,7 +245,8 @@ static void __instantiate_kernel() {{
         get_bf16_activation_type_name(activation), saved_l1_preact.has_value(),
         saved_h_unweighted.has_value(), get_route_weight_mode_name(route_weight_mode),
         get_combine_order_mode_name(combine_order_mode), saved_down_unweighted.has_value(), saved_x.has_value(),
-        to_string(situ_beta), to_string(situ_linear_beta), l1_up_weights.has_value()));
+        to_string(situ_beta), to_string(situ_linear_beta), l1_up_weights.has_value(),
+        num_sms == jit->device.get_num_sms()));
 
     // Launch
     jit->launch(
