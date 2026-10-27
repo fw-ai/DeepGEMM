@@ -3,6 +3,7 @@
 #include <cstdint>
 
 #include <cutlass/arch/barrier.h>
+#include <cutlass/arch/memory_sm80.h>
 #include <cutlass/arch/reg_reconfig.h>
 
 #include <deep_gemm/common/math.cuh>
@@ -16,6 +17,7 @@
 #include <deep_gemm/layout/sym_buffer.cuh>
 #include <deep_gemm/mma/sm100.cuh>
 #include <deep_gemm/ptx/tma.cuh>
+#include <deep_gemm/ptx/ld_st.cuh>
 #include <deep_gemm/ptx/tcgen05.cuh>
 #include <deep_gemm/ptx/utils.cuh>
 
@@ -1607,6 +1609,12 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
     auto sf_start_ptr = smem_gemm_base + SMEM_CD_SIZE +
                         kNumStages *
                             (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE);
+    // BF16 skips the FP8 recompute phase, leaving its scale storage idle.
+    // Use it for the second activation tile only when the whole tile fits.
+    constexpr bool kStageGateUp = kBF16Mode &&
+        kNumStages * (SMEM_SFA_SIZE_PER_STAGE + SMEM_SFB_SIZE_PER_STAGE) >=
+            STORE_BLOCK_M * BLOCK_N * sizeof(cd_dtype_t);
+    auto* smem_up = reinterpret_cast<cd_dtype_t*>(sf_start_ptr);
     auto smem_sfa = utils::PatternVisitor([=](const uint32_t& i) {
         return reinterpret_cast<uint32_t*>(
             sf_start_ptr + i * SMEM_SFA_SIZE_PER_STAGE);
@@ -3194,6 +3202,32 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                          s < effective_m / STORE_BLOCK_M; ++s) {
                         cutlass::arch::NamedBarrier::sync(
                             kNumDgradEpilogueThreads, 0);
+                        if constexpr (kStageGateUp) {
+                            // Recompute's TMA stores are drained before dgrad.
+                            // Stage gate/up in the idle output/scale storage
+                            // while the first output tile receives TMEM dgrad.
+                            #pragma unroll
+                            for (uint32_t linear = epilogue_thread_idx * 8;
+                                 linear < STORE_BLOCK_M * BLOCK_N;
+                                 linear += kNumDgradEpilogueThreads * 8) {
+                                const uint32_t local_m =
+                                    s * STORE_BLOCK_M + linear / BLOCK_N;
+                                if (local_m < valid_m) {
+                                    const uint64_t offset =
+                                        static_cast<uint64_t>(
+                                            (pool_block_offset + m_block_idx) * BLOCK_M + local_m) *
+                                            (2 * kIntermediateHidden) +
+                                        n_block_idx * BLOCK_N + linear % BLOCK_N;
+                                    ptx::cp_async_cg<256>(
+                                        reinterpret_cast<const uint4*>(gate_up_output + offset),
+                                        reinterpret_cast<uint4*>(smem_cd[1] + linear));
+                                    ptx::cp_async_cg<256>(
+                                        reinterpret_cast<const uint4*>(gate_up_output + offset + kIntermediateHidden),
+                                        reinterpret_cast<uint4*>(smem_up + linear));
+                                }
+                            }
+                            cutlass::arch::cp_async_fence();
+                        }
                         if (epilogue_warp_idx <
                             kNumEpilogueThreads / 32) {
                             #pragma unroll
@@ -3244,6 +3278,8 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                     smem_ptr);
                             }
                         }
+                        if constexpr (kStageGateUp)
+                            cutlass::arch::cp_async_wait<0>();
                         cutlass::arch::NamedBarrier::sync(
                             kNumDgradEpilogueThreads, 0);
 
@@ -3330,7 +3366,9 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                       hidden_col
                                 : gate_col + 8;
                             const float gate_unclamped =
-                                static_cast<float>(
+                                kStageGateUp
+                                ? static_cast<float>(smem_cd[1][linear])
+                                : static_cast<float>(
                                     gate_up_output[
                                         static_cast<uint64_t>(
                                             pool_row) *
@@ -3338,7 +3376,9 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                              kIntermediateHidden) +
                                         gate_col]);
                             const float up_unclamped =
-                                static_cast<float>(
+                                kStageGateUp
+                                ? static_cast<float>(smem_up[linear])
+                                : static_cast<float>(
                                     gate_up_output[
                                         static_cast<uint64_t>(
                                             pool_row) *
