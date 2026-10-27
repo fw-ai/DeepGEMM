@@ -1323,6 +1323,8 @@ template <
     bool kTraceKernel = false,
     bool kVectorizedGradXStore = false,
     bool kWideGradXStore = false,
+    float kSituBeta = 4.0f,
+    float kSituLinearBeta = cute::numeric_limits<float>::infinity(),
     uint32_t kNumNonEpilogueThreads = 128,
     uint32_t kNumEpilogueThreads = 128,
     uint32_t kNumThreads =
@@ -3412,7 +3414,23 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                             cd_dtype_t h_act_bf16;
                             cd_dtype_t grad_gate_bf16;
                             cd_dtype_t grad_up_bf16;
-                            if constexpr (
+                            if constexpr (kBF16Mode && kActivationType == ActivationType::SiTU) {
+                                const float tg = tanhf(gate / kSituBeta);
+                                const float sg = __fmul_rn(__fmul_rn(kSituBeta, tg), sig);
+                                float su = up;
+                                float du = 1.0f;
+                                if constexpr (kSituLinearBeta != cute::numeric_limits<float>::infinity()) {
+                                    const float tu = tanhf(up / kSituLinearBeta);
+                                    su = __fmul_rn(kSituLinearBeta, tu);
+                                    du = __fsub_rn(1.0f, __fmul_rn(tu, tu));
+                                }
+                                const float dg = __fadd_rn(
+                                    __fmul_rn(__fsub_rn(1.0f, __fmul_rn(tg, tg)), sig),
+                                    __fmul_rn(sg, __fsub_rn(1.0f, sig)));
+                                h_act_bf16 = cd_dtype_t(__fmul_rn(sg, su));
+                                grad_gate_bf16 = cd_dtype_t(__fmul_rn(__fmul_rn(grad_h, su), dg));
+                                grad_up_bf16 = cd_dtype_t(__fmul_rn(__fmul_rn(grad_h, sg), du));
+                            } else if constexpr (
                                 kBF16Mode &&
                                 kActivationType ==
                                     ActivationType::SwiGLU) {

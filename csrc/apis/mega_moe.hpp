@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cmath>
+#include <limits>
 #include <functional>
 #include <string>
 #include <pybind11/functional.h>
@@ -543,11 +545,12 @@ static void bf16_mega_moe(
     const std::optional<torch::Tensor>& route_count_mismatch,
     const std::optional<torch::Tensor>& saved_x,
     const std::optional<torch::Tensor>& shared_l1_weights_opt,
-    const std::optional<torch::Tensor>& shared_l2_weights_opt
+    const std::optional<torch::Tensor>& shared_l2_weights_opt,
+    const float situ_beta, const float situ_linear_beta
 ) {
     // Config checks
     const auto num_tokens = static_cast<int>(y.size(0));
-    DG_HOST_ASSERT(activation == "swiglu" or activation == "geglu");
+    DG_HOST_ASSERT(activation == "swiglu" or activation == "geglu" or activation == "situ");
     DG_HOST_ASSERT(
         route_weight_mode == "pre_down" ||
         route_weight_mode == "post_down");
@@ -557,6 +560,15 @@ static void bf16_mega_moe(
         combine_order_mode == "deepep_v1");
 
     DG_HOST_ASSERT(shared_l1_weights_opt.has_value() == shared_l2_weights_opt.has_value());
+
+    if (activation == "situ") {
+        DG_HOST_ASSERT(std::isfinite(situ_beta) && situ_beta > 0);
+        DG_HOST_ASSERT(situ_linear_beta > 0);
+        DG_HOST_ASSERT(route_weight_mode == "post_down");
+        DG_HOST_ASSERT(!activation_clamp_opt.has_value() || std::isinf(*activation_clamp_opt));
+        DG_HOST_ASSERT(!fast_math);
+        DG_HOST_ASSERT(!shared_l1_weights_opt.has_value());
+    }
 
     // Activation checks
     const auto activation_clamp =
@@ -679,7 +691,7 @@ static void bf16_mega_moe(
                             precomputed_route_counts,
                             active_pool_rows,
                             route_count_mismatch,
-                            saved_x);
+                            saved_x, situ_beta, situ_linear_beta);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -1006,6 +1018,7 @@ static void bf16_mega_moe_side_lora(
 
 
 static void register_apis(pybind11::module_& m) {
+    m.attr("BF16_MEGAMOE_SITU") = true;
     m.def("bf16_mega_moe_side_lora", &bf16_mega_moe_side_lora);
     m.def("get_symm_buffer_size_for_mega_moe_side_lora", &get_symm_buffer_size_for_mega_moe_side_lora);
     m.def("get_num_ring_tokens_for_mega_moe", &get_num_ring_tokens_for_mega_moe);
@@ -1091,7 +1104,9 @@ static void register_apis(pybind11::module_& m) {
         py::arg("route_count_mismatch"),
         py::arg("saved_x"),
         py::arg("shared_l1_weights_opt") = py::none(),
-        py::arg("shared_l2_weights_opt") = py::none());
+        py::arg("shared_l2_weights_opt") = py::none(),
+        py::arg("situ_beta") = 4.0f,
+        py::arg("situ_linear_beta") = std::numeric_limits<float>::infinity());
 }
 
 } // namespace deep_gemm::mega

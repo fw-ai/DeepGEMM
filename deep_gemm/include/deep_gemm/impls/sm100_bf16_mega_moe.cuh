@@ -41,6 +41,8 @@ template <
     CombineOrderMode kCombineOrderMode,
     bool kSaveDownUnweighted,
     bool kSaveX,
+    float kSituBeta = 4.0f,
+    float kSituLinearBeta = cute::numeric_limits<float>::infinity(),
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -1358,7 +1360,7 @@ sm100_bf16_mega_moe_impl(void* y,
                             }
 
                             const auto gate = __bfloat1622float2(bf16_gate);
-                            const auto up = __bfloat1622float2(bf16_up);
+                            auto up = __bfloat1622float2(bf16_up);
                             float2 z;
                             if constexpr (kActivationType == ActivationType::GeGLU) {
                                 constexpr float kAlpha = 1.5957691216057308f;
@@ -1406,6 +1408,19 @@ sm100_bf16_mega_moe_impl(void* y,
                                         1.0f / denom.y};
                                     activated =
                                         __fmul2_rn(gate, sig);
+                                }
+                            }
+                            if constexpr (kActivationType == ActivationType::SiTU) {
+                                // Match Kimi's separately rounded FP32 sigmoid,
+                                // beta*tanh(gate/beta), and final BF16 product.
+                                const float2 sig = {1.0f / denom.x, 1.0f / denom.y};
+                                activated = __fmul2_rn(
+                                    __fmul2_rn({kSituBeta, kSituBeta},
+                                        {tanhf(gate.x / kSituBeta), tanhf(gate.y / kSituBeta)}),
+                                    sig);
+                                if constexpr (kSituLinearBeta != cute::numeric_limits<float>::infinity()) {
+                                    up = __fmul2_rn({kSituLinearBeta, kSituLinearBeta},
+                                        {tanhf(up.x / kSituLinearBeta), tanhf(up.y / kSituLinearBeta)});
                                 }
                             }
                             // Standard FireTitan grouped experts materialize

@@ -1,5 +1,8 @@
 #pragma once
 
+#include <cmath>
+#include <limits>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -186,6 +189,8 @@ public:
         int num_ranks;
         bool bf16_mode = false;
         std::string activation = "swiglu";
+        float situ_beta = 4.0f;
+        float situ_linear_beta = std::numeric_limits<float>::infinity();
         bool fast_math = false;
         std::string route_weight_mode = "pre_down";
         std::string combine_order_mode = "fixed_topk";
@@ -281,7 +286,7 @@ static void __instantiate_kernel() {{
             {},
             {},
             {},
-            {}
+            {}, {}, {}
         >);
 }};
 )",
@@ -296,7 +301,7 @@ static void __instantiate_kernel() {{
             args.bf16_mode ? "true" : "false",
             args.activation == "geglu"
                 ? "ActivationType::GeGLU"
-                : "ActivationType::SwiGLU",
+                : (args.activation == "situ" ? "ActivationType::SiTU" : "ActivationType::SwiGLU"),
             args.fast_math ? "true" : "false",
             get_backward_route_weight_mode_name(
                 args.route_weight_mode),
@@ -310,7 +315,8 @@ static void __instantiate_kernel() {{
             args.compute_route_grad ? "true" : "false",
             args.trace_kernel ? "true" : "false",
             args.vectorized_grad_x_store ? "true" : "false",
-            args.wide_grad_x_store ? "true" : "false");
+            args.wide_grad_x_store ? "true" : "false",
+            to_string(args.situ_beta), to_string(args.situ_linear_beta));
     }
 
     static void launch(const auto& kernel, const Args& args) {
@@ -1258,7 +1264,9 @@ static void sm100_bf16_mega_moe_backward_dgrad(
     const int& num_topk,
     const std::string& memory_mode,
     const std::optional<torch::Tensor>& kernel_trace =
-        std::nullopt) {
+        std::nullopt,
+    const float situ_beta = 4.0f,
+    const float situ_linear_beta = std::numeric_limits<float>::infinity()) {
     constexpr int block_n = 128;
     constexpr int block_k = 128;
     constexpr int dgrad_block_k = 64;
@@ -1281,7 +1289,14 @@ static void sm100_bf16_mega_moe_backward_dgrad(
     const int num_dispatch_warps = num_ranks > 1 ? 4 : 0;
 
     DG_HOST_ASSERT(jit->device.get_arch_major() == 10);
-    DG_HOST_ASSERT(activation == "swiglu" || activation == "geglu");
+    DG_HOST_ASSERT(activation == "swiglu" || activation == "geglu" || activation == "situ");
+    if (activation == "situ") {
+        DG_HOST_ASSERT(std::isfinite(situ_beta) && situ_beta > 0);
+        DG_HOST_ASSERT(situ_linear_beta > 0);
+        DG_HOST_ASSERT(route_weight_mode == "post_down");
+        DG_HOST_ASSERT(activation_limit == std::numeric_limits<float>::infinity());
+        DG_HOST_ASSERT(!fast_math);
+    }
     DG_HOST_ASSERT(
         route_weight_mode == "pre_down" ||
         route_weight_mode == "post_down");
@@ -1637,6 +1652,8 @@ static void sm100_bf16_mega_moe_backward_dgrad(
         .num_ranks = num_ranks,
         .bf16_mode = true,
         .activation = activation,
+        .situ_beta = situ_beta,
+        .situ_linear_beta = situ_linear_beta,
         .fast_math = fast_math,
         .route_weight_mode = route_weight_mode,
         .combine_order_mode = combine_order_mode,

@@ -19,6 +19,8 @@ static std::string get_bf16_activation_type_name(
         return "ActivationType::SwiGLU";
     if (activation == "geglu")
         return "ActivationType::GeGLU";
+    if (activation == "situ")
+        return "ActivationType::SiTU";
     DG_HOST_UNREACHABLE("Unsupported activation");
 }
 
@@ -69,7 +71,8 @@ static void sm100_bf16_mega_moe(
     const std::optional<torch::Tensor>& precomputed_route_counts,
     const std::optional<int>& active_pool_rows,
     const std::optional<torch::Tensor>& route_count_mismatch,
-    const std::optional<torch::Tensor>& saved_x
+    const std::optional<torch::Tensor>& saved_x,
+    const float situ_beta, const float situ_linear_beta
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -216,7 +219,7 @@ static void __instantiate_kernel() {{
         {}, {}, {},
         {}, {},
         {},
-        {}, {}, {}, {}, {}, {}, {}, {}
+        {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
     >);
 }};
 )", num_max_tokens_per_rank,
@@ -234,7 +237,8 @@ static void __instantiate_kernel() {{
         fast_math ? "true" : "false",
         get_bf16_activation_type_name(activation), saved_l1_preact.has_value(),
         saved_h_unweighted.has_value(), get_route_weight_mode_name(route_weight_mode),
-        get_combine_order_mode_name(combine_order_mode), saved_down_unweighted.has_value(), saved_x.has_value()));
+        get_combine_order_mode_name(combine_order_mode), saved_down_unweighted.has_value(), saved_x.has_value(),
+        to_string(situ_beta), to_string(situ_linear_beta)));
 
     // Launch
     jit->launch(

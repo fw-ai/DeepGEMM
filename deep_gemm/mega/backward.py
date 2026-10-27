@@ -6,7 +6,7 @@ import torch
 import torch.distributed as dist
 
 from .. import _C
-from . import CombineOrderMode, RouteWeightMode
+from . import CombineOrderMode, RouteWeightMode, _situ_kwargs
 
 _BF16_BACKWARD_TIMING_HOOK: Optional[Callable[[str, torch.cuda.Event, torch.cuda.Event, float], None]] = None
 _BF16_BACKWARD_KERNEL_TRACE_HOOK: Optional[
@@ -256,6 +256,8 @@ def bf16_mega_moe_backward_dgrad(
     memory_mode: str = "legacy",
     rank_uniform_block_m: bool = False,
     x_prepared: bool = False,
+    situ_beta: float = 4.0,
+    situ_linear_beta: Optional[float] = None,
 ) -> None:
     """Run BF16 reverse dispatch, dgrad, activation, and direct grad-x.
 
@@ -268,9 +270,13 @@ def bf16_mega_moe_backward_dgrad(
     no longer observable after this call. ``"legacy"`` keeps independent
     storage, apart from the historical semantic aliases validated above.
     """
+    situ_kwargs = _situ_kwargs(activation, situ_beta, situ_linear_beta,
+                               route_weight_mode, activation_limit, fast_math)
+    if activation == "situ" and python_numerical_correction:
+        raise ValueError("SiTU does not support Python numerical correction")
     route_weight_mode = RouteWeightMode(route_weight_mode)
     combine_order_mode = CombineOrderMode(combine_order_mode)
-    if activation not in ("swiglu", "geglu"):
+    if activation not in ("swiglu", "geglu", "situ"):
         raise ValueError(f"unsupported activation: {activation}")
     if not write_grad_x_pool and not direct_remote_grad_x:
         raise ValueError("grad-x requires a local or direct remote output")
@@ -644,6 +650,7 @@ def bf16_mega_moe_backward_dgrad(
             combine_order_mode.value,
             memory_mode,
             kernel_trace,
+            **situ_kwargs,
         ),
     )
     if kernel_trace_hook is not None:

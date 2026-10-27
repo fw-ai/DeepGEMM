@@ -152,7 +152,9 @@ static void bf16_mega_moe_backward_dgrad_v2(
     const std::string& combine_order_mode,
     const std::string& memory_mode,
     const std::optional<torch::Tensor>& kernel_trace =
-        std::nullopt) {
+        std::nullopt,
+    const float situ_beta = 4.0f,
+    const float situ_linear_beta = std::numeric_limits<float>::infinity()) {
     deep_gemm::sm100_bf16_mega_moe_backward_dgrad(
         gate_up_output, grad_h_output, grad_gate_up_output,
         h_act_output, h_weighted_output, x_pool_output,
@@ -169,7 +171,7 @@ static void bf16_mega_moe_backward_dgrad_v2(
         token_src_metadata,
         backward_sym_buffer_ptrs, backward_rank,
         num_max_tokens_per_rank, num_topk, memory_mode,
-        kernel_trace);
+        kernel_trace, situ_beta, situ_linear_beta);
 }
 
 static void bf16_mega_moe_backward_dgrad(
@@ -607,7 +609,9 @@ static void register_apis(pybind11::module_& m) {
         py::arg("num_topk"),
         py::arg("combine_order_mode") = "fixed_topk",
         py::arg("memory_mode") = "legacy",
-        py::arg("kernel_trace") = py::none());
+        py::arg("kernel_trace") = py::none(),
+        py::arg("situ_beta") = 4.0f,
+        py::arg("situ_linear_beta") = std::numeric_limits<float>::infinity());
     m.def(
         "bf16_mega_moe_backward_dgrad",
         &bf16_mega_moe_backward_dgrad,
