@@ -15,6 +15,8 @@ except ImportError:
 
 # Configs
 from . import _C
+
+BF16_MEGAMOE_SITU = bool(getattr(_C, "BF16_MEGAMOE_SITU", False))
 from ._C import (
     shutdown,
     set_num_sms,

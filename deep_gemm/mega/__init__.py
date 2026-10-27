@@ -1,3 +1,4 @@
+import math
 import torch
 import types
 import warnings
@@ -27,6 +28,23 @@ class CombineOrderMode(str, Enum):
     FIXED_TOPK = 'fixed_topk'
     DEEPEP = 'deepep'
     DEEPEP_V1 = 'deepep_v1'
+
+
+def _situ_kwargs(activation, beta, linear_beta, route_weight_mode, clamp, fast_math):
+    if activation != 'situ':
+        return {}
+    if not math.isfinite(beta) or beta <= 0:
+        raise ValueError('situ_beta must be positive and finite')
+    linear_beta = float('inf') if linear_beta is None else linear_beta
+    if math.isnan(linear_beta) or linear_beta <= 0:
+        raise ValueError('situ_linear_beta must be positive or None')
+    if RouteWeightMode(route_weight_mode) is not RouteWeightMode.POST_DOWN:
+        raise ValueError('SiTU requires post_down route weights')
+    if clamp is not None and clamp != float('inf'):
+        raise ValueError('SiTU requires an unclamped activation')
+    if fast_math:
+        raise ValueError('SiTU requires fast_math=False')
+    return dict(situ_beta=beta, situ_linear_beta=linear_beta)
 
 
 class SymmBuffer:
@@ -451,7 +469,9 @@ def bf16_mega_moe(y: torch.Tensor,
                   num_config_tokens: Optional[int] = None,
                   saved_x: Optional[torch.Tensor] = None,
                   shared_l1_weights: Optional[torch.Tensor] = None,
-                  shared_l2_weights: Optional[torch.Tensor] = None):
+                  shared_l2_weights: Optional[torch.Tensor] = None,
+                  situ_beta: float = 4.0,
+                  situ_linear_beta: Optional[float] = None):
     """Run BF16 MegaMoE with an explicit route-weight boundary.
 
     The optional stage saves expose unweighted/weighted activation and W2
@@ -464,6 +484,10 @@ def bf16_mega_moe(y: torch.Tensor,
     counts, verifies them against its internal dispatch count, and sets the
     flag before any caller can accept a truncated result.
     """
+    situ_kwargs = _situ_kwargs(activation, situ_beta, situ_linear_beta,
+                               route_weight_mode, activation_clamp, fast_math)
+    if activation == "situ" and shared_l1_weights is not None:
+        raise ValueError("SiTU shared experts must run outside MegaMoE")
     route_weight_mode = RouteWeightMode(route_weight_mode)
     combine_order_mode = CombineOrderMode(combine_order_mode)
     if (
@@ -526,6 +550,7 @@ def bf16_mega_moe(y: torch.Tensor,
         route_count_mismatch,
         saved_x,
         shared_l1_weights, shared_l2_weights,
+        **situ_kwargs,
     )
 
 def bf16_mega_moe_side_lora(y: torch.Tensor,
