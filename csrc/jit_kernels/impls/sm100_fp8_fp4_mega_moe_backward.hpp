@@ -1771,9 +1771,11 @@ static void sm100_bf16_mega_moe_backward_dgrad(
         .vectorized_grad_x_store = deep_jit::get_env<int>(
             "DG_BF16_MEGA_MOE_VECTORIZED_GRAD_X_STORE",
             1) == 1,
-        .wide_grad_x_store = deep_jit::get_env<int>(
-            "DG_BF16_MEGA_MOE_WIDE_GRAD_X_STORE",
-            0) == 1,
+        // K3 SiTU publishes eight already-rounded BF16 elements per store.
+        // Preserve the split W1/W3 contractions and their BF16 addition.
+        .wide_grad_x_store =
+            activation == "situ" && hidden == 3584 &&
+            intermediate_hidden == 3072,
         .kernel_trace =
             kernel_trace.has_value()
             ? reinterpret_cast<uint64_t*>(
