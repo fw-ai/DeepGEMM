@@ -4790,13 +4790,25 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                 accum_stage ^ 1]
                                 ->wait(accum_phase);
                         ptx::tcgen05_after_thread_sync();
+                        // W13 no longer needs the second W2 output tile.
+                        // Reuse both tiles to halve row handoffs without
+                        // changing the accumulator rounding or allocations.
+                        constexpr uint32_t W13_STORE_BLOCK_M =
+                            kBF16Mode && kInputsPrepared &&
+                            kWideGradXStore &&
+                            kActivationType == ActivationType::SiTU &&
+                            kHidden == 3584 && kIntermediateHidden == 3072
+                            ? 2 * STORE_BLOCK_M : STORE_BLOCK_M;
+                        DG_STATIC_ASSERT(
+                            W13_STORE_BLOCK_M * STORE_BLOCK_N * sizeof(cd_dtype_t) <= SMEM_CD_SIZE,
+                            "W13 output tile exceeds retired output storage");
                         const uint32_t effective_m =
                             math::align(valid_m, 16u);
 
                         for (uint32_t s = 0;
                              s <
-                                 effective_m /
-                                     STORE_BLOCK_M;
+                                 math::ceil_div(
+                                     effective_m, W13_STORE_BLOCK_M);
                              ++s) {
                             cutlass::arch::
                                 NamedBarrier::sync(
@@ -4811,12 +4823,14 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                 #pragma unroll
                                 for (uint32_t i = 0;
                                      i <
-                                         STORE_BLOCK_M /
+                                         W13_STORE_BLOCK_M /
                                              8;
                                      ++i) {
+                                    if (s * W13_STORE_BLOCK_M + i * 8 >= effective_m)
+                                        continue;
                                     const uint32_t tmem_addr =
                                         accum_stage * UMMA_N +
-                                        s * STORE_BLOCK_M +
+                                        s * W13_STORE_BLOCK_M +
                                         i * 8;
                                     uint32_t w1_values[8];
                                     uint32_t w3_values[8];
@@ -4844,7 +4858,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                                  1) *
                                                     UMMA_N +
                                                 s *
-                                                    STORE_BLOCK_M +
+                                                    W13_STORE_BLOCK_M +
                                                 i * 8;
                                         cute::
                                             SM100_TMEM_LOAD_16dp256b1x::
@@ -4873,7 +4887,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                         outer_atom =
                                             (epilogue_warp_idx /
                                              2) *
-                                            STORE_BLOCK_M *
+                                            W13_STORE_BLOCK_M *
                                             128;
                                     const uint32_t
                                         inner_atom =
@@ -4994,7 +5008,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                 for (uint32_t linear =
                                          epilogue_thread_idx;
                                      linear <
-                                         STORE_BLOCK_M *
+                                         W13_STORE_BLOCK_M *
                                              (BLOCK_N / 8);
                                      linear +=
                                          kNumDgradEpilogueThreads) {
@@ -5007,7 +5021,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                              (BLOCK_N / 8)) *
                                         8;
                                     const uint32_t local_m =
-                                        s * STORE_BLOCK_M +
+                                        s * W13_STORE_BLOCK_M +
                                         row;
                                     if (local_m >= valid_m)
                                         continue;
@@ -5023,7 +5037,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                     const uint32_t
                                         smem_byte_offset =
                                             n_atom *
-                                                STORE_BLOCK_M *
+                                                W13_STORE_BLOCK_M *
                                                 128 +
                                             (row >> 3) *
                                                 8 * 128 +
@@ -5095,7 +5109,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                 for (uint32_t linear =
                                          epilogue_thread_idx;
                                      linear <
-                                         STORE_BLOCK_M *
+                                         W13_STORE_BLOCK_M *
                                              (BLOCK_N / 2);
                                      linear +=
                                          kNumDgradEpilogueThreads) {
@@ -5108,7 +5122,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                              (BLOCK_N / 2)) *
                                         2;
                                     const uint32_t local_m =
-                                        s * STORE_BLOCK_M +
+                                        s * W13_STORE_BLOCK_M +
                                         row;
                                     if (local_m >= valid_m)
                                         continue;
@@ -5130,7 +5144,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                             const uint32_t
                                                 smem_byte_offset =
                                                     n_atom *
-                                                        STORE_BLOCK_M *
+                                                        W13_STORE_BLOCK_M *
                                                         128 +
                                                     (row >> 3) *
                                                         8 *
@@ -5215,7 +5229,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                 for (uint32_t linear =
                                          epilogue_thread_idx;
                                      linear <
-                                         STORE_BLOCK_M *
+                                         W13_STORE_BLOCK_M *
                                              BLOCK_N;
                                      linear +=
                                          kNumDgradEpilogueThreads) {
@@ -5226,7 +5240,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                         row * BLOCK_N;
                                     const uint32_t local_m =
                                         s *
-                                            STORE_BLOCK_M +
+                                            W13_STORE_BLOCK_M +
                                         row;
                                     if (local_m >= valid_m)
                                         continue;
@@ -5242,7 +5256,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                     const uint32_t
                                         smem_byte_offset =
                                             n_atom *
-                                                STORE_BLOCK_M *
+                                                W13_STORE_BLOCK_M *
                                                 128 +
                                             (row >> 3) *
                                                 8 * 128 +
