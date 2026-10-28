@@ -747,7 +747,135 @@ sm100_bf16_mega_moe_backward_post_down_prelude(
             } else if constexpr (
                 kCombineOrderMode !=
                 CombineOrderMode::FixedTopK) {
-                if constexpr (kVirtualizeRouteLanes) {
+                if constexpr (kVirtualizeK31RouteLanes) {
+                    // Keep the 512-lane Triton tree, mapping adjacent logical
+                    // lanes to one physical lane so BF16 IO uses 32-bit pairs.
+                    // Logical XORs 16/8/4/2 become physical XORs 8/4/2/1;
+                    // logical XOR 1 combines the two virtual lanes last.
+                    DG_STATIC_ASSERT(kRouteVirtualLanes == 2 &&
+                                     kTritonRouteValuesPerThread == 8,
+                                     "K31 paired route layout changed");
+                    uint32_t grad_pairs[kTritonRouteValuesPerThread];
+                    uint32_t down_pairs[kTritonRouteValuesPerThread];
+                    const uint64_t row_base =
+                        static_cast<uint64_t>(pool_row) * kHidden;
+                    #pragma unroll
+                    for (uint32_t i = 0;
+                         i < kTritonRouteValuesPerThread; ++i) {
+                        const uint32_t col =
+                            2 * route_group_lane_idx +
+                            i * kTritonRouteThreads;
+                        grad_pairs[i] = col < kHidden
+                            ? reinterpret_cast<const uint32_t*>(
+                                  remote_grad_y)[col / 2]
+                            : 0;
+                        down_pairs[i] = col < kHidden
+                            ? reinterpret_cast<const uint32_t*>(
+                                  down_unweighted)[(row_base + col) / 2]
+                            : 0;
+                        if constexpr (kDoReverseDispatch && !kXPrepared) {
+                            if (col < kHidden) {
+                                reinterpret_cast<uint32_t*>(x_pool_output)[
+                                    (row_base + col) / 2] =
+                                    reinterpret_cast<const uint32_t*>(
+                                        remote_x)[col / 2];
+                            }
+                        }
+                    }
+                    float virtual_sums[2];
+                    #pragma unroll
+                    for (uint32_t virtual_lane = 0;
+                         virtual_lane < 2; ++virtual_lane) {
+                        float grad_y[kTritonRouteValuesPerThread];
+                        float down[kTritonRouteValuesPerThread];
+                        #pragma unroll
+                        for (uint32_t i = 0;
+                             i < kTritonRouteValuesPerThread; ++i) {
+                            grad_y[i] = static_cast<float>(
+                                cutlass::bfloat16_t::bitcast(
+                                    static_cast<uint16_t>(
+                                        grad_pairs[i] >> (16 * virtual_lane))));
+                            down[i] = static_cast<float>(
+                                cutlass::bfloat16_t::bitcast(
+                                    static_cast<uint16_t>(
+                                        down_pairs[i] >> (16 * virtual_lane))));
+                        }
+                        const float pair_02 = __fmaf_rn(
+                            grad_y[0], down[0],
+                            __fmul_rn(grad_y[2], down[2]));
+                        const float pair_13 = __fmaf_rn(
+                            grad_y[1], down[1],
+                            __fmul_rn(grad_y[3], down[3]));
+                        const float pair_46 = __fmaf_rn(
+                            grad_y[4], down[4],
+                            __fmul_rn(grad_y[6], down[6]));
+                        const float pair_57 = __fmaf_rn(
+                            grad_y[5], down[5],
+                            __fmul_rn(grad_y[7], down[7]));
+                        float value = __fadd_rn(
+                            __fadd_rn(pair_02, pair_46),
+                            __fadd_rn(pair_13, pair_57));
+                        #pragma unroll
+                        for (uint32_t offset = 8;
+                             offset > 0; offset >>= 1) {
+                            value = __fadd_rn(
+                                value, __shfl_xor_sync(
+                                    0xffffffff, value, offset));
+                        }
+                        virtual_sums[virtual_lane] = value;
+                    }
+                    if ((route_group_lane_idx & 15) == 0) {
+                        route_lane_sums[
+                            route_group_idx * kTritonRouteNumWarps +
+                            route_group_lane_idx / 16] =
+                            __fadd_rn(virtual_sums[0], virtual_sums[1]);
+                    }
+                    ptx::sync_aligned(
+                        kExactRouteGroupThreads, route_group_idx);
+                    const uint32_t lane_in_warp =
+                        route_group_lane_idx & 31;
+                    if (route_group_lane_idx / 32 == 0) {
+                        grad_route = route_lane_sums[
+                            route_group_idx * kTritonRouteNumWarps +
+                            (lane_in_warp & (kTritonRouteNumWarps - 1))];
+                        #pragma unroll
+                        for (uint32_t offset = kTritonRouteNumWarps / 2;
+                             offset > 0; offset >>= 1) {
+                            grad_route = __fadd_rn(
+                                grad_route, __shfl_xor_sync(
+                                    0xffffffff, grad_route, offset));
+                        }
+                    }
+                    if constexpr (kWriteWeighted) {
+                        const float route_weight =
+                            route_weights_output[pool_row];
+                        #pragma unroll
+                        for (uint32_t i = 0;
+                             i < kTritonRouteValuesPerThread; ++i) {
+                            const uint32_t col =
+                                2 * route_group_lane_idx +
+                                i * kTritonRouteThreads;
+                            if (col < kHidden) {
+                                const uint32_t source = kWeightedSourceIsRhs
+                                    ? down_pairs[i] : grad_pairs[i];
+                                const float low = static_cast<float>(
+                                    cutlass::bfloat16_t::bitcast(
+                                        static_cast<uint16_t>(source)));
+                                const float high = static_cast<float>(
+                                    cutlass::bfloat16_t::bitcast(
+                                        static_cast<uint16_t>(source >> 16)));
+                                const uint32_t packed =
+                                    static_cast<uint32_t>(cutlass::bfloat16_t(
+                                        low * route_weight).raw()) |
+                                    (static_cast<uint32_t>(cutlass::bfloat16_t(
+                                        high * route_weight).raw()) << 16);
+                                reinterpret_cast<uint32_t*>(
+                                    grad_y_weighted_output)[
+                                    (row_base + col) / 2] = packed;
+                            }
+                        }
+                    }
+                } else if constexpr (kVirtualizeRouteLanes) {
                     // Each physical lane evaluates two logical lanes. Their
                     // FMA and warp-XOR trees remain separate, then each
                     // physical warp publishes both logical Triton partials
