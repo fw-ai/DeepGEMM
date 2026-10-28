@@ -521,14 +521,21 @@ sm100_bf16_mega_moe_backward_post_down_prelude(
         kTritonRouteNumWarps * 32;
     constexpr uint32_t kTritonRouteValuesPerThread =
         kTritonRouteBlockH / kTritonRouteThreads;
+    // K3.1 has 512 logical reduction lanes. Reuse the exact virtual-lane
+    // reduction with 256 physical lanes to process four independent rows
+    // per CTA while preserving every FMA and warp-reduction operation.
+    constexpr bool kVirtualizeK31RouteLanes =
+        kHidden == 3584 && kRoutePreludeThreads == 256 &&
+        kCombineOrderMode != CombineOrderMode::FixedTopK &&
+        kComputeRouteDot;
     constexpr bool kVirtualizeRouteLanes =
-        kRoutePreludeThreads == 128;
+        kRoutePreludeThreads == 128 || kVirtualizeK31RouteLanes;
     DG_STATIC_ASSERT(
         kRoutePreludeThreads == 128 ||
             kRoutePreludeThreads == 256,
         "POST_DOWN route prelude requires 128 or 256 physical threads");
     DG_STATIC_ASSERT(
-        !kVirtualizeRouteLanes ||
+        !kVirtualizeRouteLanes || kVirtualizeK31RouteLanes ||
             (kHidden == 2048 &&
              kCombineOrderMode !=
                  CombineOrderMode::FixedTopK &&
@@ -741,10 +748,10 @@ sm100_bf16_mega_moe_backward_post_down_prelude(
                 kCombineOrderMode !=
                 CombineOrderMode::FixedTopK) {
                 if constexpr (kVirtualizeRouteLanes) {
-                    // Each physical lane evaluates logical lanes p and
-                    // p + 128. Their FMA and warp-XOR trees remain separate,
-                    // then the four physical warps publish all eight logical
-                    // Triton warp partials for the unchanged second level.
+                    // Each physical lane evaluates two logical lanes. Their
+                    // FMA and warp-XOR trees remain separate, then each
+                    // physical warp publishes both logical Triton partials
+                    // for the unchanged second-level reduction.
                     float weighted_values
                         [kRouteVirtualLanes]
                         [kTritonRouteValuesPerThread];
