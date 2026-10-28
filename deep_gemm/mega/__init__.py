@@ -30,7 +30,8 @@ class CombineOrderMode(str, Enum):
     DEEPEP_V1 = 'deepep_v1'
 
 
-def _situ_kwargs(activation, beta, linear_beta, route_weight_mode, clamp, fast_math):
+def _situ_kwargs(activation, beta, linear_beta, route_weight_mode, clamp, fast_math,
+                 *, allow_fast_math=False):
     if activation != 'situ':
         return {}
     if not math.isfinite(beta) or beta <= 0:
@@ -42,7 +43,7 @@ def _situ_kwargs(activation, beta, linear_beta, route_weight_mode, clamp, fast_m
         raise ValueError('SiTU requires post_down route weights')
     if clamp is not None and clamp != float('inf'):
         raise ValueError('SiTU requires an unclamped activation')
-    if fast_math:
+    if fast_math and not allow_fast_math:
         raise ValueError('SiTU requires fast_math=False')
     return dict(situ_beta=beta, situ_linear_beta=linear_beta)
 
