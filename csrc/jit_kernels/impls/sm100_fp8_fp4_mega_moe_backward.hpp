@@ -946,6 +946,16 @@ static void sm100_mega_moe_backward_combine_grad_x(
     }
 
     const int num_sms = get_mega_moe_num_sms();
+    // This local reduction has no cooperative grid barrier. Unlike the
+    // persistent dgrad wave, it can fill multiple resident blocks per SM
+    // to hide global-load latency. Avoid empty blocks for small inputs.
+    constexpr int num_threads = 256;
+    constexpr int values_per_thread = 16;
+    const int64_t num_vectors =
+        static_cast<int64_t>(num_tokens) * (hidden / values_per_thread);
+    const int num_blocks = static_cast<int>(std::max<int64_t>(
+        1, std::min<int64_t>(
+            4 * num_sms, (num_vectors + num_threads - 1) / num_threads)));
     const SM100MegaMoEBackwardCombineRuntime::Args args = {
         .num_ranks = num_ranks,
         .num_local_experts = num_local_experts,
@@ -965,7 +975,7 @@ static void sm100_mega_moe_backward_combine_grad_x(
             static_cast<uint32_t>(num_max_tokens),
         .num_topk = static_cast<uint32_t>(num_topk),
         .hidden = static_cast<uint32_t>(hidden),
-        .launch_args = make_mega_moe_launch_options(num_sms, 256),
+        .launch_args = make_mega_moe_launch_options(num_blocks, num_threads),
     };
     const auto code =
         SM100MegaMoEBackwardCombineRuntime::generate(args);
