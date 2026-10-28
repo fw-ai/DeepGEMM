@@ -1,0 +1,115 @@
+{
+  "scope": "Existing k31_shrink YAML/checkpoint; seeded synthetic next-token data, rank/alpha32, native MXFP4 merged LoRA, BF16 execution, full AC, CP8/EP4. Requested final topology; raw attention backward atomic reductions can introduce numerical differences.",
+  "tokens": 262144,
+  "cp": 8,
+  "ep": 4,
+  "steps": 20,
+  "timing": "Median per-step maximum rank over steps 7\u201320; peaks over all steps/ranks.",
+  "occupancy_observations": 594,
+  "ownership_reconciliation": {
+    "scope": "Reconciliation of PID lookup races only; raw unknown observations remain preserved. One-second sampling cannot prove ownership at unsampled instants.",
+    "samples_sha256": "5e4a2c04fe8fa2020d687852dcb7f65fb0c1ee6aa48b6ffe0306028754407992",
+    "summary_sha256": "0535fd7cfbc3bc2559985ee80859eba6d3d9807fccb3f20bc90228e2078f59d9",
+    "raw_unknown_process_observations": 1,
+    "reconciled": [
+      {
+        "sample_index": 295,
+        "utc": "2026-10-28T20:21:51.685356+00:00",
+        "pid": 2941362,
+        "gpu_uuid": "GPU-f9d0a2a2-39d1-d9d1-1f82-52e195e2303e",
+        "mode": "before",
+        "prior_confirmed_observations": 286,
+        "seconds_after_last_update_file_write": 7.363966464996338,
+        "last_confirmed_cgroup": "0::/system.slice/docker-3a085cf9583301d8656b0c2e5b8523b9cc8625c9a490aaaadde35d46abb8703f.scope\n",
+        "classification": "PID vanished during teardown after all recorded updates; immediately preceding observations establish ownership"
+      }
+    ],
+    "unresolved": 0
+  },
+  "results": {
+    "before": {
+      "losses": [
+        13.641616821289062,
+        13.657109260559082,
+        13.640748977661133,
+        13.620340347290039,
+        13.585906982421875,
+        13.539128303527832,
+        13.47443962097168,
+        13.403623580932617,
+        13.327880859375,
+        13.248076438903809,
+        13.167949676513672,
+        13.086312294006348,
+        13.005407333374023,
+        12.928411483764648,
+        12.856176376342773,
+        12.795562744140625,
+        12.745307922363281,
+        12.70128345489502,
+        12.660093307495117,
+        12.61960506439209
+      ],
+      "forward_cuda_ms": 2246.3822021484375,
+      "backward_cuda_ms": 3978.9512939453125,
+      "combined_cuda_ms": 6222.1435546875,
+      "forward_backward_s": 6.222240151371807,
+      "optimizer_s": 0.05496684601530433,
+      "gpu_peak_allocated_bytes": 82735903232,
+      "gpu_peak_reserved_bytes": 91981086720,
+      "host_process_peak_rss_bytes": 9659416576,
+      "driver_pinned_peak_bytes": 18179173,
+      "driver_pinned_errors": 0
+    },
+    "after": {
+      "losses": [
+        13.641616821289062,
+        13.65678596496582,
+        13.640807151794434,
+        13.618915557861328,
+        13.587991714477539,
+        13.539406776428223,
+        13.473533630371094,
+        13.40366268157959,
+        13.328049659729004,
+        13.247794151306152,
+        13.167427062988281,
+        13.087861061096191,
+        13.006805419921875,
+        12.928580284118652,
+        12.858142852783203,
+        12.797355651855469,
+        12.745595932006836,
+        12.702871322631836,
+        12.659439086914062,
+        12.619699478149414
+      ],
+      "forward_cuda_ms": 2146.166015625,
+      "backward_cuda_ms": 3887.4219970703125,
+      "combined_cuda_ms": 6028.643310546875,
+      "forward_backward_s": 6.028743499540724,
+      "optimizer_s": 0.05638882447965443,
+      "gpu_peak_allocated_bytes": 59933354496,
+      "gpu_peak_reserved_bytes": 67027075072,
+      "host_process_peak_rss_bytes": 9978757120,
+      "driver_pinned_peak_bytes": 4178977,
+      "driver_pinned_errors": 0
+    }
+  },
+  "combined_speedup": 1.0320968141873816,
+  "speedups": {
+    "forward_cuda_ms": 1.0466954493705618,
+    "backward_cuda_ms": 1.0235449860972077,
+    "combined_cuda_ms": 1.0320968141873816
+  },
+  "gpu_peak_non_regression": {
+    "gpu_peak_allocated_bytes": true,
+    "gpu_peak_reserved_bytes": true
+  },
+  "loss_comparison": {
+    "max_absolute_difference": 0.0020847320556640625,
+    "max_relative_difference": 0.00015344813256570894,
+    "interpretation": "20 seeded synthetic optimizer updates; no model-quality or full-model bitwise-equivalence claim"
+  },
+  "memory_scope": "Maximum per process/rank; host RSS and pinned values are not sums across eight workers"
+}
