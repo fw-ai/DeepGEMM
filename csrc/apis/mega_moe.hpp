@@ -1028,6 +1028,7 @@ static void bf16_mega_moe_side_lora(
 
 static void register_apis(pybind11::module_& m) {
     m.attr("BF16_MEGAMOE_SITU") = true;
+    m.attr("BF16_MEGAMOE_SITU_FAST_BACKWARD") = true;
     m.attr("BF16_MEGAMOE_SEPARATE_W13") = true;
     m.attr("BF16_MEGAMOE_SEPARATE_L1") = true;
     m.def("bf16_mega_moe_side_lora", &bf16_mega_moe_side_lora);

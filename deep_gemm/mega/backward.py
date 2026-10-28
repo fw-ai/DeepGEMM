@@ -270,9 +270,15 @@ def bf16_mega_moe_backward_dgrad(
     ``grad_gate_up == gate_up``. Logical tensors whose storage is reused are
     no longer observable after this call. ``"legacy"`` keeps independent
     storage, apart from the historical semantic aliases validated above.
+
+    For SiTU, ``fast_math=True`` uses the hardware tanh approximation in
+    backward only. Sigmoid evaluation, FP32 arithmetic order and BF16
+    materialization are unchanged. The default retains precise tanh.
     """
     situ_kwargs = _situ_kwargs(activation, situ_beta, situ_linear_beta,
-                               route_weight_mode, activation_limit, fast_math)
+                               route_weight_mode, activation_limit, fast_math,
+                               allow_fast_math=bool(getattr(
+                                   _C, "BF16_MEGAMOE_SITU_FAST_BACKWARD", False)))
     # With a separate up weight, w13_weights is the gate tensor [E, I, H].
     # Preserve the packed ABI when callers do not request this layout.
     if w3_weights is not None:

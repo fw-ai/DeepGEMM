@@ -3449,7 +3449,9 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                 dz_dgate = 1.0f;
                             }
                             const float neg_exp =
-                                !kBF16Mode || kFastMath
+                                !kBF16Mode ||
+                                    (kFastMath &&
+                                     kActivationType != ActivationType::SiTU)
                                 ? __expf(-z)
                                 : expf(-z);
                             const float denom =
@@ -3460,12 +3462,18 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                             cd_dtype_t grad_gate_bf16;
                             cd_dtype_t grad_up_bf16;
                             if constexpr (kBF16Mode && kActivationType == ActivationType::SiTU) {
-                                const float tg = tanhf(gate / kSituBeta);
+                                // SiTU fast backward changes only tanh. Keep
+                                // the precise sigmoid and BF16 boundaries.
+                                const float tg = kFastMath
+                                    ? __tanhf(gate / kSituBeta)
+                                    : tanhf(gate / kSituBeta);
                                 const float sg = __fmul_rn(__fmul_rn(kSituBeta, tg), sig);
                                 float su = up;
                                 float du = 1.0f;
                                 if constexpr (kSituLinearBeta != cute::numeric_limits<float>::infinity()) {
-                                    const float tu = tanhf(up / kSituLinearBeta);
+                                    const float tu = kFastMath
+                                        ? __tanhf(up / kSituLinearBeta)
+                                        : tanhf(up / kSituLinearBeta);
                                     su = __fmul_rn(kSituLinearBeta, tu);
                                     du = __fsub_rn(1.0f, __fmul_rn(tu, tu));
                                 }

@@ -1299,7 +1299,6 @@ static void sm100_bf16_mega_moe_backward_dgrad(
         DG_HOST_ASSERT(situ_linear_beta > 0);
         DG_HOST_ASSERT(route_weight_mode == "post_down");
         DG_HOST_ASSERT(activation_limit == std::numeric_limits<float>::infinity());
-        DG_HOST_ASSERT(!fast_math);
     }
     DG_HOST_ASSERT(
         route_weight_mode == "pre_down" ||
